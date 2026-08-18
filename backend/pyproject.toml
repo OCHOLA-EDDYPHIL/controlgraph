@@ -20,7 +20,7 @@ dependencies = [
 dev = [
   "hypothesis>=6.122,<7",
   "httpx>=0.28,<1",
-  "mypy>=1.13,<2",
+  "mypy>=1.13,<3",
   "pytest>=8.3,<9",
   "ruff>=0.8,<1",
 ]
