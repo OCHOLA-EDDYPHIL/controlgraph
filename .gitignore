@@ -16,6 +16,10 @@ web/coverage/
 
 # Terraform
 .terraform/
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
 *.tfstate
 *.tfstate.*
 *.tfplan
@@ -26,6 +30,7 @@ override.tf.json
 *_override.tf.json
 .terraformrc
 terraform.rc
+infra/bootstrap/backend.tf
 
 # Local configuration and secrets
 .env

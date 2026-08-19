@@ -1,0 +1,5 @@
+# Deliberately non-live placeholders; replace all identifiers before planning.
+project_id         = "controlgraph-canary-000000"
+organization_id    = "000000000000"
+billing_account_id = "000000-000000-000000"
+region             = "us-central1"
