@@ -34,6 +34,7 @@ from controlgraph_canary.application.cloud_run import (
     TargetConfigurationProjection,
     cloud_run_revision_configuration_sha256,
     target_configuration_projection,
+    target_configuration_projection_sha256,
     target_configuration_sha256,
 )
 from controlgraph_canary.application.execution import (
@@ -78,6 +79,7 @@ from controlgraph_canary.contracts.models import (
     TrafficAllocation,
 )
 from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
     ServiceClaimRecord,
     ServiceClaimStatus,
     execution_receipt_logical_id,
@@ -130,7 +132,7 @@ def _target(**changes: str) -> TargetBinding:
         "schema_version": "controlgraph.target-binding/v1",
         "project_id": PROJECT_ID,
         "region": "us-central1",
-        "environment": "acceptance",
+        "environment": "nonprod",
         "service_name": SERVICE,
     }
     values.update(changes)
@@ -183,7 +185,7 @@ def _root(
         configuration_sha256=ZERO_DIGEST,
         stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
-        captured_by="controlgraph.operator/v1",
+        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
     )
     return RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
@@ -377,25 +379,66 @@ def _snapshot(root: RolloutRoot) -> FinalAuthoritySnapshot:
         previous_epoch=None,
         revision=0,
         cause=EpochChangeCause.ROOT_CREATED,
-        changed_by="controlgraph.operator/v1",
+        changed_by=root.approved_by,
         request_id="request-authority-1",
         evidence_id="evidence-authority-1",
         changed_at="2026-08-19T12:01:00Z",
     )
+    stable_target_configuration_sha256 = target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=100,
+            candidate_percent=0,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
+    candidate_target_configuration_sha256 = target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=0,
+            candidate_percent=100,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
     claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v1",
+        schema_version="controlgraph.service-claim/v2",
         target=root.target,
         root_id=root.root_id,
         root_sha256=root_sha256,
+        stable_revision=root.stable_snapshot.stable_revision,
+        candidate_revision=root.candidate_revision,
+        initial_epoch=root.initial_epoch,
+        baseline_service_generation=root.stable_snapshot.service_generation,
+        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
+        baseline_revision_configuration_sha256=(
+            root.stable_snapshot.stable_revision_configuration_sha256
+        ),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
+        stable_target_configuration_sha256=stable_target_configuration_sha256,
+        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+        operator_owner=root.approved_by,
+        workload_creator="controlgraph.api/v1",
+        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         status=ServiceClaimStatus.ACTIVE,
-        claimed_by="controlgraph.api/v1",
         claim_request_id="request-claim",
         claim_evidence_id="evidence-claim",
         claimed_at="2026-08-19T12:01:01Z",
+        release_fence_epoch=None,
+        release_fence_authority_revision=None,
+        release_fenced_by=None,
+        release_fence_request_id=None,
+        release_fence_evidence_id=None,
+        release_fenced_at=None,
         released_by=None,
         release_request_id=None,
         release_evidence_id=None,
         released_at=None,
+        terminal_root_proof=None,
+        target_classification_proof=None,
     )
     return FinalAuthoritySnapshot(
         root=StoredRecord(root, 0),
@@ -1309,7 +1352,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-        "9859ee2f9e9a8a78518a97457e075856990ec8e7ea8c9e0b5ca898e7d8b05c8e"
+        "91cc2ad3338f51de339b64d9deae36713c0e687f122473743ce4e6612f69947c"
     )
 
 

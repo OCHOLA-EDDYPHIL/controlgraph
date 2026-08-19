@@ -251,8 +251,16 @@ class FinalAuthoritySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FencedServiceClaim:
+    """The non-issuing claim fence and epoch advance committed atomically."""
+
+    service_claim: StoredRecord[ServiceClaimRecord]
+    authority: StoredRecord[EpochAuthorityRecord]
+
+
+@dataclass(frozen=True, slots=True)
 class ReleasedServiceClaim:
-    """The claim release and epoch advance committed by one transaction."""
+    """The final claim release and unchanged fenced authority."""
 
     service_claim: StoredRecord[ServiceClaimRecord]
     authority: StoredRecord[EpochAuthorityRecord]
@@ -267,6 +275,14 @@ class AuthorityStore(Protocol):
 
     async def create_rollout(
         self,
+        root: RolloutRoot,
+        service_claim: ServiceClaimRecord,
+        authority: EpochAuthorityRecord,
+    ) -> CreatedRollout: ...
+
+    async def create_rollout_after_release(
+        self,
+        expected_released_claim: StoredRecord[ServiceClaimRecord],
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
@@ -297,12 +313,19 @@ class AuthorityStore(Protocol):
         replacement: EpochAuthorityRecord,
     ) -> StoredRecord[EpochAuthorityRecord]: ...
 
-    async def release_service_claim(
+    async def fence_service_claim(
         self,
         expected_claim: StoredRecord[ServiceClaimRecord],
         replacement_claim: ServiceClaimRecord,
         expected_authority: StoredRecord[EpochAuthorityRecord],
         replacement_authority: EpochAuthorityRecord,
+    ) -> FencedServiceClaim: ...
+
+    async def release_service_claim(
+        self,
+        expected_claim: StoredRecord[ServiceClaimRecord],
+        replacement_claim: ServiceClaimRecord,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
     ) -> ReleasedServiceClaim: ...
 
     async def read_receipt(
@@ -333,6 +356,7 @@ __all__ = [
     "AuthorityStoreUnavailable",
     "CreatedRollout",
     "DirectReceiptCreate",
+    "FencedServiceClaim",
     "FinalAuthoritySnapshot",
     "IssuanceStateSnapshot",
     "ReceiptClaimAdopted",

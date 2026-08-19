@@ -17,6 +17,10 @@ from controlgraph_canary.application.authority_store import (
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
+from controlgraph_canary.application.cloud_run import (
+    TargetConfigurationProjection,
+    target_configuration_projection_sha256,
+)
 from controlgraph_canary.application.execution import (
     DefinitiveFreshClaimLeaseFactory,
     FinalAuthorityDenial,
@@ -55,8 +59,15 @@ from controlgraph_canary.contracts import (
     encode_base64url,
 )
 from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
+    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
+    SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
     ServiceClaimRecord,
     ServiceClaimStatus,
+    ServiceClaimTargetClassification,
+    ServiceClaimTargetClassificationProof,
+    ServiceClaimTerminalRootProof,
+    ServiceClaimTerminalRootState,
     execution_receipt_logical_id,
 )
 
@@ -77,8 +88,8 @@ def _target() -> TargetBinding:
         schema_version="controlgraph.target-binding/v1",
         project_id=PROJECT_ID,
         region="us-central1",
-        environment="acceptance",
-        service_name="reference-target",
+        environment="nonprod",
+        service_name="controlgraph-reference-target",
     )
 
 
@@ -87,22 +98,27 @@ def _root() -> RolloutRoot:
     stable = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=target,
-        stable_revision="reference-stable",
-        traffic=(TrafficAllocation(revision="reference-stable", percent=100),),
+        stable_revision="controlgraph-reference-target-stable-v1",
+        traffic=(
+            TrafficAllocation(
+                revision="controlgraph-reference-target-stable-v1",
+                percent=100,
+            ),
+        ),
         concurrency=40,
         service_generation=7,
         provider_etag="etag-stable-7",
         configuration_sha256=ZERO_DIGEST,
         stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
-        captured_by="controlgraph.operator/v1",
+        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
     )
     return RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
         root_id="root-final-gate",
         target=target,
         stable_snapshot=stable,
-        candidate_revision="reference-candidate",
+        candidate_revision="controlgraph-reference-target-candidate-v1",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
@@ -296,25 +312,102 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
         evidence_id=f"evidence-authority-{epoch}",
         changed_at=f"2026-08-19T12:0{epoch}:00Z",
     )
+    stable_target_configuration_sha256 = target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=100,
+            candidate_percent=0,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
+    candidate_target_configuration_sha256 = target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=0,
+            candidate_percent=100,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
     claim_values: dict[str, object] = {
-        "schema_version": "controlgraph.service-claim/v1",
+        "schema_version": "controlgraph.service-claim/v2",
         "target": root.target,
         "root_id": root.root_id,
         "root_sha256": root_sha256,
+        "stable_revision": root.stable_snapshot.stable_revision,
+        "candidate_revision": root.candidate_revision,
+        "initial_epoch": root.initial_epoch,
+        "baseline_service_generation": root.stable_snapshot.service_generation,
+        "baseline_configuration_sha256": root.stable_snapshot.configuration_sha256,
+        "baseline_revision_configuration_sha256": (
+            root.stable_snapshot.stable_revision_configuration_sha256
+        ),
+        "candidate_revision_configuration_sha256": THREE_DIGEST,
+        "stable_target_configuration_sha256": stable_target_configuration_sha256,
+        "candidate_target_configuration_sha256": candidate_target_configuration_sha256,
+        "operator_owner": root.approved_by,
+        "workload_creator": "controlgraph.api/v1",
+        "terminal_release_condition": SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         "status": ServiceClaimStatus.RELEASED if released else ServiceClaimStatus.ACTIVE,
-        "claimed_by": "controlgraph.api/v1",
         "claim_request_id": "request-claim",
         "claim_evidence_id": "evidence-claim",
         "claimed_at": "2026-08-19T12:01:01Z",
-        "released_by": authority.changed_by if released else None,
-        "release_request_id": authority.request_id if released else None,
-        "release_evidence_id": authority.evidence_id if released else None,
-        "released_at": authority.changed_at if released else None,
+        "release_fence_epoch": authority.current_epoch if released else None,
+        "release_fence_authority_revision": authority.revision if released else None,
+        "release_fenced_by": authority.changed_by if released else None,
+        "release_fence_request_id": authority.request_id if released else None,
+        "release_fence_evidence_id": authority.evidence_id if released else None,
+        "release_fenced_at": authority.changed_at if released else None,
+        "released_by": "controlgraph.coordinator/v1" if released else None,
+        "release_request_id": "request-release" if released else None,
+        "release_evidence_id": "evidence-release" if released else None,
+        "released_at": "2026-08-19T12:02:20Z" if released else None,
+        "terminal_root_proof": (
+            ServiceClaimTerminalRootProof(
+                schema_version=SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
+                target=root.target,
+                root_id=root.root_id,
+                root_sha256=root_sha256,
+                state=ServiceClaimTerminalRootState.RECOVERED,
+                target_configuration_sha256=stable_target_configuration_sha256,
+                evidence_id="evidence-terminal",
+                evidence_sha256=ZERO_DIGEST,
+                confirmed_by="controlgraph.coordinator/v1",
+                confirmed_at="2026-08-19T12:01:10Z",
+            )
+            if released
+            else None
+        ),
+        "target_classification_proof": (
+            ServiceClaimTargetClassificationProof(
+                schema_version=SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
+                target=root.target,
+                root_id=root.root_id,
+                root_sha256=root_sha256,
+                classification=ServiceClaimTargetClassification.STABLE_RESTORED,
+                fenced_epoch=authority.current_epoch,
+                fenced_authority_revision=authority.revision,
+                service_generation=8,
+                provider_etag="etag-stable-8",
+                target_configuration_sha256=stable_target_configuration_sha256,
+                evidence_id="evidence-classification",
+                evidence_sha256=ONE_DIGEST,
+                classified_by=(
+                    f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                classified_at="2026-08-19T12:02:10Z",
+            )
+            if released
+            else None
+        ),
     }
     claim = ServiceClaimRecord(**claim_values)  # type: ignore[arg-type]
     return FinalAuthoritySnapshot(
         root=StoredRecord(root, 0),
-        service_claim=StoredRecord(claim, 1 if released else 0),
+        service_claim=StoredRecord(claim, 2 if released else 0),
         authority=StoredRecord(authority, authority.revision),
     )
 
@@ -508,35 +601,16 @@ def test_released_claim_requires_the_exact_atomic_revocation_authority(
     mode: str,
 ) -> None:
     async def scenario() -> None:
-        base = _snapshot(epoch=1 if mode == "unadvanced" else 2)
-        authority = base.authority.value
+        released = _snapshot(epoch=2, released=True)
+        authority = released.authority.value
         if mode == "unadvanced":
-            authority = EpochAuthorityRecord(
-                **{
-                    **authority.model_dump(mode="python"),
-                    "changed_at": "2026-08-19T12:02:00Z",
-                }
-            )
+            authority = _snapshot(epoch=1).authority.value
         if mode == "wrong-cause":
-            authority = EpochAuthorityRecord(
-                **{
-                    **authority.model_dump(mode="python"),
-                    "cause": EpochChangeCause.RECOVERY,
-                }
+            authority = authority.model_copy(
+                update={"cause": EpochChangeCause.RECOVERY}
             )
-        claim = ServiceClaimRecord(
-            **{
-                **base.service_claim.value.model_dump(mode="python"),
-                "status": ServiceClaimStatus.RELEASED,
-                "released_by": authority.changed_by,
-                "release_request_id": authority.request_id,
-                "release_evidence_id": authority.evidence_id,
-                "released_at": authority.changed_at,
-            }
-        )
-        snapshot = FinalAuthoritySnapshot(
-            root=base.root,
-            service_claim=StoredRecord(claim, 1),
+        snapshot = replace(
+            released,
             authority=StoredRecord(authority, authority.revision),
         )
         verified = _verified()
@@ -621,6 +695,33 @@ def test_active_claim_at_noninitial_revision_is_denied_without_adapter_call() ->
 
         result = await FinalMutationGate(
             authority_reader=_Reader(corrupt),
+            adapter=adapter,
+            clock=lambda: NOW,
+        ).execute(_lease(verified), verified)
+
+        assert isinstance(result, FinalAuthorityDenial)
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
+        assert adapter.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_canonically_wrapped_tampered_claim_projection_is_denied() -> None:
+    async def scenario() -> None:
+        verified = _verified()
+        snapshot = _snapshot()
+        altered_claim = snapshot.service_claim.value.model_copy(
+            update={"candidate_target_configuration_sha256": ZERO_DIGEST}
+        )
+        tampered = replace(
+            snapshot,
+            service_claim=StoredRecord(altered_claim, 0),
+        )
+        adapter = _Adapter(ServiceRole.EXECUTOR)
+
+        result = await FinalMutationGate(
+            authority_reader=_Reader(tampered),
             adapter=adapter,
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)

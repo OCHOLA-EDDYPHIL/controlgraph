@@ -16,6 +16,9 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreError,
     IssuanceStateSnapshot,
 )
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_target_configuration_sha256,
+)
 from controlgraph_canary.application.signing import (
     DETACHED_SIGNATURE_V1,
     DetachedSignature,
@@ -53,7 +56,11 @@ from controlgraph_canary.contracts.models import (
     SignedCapability,
     TargetBinding,
 )
-from controlgraph_canary.contracts.storage import ServiceClaimRecord, ServiceClaimStatus
+from controlgraph_canary.contracts.storage import (
+    ServiceClaimRecord,
+    ServiceClaimStatus,
+    active_service_claim_matches_root,
+)
 
 CAPABILITY_IDENTITY_V1 = "controlgraph.capability-identity/v1"
 CAPABILITY_IDENTITY_DOMAIN = b"controlgraph.capability-identity/v1\0"
@@ -477,15 +484,42 @@ class CapabilityIssuer:
         ):
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         root_sha256 = canonical_sha256(root)
+        try:
+            stable_target_configuration_sha256 = (
+                rollout_root_target_configuration_sha256(
+                    root,
+                    stable_percent=100,
+                    candidate_percent=0,
+                )
+            )
+            candidate_target_configuration_sha256 = (
+                rollout_root_target_configuration_sha256(
+                    root,
+                    stable_percent=0,
+                    candidate_percent=100,
+                )
+            )
+        except (TypeError, ValueError):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
         if (
             root.root_id != root_id
             or root.target != self._configuration.target
             or root_record.revision != 0
             or claim.status is not ServiceClaimStatus.ACTIVE
-            or claim_record.revision != 0
+            or claim_record.revision % 3 != 0
             or claim.target != root.target
             or claim.root_id != root.root_id
             or claim.root_sha256 != root_sha256
+            or not active_service_claim_matches_root(
+                claim,
+                root,
+                stable_target_configuration_sha256=(
+                    stable_target_configuration_sha256
+                ),
+                candidate_target_configuration_sha256=(
+                    candidate_target_configuration_sha256
+                ),
+            )
             or authority.target != root.target
             or authority.root_id != root.root_id
             or authority.root_sha256 != root_sha256

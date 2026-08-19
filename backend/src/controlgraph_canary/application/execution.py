@@ -17,6 +17,9 @@ from controlgraph_canary.application.authority_store import (
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_target_configuration_sha256,
+)
 from controlgraph_canary.application.identity import AuthenticationContext, ServiceRole
 from controlgraph_canary.authority.replay import (
     MutationAction,
@@ -41,6 +44,7 @@ from controlgraph_canary.contracts.storage import (
     ServiceClaimRecord,
     ServiceClaimStatus,
     execution_receipt_logical_id,
+    service_claim_matches_root,
 )
 
 
@@ -475,7 +479,7 @@ def _final_authority_denial(
     if observed_authority_epoch != intent.epoch:
         return ReasonCode.EPOCH_MISMATCH
     if (
-        snapshot.service_claim.revision != 0
+        snapshot.service_claim.revision % 3 != 0
         or claim.status is not ServiceClaimStatus.ACTIVE
         or verified.earliest_lineage_issued_at
         < _parse_utc_second(authority.changed_at)
@@ -528,6 +532,43 @@ def _coherent_authority_epoch(
     ):
         return None
     intent = verified.request.intent
+    try:
+        stable_target_configuration_sha256 = (
+            rollout_root_target_configuration_sha256(
+                root,
+                stable_percent=100,
+                candidate_percent=0,
+            )
+        )
+        candidate_target_configuration_sha256 = (
+            rollout_root_target_configuration_sha256(
+                root,
+                stable_percent=0,
+                candidate_percent=100,
+            )
+        )
+    except (TypeError, ValueError):
+        return None
+    claim_lifecycle_matches = (
+        claim.status is ServiceClaimStatus.ACTIVE
+        and snapshot.service_claim.revision % 3 == 0
+    ) or (
+        claim.status is ServiceClaimStatus.RELEASING
+        and snapshot.service_claim.revision % 3 == 1
+    ) or (
+        claim.status is ServiceClaimStatus.RELEASED
+        and snapshot.service_claim.revision % 3 == 2
+    )
+    claim_fence_matches = claim.status is ServiceClaimStatus.ACTIVE or (
+        authority.revision >= 1
+        and authority.cause is EpochChangeCause.OPERATOR_REVOCATION
+        and claim.release_fence_epoch == authority.current_epoch
+        and claim.release_fence_authority_revision == authority.revision
+        and claim.release_fenced_by == authority.changed_by
+        and claim.release_fence_request_id == authority.request_id
+        and claim.release_fence_evidence_id == authority.evidence_id
+        and claim.release_fenced_at == authority.changed_at
+    )
     if (
         snapshot.root.revision != 0
         or root != verified.root
@@ -538,27 +579,18 @@ def _coherent_authority_epoch(
         or claim.target != target
         or claim.root_id != intent.root_id
         or claim.root_sha256 != intent.root_sha256
-        or not (
-            (
-                claim.status is ServiceClaimStatus.ACTIVE
-                and snapshot.service_claim.revision == 0
-            )
-            or (
-                claim.status is ServiceClaimStatus.RELEASED
-                and snapshot.service_claim.revision == 1
-            )
+        or not service_claim_matches_root(
+            claim,
+            root,
+            stable_target_configuration_sha256=(
+                stable_target_configuration_sha256
+            ),
+            candidate_target_configuration_sha256=(
+                candidate_target_configuration_sha256
+            ),
         )
-        or (
-            claim.status is ServiceClaimStatus.RELEASED
-            and (
-                authority.revision < 1
-                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
-                or claim.released_by != authority.changed_by
-                or claim.release_request_id != authority.request_id
-                or claim.release_evidence_id != authority.evidence_id
-                or claim.released_at != authority.changed_at
-            )
-        )
+        or not claim_lifecycle_matches
+        or not claim_fence_matches
         or authority.target != target
         or authority.root_id != intent.root_id
         or authority.root_sha256 != intent.root_sha256

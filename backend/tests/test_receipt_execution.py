@@ -26,6 +26,7 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunMutationResult,
     CloudRunTrafficAllocation,
     TargetConfigurationProjection,
+    rollout_root_target_configuration_sha256,
     target_configuration_projection,
 )
 from controlgraph_canary.application.execution import (
@@ -67,6 +68,7 @@ from controlgraph_canary.contracts.models import (
     TrafficAllocation,
 )
 from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
     ServiceClaimRecord,
     ServiceClaimStatus,
 )
@@ -75,6 +77,7 @@ PROJECT_ID = "controlgraph-canary-a1b2c3"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
 TWO_DIGEST = "2" * 64
+THREE_DIGEST = "3" * 64
 NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
 KEY_VERSION = (
     f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
@@ -87,8 +90,8 @@ def _target() -> TargetBinding:
         schema_version="controlgraph.target-binding/v1",
         project_id=PROJECT_ID,
         region="us-central1",
-        environment="acceptance",
-        service_name="reference-target",
+        environment="nonprod",
+        service_name="controlgraph-reference-target",
     )
 
 
@@ -97,9 +100,12 @@ def _root() -> RolloutRoot:
     snapshot = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=target,
-        stable_revision="reference-target-stable",
+        stable_revision="controlgraph-reference-target-stable-v1",
         traffic=(
-            TrafficAllocation(revision="reference-target-stable", percent=100),
+            TrafficAllocation(
+                revision="controlgraph-reference-target-stable-v1",
+                percent=100,
+            ),
         ),
         concurrency=40,
         service_generation=7,
@@ -107,14 +113,14 @@ def _root() -> RolloutRoot:
         configuration_sha256=ZERO_DIGEST,
         stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
-        captured_by="controlgraph.operator/v1",
+        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
     )
     return RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
         root_id="root-receipt-execution",
         target=target,
         stable_snapshot=snapshot,
-        candidate_revision="reference-target-candidate",
+        candidate_revision="controlgraph-reference-target-candidate-v1",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
@@ -215,19 +221,52 @@ def _snapshot(*, epoch: int = 1) -> FinalAuthoritySnapshot:
     root = _root()
     root_sha256 = canonical_sha256(root)
     claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v1",
+        schema_version="controlgraph.service-claim/v2",
         target=root.target,
         root_id=root.root_id,
         root_sha256=root_sha256,
+        stable_revision=root.stable_snapshot.stable_revision,
+        candidate_revision=root.candidate_revision,
+        initial_epoch=root.initial_epoch,
+        baseline_service_generation=root.stable_snapshot.service_generation,
+        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
+        baseline_revision_configuration_sha256=(
+            root.stable_snapshot.stable_revision_configuration_sha256
+        ),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
+        stable_target_configuration_sha256=(
+            rollout_root_target_configuration_sha256(
+                root,
+                stable_percent=100,
+                candidate_percent=0,
+            )
+        ),
+        candidate_target_configuration_sha256=(
+            rollout_root_target_configuration_sha256(
+                root,
+                stable_percent=0,
+                candidate_percent=100,
+            )
+        ),
+        operator_owner=root.approved_by,
+        workload_creator="controlgraph.api/v1",
+        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         status=ServiceClaimStatus.ACTIVE,
-        claimed_by="controlgraph.api/v1",
         claim_request_id="request-claim",
         claim_evidence_id="evidence-claim",
         claimed_at="2026-08-19T12:01:01Z",
+        release_fence_epoch=None,
+        release_fence_authority_revision=None,
+        release_fenced_by=None,
+        release_fence_request_id=None,
+        release_fence_evidence_id=None,
+        release_fenced_at=None,
         released_by=None,
         release_request_id=None,
         release_evidence_id=None,
         released_at=None,
+        terminal_root_proof=None,
+        target_classification_proof=None,
     )
     authority = EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
@@ -543,12 +582,12 @@ def _cloud_run_result(
         outcome=outcome,
         requested_traffic=(
             CloudRunTrafficAllocation(
-                revision="reference-target-stable",
+                revision="controlgraph-reference-target-stable-v1",
                 percent=90,
                 tag="stable",
             ),
             CloudRunTrafficAllocation(
-                revision="reference-target-candidate",
+                revision="controlgraph-reference-target-candidate-v1",
                 percent=10,
                 tag="candidate",
             ),
@@ -1180,12 +1219,12 @@ def test_cloud_run_failed_safe_mapping_is_lossless(
 ) -> None:
     traffic = (
         CloudRunTrafficAllocation(
-            revision="reference-target-stable",
+            revision="controlgraph-reference-target-stable-v1",
             percent=90,
             tag="stable",
         ),
         CloudRunTrafficAllocation(
-            revision="reference-target-candidate",
+            revision="controlgraph-reference-target-candidate-v1",
             percent=10,
             tag="candidate",
         ),

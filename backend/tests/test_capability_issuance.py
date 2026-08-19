@@ -24,6 +24,10 @@ from controlgraph_canary.application.capability_issuance import (
     CapabilityIssuerConfiguration,
     TrustBundleCapabilityVerifier,
 )
+from controlgraph_canary.application.cloud_run import (
+    TargetConfigurationProjection,
+    target_configuration_projection_sha256,
+)
 from controlgraph_canary.application.signing import (
     DigestSigningBackend,
     PurposeSealedSigner,
@@ -50,7 +54,17 @@ from controlgraph_canary.contracts import (
     canonical_sha256,
     encode_base64url,
 )
-from controlgraph_canary.contracts.storage import ServiceClaimRecord, ServiceClaimStatus
+from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
+    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
+    SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
+    ServiceClaimRecord,
+    ServiceClaimStatus,
+    ServiceClaimTargetClassification,
+    ServiceClaimTargetClassificationProof,
+    ServiceClaimTerminalRootProof,
+    ServiceClaimTerminalRootState,
+)
 
 PROJECT_ID = "controlgraph-canary-abc123"
 ZERO_DIGEST = "0" * 64
@@ -72,13 +86,13 @@ def target(
     *,
     project_id: str = PROJECT_ID,
     region: str = "us-central1",
-    service_name: str = "reference-target",
+    service_name: str = "controlgraph-reference-target",
 ) -> TargetBinding:
     return TargetBinding(
         schema_version="controlgraph.target-binding/v1",
         project_id=project_id,
         region=region,
-        environment="acceptance",
+        environment="nonprod",
         service_name=service_name,
     )
 
@@ -88,22 +102,27 @@ def trusted_records() -> tuple[RolloutRoot, ServiceClaimRecord, EpochAuthorityRe
     snapshot = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=bound_target,
-        stable_revision="reference-target-stable",
-        traffic=(TrafficAllocation(revision="reference-target-stable", percent=100),),
+        stable_revision="controlgraph-reference-target-stable-v1",
+        traffic=(
+            TrafficAllocation(
+                revision="controlgraph-reference-target-stable-v1",
+                percent=100,
+            ),
+        ),
         concurrency=40,
         service_generation=7,
         provider_etag="etag-stable-7",
         configuration_sha256=ZERO_DIGEST,
         stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
-        captured_by="controlgraph.operator/v1",
+        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
     )
     root = RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
         root_id="root-001",
         target=bound_target,
         stable_snapshot=snapshot,
-        candidate_revision="reference-target-candidate",
+        candidate_revision="controlgraph-reference-target-candidate-v1",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
@@ -114,20 +133,54 @@ def trusted_records() -> tuple[RolloutRoot, ServiceClaimRecord, EpochAuthorityRe
         approved_at="2026-08-19T12:01:00Z",
     )
     root_sha256 = canonical_sha256(root)
+
+    def target_configuration_sha256(stable_percent: int, candidate_percent: int) -> str:
+        return target_configuration_projection_sha256(
+            TargetConfigurationProjection(
+                target=root.target,
+                stable_revision=root.stable_snapshot.stable_revision,
+                candidate_revision=root.candidate_revision,
+                stable_percent=stable_percent,
+                candidate_percent=candidate_percent,
+                concurrency=root.stable_snapshot.concurrency,
+            )
+        )
+
     claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v1",
+        schema_version="controlgraph.service-claim/v2",
         target=bound_target,
         root_id=root.root_id,
         root_sha256=root_sha256,
+        stable_revision=root.stable_snapshot.stable_revision,
+        candidate_revision=root.candidate_revision,
+        initial_epoch=root.initial_epoch,
+        baseline_service_generation=root.stable_snapshot.service_generation,
+        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
+        baseline_revision_configuration_sha256=(
+            root.stable_snapshot.stable_revision_configuration_sha256
+        ),
+        candidate_revision_configuration_sha256=TWO_DIGEST,
+        stable_target_configuration_sha256=target_configuration_sha256(100, 0),
+        candidate_target_configuration_sha256=target_configuration_sha256(0, 100),
+        operator_owner=root.approved_by,
+        workload_creator="controlgraph.api/v1",
+        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         status=ServiceClaimStatus.ACTIVE,
-        claimed_by="controlgraph.coordinator/v1",
         claim_request_id="request-root-001",
         claim_evidence_id="evidence-root-001",
         claimed_at="2026-08-19T12:01:00Z",
+        release_fence_epoch=None,
+        release_fence_authority_revision=None,
+        release_fenced_by=None,
+        release_fence_request_id=None,
+        release_fence_evidence_id=None,
+        release_fenced_at=None,
         released_by=None,
         release_request_id=None,
         release_evidence_id=None,
         released_at=None,
+        terminal_root_proof=None,
+        target_classification_proof=None,
     )
     authority = EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
@@ -138,12 +191,66 @@ def trusted_records() -> tuple[RolloutRoot, ServiceClaimRecord, EpochAuthorityRe
         previous_epoch=None,
         revision=0,
         cause=EpochChangeCause.ROOT_CREATED,
-        changed_by="controlgraph.coordinator/v1",
+        changed_by=root.approved_by,
         request_id="request-root-001",
         evidence_id="evidence-root-001",
         changed_at="2026-08-19T12:01:00Z",
     )
     return root, claim, authority
+
+
+def released_claim(
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+) -> ServiceClaimRecord:
+    terminal = ServiceClaimTerminalRootProof(
+        schema_version=SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
+        target=claim.target,
+        root_id=claim.root_id,
+        root_sha256=claim.root_sha256,
+        state=ServiceClaimTerminalRootState.RECOVERED,
+        target_configuration_sha256=claim.stable_target_configuration_sha256,
+        evidence_id="evidence-terminal-release",
+        evidence_sha256=ZERO_DIGEST,
+        confirmed_by="controlgraph.coordinator/v1",
+        confirmed_at="2026-08-19T12:01:10Z",
+    )
+    classification = ServiceClaimTargetClassificationProof(
+        schema_version=SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
+        target=claim.target,
+        root_id=claim.root_id,
+        root_sha256=claim.root_sha256,
+        classification=ServiceClaimTargetClassification.STABLE_RESTORED,
+        fenced_epoch=authority.current_epoch,
+        fenced_authority_revision=authority.revision,
+        service_generation=8,
+        provider_etag="etag-stable-8",
+        target_configuration_sha256=claim.stable_target_configuration_sha256,
+        evidence_id="evidence-target-release",
+        evidence_sha256=ONE_DIGEST,
+        classified_by=(
+            f"controlgraph-verifier@{claim.target.project_id}.iam.gserviceaccount.com"
+        ),
+        classified_at="2026-08-19T12:04:00Z",
+    )
+    return ServiceClaimRecord(
+        **{
+            **claim.model_dump(mode="python"),
+            "status": ServiceClaimStatus.RELEASED,
+            "release_fence_epoch": authority.current_epoch,
+            "release_fence_authority_revision": authority.revision,
+            "release_fenced_by": authority.changed_by,
+            "release_fence_request_id": authority.request_id,
+            "release_fence_evidence_id": authority.evidence_id,
+            "release_fenced_at": authority.changed_at,
+            "released_by": "controlgraph.coordinator/v1",
+            "release_request_id": "request-claim-release",
+            "release_evidence_id": "evidence-claim-release",
+            "released_at": "2026-08-19T12:05:00Z",
+            "terminal_root_proof": terminal,
+            "target_classification_proof": classification,
+        }
+    )
 
 
 class FakeAuthorityStore:
@@ -159,7 +266,7 @@ class FakeAuthorityStore:
         self._root = default_root if root is None else root
         self._claim = default_claim if claim is None else claim
         self._authority = default_authority if authority is None else authority
-        self._claim_revision = 0 if self._claim.status is ServiceClaimStatus.ACTIVE else 1
+        self._claim_revision = 0 if self._claim.status is ServiceClaimStatus.ACTIVE else 2
         self._fail = fail
         self.target = default_root.target
         self.reads: list[str] = []
@@ -184,7 +291,7 @@ class FakeAuthorityStore:
 
     def release(self, claim: ServiceClaimRecord, authority: EpochAuthorityRecord) -> None:
         self._claim = claim
-        self._claim_revision += 1
+        self._claim_revision = 2
         self._authority = authority
 
 
@@ -398,22 +505,13 @@ def test_authority_change_during_signing_never_returns_current_authority(
             "previous_epoch": 1,
             "revision": 1,
             "cause": EpochChangeCause.OPERATOR_REVOCATION,
-            "changed_by": "controlgraph.coordinator/v1",
+            "changed_by": "controlgraph.operator/v1",
             "request_id": "request-release-001",
             "evidence_id": "evidence-release-001",
             "changed_at": "2026-08-19T12:02:00Z",
         }
     )
-    released = ServiceClaimRecord(
-        **{
-            **claim.model_dump(mode="python"),
-            "status": ServiceClaimStatus.RELEASED,
-            "released_by": advanced.changed_by,
-            "release_request_id": advanced.request_id,
-            "release_evidence_id": advanced.evidence_id,
-            "released_at": advanced.changed_at,
-        }
-    )
+    released = released_claim(claim, advanced)
 
     def change_state() -> None:
         if release_claim:
@@ -447,22 +545,13 @@ def test_release_after_issuance_atomically_makes_the_capability_epoch_stale() ->
             "previous_epoch": 1,
             "revision": 1,
             "cause": EpochChangeCause.OPERATOR_REVOCATION,
-            "changed_by": "controlgraph.coordinator/v1",
+            "changed_by": "controlgraph.operator/v1",
             "request_id": "request-release-001",
             "evidence_id": "evidence-release-001",
             "changed_at": "2026-08-19T12:03:00Z",
         }
     )
-    released = ServiceClaimRecord(
-        **{
-            **claim.model_dump(mode="python"),
-            "status": ServiceClaimStatus.RELEASED,
-            "released_by": revoked.changed_by,
-            "release_request_id": revoked.request_id,
-            "release_evidence_id": revoked.evidence_id,
-            "released_at": revoked.changed_at,
-        }
-    )
+    released = released_claim(claim, revoked)
 
     store.release(released, revoked)
     current = asyncio.run(store.read_issuance_state(root.root_id))
@@ -635,18 +724,53 @@ def test_issuer_fails_closed_for_unavailable_or_inconsistent_trusted_state() -> 
     assert backend.digests == []
 
 
-def test_released_service_claim_cannot_issue_new_authority() -> None:
+@pytest.mark.parametrize(
+    "field",
+    [
+        "stable_target_configuration_sha256",
+        "candidate_target_configuration_sha256",
+    ],
+)
+def test_issuer_rejects_a_canonically_wrapped_tampered_claim_projection(
+    field: str,
+) -> None:
     root, claim, authority = trusted_records()
-    released = ServiceClaimRecord(
+    altered_claim = ServiceClaimRecord(
         **{
             **claim.model_dump(mode="python"),
-            "status": ServiceClaimStatus.RELEASED,
-            "released_by": "controlgraph.coordinator/v1",
-            "release_request_id": "request-release-001",
-            "release_evidence_id": "evidence-release-001",
-            "released_at": "2026-08-19T12:01:30Z",
+            field: ZERO_DIGEST,
         }
     )
+    value, backend, _ = issuer(
+        store=FakeAuthorityStore(
+            root=root,
+            claim=altered_claim,
+            authority=authority,
+        )
+    )
+
+    with pytest.raises(CapabilityIssuanceError) as denied:
+        issue(value)
+
+    assert denied.value.code is CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID
+    assert backend.digests == []
+
+def test_released_service_claim_cannot_issue_new_authority() -> None:
+    root, claim, authority = trusted_records()
+    release_authority = EpochAuthorityRecord(
+        **{
+            **authority.model_dump(mode="python"),
+            "current_epoch": 2,
+            "previous_epoch": 1,
+            "revision": 1,
+            "cause": EpochChangeCause.OPERATOR_REVOCATION,
+            "changed_by": "controlgraph.operator/v1",
+            "request_id": "request-release-001",
+            "evidence_id": "evidence-release-001",
+            "changed_at": "2026-08-19T12:01:30Z",
+        }
+    )
+    released = released_claim(claim, release_authority)
     value, backend, _ = issuer(
         store=FakeAuthorityStore(root=root, claim=released, authority=authority)
     )

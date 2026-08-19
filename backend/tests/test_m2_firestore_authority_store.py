@@ -16,6 +16,7 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
     DirectReceiptCreate,
+    FencedServiceClaim,
     FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
     ReceiptClaimAdopted,
@@ -23,6 +24,10 @@ from controlgraph_canary.application.authority_store import (
     ReceiptClaimCreated,
     ReleasedServiceClaim,
     StoredRecord,
+)
+from controlgraph_canary.application.cloud_run import (
+    TargetConfigurationProjection,
+    target_configuration_projection_sha256,
 )
 from controlgraph_canary.authority.replay import (
     MutationAction,
@@ -44,9 +49,16 @@ from controlgraph_canary.contracts.models import (
     TrafficAllocation,
 )
 from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
+    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
+    SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
     AuthorityStorageKind,
     ServiceClaimRecord,
     ServiceClaimStatus,
+    ServiceClaimTargetClassification,
+    ServiceClaimTargetClassificationProof,
+    ServiceClaimTerminalRootProof,
+    ServiceClaimTerminalRootState,
     epoch_authority_document_id,
     execution_receipt_document_id,
     execution_receipt_logical_id,
@@ -71,32 +83,45 @@ def target() -> TargetBinding:
         schema_version="controlgraph.target-binding/v1",
         project_id="controlgraph-canary-a1b2c3",
         region="us-central1",
-        environment="acceptance",
-        service_name="reference-target",
+        environment="nonprod",
+        service_name="controlgraph-reference-target",
     )
 
 
-def rollout_root(root_id: str = "root-firestore-001") -> RolloutRoot:
+def rollout_root(
+    root_id: str = "root-firestore-001",
+    *,
+    captured_at: str = "2026-08-19T12:00:00Z",
+    approved_at: str = "2026-08-19T12:01:00Z",
+    service_generation: int = 12,
+) -> RolloutRoot:
     configured_target = target()
     snapshot = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=configured_target,
-        stable_revision="reference-stable",
-        traffic=(TrafficAllocation(revision="reference-stable", percent=100),),
+        stable_revision="controlgraph-reference-target-stable-v1",
+        traffic=(
+            TrafficAllocation(
+                revision="controlgraph-reference-target-stable-v1",
+                percent=100,
+            ),
+        ),
         concurrency=8,
-        service_generation=12,
-        provider_etag="etag-stable-12",
+        service_generation=service_generation,
+        provider_etag=f"etag-stable-{service_generation}",
         configuration_sha256=ZERO_DIGEST,
         stable_revision_configuration_sha256=ONE_DIGEST,
-        captured_at="2026-08-19T12:00:00Z",
-        captured_by="controlgraph.operator/v1",
+        captured_at=captured_at,
+        captured_by=(
+            f"controlgraph-verifier@{configured_target.project_id}.iam.gserviceaccount.com"
+        ),
     )
     return RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
         root_id=root_id,
         target=configured_target,
         stable_snapshot=snapshot,
-        candidate_revision="reference-candidate",
+        candidate_revision="controlgraph-reference-target-candidate-v1",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
@@ -104,29 +129,80 @@ def rollout_root(root_id: str = "root-firestore-001") -> RolloutRoot:
         initial_epoch=1,
         plan_sha256=TWO_DIGEST,
         approved_by="controlgraph.operator/v1",
-        approved_at="2026-08-19T12:01:00Z",
+        approved_at=approved_at,
     )
 
 
 def initial_records(
     root_id: str = "root-firestore-001",
+    *,
+    captured_at: str = "2026-08-19T12:00:00Z",
+    approved_at: str = "2026-08-19T12:01:00Z",
+    claimed_at: str = "2026-08-19T12:01:01Z",
+    service_generation: int = 12,
 ) -> tuple[RolloutRoot, ServiceClaimRecord, EpochAuthorityRecord]:
-    root = rollout_root(root_id)
+    root = rollout_root(
+        root_id,
+        captured_at=captured_at,
+        approved_at=approved_at,
+        service_generation=service_generation,
+    )
     root_sha256 = canonical_sha256(root)
+    stable_target_configuration_sha256 = target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=100,
+            candidate_percent=0,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
+    candidate_target_configuration_sha256 = target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=0,
+            candidate_percent=100,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
     claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v1",
+        schema_version="controlgraph.service-claim/v2",
         target=root.target,
         root_id=root.root_id,
         root_sha256=root_sha256,
+        stable_revision=root.stable_snapshot.stable_revision,
+        candidate_revision=root.candidate_revision,
+        initial_epoch=root.initial_epoch,
+        baseline_service_generation=root.stable_snapshot.service_generation,
+        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
+        baseline_revision_configuration_sha256=(
+            root.stable_snapshot.stable_revision_configuration_sha256
+        ),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
+        stable_target_configuration_sha256=stable_target_configuration_sha256,
+        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+        operator_owner=root.approved_by,
+        workload_creator="controlgraph.api/v1",
+        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         status=ServiceClaimStatus.ACTIVE,
-        claimed_by="controlgraph.api/v1",
         claim_request_id=f"request-{root_id}",
         claim_evidence_id=f"evidence-{root_id}",
-        claimed_at="2026-08-19T12:01:01Z",
+        claimed_at=claimed_at,
+        release_fence_epoch=None,
+        release_fence_authority_revision=None,
+        release_fenced_by=None,
+        release_fence_request_id=None,
+        release_fence_evidence_id=None,
+        release_fenced_at=None,
         released_by=None,
         release_request_id=None,
         release_evidence_id=None,
         released_at=None,
+        terminal_root_proof=None,
+        target_classification_proof=None,
     )
     authority = EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
@@ -137,10 +213,10 @@ def initial_records(
         previous_epoch=None,
         revision=0,
         cause=EpochChangeCause.ROOT_CREATED,
-        changed_by="controlgraph.api/v1",
+        changed_by=root.approved_by,
         request_id=claim.claim_request_id,
         evidence_id=claim.claim_evidence_id,
-        changed_at="2026-08-19T12:01:01Z",
+        changed_at=claimed_at,
     )
     return root, claim, authority
 
@@ -149,6 +225,7 @@ def advanced_authority(
     current: EpochAuthorityRecord,
     *,
     suffix: str,
+    changed_at: str = "2026-08-19T12:05:00Z",
 ) -> EpochAuthorityRecord:
     return EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
@@ -162,7 +239,7 @@ def advanced_authority(
         changed_by="controlgraph.operator/v1",
         request_id=f"request-revoke-{suffix}",
         evidence_id=f"evidence-revoke-{suffix}",
-        changed_at="2026-08-19T12:02:00Z",
+        changed_at=changed_at,
     )
 
 
@@ -171,19 +248,72 @@ def release_transition(
     authority: EpochAuthorityRecord,
     *,
     suffix: str = "release",
-) -> tuple[ServiceClaimRecord, EpochAuthorityRecord]:
-    replacement_authority = advanced_authority(authority, suffix=suffix)
-    replacement_claim = ServiceClaimRecord(
+    terminal_confirmed_at: str = "2026-08-19T12:03:00Z",
+    fenced_at: str = "2026-08-19T12:05:00Z",
+    classified_at: str = "2026-08-19T12:06:00Z",
+    released_at: str = "2026-08-19T12:07:00Z",
+    classified_generation: int = 14,
+) -> tuple[ServiceClaimRecord, ServiceClaimRecord, EpochAuthorityRecord]:
+    replacement_authority = advanced_authority(
+        authority,
+        suffix=suffix,
+        changed_at=fenced_at,
+    )
+    terminal = ServiceClaimTerminalRootProof(
+        schema_version=SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
+        target=claim.target,
+        root_id=claim.root_id,
+        root_sha256=claim.root_sha256,
+        state=ServiceClaimTerminalRootState.RECOVERED,
+        target_configuration_sha256=claim.stable_target_configuration_sha256,
+        evidence_id=f"evidence-terminal-{suffix}",
+        evidence_sha256=ZERO_DIGEST,
+        confirmed_by="controlgraph.coordinator/v1",
+        confirmed_at=terminal_confirmed_at,
+    )
+    classification = ServiceClaimTargetClassificationProof(
+        schema_version=SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
+        target=claim.target,
+        root_id=claim.root_id,
+        root_sha256=claim.root_sha256,
+        classification=ServiceClaimTargetClassification.STABLE_RESTORED,
+        fenced_epoch=replacement_authority.current_epoch,
+        fenced_authority_revision=replacement_authority.revision,
+        service_generation=classified_generation,
+        provider_etag=f"etag-stable-{classified_generation}",
+        target_configuration_sha256=claim.stable_target_configuration_sha256,
+        evidence_id=f"evidence-target-{suffix}",
+        evidence_sha256=ONE_DIGEST,
+        classified_by=(
+            f"controlgraph-verifier@{claim.target.project_id}.iam.gserviceaccount.com"
+        ),
+        classified_at=classified_at,
+    )
+    fenced_claim = ServiceClaimRecord(
         **{
             **claim.model_dump(mode="python"),
-            "status": ServiceClaimStatus.RELEASED,
-            "released_by": replacement_authority.changed_by,
-            "release_request_id": replacement_authority.request_id,
-            "release_evidence_id": replacement_authority.evidence_id,
-            "released_at": replacement_authority.changed_at,
+            "status": ServiceClaimStatus.RELEASING,
+            "release_fence_epoch": replacement_authority.current_epoch,
+            "release_fence_authority_revision": replacement_authority.revision,
+            "release_fenced_by": replacement_authority.changed_by,
+            "release_fence_request_id": replacement_authority.request_id,
+            "release_fence_evidence_id": replacement_authority.evidence_id,
+            "release_fenced_at": replacement_authority.changed_at,
+            "terminal_root_proof": terminal,
         }
     )
-    return replacement_claim, replacement_authority
+    released_claim = ServiceClaimRecord(
+        **{
+            **fenced_claim.model_dump(mode="python"),
+            "status": ServiceClaimStatus.RELEASED,
+            "released_by": "controlgraph.coordinator/v1",
+            "release_request_id": f"request-release-{suffix}",
+            "release_evidence_id": f"evidence-release-{suffix}",
+            "released_at": released_at,
+            "target_classification_proof": classification,
+        }
+    )
+    return fenced_claim, released_claim, replacement_authority
 
 
 def claimed_receipt(seed: str = "firestore-001") -> ExecutionReceipt:
@@ -647,6 +777,7 @@ def test_rollout_creation_atomically_persists_three_strongly_read_records() -> N
         assert created.root == StoredRecord(root, 0)
         assert created.service_claim == StoredRecord(claim, 0)
         assert created.authority == StoredRecord(authority, 0)
+        assert claim.candidate_revision_configuration_sha256 == THREE_DIGEST
         assert await store.read_rollout_root(root.root_id) == created.root
         assert await store.read_service_claim() == created.service_claim
         assert await store.read_authority(root.root_id) == created.authority
@@ -659,6 +790,20 @@ def test_rollout_creation_atomically_persists_three_strongly_read_records() -> N
             f"{epoch_authority_document_id(root.root_id)}",
         }
         assert set(client.documents) == expected_paths
+
+    asyncio.run(scenario())
+
+
+def test_rollout_creation_binds_initial_authority_to_operator_owner() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        root, claim, authority = initial_records()
+        workload_attributed = authority.model_copy(
+            update={"changed_by": claim.workload_creator}
+        )
+
+        with pytest.raises(ValueError, match="one atomic authority state"):
+            await store.create_rollout(root, claim, workload_attributed)
 
     asyncio.run(scenario())
 
@@ -688,6 +833,27 @@ def test_racing_root_creates_have_one_service_claim_winner() -> None:
             if path.startswith(f"{AuthorityStorageKind.ROLLOUT_ROOT.value}/")
         ]
         assert len(stored_roots) == 1
+
+    asyncio.run(scenario())
+
+
+def test_legacy_active_claim_path_blocks_v2_creation() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        claim_path = (
+            f"{AuthorityStorageKind.SERVICE_CLAIM.value}/"
+            f"{service_claim_document_id(root.target)}"
+        )
+        client.documents[claim_path] = _StoredDocument(
+            data={"schema_version": "controlgraph.service-claim/v1"},
+            update_time=client.clock,
+        )
+
+        with pytest.raises(AuthorityStoreConflict):
+            await store.create_rollout(root, claim, authority)
+
+        assert set(client.documents) == {claim_path}
 
     asyncio.run(scenario())
 
@@ -1065,7 +1231,7 @@ def test_transactional_authority_read_rejects_revision_corruption_without_writin
     asyncio.run(scenario())
 
 
-def test_service_claim_release_atomically_advances_authority() -> None:
+def test_service_claim_fence_atomically_revokes_then_release_preserves_authority() -> None:
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
@@ -1074,53 +1240,60 @@ def test_service_claim_release_atomically_advances_authority() -> None:
         expected_authority = await store.read_authority(root.root_id)
         assert expected_claim is not None
         assert expected_authority is not None
-        released, revoked = release_transition(claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
 
-        result = await store.release_service_claim(
+        fence_result = await store.fence_service_claim(
             expected_claim,
-            released,
+            fenced,
             expected_authority,
             revoked,
         )
-
+        assert fence_result == FencedServiceClaim(
+            service_claim=StoredRecord(fenced, 1),
+            authority=StoredRecord(revoked, 1),
+        )
+        result = await store.release_service_claim(
+            fence_result.service_claim,
+            released,
+            fence_result.authority,
+        )
         assert result == ReleasedServiceClaim(
-            service_claim=StoredRecord(released, 1),
+            service_claim=StoredRecord(released, 2),
             authority=StoredRecord(revoked, 1),
         )
         snapshot = await store.read_issuance_state(root.root_id)
         assert snapshot == IssuanceStateSnapshot(
             root=StoredRecord(root, 0),
-            service_claim=StoredRecord(released, 1),
+            service_claim=StoredRecord(released, 2),
             authority=StoredRecord(revoked, 1),
         )
         with pytest.raises(AuthorityStoreConflict):
             await store.release_service_claim(
-                expected_claim,
+                fence_result.service_claim,
                 released,
-                expected_authority,
-                revoked,
+                fence_result.authority,
             )
 
     asyncio.run(scenario())
 
 
-def test_ambiguous_release_is_adopted_only_when_both_replacements_match() -> None:
+def test_ambiguous_fence_is_adopted_only_when_both_replacements_match() -> None:
     async def scenario() -> None:
         store, _, runner = store_fixture()
         root, claim, authority = initial_records()
         created = await store.create_rollout(root, claim, authority)
-        released, revoked = release_transition(claim, authority)
+        fenced, _, revoked = release_transition(claim, authority)
         runner.mode = "commit-then-timeout"
 
-        adopted = await store.release_service_claim(
+        adopted = await store.fence_service_claim(
             created.service_claim,
-            released,
+            fenced,
             created.authority,
             revoked,
         )
 
-        assert adopted == ReleasedServiceClaim(
-            service_claim=StoredRecord(released, 1),
+        assert adopted == FencedServiceClaim(
+            service_claim=StoredRecord(fenced, 1),
             authority=StoredRecord(revoked, 1),
         )
 
@@ -1128,9 +1301,9 @@ def test_ambiguous_release_is_adopted_only_when_both_replacements_match() -> Non
         partial_created = await partial_store.create_rollout(root, claim, authority)
         partial_runner.mode = "commit-first-only-then-timeout"
         with pytest.raises(AuthorityStoreOutcomeUnknown):
-            await partial_store.release_service_claim(
+            await partial_store.fence_service_claim(
                 partial_created.service_claim,
-                released,
+                fenced,
                 partial_created.authority,
                 revoked,
             )
@@ -1147,7 +1320,7 @@ def test_ambiguous_release_is_adopted_only_when_both_replacements_match() -> Non
         ("changed_at", "2026-08-19T12:02:01Z"),
     ],
 )
-def test_release_rejects_unmatched_transition_bindings_before_writing(
+def test_fence_rejects_unmatched_transition_bindings_before_writing(
     field: str,
     value: str,
 ) -> None:
@@ -1159,7 +1332,7 @@ def test_release_rejects_unmatched_transition_bindings_before_writing(
         expected_authority = await store.read_authority(root.root_id)
         assert expected_claim is not None
         assert expected_authority is not None
-        released, revoked = release_transition(claim, authority)
+        fenced, _, revoked = release_transition(claim, authority)
         mismatched = EpochAuthorityRecord(
             **{
                 **revoked.model_dump(mode="python"),
@@ -1169,9 +1342,9 @@ def test_release_rejects_unmatched_transition_bindings_before_writing(
         before = deepcopy(client.documents)
 
         with pytest.raises(ValueError):
-            await store.release_service_claim(
+            await store.fence_service_claim(
                 expected_claim,
-                released,
+                fenced,
                 expected_authority,
                 mismatched,
             )
@@ -1181,48 +1354,362 @@ def test_release_rejects_unmatched_transition_bindings_before_writing(
     asyncio.run(scenario())
 
 
-def test_issuance_snapshot_cannot_mix_with_an_interleaved_release() -> None:
+def test_fence_cannot_replace_the_claimed_candidate_revision_digest() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, _, revoked = release_transition(claim, authority)
+        altered = fenced.model_copy(
+            update={"candidate_revision_configuration_sha256": TWO_DIGEST}
+        )
+        before = deepcopy(client.documents)
+
+        with pytest.raises(ValueError, match="exact epoch fence"):
+            await store.fence_service_claim(
+                created.service_claim,
+                altered,
+                created.authority,
+                revoked,
+            )
+
+        assert client.documents == before
+
+    asyncio.run(scenario())
+
+
+def test_issuance_snapshot_cannot_mix_with_an_interleaved_fence() -> None:
     async def scenario() -> None:
         store, client, runner = store_fixture()
         root, claim, authority = initial_records()
         created = await store.create_rollout(root, claim, authority)
-        released, revoked = release_transition(claim, authority)
+        fenced, _, revoked = release_transition(claim, authority)
         client.transaction_read_count = 0
         client.pause_transaction_read_after = 1
 
         snapshot_task = asyncio.create_task(store.read_issuance_state(root.root_id))
         await asyncio.wait_for(client.transaction_read_paused.wait(), timeout=1)
-        release_task = asyncio.create_task(
-            store.release_service_claim(
+        fence_task = asyncio.create_task(
+            store.fence_service_claim(
                 created.service_claim,
-                released,
+                fenced,
                 created.authority,
                 revoked,
             )
         )
         await asyncio.sleep(0)
-        assert not release_task.done()
+        assert not fence_task.done()
         client.continue_transaction_read.set()
 
         snapshot = await snapshot_task
-        released_state = await release_task
+        fenced_state = await fence_task
 
         assert snapshot == IssuanceStateSnapshot(
             root=created.root,
             service_claim=created.service_claim,
             authority=created.authority,
         )
-        assert released_state == ReleasedServiceClaim(
-            service_claim=StoredRecord(released, 1),
+        assert fenced_state == FencedServiceClaim(
+            service_claim=StoredRecord(fenced, 1),
             authority=StoredRecord(revoked, 1),
         )
         assert await store.read_issuance_state(root.root_id) == IssuanceStateSnapshot(
             root=created.root,
-            service_claim=released_state.service_claim,
-            authority=released_state.authority,
+            service_claim=fenced_state.service_claim,
+            authority=fenced_state.authority,
         )
         assert runner.expected_writes == [3, 0, 2, 0]
         assert runner.write_result_counts == [3, 0, 2, 0]
+
+    asyncio.run(scenario())
+
+
+def test_release_requires_a_fenced_claim_and_the_exact_fenced_authority() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
+        before = deepcopy(client.documents)
+
+        with pytest.raises(ValueError, match="exact fenced release"):
+            await store.release_service_claim(
+                created.service_claim,
+                released,
+                created.authority,
+            )
+        assert client.documents == before
+
+        fenced_state = await store.fence_service_claim(
+            created.service_claim,
+            fenced,
+            created.authority,
+            revoked,
+        )
+        before = deepcopy(client.documents)
+        with pytest.raises(ValueError, match="exact fenced release"):
+            await store.release_service_claim(
+                fenced_state.service_claim,
+                released,
+                created.authority,
+            )
+        assert client.documents == before
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_final_release_adopts_only_the_exact_claim_revision() -> None:
+    async def scenario() -> None:
+        store, _, runner = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
+        fenced_state = await store.fence_service_claim(
+            created.service_claim,
+            fenced,
+            created.authority,
+            revoked,
+        )
+        runner.mode = "commit-then-timeout"
+
+        adopted = await store.release_service_claim(
+            fenced_state.service_claim,
+            released,
+            fenced_state.authority,
+        )
+
+        assert adopted == ReleasedServiceClaim(
+            service_claim=StoredRecord(released, 2),
+            authority=fenced_state.authority,
+        )
+
+        partial_store, _, partial_runner = store_fixture()
+        partial_created = await partial_store.create_rollout(root, claim, authority)
+        partial_fenced = await partial_store.fence_service_claim(
+            partial_created.service_claim,
+            fenced,
+            partial_created.authority,
+            revoked,
+        )
+        partial_runner.mode = "commit-first-only-then-timeout"
+        with pytest.raises(AuthorityStoreOutcomeUnknown):
+            await partial_store.release_service_claim(
+                partial_fenced.service_claim,
+                released,
+                partial_fenced.authority,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_takeover_is_blocked_until_terminal_release_then_is_explicit() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
+        replacement = initial_records(
+            "root-firestore-002",
+            captured_at="2026-08-19T12:08:00Z",
+            approved_at="2026-08-19T12:09:00Z",
+            claimed_at="2026-08-19T12:09:01Z",
+            service_generation=15,
+        )
+
+        with pytest.raises(ValueError, match="safely released claim"):
+            await store.create_rollout_after_release(created.service_claim, *replacement)
+
+        fenced_state = await store.fence_service_claim(
+            created.service_claim,
+            fenced,
+            created.authority,
+            revoked,
+        )
+        with pytest.raises(ValueError, match="safely released claim"):
+            await store.create_rollout_after_release(
+                fenced_state.service_claim,
+                *replacement,
+            )
+
+        released_state = await store.release_service_claim(
+            fenced_state.service_claim,
+            released,
+            fenced_state.authority,
+        )
+        takeover = await store.create_rollout_after_release(
+            released_state.service_claim,
+            *replacement,
+        )
+
+        assert takeover.root == StoredRecord(replacement[0], 0)
+        assert takeover.service_claim == StoredRecord(replacement[1], 3)
+        assert takeover.authority == StoredRecord(replacement[2], 0)
+        assert await store.read_service_claim() == takeover.service_claim
+
+    asyncio.run(scenario())
+
+
+def test_racing_released_claim_takeovers_have_one_winner() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
+        fenced_state = await store.fence_service_claim(
+            created.service_claim,
+            fenced,
+            created.authority,
+            revoked,
+        )
+        released_state = await store.release_service_claim(
+            fenced_state.service_claim,
+            released,
+            fenced_state.authority,
+        )
+        first = initial_records(
+            "root-firestore-takeover-a",
+            captured_at="2026-08-19T12:08:00Z",
+            approved_at="2026-08-19T12:09:00Z",
+            claimed_at="2026-08-19T12:09:01Z",
+            service_generation=15,
+        )
+        second = initial_records(
+            "root-firestore-takeover-b",
+            captured_at="2026-08-19T12:08:00Z",
+            approved_at="2026-08-19T12:09:00Z",
+            claimed_at="2026-08-19T12:09:01Z",
+            service_generation=15,
+        )
+
+        results = await asyncio.gather(
+            store.create_rollout_after_release(released_state.service_claim, *first),
+            store.create_rollout_after_release(released_state.service_claim, *second),
+            return_exceptions=True,
+        )
+
+        winners = [result for result in results if not isinstance(result, BaseException)]
+        conflicts = [result for result in results if isinstance(result, AuthorityStoreConflict)]
+        assert len(winners) == len(conflicts) == 1
+        winner = winners[0]
+        assert winner.service_claim.revision == 3
+        assert await store.read_service_claim() == winner.service_claim
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_takeover_adopts_exact_commit_and_rejects_partial_state() -> None:
+    async def released_fixture() -> tuple[
+        FirestoreAuthorityStore,
+        _FakeTransactionRunner,
+        StoredRecord[ServiceClaimRecord],
+    ]:
+        store, _, runner = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
+        fenced_state = await store.fence_service_claim(
+            created.service_claim,
+            fenced,
+            created.authority,
+            revoked,
+        )
+        released_state = await store.release_service_claim(
+            fenced_state.service_claim,
+            released,
+            fenced_state.authority,
+        )
+        return store, runner, released_state.service_claim
+
+    async def scenario() -> None:
+        replacement = initial_records(
+            "root-firestore-ambiguous-takeover",
+            captured_at="2026-08-19T12:08:00Z",
+            approved_at="2026-08-19T12:09:00Z",
+            claimed_at="2026-08-19T12:09:01Z",
+            service_generation=15,
+        )
+        store, runner, expected = await released_fixture()
+        runner.mode = "commit-then-timeout"
+
+        adopted = await store.create_rollout_after_release(expected, *replacement)
+
+        assert adopted.root == StoredRecord(replacement[0], 0)
+        assert adopted.service_claim == StoredRecord(replacement[1], 3)
+        assert adopted.authority == StoredRecord(replacement[2], 0)
+
+        partial_store, partial_runner, partial_expected = await released_fixture()
+        partial_runner.mode = "commit-first-only-then-timeout"
+        with pytest.raises(AuthorityStoreOutcomeUnknown):
+            await partial_store.create_rollout_after_release(
+                partial_expected,
+                *replacement,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_claim_lifecycle_revisions_remain_monotonic_across_multiple_roots() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        fenced, released, revoked = release_transition(claim, authority)
+        first_fence = await store.fence_service_claim(
+            created.service_claim,
+            fenced,
+            created.authority,
+            revoked,
+        )
+        first_release = await store.release_service_claim(
+            first_fence.service_claim,
+            released,
+            first_fence.authority,
+        )
+        second = initial_records(
+            "root-firestore-cycle-two",
+            captured_at="2026-08-19T12:08:00Z",
+            approved_at="2026-08-19T12:09:00Z",
+            claimed_at="2026-08-19T12:09:01Z",
+            service_generation=15,
+        )
+        takeover = await store.create_rollout_after_release(
+            first_release.service_claim,
+            *second,
+        )
+
+        with pytest.raises(AuthorityStoreConflict):
+            await store.release_service_claim(
+                first_fence.service_claim,
+                released,
+                first_fence.authority,
+            )
+
+        second_fenced, second_released, second_revoked = release_transition(
+            second[1],
+            second[2],
+            suffix="cycle-two",
+            terminal_confirmed_at="2026-08-19T12:10:00Z",
+            fenced_at="2026-08-19T12:11:00Z",
+            classified_at="2026-08-19T12:12:00Z",
+            released_at="2026-08-19T12:13:00Z",
+            classified_generation=16,
+        )
+        second_fence = await store.fence_service_claim(
+            takeover.service_claim,
+            second_fenced,
+            takeover.authority,
+            second_revoked,
+        )
+        second_release = await store.release_service_claim(
+            second_fence.service_claim,
+            second_released,
+            second_fence.authority,
+        )
+
+        assert first_release.service_claim.revision == 2
+        assert takeover.service_claim.revision == 3
+        assert second_fence.service_claim.revision == 4
+        assert second_release.service_claim.revision == 5
 
     asyncio.run(scenario())
 
@@ -1307,21 +1794,21 @@ def test_final_authority_snapshot_sanitizes_batch_get_failure() -> None:
     asyncio.run(scenario())
 
 
-def test_final_authority_snapshot_captures_revocation_before_returning() -> None:
+def test_final_authority_snapshot_captures_claim_fence_before_returning() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
         created = await store.create_rollout(root, claim, authority)
-        released, revoked = release_transition(claim, authority)
+        fenced, _, revoked = release_transition(claim, authority)
         client.pause_batch_get_before_capture = True
 
         snapshot_task = asyncio.create_task(
             store.read_final_authority_snapshot(root.root_id)
         )
         await asyncio.wait_for(client.batch_get_started.wait(), timeout=1)
-        released_state = await store.release_service_claim(
+        fenced_state = await store.fence_service_claim(
             created.service_claim,
-            released,
+            fenced,
             created.authority,
             revoked,
         )
@@ -1329,29 +1816,29 @@ def test_final_authority_snapshot_captures_revocation_before_returning() -> None
 
         assert await snapshot_task == FinalAuthoritySnapshot(
             root=created.root,
-            service_claim=released_state.service_claim,
-            authority=released_state.authority,
+            service_claim=fenced_state.service_claim,
+            authority=fenced_state.authority,
         )
         assert client.batch_get_calls == 1
 
     asyncio.run(scenario())
 
 
-def test_final_authority_batch_get_cannot_mix_with_interleaved_release() -> None:
+def test_final_authority_batch_get_cannot_mix_with_interleaved_fence() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
         created = await store.create_rollout(root, claim, authority)
-        released, revoked = release_transition(claim, authority)
+        fenced, _, revoked = release_transition(claim, authority)
         client.pause_batch_get_after_first = True
 
         snapshot_task = asyncio.create_task(
             store.read_final_authority_snapshot(root.root_id)
         )
         await asyncio.wait_for(client.batch_get_first_yielded.wait(), timeout=1)
-        released_state = await store.release_service_claim(
+        fenced_state = await store.fence_service_claim(
             created.service_claim,
-            released,
+            fenced,
             created.authority,
             revoked,
         )
@@ -1366,8 +1853,8 @@ def test_final_authority_batch_get_cannot_mix_with_interleaved_release() -> None
             root.root_id
         ) == FinalAuthoritySnapshot(
             root=created.root,
-            service_claim=released_state.service_claim,
-            authority=released_state.authority,
+            service_claim=fenced_state.service_claim,
+            authority=fenced_state.authority,
         )
 
     asyncio.run(scenario())
