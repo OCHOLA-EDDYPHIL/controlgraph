@@ -11,7 +11,11 @@ from enum import StrEnum
 from typing import Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
-from controlgraph_canary.application.authority_store import AuthorityStore, AuthorityStoreError
+from controlgraph_canary.application.authority_store import (
+    AuthorityStore,
+    AuthorityStoreError,
+    IssuanceStateSnapshot,
+)
 from controlgraph_canary.application.signing import (
     DETACHED_SIGNATURE_V1,
     DetachedSignature,
@@ -259,6 +263,7 @@ class TrustBundleCapabilityVerifier:
 
 @dataclass(frozen=True, slots=True)
 class _TrustedIssuanceState:
+    snapshot: IssuanceStateSnapshot
     root: RolloutRoot
     root_sha256: str
     authority: EpochAuthorityRecord
@@ -433,6 +438,9 @@ class CapabilityIssuer:
             signature=detached.signature,
         )
         self._validate_complete_lineage(state, request, (*lineage, envelope))
+        confirmed_state = await self._read_trusted_state(request.root_id, issued_second)
+        if confirmed_state.snapshot != state.snapshot:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return envelope
 
     def _authorize(self, principal: AuthenticatedIssuancePrincipal | None) -> None:
@@ -449,13 +457,16 @@ class CapabilityIssuer:
         issued_second: int,
     ) -> _TrustedIssuanceState:
         try:
-            root_record = await self._store.read_rollout_root(root_id)
-            claim_record = await self._store.read_service_claim()
-            authority_record = await self._store.read_authority(root_id)
+            snapshot = await self._store.read_issuance_state(root_id)
         except AuthorityStoreError:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
-        if root_record is None or claim_record is None or authority_record is None:
+        if snapshot is None:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        if type(snapshot) is not IssuanceStateSnapshot:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        root_record = snapshot.root
+        claim_record = snapshot.service_claim
+        authority_record = snapshot.authority
         root = root_record.value
         claim = claim_record.value
         authority = authority_record.value
@@ -469,13 +480,16 @@ class CapabilityIssuer:
         if (
             root.root_id != root_id
             or root.target != self._configuration.target
+            or root_record.revision != 0
             or claim.status is not ServiceClaimStatus.ACTIVE
+            or claim_record.revision != 0
             or claim.target != root.target
             or claim.root_id != root.root_id
             or claim.root_sha256 != root_sha256
             or authority.target != root.target
             or authority.root_id != root.root_id
             or authority.root_sha256 != root_sha256
+            or authority_record.revision != authority.revision
             or _FORBIDDEN_RESOURCE_NAME in root.stable_snapshot.stable_revision.lower()
             or _FORBIDDEN_RESOURCE_NAME in root.candidate_revision.lower()
             or _parse_utc_second(root.approved_at) > issued_second
@@ -484,6 +498,7 @@ class CapabilityIssuer:
         ):
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return _TrustedIssuanceState(
+            snapshot=snapshot,
             root=root,
             root_sha256=root_sha256,
             authority=authority,
@@ -549,7 +564,7 @@ class CapabilityIssuer:
                 raise _deny(CapabilityIssuanceErrorCode.LINEAGE_INVALID)
         self._validate_complete_lineage(state, request, lineage)
         parent = lineage[-1]
-        return canonical_sha256(parent), _parse_utc_second(parent.claims.expires_at)
+        return parent.claims_sha256, _parse_utc_second(parent.claims.expires_at)
 
     def _validate_complete_lineage(
         self,
@@ -560,7 +575,7 @@ class CapabilityIssuer:
         try:
             grants = tuple(
                 CapabilityGrant(
-                    capability_sha256=canonical_sha256(capability),
+                    capability_sha256=capability.claims_sha256,
                     parent_capability_sha256=capability.claims.parent_capability_sha256,
                     scope=_scope_from_claims(capability.claims, state.root),
                 )

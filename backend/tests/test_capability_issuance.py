@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from dataclasses import fields
 from datetime import UTC, datetime
 from typing import cast
@@ -9,11 +10,13 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreUnavailable,
+    IssuanceStateSnapshot,
     StoredRecord,
 )
 from controlgraph_canary.application.capability_issuance import (
     MAX_CAPABILITY_LIFETIME_SECONDS,
     AuthenticatedIssuancePrincipal,
+    CapabilityEnvelopeVerifier,
     CapabilityIssuanceError,
     CapabilityIssuanceErrorCode,
     CapabilityIssuanceRequest,
@@ -33,6 +36,7 @@ from controlgraph_canary.application.signing import (
     build_signing_input,
     make_trust_bundle_entry,
 )
+from controlgraph_canary.authority import EpochCheckOutcome, check_epoch
 from controlgraph_canary.contracts import (
     CapabilityAction,
     EpochAuthorityRecord,
@@ -153,28 +157,33 @@ class FakeAuthorityStore:
         self._root = default_root if root is None else root
         self._claim = default_claim if claim is None else claim
         self._authority = default_authority if authority is None else authority
+        self._claim_revision = 0 if self._claim.status is ServiceClaimStatus.ACTIVE else 1
         self._fail = fail
         self.target = default_root.target
         self.reads: list[str] = []
 
-    async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None:
-        self.reads.append(f"root:{root_id}")
+    async def read_issuance_state(self, root_id: str) -> IssuanceStateSnapshot | None:
+        self.reads.append(f"snapshot:{root_id}")
         if self._fail:
             raise AuthorityStoreUnavailable
         if root_id != self._root.root_id:
             return None
-        return StoredRecord(value=self._root, revision=0)
+        return IssuanceStateSnapshot(
+            root=StoredRecord(value=self._root, revision=0),
+            service_claim=StoredRecord(value=self._claim, revision=self._claim_revision),
+            authority=StoredRecord(
+                value=self._authority,
+                revision=self._authority.revision,
+            ),
+        )
 
-    async def read_service_claim(self) -> StoredRecord[ServiceClaimRecord] | None:
-        self.reads.append("claim")
-        return StoredRecord(value=self._claim, revision=0)
+    def replace_authority(self, replacement: EpochAuthorityRecord) -> None:
+        self._authority = replacement
 
-    async def read_authority(
-        self,
-        root_id: str,
-    ) -> StoredRecord[EpochAuthorityRecord] | None:
-        self.reads.append(f"authority:{root_id}")
-        return StoredRecord(value=self._authority, revision=self._authority.revision)
+    def release(self, claim: ServiceClaimRecord, authority: EpochAuthorityRecord) -> None:
+        self._claim = claim
+        self._claim_revision += 1
+        self._authority = authority
 
 
 class RecordingSigningBackend:
@@ -190,6 +199,17 @@ class RecordingSigningBackend:
     def sign_digest(self, digest: bytes) -> bytes:
         self.digests.append(digest)
         return self.signature
+
+
+class StateChangingSigningBackend(RecordingSigningBackend):
+    def __init__(self, profile: SigningProfile, change_state: Callable[[], None]) -> None:
+        super().__init__(profile)
+        self._change_state = change_state
+
+    def sign_digest(self, digest: bytes) -> bytes:
+        signature = super().sign_digest(digest)
+        self._change_state()
+        return signature
 
 
 class LocalSigningBackend(RecordingSigningBackend):
@@ -265,7 +285,7 @@ def issuer(
     config: CapabilityIssuerConfiguration | None = None,
     backend: RecordingSigningBackend | None = None,
     resolver: FakeLineageResolver | None = None,
-    verifier: RecordingEnvelopeVerifier | None = None,
+    verifier: CapabilityEnvelopeVerifier | None = None,
 ) -> tuple[CapabilityIssuer, RecordingSigningBackend, FakeAuthorityStore]:
     selected_store = store or FakeAuthorityStore()
     selected_backend = backend or RecordingSigningBackend(
@@ -327,7 +347,7 @@ def test_issues_exact_canonical_root_bound_claims_through_capability_signer() ->
     assert claims.signing_key_version == CAPABILITY_KEY_VERSION
     assert envelope.claims_sha256 == canonical_sha256(claims)
     assert backend.digests == [build_signing_input(backend.profile, claims).digest]
-    assert store.reads == ["root:root-001", "claim", "authority:root-001"]
+    assert store.reads == ["snapshot:root-001", "snapshot:root-001"]
 
 
 def test_claims_and_signing_input_are_deterministic_for_identical_trusted_inputs() -> None:
@@ -361,6 +381,100 @@ def test_epoch_is_loaded_from_current_authority_and_cannot_be_selected_by_reques
     envelope = issue(value)
 
     assert envelope.claims.epoch == 2
+
+
+@pytest.mark.parametrize("release_claim", [False, True])
+def test_authority_change_during_signing_never_returns_current_authority(
+    release_claim: bool,
+) -> None:
+    root, claim, authority = trusted_records()
+    store = FakeAuthorityStore(root=root, claim=claim, authority=authority)
+    advanced = EpochAuthorityRecord(
+        **{
+            **authority.model_dump(mode="python"),
+            "current_epoch": 2,
+            "previous_epoch": 1,
+            "revision": 1,
+            "cause": EpochChangeCause.OPERATOR_REVOCATION,
+            "changed_by": "controlgraph.coordinator/v1",
+            "request_id": "request-release-001",
+            "evidence_id": "evidence-release-001",
+            "changed_at": "2026-08-19T12:02:00Z",
+        }
+    )
+    released = ServiceClaimRecord(
+        **{
+            **claim.model_dump(mode="python"),
+            "status": ServiceClaimStatus.RELEASED,
+            "released_by": advanced.changed_by,
+            "release_request_id": advanced.request_id,
+            "release_evidence_id": advanced.evidence_id,
+            "released_at": advanced.changed_at,
+        }
+    )
+
+    def change_state() -> None:
+        if release_claim:
+            store.release(released, advanced)
+        else:
+            store.replace_authority(advanced)
+
+    backend = StateChangingSigningBackend(
+        SigningProfile.capability(PROJECT_ID, CAPABILITY_KEY_VERSION),
+        change_state,
+    )
+    value, _, _ = issuer(store=store, backend=backend)
+
+    with pytest.raises(CapabilityIssuanceError) as denied:
+        issue(value)
+
+    assert denied.value.code is CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID
+    assert len(backend.digests) == 1
+    assert store.reads == ["snapshot:root-001", "snapshot:root-001"]
+
+
+def test_release_after_issuance_atomically_makes_the_capability_epoch_stale() -> None:
+    root, claim, authority = trusted_records()
+    store = FakeAuthorityStore(root=root, claim=claim, authority=authority)
+    value, _, _ = issuer(store=store)
+    envelope = issue(value)
+    revoked = EpochAuthorityRecord(
+        **{
+            **authority.model_dump(mode="python"),
+            "current_epoch": 2,
+            "previous_epoch": 1,
+            "revision": 1,
+            "cause": EpochChangeCause.OPERATOR_REVOCATION,
+            "changed_by": "controlgraph.coordinator/v1",
+            "request_id": "request-release-001",
+            "evidence_id": "evidence-release-001",
+            "changed_at": "2026-08-19T12:03:00Z",
+        }
+    )
+    released = ServiceClaimRecord(
+        **{
+            **claim.model_dump(mode="python"),
+            "status": ServiceClaimStatus.RELEASED,
+            "released_by": revoked.changed_by,
+            "release_request_id": revoked.request_id,
+            "release_evidence_id": revoked.evidence_id,
+            "released_at": revoked.changed_at,
+        }
+    )
+
+    store.release(released, revoked)
+    current = asyncio.run(store.read_issuance_state(root.root_id))
+    assert current is not None
+    epoch_check = check_epoch(
+        token_root_id=envelope.claims.root_id,
+        token_epoch=envelope.claims.epoch,
+        authority_root_id=current.authority.value.root_id,
+        current_epoch=current.authority.value.current_epoch,
+    )
+
+    assert current.service_claim.value.status is ServiceClaimStatus.RELEASED
+    assert epoch_check.outcome is EpochCheckOutcome.STALE
+    assert epoch_check.authorized is False
 
 
 def test_signed_envelope_adapts_to_exact_trust_bundle_verification() -> None:
@@ -594,10 +708,67 @@ def test_derived_child_uses_locally_computed_verified_parent_digest_and_narrower
 
     assert resolver.lookups == [parent.claims.capability_id]
     assert verifier.verified == [parent]
-    assert child.claims.parent_capability_sha256 == canonical_sha256(parent)
+    assert child.claims.parent_capability_sha256 == parent.claims_sha256
     assert child.claims.not_before == "2026-08-19T12:03:00Z"
     assert child.claims.expires_at == parent.claims.expires_at
     assert child.claims.capability_id != parent.claims.capability_id
+
+
+def test_verified_claims_digest_is_stable_across_distinct_valid_ecdsa_signatures() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_KEY_VERSION)
+    backend = LocalSigningBackend(profile, private_key)
+    root_issuer, _, _ = issuer(backend=backend)
+    first_parent = issue(root_issuer)
+    second_parent = issue(root_issuer)
+    public_key_pem = (
+        private_key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("ascii")
+    )
+    verifier = TrustBundleCapabilityVerifier(
+        TrustBundleVerifier(
+            VerificationProfile.capability(PROJECT_ID, profile.key_resource),
+            TrustBundle(
+                entries=(
+                    make_trust_bundle_entry(
+                        profile=profile,
+                        state=SigningKeyState.ENABLED,
+                        public_key_pem=public_key_pem,
+                    ),
+                )
+            ),
+        )
+    )
+
+    verifier.verify(first_parent)
+    verifier.verify(second_parent)
+    assert first_parent.claims == second_parent.claims
+    assert first_parent.signature != second_parent.signature
+    assert canonical_sha256(first_parent) != canonical_sha256(second_parent)
+    assert first_parent.claims_sha256 == second_parent.claims_sha256
+
+    first_child_issuer, _, _ = issuer(
+        backend=backend,
+        resolver=FakeLineageResolver((first_parent,)),
+        verifier=verifier,
+    )
+    second_child_issuer, _, _ = issuer(
+        backend=backend,
+        resolver=FakeLineageResolver((second_parent,)),
+        verifier=verifier,
+    )
+    child_request = request(parent_capability_id=first_parent.claims.capability_id)
+    child_time = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
+
+    first_child = issue(first_child_issuer, child_request, now=child_time)
+    second_child = issue(second_child_issuer, child_request, now=child_time)
+
+    assert first_child.claims == second_child.claims
+    assert first_child.claims.parent_capability_sha256 == first_parent.claims_sha256
 
 
 def test_parent_locator_must_resolve_to_matching_verified_envelope() -> None:

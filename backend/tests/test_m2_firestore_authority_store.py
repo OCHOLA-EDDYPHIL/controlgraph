@@ -14,6 +14,8 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreErrorCode,
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
+    IssuanceStateSnapshot,
+    ReleasedServiceClaim,
     StoredRecord,
 )
 from controlgraph_canary.contracts.codec import canonical_json_bytes, canonical_sha256
@@ -150,6 +152,26 @@ def advanced_authority(
     )
 
 
+def release_transition(
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+    *,
+    suffix: str = "release",
+) -> tuple[ServiceClaimRecord, EpochAuthorityRecord]:
+    replacement_authority = advanced_authority(authority, suffix=suffix)
+    replacement_claim = ServiceClaimRecord(
+        **{
+            **claim.model_dump(mode="python"),
+            "status": ServiceClaimStatus.RELEASED,
+            "released_by": replacement_authority.changed_by,
+            "release_request_id": replacement_authority.request_id,
+            "release_evidence_id": replacement_authority.evidence_id,
+            "released_at": replacement_authority.changed_at,
+        }
+    )
+    return replacement_claim, replacement_authority
+
+
 def claimed_receipt(seed: str = "firestore-001") -> ExecutionReceipt:
     root = rollout_root()
     idempotency_key = f"intent-{seed}"
@@ -236,7 +258,13 @@ class _Reference:
         if self._client.read_error is not None:
             raise self._client.read_error
         if isinstance(transaction, _Transaction):
-            return transaction.snapshot(self)
+            snapshot = transaction.snapshot(self)
+            self._client.transaction_read_count += 1
+            if self._client.pause_transaction_read_after == self._client.transaction_read_count:
+                self._client.pause_transaction_read_after = None
+                self._client.transaction_read_paused.set()
+                await self._client.continue_transaction_read.wait()
+            return snapshot
         return self._client.snapshot(self)
 
 
@@ -281,6 +309,10 @@ class _FakeClient:
         self.clock = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
         self.read_error: Exception | None = None
         self.document_calls = 0
+        self.transaction_read_count = 0
+        self.pause_transaction_read_after: int | None = None
+        self.transaction_read_paused = asyncio.Event()
+        self.continue_transaction_read = asyncio.Event()
 
     def document(self, *document_path: str) -> _Reference:
         self.document_calls += 1
@@ -299,6 +331,8 @@ class _FakeTransactionRunner:
     def __init__(self) -> None:
         self.mode = "normal"
         self.maximum_attempts: list[int] = []
+        self.expected_writes: list[int] = []
+        self.write_result_counts: list[int] = []
         self.task_to_cancel: asyncio.Task[object] | None = None
 
     async def __call__(
@@ -309,6 +343,7 @@ class _FakeTransactionRunner:
         body: Any,
     ) -> None:
         self.maximum_attempts.append(maximum_attempts)
+        self.expected_writes.append(expected_writes)
         async with client.lock:
             transaction = client.transaction(max_attempts=maximum_attempts)
             if self.mode == "timeout-before-body":
@@ -320,6 +355,7 @@ class _FakeTransactionRunner:
             if self.mode == "timeout-before-commit":
                 self.mode = "normal"
                 raise TimeoutError("synthetic provider detail")
+            original = deepcopy(client.documents)
             pending = deepcopy(client.documents)
             for operation, reference, data in transaction.operations:
                 if operation == "create" and reference.path in pending:
@@ -330,11 +366,20 @@ class _FakeTransactionRunner:
                 pending[reference.path] = _StoredDocument(data, client.clock)
                 transaction.write_results.append(_WriteResult(client.clock))
             client.documents = pending
+            self.write_result_counts.append(len(transaction.write_results))
             if self.mode == "commit-then-cancel-caller":
                 self.mode = "normal"
                 if self.task_to_cancel is None:
                     raise AssertionError("a caller task is required")
                 self.task_to_cancel.cancel()
+            if self.mode == "commit-first-only-then-timeout":
+                self.mode = "normal"
+                last_path = transaction.operations[-1][1].path
+                if last_path in original:
+                    client.documents[last_path] = original[last_path]
+                else:
+                    del client.documents[last_path]
+                raise TimeoutError("synthetic provider detail")
             if self.mode == "commit-corrupt-then-timeout":
                 self.mode = "normal"
                 last_path = transaction.operations[-1][1].path
@@ -841,28 +886,163 @@ def test_transactional_authority_read_rejects_revision_corruption_without_writin
     asyncio.run(scenario())
 
 
-def test_service_claim_release_is_cas_and_preserves_claim_identity() -> None:
+def test_service_claim_release_atomically_advances_authority() -> None:
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
         await store.create_rollout(root, claim, authority)
-        expected = await store.read_service_claim()
-        assert expected is not None
-        released = ServiceClaimRecord(
-            **{
-                **claim.model_dump(mode="python"),
-                "status": ServiceClaimStatus.RELEASED,
-                "released_by": "controlgraph.coordinator/v1",
-                "release_request_id": "request-release-001",
-                "release_evidence_id": "evidence-release-001",
-                "released_at": "2026-08-19T12:05:00Z",
-            }
+        expected_claim = await store.read_service_claim()
+        expected_authority = await store.read_authority(root.root_id)
+        assert expected_claim is not None
+        assert expected_authority is not None
+        released, revoked = release_transition(claim, authority)
+
+        result = await store.release_service_claim(
+            expected_claim,
+            released,
+            expected_authority,
+            revoked,
         )
 
-        result = await store.release_service_claim(expected, released)
-
-        assert result == StoredRecord(released, 1)
+        assert result == ReleasedServiceClaim(
+            service_claim=StoredRecord(released, 1),
+            authority=StoredRecord(revoked, 1),
+        )
+        snapshot = await store.read_issuance_state(root.root_id)
+        assert snapshot == IssuanceStateSnapshot(
+            root=StoredRecord(root, 0),
+            service_claim=StoredRecord(released, 1),
+            authority=StoredRecord(revoked, 1),
+        )
         with pytest.raises(AuthorityStoreConflict):
-            await store.release_service_claim(expected, released)
+            await store.release_service_claim(
+                expected_claim,
+                released,
+                expected_authority,
+                revoked,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_release_is_adopted_only_when_both_replacements_match() -> None:
+    async def scenario() -> None:
+        store, _, runner = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        released, revoked = release_transition(claim, authority)
+        runner.mode = "commit-then-timeout"
+
+        adopted = await store.release_service_claim(
+            created.service_claim,
+            released,
+            created.authority,
+            revoked,
+        )
+
+        assert adopted == ReleasedServiceClaim(
+            service_claim=StoredRecord(released, 1),
+            authority=StoredRecord(revoked, 1),
+        )
+
+        partial_store, _, partial_runner = store_fixture()
+        partial_created = await partial_store.create_rollout(root, claim, authority)
+        partial_runner.mode = "commit-first-only-then-timeout"
+        with pytest.raises(AuthorityStoreOutcomeUnknown):
+            await partial_store.release_service_claim(
+                partial_created.service_claim,
+                released,
+                partial_created.authority,
+                revoked,
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("root_id", "root-unmatched-release"),
+        ("request_id", "request-unmatched-release"),
+        ("evidence_id", "evidence-unmatched-release"),
+        ("changed_at", "2026-08-19T12:02:01Z"),
+    ],
+)
+def test_release_rejects_unmatched_transition_bindings_before_writing(
+    field: str,
+    value: str,
+) -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        await store.create_rollout(root, claim, authority)
+        expected_claim = await store.read_service_claim()
+        expected_authority = await store.read_authority(root.root_id)
+        assert expected_claim is not None
+        assert expected_authority is not None
+        released, revoked = release_transition(claim, authority)
+        mismatched = EpochAuthorityRecord(
+            **{
+                **revoked.model_dump(mode="python"),
+                field: value,
+            }
+        )
+        before = deepcopy(client.documents)
+
+        with pytest.raises(ValueError):
+            await store.release_service_claim(
+                expected_claim,
+                released,
+                expected_authority,
+                mismatched,
+            )
+
+        assert client.documents == before
+
+    asyncio.run(scenario())
+
+
+def test_issuance_snapshot_cannot_mix_with_an_interleaved_release() -> None:
+    async def scenario() -> None:
+        store, client, runner = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        released, revoked = release_transition(claim, authority)
+        client.transaction_read_count = 0
+        client.pause_transaction_read_after = 1
+
+        snapshot_task = asyncio.create_task(store.read_issuance_state(root.root_id))
+        await asyncio.wait_for(client.transaction_read_paused.wait(), timeout=1)
+        release_task = asyncio.create_task(
+            store.release_service_claim(
+                created.service_claim,
+                released,
+                created.authority,
+                revoked,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not release_task.done()
+        client.continue_transaction_read.set()
+
+        snapshot = await snapshot_task
+        released_state = await release_task
+
+        assert snapshot == IssuanceStateSnapshot(
+            root=created.root,
+            service_claim=created.service_claim,
+            authority=created.authority,
+        )
+        assert released_state == ReleasedServiceClaim(
+            service_claim=StoredRecord(released, 1),
+            authority=StoredRecord(revoked, 1),
+        )
+        assert await store.read_issuance_state(root.root_id) == IssuanceStateSnapshot(
+            root=created.root,
+            service_claim=released_state.service_claim,
+            authority=released_state.authority,
+        )
+        assert runner.expected_writes == [3, 0, 2, 0]
+        assert runner.write_result_counts == [3, 0, 2, 0]
 
     asyncio.run(scenario())

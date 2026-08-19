@@ -11,6 +11,7 @@ import pytest
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
+    IssuanceStateSnapshot,
     StoredRecord,
 )
 from controlgraph_canary.contracts.codec import canonical_sha256
@@ -125,6 +126,24 @@ def _revocation(current: EpochAuthorityRecord, *, suffix: str) -> EpochAuthority
     )
 
 
+def _release(
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+) -> tuple[ServiceClaimRecord, EpochAuthorityRecord]:
+    revoked = _revocation(authority, suffix="release")
+    released = ServiceClaimRecord(
+        **{
+            **claim.model_dump(mode="python"),
+            "status": ServiceClaimStatus.RELEASED,
+            "released_by": revoked.changed_by,
+            "release_request_id": revoked.request_id,
+            "release_evidence_id": revoked.evidence_id,
+            "released_at": revoked.changed_at,
+        }
+    )
+    return released, revoked
+
+
 def _receipt(
     root: RolloutRoot,
     *,
@@ -221,6 +240,52 @@ def test_emulator_root_creation_and_epoch_revocation_have_single_winners() -> No
         assert revoked.revision == revoked.value.revision == 1
         assert revoked.value.current_epoch == 2
         assert created is not None
+
+    asyncio.run(scenario())
+
+
+def test_emulator_issuance_snapshot_is_coherent_across_claim_release() -> None:
+    async def scenario() -> None:
+        target = _target()
+        root, claim, authority = _initial_records(
+            target=target,
+            root_id=f"root-{uuid4().hex}",
+        )
+        first_store = FirestoreAuthorityStore.for_emulator(
+            target=target,
+            configured_project_id=target.project_id,
+        )
+        second_store = FirestoreAuthorityStore.for_emulator(
+            target=target,
+            configured_project_id=target.project_id,
+        )
+        created = await first_store.create_rollout(root, claim, authority)
+        released, revoked = _release(claim, authority)
+
+        snapshot, release_result = await asyncio.gather(
+            first_store.read_issuance_state(root.root_id),
+            second_store.release_service_claim(
+                created.service_claim,
+                released,
+                created.authority,
+                revoked,
+            ),
+        )
+
+        before = IssuanceStateSnapshot(
+            root=created.root,
+            service_claim=created.service_claim,
+            authority=created.authority,
+        )
+        after = IssuanceStateSnapshot(
+            root=created.root,
+            service_claim=release_result.service_claim,
+            authority=release_result.authority,
+        )
+        assert snapshot in (before, after)
+        assert await first_store.read_issuance_state(root.root_id) == after
+        assert after.service_claim.value.status is ServiceClaimStatus.RELEASED
+        assert after.authority.value.current_epoch == 2
 
     asyncio.run(scenario())
 
