@@ -216,6 +216,9 @@ class RolloutRootCreator:
         except asyncio.CancelledError:
             raise
         except AuthorityStoreConflict:
+            raced = await self._existing_claim(command, authenticated)
+            if raced.adopted is not None:
+                return raced.adopted
             raise RootCreationError(RootCreationErrorCode.ACTIVE_CLAIM_CONFLICT) from None
         except AuthorityStoreOutcomeUnknown:
             raise RootCreationError(RootCreationErrorCode.OUTCOME_UNKNOWN) from None

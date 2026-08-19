@@ -15,6 +15,7 @@ from test_root_creation_application import (
 )
 
 from controlgraph_canary.application.authority_store import (
+    AuthorityStoreConflict,
     AuthorityStoreOutcomeUnknown,
     RootCreationBundle,
     RootCreationWriteResult,
@@ -31,6 +32,7 @@ from controlgraph_canary.application.root_creation_service import (
     RootCreationErrorCode,
 )
 from controlgraph_canary.application.root_trust import TrustedRootPreflight
+from controlgraph_canary.contracts.codec import encode_base64url
 from controlgraph_canary.contracts.models import EvidenceEvent
 from controlgraph_canary.contracts.root_creation import (
     RootCreationCommandV1,
@@ -82,6 +84,8 @@ class _Store:
         self.claim: StoredRecord | None = None
         self.bundle: RootCreationBundle | None = None
         self.write_error: BaseException | None = None
+        self.conflict_bundle: RootCreationBundle | None = None
+        self.attempted_creation_result: object | None = None
         self.expected_released_claim: StoredRecord | None = None
 
     async def read_service_claim(self) -> StoredRecord | None:
@@ -107,7 +111,11 @@ class _Store:
     ) -> RootCreationWriteResult:
         self.events.append("write")
         self.expected_released_claim = expected_released_claim
+        self.attempted_creation_result = creation_result
         if self.write_error is not None:
+            if self.conflict_bundle is not None:
+                self.bundle = self.conflict_bundle
+                self.claim = self.conflict_bundle.service_claim
             raise self.write_error
         artifacts = RootCreationArtifacts(
             root=root,
@@ -152,6 +160,8 @@ def _principal(**changes: object) -> AuthenticationContext:
 
 def _creator(
     events: list[str],
+    *,
+    now: datetime = NOW,
 ) -> tuple[RolloutRootCreator, _Store, _PreflightClient, _EvidenceClient]:
     store = _Store(events)
     preflight = _PreflightClient(events)
@@ -161,7 +171,7 @@ def _creator(
         preflight_client=preflight,
         evidence_client=evidence,
         configuration=_configuration(),
-        clock=lambda: NOW,
+        clock=lambda: now,
     )
     return creator, store, preflight, evidence
 
@@ -291,5 +301,43 @@ def test_store_unknown_outcome_stays_explicit_and_cancellation_propagates() -> N
         with pytest.raises(asyncio.CancelledError):
             await creator.create(_command(), principal=_principal())
         assert events == ["read-claim", "preflight"]
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_logical_replay_adopts_winner_with_other_time_and_signature() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        creator, store, _, _ = _creator(
+            events,
+            now=datetime(2026, 8, 19, 12, 5, 2, tzinfo=UTC),
+        )
+        winner_unsigned = _unsigned()
+        winner_signed = _signed(winner_unsigned).model_copy(
+            update={"signature": encode_base64url(b"winner-p256-signature")}
+        )
+        winner = complete_root_creation(winner_unsigned, winner_signed)
+        store.write_error = AuthorityStoreConflict()
+        store.conflict_bundle = _bundle(winner)
+
+        result = await creator.create(_command(), principal=_principal())
+
+        assert result.result.outcome == "ADOPTED"
+        assert result.bundle == store.conflict_bundle
+        assert result.result.root.content.approved_at == "2026-08-19T12:05:00Z"
+        assert store.attempted_creation_result is not None
+        assert (
+            store.attempted_creation_result.root.content.approved_at
+            == "2026-08-19T12:05:02Z"
+        )
+        assert store.attempted_creation_result.root.root_id != result.result.root.root_id
+        assert events == [
+            "read-claim",
+            "preflight",
+            "evidence",
+            "write",
+            "read-claim",
+            "read-bundle",
+        ]
 
     asyncio.run(scenario())
