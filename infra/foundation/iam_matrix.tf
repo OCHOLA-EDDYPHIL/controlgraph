@@ -246,6 +246,7 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
+        "run_reference_invoke",
       ])
       evidence_writer = toset([
         "kms_evidence_sign",

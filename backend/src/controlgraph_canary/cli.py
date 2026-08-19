@@ -38,6 +38,17 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser = subparsers.add_parser("serve", help="serve the read-only HTTP surface")
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    for variant in ("stable", "candidate"):
+        reference_parser = subparsers.add_parser(
+            f"serve-reference-{variant}",
+            help=f"serve the fixed {variant} reference marker",
+        )
+        reference_parser.add_argument("--host", default="0.0.0.0")
+        reference_parser.add_argument(
+            "--port",
+            type=int,
+            default=int(os.environ.get("PORT", "8080")),
+        )
     return parser
 
 
@@ -76,6 +87,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = ControllerSettings.from_environment()
         app_path = f"controlgraph_canary.services.{settings.role}.app:app"
         uvicorn.run(app_path, host=args.host, port=args.port, access_log=False)
+        return 0
+
+    if args.command in {"serve-reference-stable", "serve-reference-candidate"}:
+        import uvicorn
+
+        from controlgraph_canary.reference_target import ReferenceVariant, create_reference_app
+
+        variant = ReferenceVariant(args.command.removeprefix("serve-reference-"))
+        app = create_reference_app(variant)
+        uvicorn.run(app, host=args.host, port=args.port, access_log=False)
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")

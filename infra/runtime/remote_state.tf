@@ -49,3 +49,21 @@ check "controller_image_is_isolated" {
     error_message = "controller_image must come from the dedicated regional ControlGraph repository."
   }
 }
+
+check "reference_target_images_are_isolated" {
+  assert {
+    condition = (
+      startswith(
+        var.reference_target_stable_image,
+        "${var.region}-docker.pkg.dev/${var.project_id}/${data.terraform_remote_state.foundation.outputs.artifact_repository.repository_id}/",
+      ) &&
+      startswith(
+        var.reference_target_candidate_image,
+        "${var.region}-docker.pkg.dev/${var.project_id}/${data.terraform_remote_state.foundation.outputs.artifact_repository.repository_id}/",
+      ) &&
+      regex("sha256:([0-9a-f]{64})$", var.reference_target_stable_image)[0] !=
+      regex("sha256:([0-9a-f]{64})$", var.reference_target_candidate_image)[0]
+    )
+    error_message = "Reference-target images must be distinct digests from the dedicated regional ControlGraph repository."
+  }
+}

@@ -1,4 +1,4 @@
-FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,4 +18,11 @@ RUN uv sync --frozen --no-dev --no-editable \
 USER 65532:65532
 EXPOSE 8080
 
+FROM runtime AS reference-stable
+CMD ["controlgraph-canary", "serve-reference-stable"]
+
+FROM runtime AS reference-candidate
+CMD ["controlgraph-canary", "serve-reference-candidate"]
+
+FROM runtime AS controller
 CMD ["controlgraph-canary", "serve"]
