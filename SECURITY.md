@@ -2,7 +2,8 @@
 
 ## Supported versions
 
-ControlGraph Canary is currently a pre-release scaffold. Security fixes are made on the latest revision only.
+ControlGraph Canary is pre-release software. Security fixes are made on the latest revision
+only.
 
 ## Reporting a vulnerability
 
@@ -19,9 +20,18 @@ Do not include production credentials, customer data, or live project identifier
 ## Security invariants
 
 - A stale or future epoch never grants authority.
-- Controller identity and epoch are treated as untrusted inputs until validated.
-- Authority code remains independent of agent frameworks and optional integrations.
-- CI has read-only repository permissions and no cloud identity.
+- Caller identity, signatures, claims, scope, target bindings, epochs, and preconditions are
+  untrusted until independently validated.
+- Every mutating executor performs a fresh authoritative epoch read immediately before the
+  target-bound mutation adapter is invoked.
+- Authority code remains independent of HTTP frameworks, cloud SDKs, model SDKs, agent
+  frameworks, and optional integrations.
+- Scope attenuation can preserve or narrow authority but cannot expand it.
+- Duplicate delivery is safe only for an identical canonical request; an ambiguous provider
+  outcome requires readback and never permits a blind retry.
+- CI has read-only repository permissions by default and uses no long-lived cloud key.
 - The web console does not directly invoke cloud control-plane APIs.
 
-This scaffold is not production-ready. Before deployment, add authenticated operator access, durable epoch storage, auditable authority acquisition, least-privilege Cloud Run permissions, request integrity controls, and failure-injection tests.
+This project is not production-ready. Deployment evidence applies only to the isolated
+acceptance environment and exact tested revision; it is not a claim of general security,
+availability, or production suitability.

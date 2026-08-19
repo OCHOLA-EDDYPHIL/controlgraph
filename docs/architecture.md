@@ -1,67 +1,234 @@
 # Architecture
 
-## Purpose
+## Purpose and implementation posture
 
-ControlGraph Canary is intended to coordinate canary revisions on Cloud Run while preventing two controller instances from exercising authority at the same time. This revision establishes the safety boundary and repository shape; it does not mutate cloud resources.
+ControlGraph Canary addresses stale authority at execution time. A request can be correctly
+authenticated, correctly signed, and intact yet no longer be authorized because it was queued
+before an operator revoked its rollout epoch.
 
-## Component boundary
+The current repository is a pre-integration scaffold. It implements a local exact-match epoch
+primitive, read-only HTTP routes, a CLI diagnostic, a static React shell, Terraform input
+contracts, and local tests. It does not currently store authoritative epochs, sign capabilities,
+deliver authenticated tasks, mutate Cloud Run, evaluate hosted health, recover a service, or
+render a hosted evidence timeline.
+
+The architecture below fixes the boundary that later numbered implementation work must satisfy.
+It must not be read as evidence that the hosted path has already been deployed or accepted.
+
+## Control path
 
 ```text
-Operator browser
-      |
-      v
-React console ---- read-only status ----> Python HTTP surface
-                                             |
-                                             v
-                                      application facade
-                                             |
-                                             v
-                                      epoch authority core
-
-Terraform contract modules ---- future deployment wiring (no resources today)
+API or CLI
+    |
+    v
+authenticated application facade
+    |
+    v
+deterministic reducer and closed canary policy
+    |
+    v
+KMS capability issuer
+    |
+    v
+addressed Cloud Tasks delivery with dedicated OIDC caller
+    |
+    v
+caller, signature, time, lineage, scope, binding, and request validation
+    |
+    v
+transactional receipt claim
+    |
+    v
+fresh authoritative epoch read immediately before mutation
+    |
+    v
+target-bound Cloud Run adapter with provider precondition
+    |
+    v
+idempotent receipt, independent readback, and evidence
 ```
 
-The product name describes a control relationship, not a reusable graph-processing framework. Domain behavior should remain explicit and small.
+No model appears in this path. An optional Gemini or ADK advisory integration may consume a
+narrow, read-only application view, but its output cannot approve authority, classify health,
+select a rollout or recovery action, enqueue protected work, or call a mutation adapter.
 
-## Epoch-fencing invariant
+## Layering and dependency direction
 
-An authority grant contains a non-negative integer epoch and a controller identity. A durable authority mechanism will monotonically advance the current epoch whenever ownership changes. Immediately before an eventual control-plane mutation, the actor must prove that its token epoch exactly equals the current epoch.
+The Python implementation is divided by authority rather than by cloud product:
 
-Equality is intentional:
+```text
+HTTP services / CLI / composition roots
+             |                  |
+             |                  v
+             |          Google integrations
+             |          Firestore, KMS, OIDC,
+             |          Cloud Tasks, Cloud Run
+             |                  |
+             +---------> application facade and ports
+                                      |
+                         +------------+------------+
+                         v                         v
+                  versioned contracts       authority kernel
+                                            reducer, epoch,
+                                            policy, replay rules
+```
 
-- token epoch lower than current: the controller was superseded;
-- token epoch higher than current: the token is not yet authoritative or the read is inconsistent;
-- exact match: epoch validation succeeds, subject to all other authorization checks.
+The authority kernel is pure Python and imports no HTTP framework, Google Cloud SDK, model SDK,
+ADK, or agent framework. Boundary contracts may use narrowly selected validation dependencies,
+but cloud and transport types do not enter domain decisions. Integrations depend inward through
+application ports; the authority and application layers never import an integration.
 
-Any inability to read or validate current authority must fail closed. Epoch validation is necessary but not sufficient: production wiring must also authenticate callers, bind the epoch to the intended controller and operation, protect storage integrity, and emit an audit record.
+Optional agent integrations belong under `integrations/` and receive no mutation-capable facade.
 
-## Python dependency policy
+## Domain records
 
-`controlgraph_canary.authority` is authority-bearing. It may import only Python's standard library and other dependency-free domain primitives. It must not import HTTP frameworks, cloud SDKs, agent frameworks, or ADK packages. A test inspects its imports to preserve this boundary.
+The first contract contains exact, versioned records for:
 
-If an ADK-based operator assistant is added later, place it outside the authority and service packages (for example, under a top-level `integrations/adk/` tree). The integration may call a narrow, non-authoritative application facade. Dependency direction must never point from the authority core or mutation-capable service package toward ADK.
+- project, region, environment, and service target binding;
+- stable service snapshot and provider precondition;
+- immutable rollout root and content digest;
+- root-scoped epoch authority and monotonic transitions;
+- capability claims, signatures, lineage, and attenuation;
+- mutation intent and addressed task request;
+- execution receipt and ambiguity classification;
+- deterministic health input and restore-only recovery plan; and
+- ordered evidence events.
 
-## HTTP and console posture
+The complete vocabulary and terminal semantics are defined in `product-contract.md`.
 
-The current HTTP routes expose health and static capability information only. The React console is a local operator shell with no credential handling and no direct cloud API calls. A future write surface requires a separate threat model, authenticated operator identity, CSRF/replay protections where applicable, authorization tests, and an explicit human confirmation flow.
+## Canonical wire boundary
 
-## Infrastructure posture
+Every object crossing a language, process, persistence, or trust boundary has one exact schema
+version and bounded canonical representation. Signed and hashed content uses deterministic UTF-8
+JSON, duplicate-key rejection, explicit timestamp and number rules, unknown-field rejection, and
+domain-separated digests. Parsing untrusted input never chooses a key, algorithm, URL, resource,
+or method.
 
-Terraform currently validates configuration contracts and immutable image references but creates no resources. Future modules should separate:
+Python and TypeScript may share golden fixtures for representation and display, but TypeScript
+never becomes an authority implementation. The server remains the source of mutation decisions.
 
-1. Cloud Run runtime identity and service;
-2. durable epoch authority storage;
-3. least-privilege access to a narrowly scoped target service; and
-4. audit/observability sinks.
+## Epoch authority
 
-Avoid implicit provider credentials in CI. Plans and applies require an intentionally configured environment and human-reviewed workflow outside the checks included here.
+Each immutable rollout root has an independent non-negative, monotonically increasing epoch.
+Authority changes compare an expected current epoch and advance it exactly once while recording
+the actor, cause, request identity, prior epoch, new epoch, and evidence identity.
 
-## Explicit non-goals for this scaffold
+Exact equality is required:
 
-- rollout or control-plane mutation logic;
-- a general graph engine;
-- multi-language service implementations;
-- event-bus orchestration;
-- external policy-engine integration;
-- hackathon or submission workflow state; and
-- autonomous deployment.
+- signed epoch lower than current: the work is stale;
+- signed epoch higher than current: the authority view or request is inconsistent;
+- exact match: epoch validation succeeds, subject to every other gate.
+
+Epochs are never inferred from time, shared between roots, decremented, or reused. Queue admission,
+issuance, and an earlier process check cannot substitute for a strongly consistent authority read
+immediately before mutation. Failure to read or validate current authority denies the operation.
+
+## Immutable roots and attenuation
+
+A rollout begins with two matching reads of an eligible 100 percent stable target. The snapshot
+records exact immutable revisions, traffic, approved concurrency, service generation or etag, and
+a canonical configuration digest. A canonical service claim permits at most one active root for
+the project, region, environment, and service.
+
+Root creation atomically binds the stable snapshot, candidate, 90/10 plan, deterministic policy,
+recovery limits, initial epoch, operator approval, and maximum authority. Root content is
+content-addressed and immutable; revocation updates a separate authority record.
+
+Child capabilities must be equal to or narrower than their parent across caller, audience,
+project, region, environment, service, root, epoch, action, revision, traffic, concurrency,
+provider precondition, lifetime, plan, and request identity. Lineage ends at the approved root and
+rejects missing, cyclic, unknown, or widened ancestry.
+
+## Identity and signing
+
+Operator, API, coordinator, issuer, executor, recovery, verifier, and task-caller identities are
+separate. Service invocation uses Cloud Run IAM, and protected application routes independently
+verify Google-issued identity claims against an exact audience and caller policy. A valid identity
+does not authorize mutation without the capability.
+
+Cloud KMS holds asymmetric private keys. Capabilities bind the configured signing algorithm and
+exact key version into their canonical claims. Callers cannot select a key, algorithm, trust
+bundle, or public-key URL. Capability and evidence signing use separate permissions. The issuer
+can sign approved canonical claims but cannot mutate Cloud Run.
+
+## Delivery and execution
+
+Cloud Tasks carries addressed commands to fixed private handler URLs with a dedicated OIDC caller,
+audience, regional queue, bounded age, rate, concurrency, retry, and backoff. Cloud Tasks is not an
+event bus and its delivery identity is separate from action authority.
+
+Protected execution performs these gates in order:
+
+1. caller verification;
+2. canonical contract and signature verification;
+3. issuer, subject, audience, time, lineage, scope, target, plan, precondition, and request checks;
+4. strong authority read;
+5. transactional claim of the exact execution receipt;
+6. a second strong authority read immediately before mutation;
+7. one conditional adapter call; and
+8. durable result recording followed by independent readback.
+
+The adapter accepts an internal mutation permit produced only after the final authority check. It
+does not accept an arbitrary project, region, service, image, revision, URL, API method, or field
+mask from a capability holder.
+
+## Receipts, replay, and uncertain outcomes
+
+The deterministic idempotency identity binds root, epoch, action, target, provider precondition,
+plan, and canonical payload. A Firestore transaction gives one exact request ownership of its safe
+execution phase.
+
+An exact duplicate returns or adopts the existing result. Reuse with different canonical content
+is an attack and is denied. A timeout, connection loss, malformed operation result, or other
+unknown provider response becomes `AMBIGUOUS`. The adapter does not retry the mutation merely
+because delivery or HTTP failed. Exact readback may adopt only the expected canonical poststate;
+otherwise uncertainty remains explicit.
+
+## Cloud boundary
+
+The planned deployment is one isolated Google Cloud project and one compatible region. Terraform
+defines required APIs, immutable-image Artifact Registry inputs, Firestore, KMS, Cloud Tasks,
+private Cloud Run services, distinct identities, bounded resources, audit configuration, and a
+disposable reference target. Minimum instances remain zero where safe, and no long-lived service
+account key is used.
+
+The operator API may use an authenticated ingress suitable for the CLI. Issuer, executor,
+recovery, and verifier handlers admit only intended internal authenticated callers. The reference
+target is disposable, contains no customer data, and exposes only a harmless probe marker to its
+authorized reader.
+
+Cloud Run IAM cannot constrain a service update to individual traffic fields. The executor's
+narrow application contract and target-bound adapter therefore remain necessary even under
+least-privilege IAM. Firestore and Cloud Run also do not share an atomic transaction; the threat
+model records the residual interval between the final authority read and provider call rather
+than overstating the guarantee.
+
+## Operator surfaces
+
+The API is the authority-preserving operator boundary. A CLI mutation command calls that API with
+an authenticated identity, versioned request, expected epoch, request identity, reason, and
+explicit confirmation; it does not write Firestore or invoke Cloud Run directly.
+
+The current console is static and read-only. Any later evidence presentation must obtain bounded
+data through the API and must not hold provider credentials or become a mutation surface. This
+architecture makes no claim that such hosted console behavior is currently implemented.
+
+## Selective reuse and provenance
+
+Owner-authored patterns may be adapted only from the accepted immutable RECONCILE source and paths
+recorded in `decisions/0001-selective-reuse.md` and `provenance.md`. ControlGraph has no runtime,
+source-path, symlink, state, credential, or deployment dependency on RECONCILE. Adapted behavior
+uses ControlGraph terminology, closed contracts, and ControlGraph-specific tests.
+
+## Explicit non-goals
+
+- arbitrary service deployment or container selection;
+- a general graph, topology, workflow, or policy engine;
+- Go, Rust, or another backend implementation language;
+- Pub/Sub or another event bus;
+- OpenFGA or another external authorization system;
+- multi-project or multi-region authority paths;
+- autonomous model authority;
+- direct cloud mutation from a browser console;
+- RECONCILE runtime, state, credentials, Terraform, or product workflows; and
+- product-submission or temporary project-tracking state.
