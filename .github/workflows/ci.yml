@@ -111,7 +111,7 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - name: Check clean-room and secret boundaries
-        run: python scripts/check_clean_room.py
+        run: uv run --project backend --frozen python scripts/check_clean_room.py
       - name: Audit Python dependencies
         run: |
           uv export --project backend --frozen --no-dev --no-emit-project --quiet --output-file /tmp/controlgraph-requirements.txt
