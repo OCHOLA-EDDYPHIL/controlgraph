@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol, Self, cast
@@ -20,6 +20,7 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
     CreatedRollout,
+    FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
     ReleasedServiceClaim,
     StoredRecord,
@@ -123,6 +124,17 @@ class AsyncFirestoreAuthorityClientPort(Protocol):
 
     def document(self, *document_path: str) -> _DocumentReferencePort: ...
 
+    def get_all(
+        self,
+        references: Sequence[_DocumentReferencePort],
+        field_paths: object | None = None,
+        transaction: object | None = None,
+        retry: object | None = None,
+        timeout: float | None = None,
+        *,
+        read_time: datetime | None = None,
+    ) -> AsyncIterator[object]: ...
+
     def transaction(
         self,
         max_attempts: int = FIRESTORE_MAX_TRANSACTION_ATTEMPTS,
@@ -164,6 +176,15 @@ class _DecodedIssuanceState:
     root: _DecodedDocument[RolloutRoot] | None
     service_claim: _DecodedDocument[ServiceClaimRecord] | None
     authority: _DecodedDocument[EpochAuthorityRecord] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalReadSpec:
+    reference: _DocumentReferencePort
+    kind: AuthorityStorageKind
+    logical_id: str
+    document_id: str
+    model_type: type[StrictContractModel]
 
 
 def _default_client_factory(
@@ -632,7 +653,7 @@ class FirestoreAuthorityStore:
                     raise AuthorityStoreUnavailable from None
                 if any(
                     not callable(getattr(client, name, None))
-                    for name in ("document", "transaction")
+                    for name in ("document", "get_all", "transaction")
                 ):
                     raise AuthorityStoreUnavailable
                 try:
@@ -1036,6 +1057,122 @@ class FirestoreAuthorityStore:
             root=decoded_state.root.stored,
             service_claim=decoded_state.service_claim.stored,
             authority=decoded_state.authority.stored,
+        )
+
+    async def read_final_authority_snapshot(
+        self,
+        root_id: str,
+    ) -> FinalAuthoritySnapshot | None:
+        """Read the complete final fence with one strongly consistent BatchGet RPC."""
+
+        client = await self._client()
+        root_document_id = rollout_root_document_id(root_id)
+        claim_logical_id = service_claim_logical_id(self._target)
+        claim_document_id = service_claim_document_id(self._target)
+        authority_document_id = epoch_authority_document_id(root_id)
+        specs = (
+            _FinalReadSpec(
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRoot,
+            ),
+            _FinalReadSpec(
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document_id,
+                model_type=ServiceClaimRecord,
+            ),
+            _FinalReadSpec(
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            ),
+        )
+        expected = {spec.reference.path: spec for spec in specs}
+        decoded: dict[str, _DecodedDocument[StrictContractModel] | None] = {}
+        previous_read_time: datetime | None = None
+        try:
+            async with asyncio.timeout(FIRESTORE_OPERATION_TIMEOUT_SECONDS):
+                snapshots = client.get_all(
+                    [spec.reference for spec in specs],
+                    field_paths=None,
+                    transaction=None,
+                    retry=None,
+                    timeout=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
+                    read_time=None,
+                )
+                async for snapshot in snapshots:
+                    try:
+                        provider_snapshot = cast(_ProviderSnapshotPort, snapshot)
+                        current_read_time = _aware_utc(provider_snapshot.read_time)
+                        path = provider_snapshot.reference.path
+                    except Exception:
+                        raise AuthorityStoreCorruptRecord from None
+                    if (
+                        previous_read_time is not None
+                        and current_read_time < previous_read_time
+                    ):
+                        raise AuthorityStoreCorruptRecord
+                    previous_read_time = current_read_time
+                    spec = expected.get(path)
+                    if spec is None or path in decoded:
+                        raise AuthorityStoreCorruptRecord
+                    decoded[path] = self._decode_snapshot(
+                        snapshot,
+                        reference=spec.reference,
+                        kind=spec.kind,
+                        logical_id=spec.logical_id,
+                        document_id=spec.document_id,
+                        model_type=spec.model_type,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception:
+            raise AuthorityStoreUnavailable from None
+        if set(decoded) != set(expected):
+            raise AuthorityStoreCorruptRecord
+        root = cast(
+            _DecodedDocument[RolloutRoot] | None,
+            decoded[specs[0].reference.path],
+        )
+        service_claim = cast(
+            _DecodedDocument[ServiceClaimRecord] | None,
+            decoded[specs[1].reference.path],
+        )
+        authority = cast(
+            _DecodedDocument[EpochAuthorityRecord] | None,
+            decoded[specs[2].reference.path],
+        )
+        present = tuple(
+            value for value in (root, service_claim, authority) if value is not None
+        )
+        if any(value.value.target != self._target for value in present):
+            raise AuthorityStoreCorruptRecord
+        if root is None or service_claim is None or authority is None:
+            return None
+        return FinalAuthoritySnapshot(
+            root=root.stored,
+            service_claim=service_claim.stored,
+            authority=authority.stored,
         )
 
     async def advance_authority(

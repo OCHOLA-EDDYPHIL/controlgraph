@@ -11,6 +11,7 @@ import pytest
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
+    FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
     StoredRecord,
 )
@@ -286,6 +287,50 @@ def test_emulator_issuance_snapshot_is_coherent_across_claim_release() -> None:
         assert await first_store.read_issuance_state(root.root_id) == after
         assert after.service_claim.value.status is ServiceClaimStatus.RELEASED
         assert after.authority.value.current_epoch == 2
+
+    asyncio.run(scenario())
+
+
+def test_emulator_final_snapshot_is_coherent_across_claim_release() -> None:
+    async def scenario() -> None:
+        target = _target()
+        root, claim, authority = _initial_records(
+            target=target,
+            root_id=f"root-{uuid4().hex}",
+        )
+        first_store = FirestoreAuthorityStore.for_emulator(
+            target=target,
+            configured_project_id=target.project_id,
+        )
+        second_store = FirestoreAuthorityStore.for_emulator(
+            target=target,
+            configured_project_id=target.project_id,
+        )
+        created = await first_store.create_rollout(root, claim, authority)
+        released, revoked = _release(claim, authority)
+
+        snapshot, release_result = await asyncio.gather(
+            first_store.read_final_authority_snapshot(root.root_id),
+            second_store.release_service_claim(
+                created.service_claim,
+                released,
+                created.authority,
+                revoked,
+            ),
+        )
+
+        before = FinalAuthoritySnapshot(
+            root=created.root,
+            service_claim=created.service_claim,
+            authority=created.authority,
+        )
+        after = FinalAuthoritySnapshot(
+            root=created.root,
+            service_claim=release_result.service_claim,
+            authority=release_result.authority,
+        )
+        assert snapshot in (before, after)
+        assert await first_store.read_final_authority_snapshot(root.root_id) == after
 
     asyncio.run(scenario())
 

@@ -85,6 +85,15 @@ class IssuanceStateSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FinalAuthoritySnapshot:
+    """One atomic view used immediately before a protected mutation."""
+
+    root: StoredRecord[RolloutRoot]
+    service_claim: StoredRecord[ServiceClaimRecord]
+    authority: StoredRecord[EpochAuthorityRecord]
+
+
+@dataclass(frozen=True, slots=True)
 class ReleasedServiceClaim:
     """The claim release and epoch advance committed by one transaction."""
 
@@ -119,6 +128,11 @@ class AuthorityStore(Protocol):
         self,
         root_id: str,
     ) -> IssuanceStateSnapshot | None: ...
+
+    async def read_final_authority_snapshot(
+        self,
+        root_id: str,
+    ) -> FinalAuthoritySnapshot | None: ...
 
     async def advance_authority(
         self,
@@ -160,6 +174,7 @@ __all__ = [
     "AuthorityStoreOutcomeUnknown",
     "AuthorityStoreUnavailable",
     "CreatedRollout",
+    "FinalAuthoritySnapshot",
     "IssuanceStateSnapshot",
     "ReleasedServiceClaim",
     "StoredRecord",

@@ -425,6 +425,9 @@ def test_verifies_closed_signed_actions_for_both_protected_routes(
     assert verified.root == _root()
     assert verified.claims_sha256 == request.capability.claims_sha256
     assert verified.capability_sha256 == canonical_sha256(request.capability)
+    assert verified.earliest_lineage_issued_at == int(
+        datetime(2026, 8, 19, 12, 2, tzinfo=UTC).timestamp()
+    )
     assert root_reader.reads == ["root-001"]
     assert root_reader.receipt_claims == 0
 
@@ -466,6 +469,9 @@ def test_complete_lineage_uses_verified_claim_digests() -> None:
     )
 
     assert verified.claims_sha256 == child.claims_sha256
+    assert verified.earliest_lineage_issued_at == int(
+        datetime(2026, 8, 19, 12, 2, tzinfo=UTC).timestamp()
+    )
     assert lineage_reader.lookups == [parent.claims_sha256]
 
 

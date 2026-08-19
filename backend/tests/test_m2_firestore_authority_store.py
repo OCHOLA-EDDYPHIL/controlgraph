@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreErrorCode,
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
+    FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
     ReleasedServiceClaim,
     StoredRecord,
@@ -313,6 +315,15 @@ class _FakeClient:
         self.pause_transaction_read_after: int | None = None
         self.transaction_read_paused = asyncio.Event()
         self.continue_transaction_read = asyncio.Event()
+        self.batch_get_calls = 0
+        self.batch_get_arguments: list[tuple[object, ...]] = []
+        self.batch_get_mode = "normal"
+        self.pause_batch_get_before_capture = False
+        self.batch_get_started = asyncio.Event()
+        self.continue_batch_get = asyncio.Event()
+        self.pause_batch_get_after_first = False
+        self.batch_get_first_yielded = asyncio.Event()
+        self.continue_batch_get_stream = asyncio.Event()
 
     def document(self, *document_path: str) -> _Reference:
         self.document_calls += 1
@@ -321,6 +332,50 @@ class _FakeClient:
     def transaction(self, max_attempts: int = 3, read_only: bool = False) -> _Transaction:
         del read_only
         return _Transaction(self, max_attempts)
+
+    async def get_all(
+        self,
+        references: Sequence[_Reference],
+        field_paths: object | None = None,
+        transaction: object | None = None,
+        retry: object | None = None,
+        timeout: float | None = None,
+        *,
+        read_time: datetime | None = None,
+    ) -> AsyncIterator[_Snapshot]:
+        self.batch_get_calls += 1
+        self.batch_get_arguments.append(
+            (tuple(reference.path for reference in references), field_paths, transaction, retry,
+             timeout, read_time)
+        )
+        self.batch_get_started.set()
+        if self.pause_batch_get_before_capture:
+            await self.continue_batch_get.wait()
+        if self.read_error is not None:
+            raise self.read_error
+        async with self.lock:
+            captured = deepcopy(self.documents)
+            self.clock += timedelta(microseconds=1)
+            initial_read_time = self.clock
+        selected = list(references)
+        if self.batch_get_mode == "reversed":
+            selected.reverse()
+        elif self.batch_get_mode == "partial":
+            selected = selected[:-1]
+        elif self.batch_get_mode == "duplicate":
+            selected[-1] = selected[0]
+        elif self.batch_get_mode == "unexpected":
+            selected[-1] = _Reference(self, "unexpected/document")
+        for index, reference in enumerate(selected):
+            read_time = initial_read_time + timedelta(microseconds=index)
+            if self.batch_get_mode == "read-time-regression" and index == 1:
+                read_time = initial_read_time - timedelta(microseconds=1)
+            yield _Snapshot(reference, captured.get(reference.path), read_time)
+            if self.pause_batch_get_after_first and index == 0:
+                self.batch_get_first_yielded.set()
+                await self.continue_batch_get_stream.wait()
+            if self.batch_get_mode == "mid-stream-error" and index == 0:
+                raise RuntimeError("synthetic batch stream detail")
 
     def snapshot(self, reference: _Reference) -> _Snapshot:
         self.clock += timedelta(microseconds=1)
@@ -1044,5 +1099,151 @@ def test_issuance_snapshot_cannot_mix_with_an_interleaved_release() -> None:
         )
         assert runner.expected_writes == [3, 0, 2, 0]
         assert runner.write_result_counts == [3, 0, 2, 0]
+
+    asyncio.run(scenario())
+
+
+def test_final_authority_snapshot_uses_one_order_independent_batch_get() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        client.document_calls = 0
+        client.batch_get_mode = "reversed"
+
+        snapshot = await store.read_final_authority_snapshot(root.root_id)
+
+        assert snapshot == FinalAuthoritySnapshot(
+            root=created.root,
+            service_claim=created.service_claim,
+            authority=created.authority,
+        )
+        assert client.batch_get_calls == 1
+        assert client.document_calls == 3
+        paths, field_paths, transaction, retry, timeout, read_time = (
+            client.batch_get_arguments[0]
+        )
+        assert len(paths) == 3
+        assert field_paths is transaction is retry is read_time is None
+        assert timeout == 5.0
+
+    asyncio.run(scenario())
+
+
+def test_final_authority_snapshot_returns_none_for_a_complete_missing_response() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        await store.create_rollout(root, claim, authority)
+        claim_path = (
+            f"{AuthorityStorageKind.SERVICE_CLAIM.value}/"
+            f"{service_claim_document_id(root.target)}"
+        )
+        del client.documents[claim_path]
+
+        assert await store.read_final_authority_snapshot(root.root_id) is None
+        assert client.batch_get_calls == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["partial", "duplicate", "unexpected", "read-time-regression"],
+)
+def test_final_authority_snapshot_rejects_malformed_batch_streams(mode: str) -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        await store.create_rollout(root, claim, authority)
+        client.batch_get_mode = mode
+
+        with pytest.raises(AuthorityStoreCorruptRecord):
+            await store.read_final_authority_snapshot(root.root_id)
+
+        assert client.batch_get_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_final_authority_snapshot_sanitizes_batch_get_failure() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        await store.create_rollout(root, claim, authority)
+        client.batch_get_mode = "mid-stream-error"
+
+        with pytest.raises(AuthorityStoreUnavailable) as error:
+            await store.read_final_authority_snapshot(root.root_id)
+
+        assert str(error.value) == AuthorityStoreErrorCode.UNAVAILABLE.value
+        assert "synthetic batch stream detail" not in str(error.value)
+        assert client.batch_get_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_final_authority_snapshot_captures_revocation_before_returning() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        released, revoked = release_transition(claim, authority)
+        client.pause_batch_get_before_capture = True
+
+        snapshot_task = asyncio.create_task(
+            store.read_final_authority_snapshot(root.root_id)
+        )
+        await asyncio.wait_for(client.batch_get_started.wait(), timeout=1)
+        released_state = await store.release_service_claim(
+            created.service_claim,
+            released,
+            created.authority,
+            revoked,
+        )
+        client.continue_batch_get.set()
+
+        assert await snapshot_task == FinalAuthoritySnapshot(
+            root=created.root,
+            service_claim=released_state.service_claim,
+            authority=released_state.authority,
+        )
+        assert client.batch_get_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_final_authority_batch_get_cannot_mix_with_interleaved_release() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        root, claim, authority = initial_records()
+        created = await store.create_rollout(root, claim, authority)
+        released, revoked = release_transition(claim, authority)
+        client.pause_batch_get_after_first = True
+
+        snapshot_task = asyncio.create_task(
+            store.read_final_authority_snapshot(root.root_id)
+        )
+        await asyncio.wait_for(client.batch_get_first_yielded.wait(), timeout=1)
+        released_state = await store.release_service_claim(
+            created.service_claim,
+            released,
+            created.authority,
+            revoked,
+        )
+        client.continue_batch_get_stream.set()
+
+        assert await snapshot_task == FinalAuthoritySnapshot(
+            root=created.root,
+            service_claim=created.service_claim,
+            authority=created.authority,
+        )
+        assert await store.read_final_authority_snapshot(
+            root.root_id
+        ) == FinalAuthoritySnapshot(
+            root=created.root,
+            service_claim=released_state.service_claim,
+            authority=released_state.authority,
+        )
 
     asyncio.run(scenario())
