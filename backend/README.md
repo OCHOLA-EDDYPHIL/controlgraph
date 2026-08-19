@@ -54,6 +54,6 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8787 \
   uv run pytest tests/test_m2_firestore_emulator.py
 ```
 
-The ordinary test suite skips those three emulator cases when the endpoint is absent. Fake
+The ordinary test suite skips those emulator cases when the endpoint is absent. Fake
 provider tests still cover commit ambiguity, exact readback, corruption, and sanitized failure
 classes on every run.

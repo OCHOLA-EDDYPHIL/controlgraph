@@ -22,10 +22,8 @@ from controlgraph_canary.authority import (
     decide_replay,
     decide_transport_failure,
     deny_before_dispatch,
-    mark_provider_attempted,
     mutation_identity,
     receipt_claim_identity,
-    record_pre_dispatch_failure,
     record_provider_result,
     record_readback,
 )
@@ -164,21 +162,19 @@ def test_invalid_identity_inputs_fail_closed(
         change(binding())
 
 
-def test_new_and_exact_pre_dispatch_deliveries_have_explicit_decisions() -> None:
+def test_new_claim_and_exact_duplicate_have_nonresumable_decisions() -> None:
     value = binding()
     claimed = decide_replay(value, None)
 
     assert claimed.action is ReplayAction.CLAIM_NEW
     assert claimed.receipt == claim_receipt(value)
-    assert claimed.may_enter_dispatch is True
     assert claimed.requires_readback is False
 
     duplicate = decide_replay(value, claimed.receipt)
 
-    assert duplicate.action is ReplayAction.RESUME_PRE_DISPATCH
+    assert duplicate.action is ReplayAction.RETURN_IN_PROGRESS
     assert duplicate.receipt is claimed.receipt
-    assert duplicate.may_enter_dispatch is True
-    assert duplicate.reason is None
+    assert duplicate.reason is DenialReason.RECEIPT_IN_PROGRESS
 
 
 def test_reuse_with_any_changed_binding_is_denied_as_a_conflict() -> None:
@@ -190,7 +186,6 @@ def test_reuse_with_any_changed_binding_is_denied_as_a_conflict() -> None:
         assert decision.action is ReplayAction.DENY_CONFLICT
         assert decision.receipt is stored
         assert decision.reason is DenialReason.IDEMPOTENCY_CONFLICT
-        assert decision.may_enter_dispatch is False
         assert decision.requires_readback is False
 
 
@@ -199,18 +194,23 @@ def terminal_receipts() -> tuple[ReplayReceipt, ...]:
         claim_receipt(binding()),
         DenialReason.EPOCH_MISMATCH,
     )
-    attempted = mark_provider_attempted(claim_receipt(binding()))
     failed_safe = record_provider_result(
-        attempted,
+        claim_receipt(binding()),
         ProviderAttemptResult.PRECONDITION_REJECTED,
     )
-    applied = record_provider_result(attempted, ProviderAttemptResult.ACCEPTED)
+    applied = record_provider_result(
+        claim_receipt(binding()),
+        ProviderAttemptResult.ACCEPTED,
+    )
     verified = record_readback(
         applied,
         observed_poststate_sha256=THREE_DIGEST,
     )
     ambiguous = record_readback(
-        attempted,
+        record_provider_result(
+            claim_receipt(binding()),
+            ProviderAttemptResult.UNKNOWN,
+        ),
         observed_poststate_sha256=ONE_DIGEST,
     )
     unresolved = close_unresolved_ambiguity(ambiguous)
@@ -224,25 +224,19 @@ def test_exact_terminal_duplicate_returns_the_stored_result() -> None:
         assert decision.action is ReplayAction.RETURN_STORED
         assert decision.receipt is stored
         assert stored.terminal is True
-        assert decision.may_enter_dispatch is False
         assert decision.requires_readback is False
 
 
-def test_provider_attempt_is_ambiguous_before_the_external_call() -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
+def test_claimed_duplicate_is_in_progress_and_never_requires_readback() -> None:
+    claimed = claim_receipt(binding())
 
-    assert attempted.phase is ReceiptPhase.PROVIDER_ATTEMPTED
-    assert attempted.outcome is ReplayReceiptOutcome.AMBIGUOUS
-    assert attempted.reason is DenialReason.PROVIDER_OUTCOME_AMBIGUOUS
-    assert attempted.awaits_readback is True
-
-    duplicate = decide_replay(binding(), attempted)
-    assert duplicate.action is ReplayAction.REQUIRE_READBACK
-    assert duplicate.requires_readback is True
-    assert duplicate.may_enter_dispatch is False
-
-    with pytest.raises(ValueError):
-        mark_provider_attempted(attempted)
+    assert claimed.phase is ReceiptPhase.CLAIMED
+    assert claimed.outcome is ReplayReceiptOutcome.CLAIMED
+    assert claimed.awaits_readback is False
+    duplicate = decide_replay(binding(), claimed)
+    assert duplicate.action is ReplayAction.RETURN_IN_PROGRESS
+    assert duplicate.reason is DenialReason.RECEIPT_IN_PROGRESS
+    assert duplicate.requires_readback is False
 
 
 def test_known_pre_dispatch_denial_is_terminal_without_provider_uncertainty() -> None:
@@ -258,9 +252,8 @@ def test_known_pre_dispatch_denial_is_terminal_without_provider_uncertainty() ->
 
 
 def test_known_provider_precondition_rejection_is_failed_safe() -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
     result = record_provider_result(
-        attempted,
+        claim_receipt(binding()),
         ProviderAttemptResult.PRECONDITION_REJECTED,
     )
 
@@ -270,9 +263,24 @@ def test_known_provider_precondition_rejection_is_failed_safe() -> None:
     assert result.awaits_readback is False
 
 
+def test_known_provider_request_rejection_is_failed_safe_without_raw_detail() -> None:
+    result = record_provider_result(
+        claim_receipt(binding()),
+        ProviderAttemptResult.REQUEST_REJECTED,
+    )
+
+    assert result.phase is ReceiptPhase.TERMINAL
+    assert result.outcome is ReplayReceiptOutcome.FAILED_SAFE
+    assert result.reason is DenialReason.PROVIDER_REQUEST_REJECTED
+    assert result.result_sha256 is None
+    assert result.awaits_readback is False
+
+
 def test_accepted_provider_result_still_requires_exact_readback() -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
-    result = record_provider_result(attempted, ProviderAttemptResult.ACCEPTED)
+    result = record_provider_result(
+        claim_receipt(binding()),
+        ProviderAttemptResult.ACCEPTED,
+    )
 
     assert result.phase is ReceiptPhase.READBACK_REQUIRED
     assert result.outcome is ReplayReceiptOutcome.APPLIED
@@ -293,8 +301,7 @@ def test_accepted_provider_result_still_requires_exact_readback() -> None:
 def test_uncertain_provider_results_require_readback_and_never_resume(
     result: ProviderAttemptResult,
 ) -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
-    uncertain = record_provider_result(attempted, result)
+    uncertain = record_provider_result(claim_receipt(binding()), result)
 
     assert uncertain.phase is ReceiptPhase.READBACK_REQUIRED
     assert uncertain.outcome is ReplayReceiptOutcome.AMBIGUOUS
@@ -303,16 +310,16 @@ def test_uncertain_provider_results_require_readback_and_never_resume(
 
     replay = decide_replay(binding(), uncertain)
     assert replay.action is ReplayAction.REQUIRE_READBACK
-    assert replay.may_enter_dispatch is False
-
     with pytest.raises(ValueError):
         record_provider_result(uncertain, ProviderAttemptResult.ACCEPTED)
 
 
 @pytest.mark.parametrize("observed", [ONE_DIGEST, None])
 def test_only_exact_readback_adopts_verified_success(observed: str | None) -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
-    uncertain = record_provider_result(attempted, ProviderAttemptResult.TIMEOUT)
+    uncertain = record_provider_result(
+        claim_receipt(binding()),
+        ProviderAttemptResult.TIMEOUT,
+    )
 
     unresolved = record_readback(
         uncertain,
@@ -333,8 +340,10 @@ def test_only_exact_readback_adopts_verified_success(observed: str | None) -> No
 
 
 def test_exact_readback_can_resolve_an_unknown_provider_response() -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
-    uncertain = record_provider_result(attempted, ProviderAttemptResult.UNKNOWN)
+    uncertain = record_provider_result(
+        claim_receipt(binding()),
+        ProviderAttemptResult.UNKNOWN,
+    )
 
     verified = record_readback(
         uncertain,
@@ -349,8 +358,10 @@ def test_exact_readback_can_resolve_an_unknown_provider_response() -> None:
 
 
 def test_unresolved_ambiguity_cannot_close_before_readback() -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding()))
-    uncertain = record_provider_result(attempted, ProviderAttemptResult.TIMEOUT)
+    uncertain = record_provider_result(
+        claim_receipt(binding()),
+        ProviderAttemptResult.TIMEOUT,
+    )
 
     with pytest.raises(ValueError):
         close_unresolved_ambiguity(uncertain)
@@ -408,27 +419,13 @@ def test_transport_retry_is_bounded_and_only_before_dispatch() -> None:
     assert final.reason is DenialReason.TRANSPORT_UNAVAILABLE
 
 
-def test_pre_dispatch_retry_bound_is_durable_across_duplicate_delivery() -> None:
+def test_durable_claim_never_turns_a_later_delivery_into_dispatch_authority() -> None:
     claimed = claim_receipt(binding())
 
-    first = record_pre_dispatch_failure(claimed, maximum_attempts=3)
-    second = record_pre_dispatch_failure(first, maximum_attempts=3)
-    exhausted = record_pre_dispatch_failure(second, maximum_attempts=3)
-
-    assert first.pre_dispatch_attempts == 1
-    assert second.pre_dispatch_attempts == 2
-    assert decide_replay(binding(), first).action is ReplayAction.RESUME_PRE_DISPATCH
-    assert decide_replay(binding(), second).action is ReplayAction.RESUME_PRE_DISPATCH
-    assert exhausted.phase is ReceiptPhase.TERMINAL
-    assert exhausted.outcome is ReplayReceiptOutcome.FAILED_SAFE
-    assert exhausted.reason is DenialReason.TRANSPORT_UNAVAILABLE
-    assert exhausted.pre_dispatch_attempts == 3
-    replay = decide_replay(binding(), exhausted)
-    assert replay.action is ReplayAction.RETURN_STORED
-    assert replay.may_enter_dispatch is False
-
-    with pytest.raises(ValueError):
-        record_pre_dispatch_failure(exhausted, maximum_attempts=3)
+    for _ in range(3):
+        replay = decide_replay(binding(), claimed)
+        assert replay.action is ReplayAction.RETURN_IN_PROGRESS
+        assert replay.reason is DenialReason.RECEIPT_IN_PROGRESS
 
 
 @pytest.mark.parametrize(

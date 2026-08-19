@@ -12,6 +12,7 @@ from typing import Protocol, runtime_checkable
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreError,
+    DirectReceiptCreate,
     FinalAuthoritySnapshot,
     StoredRecord,
 )
@@ -27,6 +28,7 @@ from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
+    EpochChangeCause,
     ExecutionReceipt,
     MutationIntent,
     ReasonCode,
@@ -74,62 +76,32 @@ class FinalAuthorityDenial:
 
     reason_code: ReasonCode
     claimed_receipt: StoredRecord[ExecutionReceipt]
+    observed_authority_epoch: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.reason_code) is not ReasonCode:
             raise TypeError("an exact final-authority denial reason is required")
+        if self.observed_authority_epoch is not None and (
+            type(self.observed_authority_epoch) is not int
+            or self.observed_authority_epoch < 1
+        ):
+            raise ValueError("observed authority epoch is invalid")
         _validate_claimed_record(self.claimed_receipt)
 
 
-class _DefinitiveCreateKey:
-    pass
+@dataclass(frozen=True, slots=True)
+class FinalMutationResult[ResultT]:
+    """Adapter result bound to the authoritative epoch read immediately before it."""
 
+    result: ResultT
+    observed_authority_epoch: int
 
-_DEFINITIVE_CREATE_KEY = _DefinitiveCreateKey()
-
-
-class DefinitiveReceiptCreate:
-    """Opaque proof that a receipt create completed directly and unambiguously."""
-
-    __slots__ = ("_available", "_binding", "_claimed_receipt", "_lock")
-
-    def __init__(
-        self,
-        key: _DefinitiveCreateKey,
-        claimed_receipt: StoredRecord[ExecutionReceipt],
-        binding: MutationBinding,
-    ) -> None:
-        if key is not _DEFINITIVE_CREATE_KEY:
-            raise TypeError("definitive receipt-create proof is internally issued")
-        _validate_claimed_record(claimed_receipt)
-        if type(binding) is not MutationBinding or not _receipt_matches_binding(
-            claimed_receipt,
-            binding,
+    def __post_init__(self) -> None:
+        if (
+            type(self.observed_authority_epoch) is not int
+            or self.observed_authority_epoch < 1
         ):
-            raise ValueError("definitive receipt create does not match its mutation binding")
-        self._claimed_receipt = claimed_receipt
-        self._binding = binding
-        self._available = True
-        self._lock = Lock()
-
-    @classmethod
-    def _from_confirmed_create(
-        cls,
-        claimed_receipt: StoredRecord[ExecutionReceipt],
-        binding: MutationBinding,
-    ) -> DefinitiveReceiptCreate:
-        """Issue proof only on a store path that directly confirmed one create."""
-
-        return cls(_DEFINITIVE_CREATE_KEY, claimed_receipt, binding)
-
-    def _take_claim(
-        self,
-    ) -> tuple[StoredRecord[ExecutionReceipt], MutationBinding]:
-        with self._lock:
-            if not self._available:
-                raise ValueError("definitive receipt-create proof is already consumed")
-            self._available = False
-            return self._claimed_receipt, self._binding
+            raise ValueError("observed authority epoch is invalid")
 
 
 class _LeaseKey:
@@ -179,17 +151,26 @@ class ReceiptDispatchLease:
                 return ReasonCode.IDEMPOTENCY_CONFLICT
             return None
 
-    def _denial(self, reason_code: ReasonCode) -> FinalAuthorityDenial:
+    def _denial(
+        self,
+        reason_code: ReasonCode,
+        observed_authority_epoch: int | None = None,
+    ) -> FinalAuthorityDenial:
         return FinalAuthorityDenial(
             reason_code=reason_code,
             claimed_receipt=self._claimed_receipt,
+            observed_authority_epoch=observed_authority_epoch,
         )
 
-    def _close_with_denial(self, reason_code: ReasonCode) -> FinalAuthorityDenial:
+    def _close_with_denial(
+        self,
+        reason_code: ReasonCode,
+        observed_authority_epoch: int | None = None,
+    ) -> FinalAuthorityDenial:
         with self._lock:
             if self._state is _LeaseState.ENTERED:
                 self._state = _LeaseState.CLOSED
-        return self._denial(reason_code)
+        return self._denial(reason_code, observed_authority_epoch)
 
     def _authorize(
         self,
@@ -215,9 +196,9 @@ class DefinitiveFreshClaimLeaseFactory:
     """Mint dispatch ownership only from definitive receipt-create proof."""
 
     @staticmethod
-    def mint(created: DefinitiveReceiptCreate) -> ReceiptDispatchLease:
-        if type(created) is not DefinitiveReceiptCreate:
-            raise TypeError("a definitive receipt-create proof is required")
+    def mint(created: DirectReceiptCreate) -> ReceiptDispatchLease:
+        if type(created) is not DirectReceiptCreate:
+            raise TypeError("a direct receipt-create proof is required")
         claimed_receipt, binding = created._take_claim()
         return ReceiptDispatchLease(
             _LEASE_KEY,
@@ -325,11 +306,15 @@ class FinalMutationGate[ResultT]:
         self._service_role = service_role
         self._clock = clock or _now_utc_second
 
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
     async def execute(
         self,
         lease: ReceiptDispatchLease,
         verified: VerifiedMutation,
-    ) -> ResultT | FinalAuthorityDenial:
+    ) -> FinalMutationResult[ResultT] | FinalAuthorityDenial:
         """Consume one lease, recheck authority, and dispatch without another await."""
 
         if type(lease) is not ReceiptDispatchLease or type(verified) is not VerifiedMutation:
@@ -359,11 +344,22 @@ class FinalMutationGate[ResultT]:
             service_role=self._service_role,
             now_second=now_second,
         )
+        observed_authority_epoch = _observed_authority_epoch(
+            snapshot,
+            verified=verified,
+            target=self._target,
+        )
         if denial is not None:
-            return lease._close_with_denial(denial)
+            return lease._close_with_denial(denial, observed_authority_epoch)
+        if observed_authority_epoch is None:
+            return lease._close_with_denial(ReasonCode.AUTHORITY_UNAVAILABLE)
         permit = lease._authorize(verified, self._target, self._service_role)
         try:
-            return await self._adapter.mutate(permit)
+            result = await self._adapter.mutate(permit)
+            return FinalMutationResult(
+                result=result,
+                observed_authority_epoch=observed_authority_epoch,
+            )
         finally:
             permit._close()
 
@@ -469,6 +465,22 @@ def _final_authority_denial(
     intent = verified.request.intent
     if type(verified.earliest_lineage_issued_at) is not int:
         return ReasonCode.AUTHORITY_UNAVAILABLE
+    observed_authority_epoch = _coherent_authority_epoch(
+        snapshot,
+        verified=verified,
+        target=target,
+    )
+    if observed_authority_epoch is None:
+        return ReasonCode.AUTHORITY_UNAVAILABLE
+    if observed_authority_epoch != intent.epoch:
+        return ReasonCode.EPOCH_MISMATCH
+    if (
+        snapshot.service_claim.revision != 0
+        or claim.status is not ServiceClaimStatus.ACTIVE
+        or verified.earliest_lineage_issued_at
+        < _parse_utc_second(authority.changed_at)
+    ):
+        return ReasonCode.AUTHORITY_UNAVAILABLE
     claims = verified.request.capability.claims
     if now_second < _parse_utc_second(claims.not_before) or now_second < _parse_utc_second(
         verified.request.scheduled_at
@@ -480,35 +492,83 @@ def _final_authority_denial(
         return ReasonCode.CAPABILITY_EXPIRED
     if not _role_admits(service_role, intent.action):
         return ReasonCode.CLAIM_BINDING_MISMATCH
-    root_sha256 = canonical_sha256(root)
-    exact_root = (
-        snapshot.root.revision == 0
-        and root == verified.root
-        and root.target == target
-        and intent.target == target
-        and root.root_id == intent.root_id
-        and root_sha256 == intent.root_sha256
-    )
-    exact_claim = (
-        snapshot.service_claim.revision == 0
-        and claim.target == target
-        and claim.root_id == intent.root_id
-        and claim.root_sha256 == intent.root_sha256
-        and claim.status is ServiceClaimStatus.ACTIVE
-    )
-    exact_authority = (
-        authority.target == target
-        and authority.root_id == intent.root_id
-        and authority.root_sha256 == intent.root_sha256
-        and snapshot.authority.revision == authority.revision
-        and authority.current_epoch == authority.revision + 1
-        and authority.current_epoch == intent.epoch
-        and verified.earliest_lineage_issued_at
-        >= _parse_utc_second(authority.changed_at)
-    )
-    if not (exact_root and exact_claim and exact_authority):
-        return ReasonCode.EPOCH_MISMATCH
     return None
+
+
+def _observed_authority_epoch(
+    snapshot: FinalAuthoritySnapshot | None,
+    *,
+    verified: VerifiedMutation,
+    target: TargetBinding,
+) -> int | None:
+    return _coherent_authority_epoch(snapshot, verified=verified, target=target)
+
+
+def _coherent_authority_epoch(
+    snapshot: FinalAuthoritySnapshot | None,
+    *,
+    verified: VerifiedMutation,
+    target: TargetBinding,
+) -> int | None:
+    if snapshot is None or type(snapshot) is not FinalAuthoritySnapshot:
+        return None
+    if any(
+        type(record) is not StoredRecord
+        for record in (snapshot.root, snapshot.service_claim, snapshot.authority)
+    ):
+        return None
+    root = snapshot.root.value
+    claim = snapshot.service_claim.value
+    authority_record = snapshot.authority
+    authority = authority_record.value
+    if (
+        type(root) is not RolloutRoot
+        or type(claim) is not ServiceClaimRecord
+        or type(authority) is not EpochAuthorityRecord
+    ):
+        return None
+    intent = verified.request.intent
+    if (
+        snapshot.root.revision != 0
+        or root != verified.root
+        or root.target != target
+        or intent.target != target
+        or root.root_id != intent.root_id
+        or canonical_sha256(root) != intent.root_sha256
+        or claim.target != target
+        or claim.root_id != intent.root_id
+        or claim.root_sha256 != intent.root_sha256
+        or not (
+            (
+                claim.status is ServiceClaimStatus.ACTIVE
+                and snapshot.service_claim.revision == 0
+            )
+            or (
+                claim.status is ServiceClaimStatus.RELEASED
+                and snapshot.service_claim.revision == 1
+            )
+        )
+        or (
+            claim.status is ServiceClaimStatus.RELEASED
+            and (
+                authority.revision < 1
+                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+                or claim.released_by != authority.changed_by
+                or claim.release_request_id != authority.request_id
+                or claim.release_evidence_id != authority.evidence_id
+                or claim.released_at != authority.changed_at
+            )
+        )
+        or authority.target != target
+        or authority.root_id != intent.root_id
+        or authority.root_sha256 != intent.root_sha256
+        or type(authority.current_epoch) is not int
+        or authority.current_epoch < 1
+        or authority_record.revision != authority.revision
+        or authority.current_epoch != authority.revision + 1
+    ):
+        return None
+    return authority.current_epoch
 
 
 def _role_admits(service_role: ServiceRole, action: CapabilityAction) -> bool:
@@ -541,10 +601,10 @@ def _now_utc_second() -> datetime:
 
 __all__ = [
     "DefinitiveFreshClaimLeaseFactory",
-    "DefinitiveReceiptCreate",
     "FinalAuthorityDenial",
     "FinalAuthorityReader",
     "FinalMutationGate",
+    "FinalMutationResult",
     "MutationPermit",
     "ReceiptDispatchLease",
     "TargetBoundMutationAdapter",

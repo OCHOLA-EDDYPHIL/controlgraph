@@ -80,6 +80,7 @@ class ReasonCode(StrEnum):
     RECEIPT_IN_PROGRESS = "RECEIPT_IN_PROGRESS"
     TRANSPORT_UNAVAILABLE = "TRANSPORT_UNAVAILABLE"
     PROVIDER_PRECONDITION_FAILED = "PROVIDER_PRECONDITION_FAILED"
+    PROVIDER_REQUEST_REJECTED = "PROVIDER_REQUEST_REJECTED"
     PROVIDER_OUTCOME_AMBIGUOUS = "PROVIDER_OUTCOME_AMBIGUOUS"
     TRANSITION_INVALID = "TRANSITION_INVALID"
     POLICY_UNHEALTHY = "POLICY_UNHEALTHY"
@@ -338,10 +339,12 @@ class ExecutionReceipt(StrictContractModel):
     epoch: PositiveSafeInteger
     action: CapabilityAction
     provider_etag: OpaqueToken
+    dispatch_not_after: UtcSecond
     outcome: ReceiptOutcome
     reason_code: ReasonCode | None
     provider_operation: BoundedText | None
     observed_etag: OpaqueToken | None
+    observed_authority_epoch: PositiveSafeInteger | None
     created_at: UtcSecond
     updated_at: UtcSecond
     evidence_ids: Annotated[tuple[Identifier, ...], Field(max_length=64)]
@@ -350,6 +353,8 @@ class ExecutionReceipt(StrictContractModel):
     def validate_outcome_shape(self) -> Self:
         if self.updated_at < self.created_at:
             raise ValueError("receipt timestamps are not ordered")
+        if self.dispatch_not_after < self.created_at:
+            raise ValueError("receipt dispatch deadline precedes its claim")
         needs_reason = self.outcome in {
             ReceiptOutcome.DENIED,
             ReceiptOutcome.FAILED_SAFE,
@@ -357,10 +362,43 @@ class ExecutionReceipt(StrictContractModel):
         }
         if needs_reason != (self.reason_code is not None):
             raise ValueError("receipt reason does not match its outcome")
+        if self.outcome is ReceiptOutcome.FAILED_SAFE and self.reason_code not in {
+            ReasonCode.PROVIDER_PRECONDITION_FAILED,
+            ReasonCode.TARGET_BINDING_MISMATCH,
+            ReasonCode.PROVIDER_REQUEST_REJECTED,
+        }:
+            raise ValueError("failed-safe receipt reason is invalid")
+        if (
+            self.outcome is ReceiptOutcome.AMBIGUOUS
+            and self.reason_code is not ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS
+        ):
+            raise ValueError("ambiguous receipt reason is invalid")
         if self.outcome is ReceiptOutcome.CLAIMED and (
-            self.provider_operation is not None or self.observed_etag is not None
+            self.provider_operation is not None
+            or self.observed_etag is not None
+            or self.observed_authority_epoch is not None
         ):
             raise ValueError("claimed receipt cannot contain a provider result")
+        if self.outcome is ReceiptOutcome.DENIED and (
+            self.provider_operation is not None or self.observed_etag is not None
+        ):
+            raise ValueError("denied receipt cannot contain a provider result")
+        if self.outcome is ReceiptOutcome.APPLIED and (
+            self.provider_operation is None or self.observed_etag is not None
+        ):
+            raise ValueError("applied receipt result shape is invalid")
+        if self.outcome is ReceiptOutcome.FAILED_SAFE and (
+            self.provider_operation is not None or self.observed_etag is not None
+        ):
+            raise ValueError("failed-safe receipt cannot contain a provider result")
+        if (
+            self.reason_code is ReasonCode.EPOCH_MISMATCH
+            and (
+                self.observed_authority_epoch is None
+                or self.observed_authority_epoch == self.epoch
+            )
+        ):
+            raise ValueError("epoch mismatch receipt requires a different observed authority epoch")
         if self.outcome is ReceiptOutcome.VERIFIED and self.observed_etag is None:
             raise ValueError("verified receipt requires an observed etag")
         if len(set(self.evidence_ids)) != len(self.evidence_ids):

@@ -123,7 +123,7 @@ post-state digest, and idempotency key.
 
 | Outcome | Completion rule |
 |---|---|
-| `CLAIMED` | One exact request owns the right to attempt its next safe phase. It is not success. |
+| `CLAIMED` | A directly confirmed fresh create may carry one process-local dispatch lease. The stored record alone grants no later dispatch authority and is not success. |
 | `DENIED` | Validation or authority failed and the mutation adapter was not called. |
 | `APPLIED` | The provider returned a known accepted result; independent verification is still required. |
 | `VERIFIED` | Independent readback matches the exact approved postcondition. |
@@ -132,7 +132,8 @@ post-state digest, and idempotency key.
 
 An exact duplicate may return the existing receipt. Reuse of an idempotency key with a different
 canonical request is denied. An ambiguous receipt is never converted to success merely because a
-request was accepted or timed out.
+request was accepted or timed out. A persisted claim is never replayed as a mutation attempt;
+after its dispatch deadline, recovery is readback-only.
 
 ## Stable reason codes
 
@@ -159,6 +160,7 @@ families are:
 | `RECEIPT_IN_PROGRESS` | Another exact delivery already owns the safe execution phase. |
 | `TRANSPORT_UNAVAILABLE` | Bounded delivery attempts ended before provider dispatch was possible. |
 | `PROVIDER_PRECONDITION_FAILED` | The target changed from the approved snapshot. |
+| `PROVIDER_REQUEST_REJECTED` | The provider rejected the bounded request before producing the protected effect. |
 | `PROVIDER_OUTCOME_AMBIGUOUS` | A provider response cannot prove whether the mutation committed. |
 | `TRANSITION_INVALID` | The requested state transition is not legal. |
 | `POLICY_UNHEALTHY` | Deterministic health policy selected restore-only recovery. |

@@ -8,6 +8,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, Final, Protocol, Self, cast
 from uuid import uuid4
 
@@ -20,11 +21,18 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
     CreatedRollout,
+    DirectReceiptCreate,
     FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
+    ReceiptClaimAdopted,
+    ReceiptClaimConflict,
+    ReceiptClaimCreated,
+    ReceiptClaimResult,
     ReleasedServiceClaim,
     StoredRecord,
+    validate_receipt_claim_binding,
 )
+from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts.base import StrictContractModel
 from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
@@ -154,6 +162,11 @@ class _ExpectedStateMismatch(RuntimeError):
     pass
 
 
+class _TransactionCommitDisposition(StrEnum):
+    DIRECT_CONFIRMED = "DIRECT_CONFIRMED"
+    READBACK_RESOLVED = "READBACK_RESOLVED"
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedDocument[ModelT: StrictContractModel]:
     wrapper: AuthorityStorageDocument
@@ -241,17 +254,31 @@ async def _await_shielded[ResultT](
     timeout_seconds: float,
 ) -> ResultT:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
+    cancellation_requested = False
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
+            if cancellation_requested:
+                raise asyncio.CancelledError
             raise TimeoutError
         try:
             async with asyncio.timeout(remaining):
-                return await asyncio.shield(task)
+                result = await asyncio.shield(task)
         except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancellation_requested = True
             current_task = asyncio.current_task()
             if current_task is not None:
                 current_task.uncancel()
+            continue
+        except BaseException:
+            if cancellation_requested:
+                raise asyncio.CancelledError from None
+            raise
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return result
 
 
 def _consume_background_result(task: asyncio.Future[Any]) -> None:
@@ -453,6 +480,7 @@ def _validate_claim_release_authority(
         or replacement_claim.release_request_id != replacement_authority.request_id
         or replacement_claim.release_evidence_id != replacement_authority.evidence_id
         or replacement_claim.released_at != replacement_authority.changed_at
+        or replacement_authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
     ):
         raise ValueError("service claim release and authority advance are not one transition")
 
@@ -461,29 +489,27 @@ _RECEIPT_TRANSITIONS: Final = {
     ReceiptOutcome.CLAIMED: frozenset(
         {
             ReceiptOutcome.DENIED,
+            ReceiptOutcome.APPLIED,
             ReceiptOutcome.FAILED_SAFE,
             ReceiptOutcome.AMBIGUOUS,
         }
     ),
     ReceiptOutcome.AMBIGUOUS: frozenset(
         {
-            ReceiptOutcome.APPLIED,
             ReceiptOutcome.VERIFIED,
-            ReceiptOutcome.FAILED_SAFE,
             ReceiptOutcome.AMBIGUOUS,
         }
     ),
     ReceiptOutcome.APPLIED: frozenset(
         {
             ReceiptOutcome.VERIFIED,
-            ReceiptOutcome.FAILED_SAFE,
             ReceiptOutcome.AMBIGUOUS,
         }
     ),
 }
 
 
-def _receipt_binding(receipt: ExecutionReceipt) -> tuple[object, ...]:
+def _receipt_semantic_binding(receipt: ExecutionReceipt) -> tuple[object, ...]:
     return (
         receipt.receipt_id,
         receipt.request_id,
@@ -498,6 +524,13 @@ def _receipt_binding(receipt: ExecutionReceipt) -> tuple[object, ...]:
         receipt.epoch,
         receipt.action,
         receipt.provider_etag,
+        receipt.dispatch_not_after,
+    )
+
+
+def _receipt_cas_binding(receipt: ExecutionReceipt) -> tuple[object, ...]:
+    return (
+        *_receipt_semantic_binding(receipt),
         receipt.created_at,
     )
 
@@ -527,7 +560,7 @@ def _validate_receipt_replacement(
         raise TypeError("receipt compare-and-set requires exact receipt records")
     _validate_receipt_identity(configured_target, current)
     _validate_receipt_identity(configured_target, replacement)
-    if _receipt_binding(current) != _receipt_binding(replacement):
+    if _receipt_cas_binding(current) != _receipt_cas_binding(replacement):
         raise ValueError("receipt replacement changes an immutable binding")
     if replacement.outcome not in _RECEIPT_TRANSITIONS.get(current.outcome, frozenset()):
         raise ValueError("receipt replacement is not a permitted forward transition")
@@ -535,6 +568,24 @@ def _validate_receipt_replacement(
         raise ValueError("receipt replacement moves time backwards")
     if replacement.evidence_ids[: len(current.evidence_ids)] != current.evidence_ids:
         raise ValueError("receipt replacement removes existing evidence")
+    if (
+        current.observed_authority_epoch is not None
+        and replacement.observed_authority_epoch != current.observed_authority_epoch
+    ) or (
+        current.outcome is not ReceiptOutcome.CLAIMED
+        and current.observed_authority_epoch is None
+        and replacement.observed_authority_epoch is not None
+    ):
+        raise ValueError("receipt replacement changes its final authority observation")
+    if (
+        current.provider_operation is not None
+        and replacement.provider_operation != current.provider_operation
+    ) or (
+        current.outcome is not ReceiptOutcome.CLAIMED
+        and current.provider_operation is None
+        and replacement.provider_operation is not None
+    ):
+        raise ValueError("receipt replacement changes its provider operation")
     if replacement == current:
         raise ValueError("receipt replacement does not change durable state")
 
@@ -830,10 +881,10 @@ class FirestoreAuthorityStore:
         self,
         documents: tuple[_PreparedDocument[StrictContractModel], ...],
         body: _TransactionBody,
-    ) -> tuple[_DecodedDocument[StrictContractModel], ...] | None:
+    ) -> _TransactionCommitDisposition:
         client = await self._client()
 
-        async def execute() -> tuple[_DecodedDocument[StrictContractModel], ...] | None:
+        async def execute() -> _TransactionCommitDisposition:
             try:
                 await self._transaction_runner(
                     client,
@@ -850,8 +901,9 @@ class FirestoreAuthorityStore:
             except Exception as error:
                 if _is_contention(error):
                     raise AuthorityStoreConflict from None
-                return await self._resolve_ambiguous(documents)
-            return None
+                await self._resolve_ambiguous(documents)
+                return _TransactionCommitDisposition.READBACK_RESOLVED
+            return _TransactionCommitDisposition.DIRECT_CONFIRMED
 
         operation = asyncio.create_task(execute())
         try:
@@ -859,15 +911,22 @@ class FirestoreAuthorityStore:
                 operation,
                 timeout_seconds=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            operation.add_done_callback(_consume_background_result)
+            raise
         except TimeoutError:
             operation.add_done_callback(_consume_background_result)
 
         classification = asyncio.create_task(self._resolve_ambiguous(documents))
         try:
-            return await _await_shielded(
+            await _await_shielded(
                 classification,
                 timeout_seconds=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
             )
+            return _TransactionCommitDisposition.READBACK_RESOLVED
+        except asyncio.CancelledError:
+            classification.add_done_callback(_consume_background_result)
+            raise
         except TimeoutError:
             classification.add_done_callback(_consume_background_result)
             raise AuthorityStoreOutcomeUnknown from None
@@ -1314,15 +1373,15 @@ class FirestoreAuthorityStore:
                 raise AuthorityStoreCorruptRecord from None
         return None if decoded is None else decoded.stored
 
-    async def claim_receipt(
+    async def claim_or_adopt_receipt(
         self,
         receipt: ExecutionReceipt,
-    ) -> StoredRecord[ExecutionReceipt]:
+        binding: MutationBinding,
+    ) -> ReceiptClaimResult:
         if type(receipt) is not ExecutionReceipt:
             raise TypeError("receipt claim requires an exact receipt")
+        validate_receipt_claim_binding(receipt, binding)
         logical_id = _validate_receipt_identity(self._target, receipt)
-        if receipt.outcome is not ReceiptOutcome.CLAIMED:
-            raise ValueError("receipt claim is not in the claim phase")
         document = _prepared_document(
             kind=AuthorityStorageKind.EXECUTION_RECEIPT,
             logical_id=logical_id,
@@ -1347,8 +1406,26 @@ class FirestoreAuthorityStore:
             )
             transaction.create(reference, _document_data(document.wrapper))
 
-        await self._run_transaction(documents, create)
-        return _stored(document)
+        try:
+            disposition = await self._run_transaction(documents, create)
+        except AuthorityStoreConflict:
+            existing = await self.read_receipt(receipt.idempotency_key)
+            if existing is None:
+                raise AuthorityStoreOutcomeUnknown from None
+            if _receipt_semantic_binding(existing.value) != _receipt_semantic_binding(
+                receipt
+            ):
+                return ReceiptClaimConflict()
+            return ReceiptClaimAdopted(existing)
+
+        claimed = _stored(document)
+        if disposition is _TransactionCommitDisposition.DIRECT_CONFIRMED:
+            direct_create = DirectReceiptCreate._from_direct_store_create(
+                claimed,
+                binding,
+            )
+            return ReceiptClaimCreated(claimed, direct_create)
+        return ReceiptClaimAdopted(claimed)
 
     async def compare_and_set_receipt(
         self,

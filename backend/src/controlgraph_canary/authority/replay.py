@@ -151,10 +151,9 @@ def mutation_identity(binding: MutationBinding) -> str:
 
 
 class ReceiptPhase(StrEnum):
-    """Durable phases that determine whether exact work may resume."""
+    """Durable phases that never grant a later delivery dispatch authority."""
 
-    PRE_DISPATCH_CLAIMED = "PRE_DISPATCH_CLAIMED"
-    PROVIDER_ATTEMPTED = "PROVIDER_ATTEMPTED"
+    CLAIMED = "CLAIMED"
     READBACK_REQUIRED = "READBACK_REQUIRED"
     TERMINAL = "TERMINAL"
 
@@ -180,7 +179,6 @@ class ReplayReceipt:
     reason: DenialReason | None = None
     result_sha256: str | None = None
     readback_attempted: bool = False
-    pre_dispatch_attempts: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.binding, MutationBinding):
@@ -195,32 +193,17 @@ class ReplayReceipt:
             _require_sha256("result_sha256", self.result_sha256)
         if type(self.readback_attempted) is not bool:
             raise ValueError("readback_attempted must be a boolean")
-        if (
-            type(self.pre_dispatch_attempts) is not int
-            or not 0 <= self.pre_dispatch_attempts <= MAX_PRE_DISPATCH_TRANSPORT_ATTEMPTS
-        ):
-            raise ValueError("pre_dispatch_attempts is outside the durable retry bound")
         self._validate_shape()
 
     def _validate_shape(self) -> None:
-        if self.phase is ReceiptPhase.PRE_DISPATCH_CLAIMED:
+        if self.phase is ReceiptPhase.CLAIMED:
             if (
                 self.outcome is not ReplayReceiptOutcome.CLAIMED
                 or self.reason is not None
                 or self.result_sha256 is not None
                 or self.readback_attempted
-                or self.pre_dispatch_attempts >= MAX_PRE_DISPATCH_TRANSPORT_ATTEMPTS
             ):
-                raise ValueError("pre-dispatch receipt shape is invalid")
-            return
-        if self.phase is ReceiptPhase.PROVIDER_ATTEMPTED:
-            if (
-                self.outcome is not ReplayReceiptOutcome.AMBIGUOUS
-                or self.reason is not DenialReason.PROVIDER_OUTCOME_AMBIGUOUS
-                or self.result_sha256 is not None
-                or self.readback_attempted
-            ):
-                raise ValueError("provider-attempted receipt shape is invalid")
+                raise ValueError("claimed receipt shape is invalid")
             return
         if self.phase is ReceiptPhase.READBACK_REQUIRED:
             if self.outcome is ReplayReceiptOutcome.APPLIED:
@@ -273,17 +256,14 @@ class ReplayReceipt:
 
     @property
     def awaits_readback(self) -> bool:
-        return self.phase in {
-            ReceiptPhase.PROVIDER_ATTEMPTED,
-            ReceiptPhase.READBACK_REQUIRED,
-        }
+        return self.phase is ReceiptPhase.READBACK_REQUIRED
 
 
 class ReplayAction(StrEnum):
     """Complete duplicate-delivery decision set."""
 
     CLAIM_NEW = "CLAIM_NEW"
-    RESUME_PRE_DISPATCH = "RESUME_PRE_DISPATCH"
+    RETURN_IN_PROGRESS = "RETURN_IN_PROGRESS"
     RETURN_STORED = "RETURN_STORED"
     DENY_CONFLICT = "DENY_CONFLICT"
     REQUIRE_READBACK = "REQUIRE_READBACK"
@@ -298,23 +278,16 @@ class ReplayDecision:
     reason: DenialReason | None
 
     @property
-    def may_enter_dispatch(self) -> bool:
-        return self.action in {
-            ReplayAction.CLAIM_NEW,
-            ReplayAction.RESUME_PRE_DISPATCH,
-        }
-
-    @property
     def requires_readback(self) -> bool:
         return self.action is ReplayAction.REQUIRE_READBACK
 
 
 def claim_receipt(binding: MutationBinding) -> ReplayReceipt:
-    """Create the only phase from which exact work may enter dispatch."""
+    """Create pure durable claim state without granting dispatch authority."""
 
     return ReplayReceipt(
         binding=binding,
-        phase=ReceiptPhase.PRE_DISPATCH_CLAIMED,
+        phase=ReceiptPhase.CLAIMED,
         outcome=ReplayReceiptOutcome.CLAIMED,
     )
 
@@ -339,15 +312,19 @@ def decide_replay(
         )
     if stored.terminal:
         return ReplayDecision(ReplayAction.RETURN_STORED, stored, stored.reason)
-    if stored.phase is ReceiptPhase.PRE_DISPATCH_CLAIMED:
-        return ReplayDecision(ReplayAction.RESUME_PRE_DISPATCH, stored, None)
+    if stored.phase is ReceiptPhase.CLAIMED:
+        return ReplayDecision(
+            ReplayAction.RETURN_IN_PROGRESS,
+            stored,
+            DenialReason.RECEIPT_IN_PROGRESS,
+        )
     return ReplayDecision(ReplayAction.REQUIRE_READBACK, stored, stored.reason)
 
 
 def deny_before_dispatch(receipt: ReplayReceipt, reason: DenialReason) -> ReplayReceipt:
     """Record a known denial before any provider mutation could occur."""
 
-    if receipt.phase is not ReceiptPhase.PRE_DISPATCH_CLAIMED:
+    if receipt.phase is not ReceiptPhase.CLAIMED:
         raise ValueError("denial is only valid before provider dispatch")
     if not isinstance(reason, DenialReason):
         raise TypeError("reason must be a DenialReason")
@@ -359,50 +336,12 @@ def deny_before_dispatch(receipt: ReplayReceipt, reason: DenialReason) -> Replay
     )
 
 
-def mark_provider_attempted(receipt: ReplayReceipt) -> ReplayReceipt:
-    """Persist mutation uncertainty before invoking the provider once."""
-
-    if receipt.phase is not ReceiptPhase.PRE_DISPATCH_CLAIMED:
-        raise ValueError("provider attempt may begin only from pre-dispatch claimed")
-    return replace(
-        receipt,
-        phase=ReceiptPhase.PROVIDER_ATTEMPTED,
-        outcome=ReplayReceiptOutcome.AMBIGUOUS,
-        reason=DenialReason.PROVIDER_OUTCOME_AMBIGUOUS,
-    )
-
-
-def record_pre_dispatch_failure(
-    receipt: ReplayReceipt,
-    *,
-    maximum_attempts: int = MAX_PRE_DISPATCH_TRANSPORT_ATTEMPTS,
-) -> ReplayReceipt:
-    """Durably consume one safe retry or terminalize before provider dispatch."""
-
-    if receipt.phase is not ReceiptPhase.PRE_DISPATCH_CLAIMED:
-        raise ValueError("pre-dispatch failure requires a claimed receipt")
-    if (
-        type(maximum_attempts) is not int
-        or not 1 <= maximum_attempts <= MAX_PRE_DISPATCH_TRANSPORT_ATTEMPTS
-    ):
-        raise ValueError("maximum_attempts is outside the pre-dispatch bound")
-    next_attempt = receipt.pre_dispatch_attempts + 1
-    if next_attempt >= maximum_attempts:
-        return replace(
-            receipt,
-            phase=ReceiptPhase.TERMINAL,
-            outcome=ReplayReceiptOutcome.FAILED_SAFE,
-            reason=DenialReason.TRANSPORT_UNAVAILABLE,
-            pre_dispatch_attempts=next_attempt,
-        )
-    return replace(receipt, pre_dispatch_attempts=next_attempt)
-
-
 class ProviderAttemptResult(StrEnum):
-    """Closed provider signals after the mutation attempt was persisted."""
+    """Closed provider signals returned by the sole admitted mutation call."""
 
     ACCEPTED = "ACCEPTED"
     PRECONDITION_REJECTED = "PRECONDITION_REJECTED"
+    REQUEST_REJECTED = "REQUEST_REJECTED"
     TIMEOUT = "TIMEOUT"
     CONNECTION_LOST = "CONNECTION_LOST"
     MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
@@ -415,8 +354,8 @@ def record_provider_result(
 ) -> ReplayReceipt:
     """Classify one provider attempt without ever authorizing another."""
 
-    if receipt.phase is not ReceiptPhase.PROVIDER_ATTEMPTED:
-        raise ValueError("provider result requires a persisted provider attempt")
+    if receipt.phase is not ReceiptPhase.CLAIMED:
+        raise ValueError("provider result requires the directly owned claim")
     if not isinstance(result, ProviderAttemptResult):
         raise TypeError("result must be a ProviderAttemptResult")
     if result is ProviderAttemptResult.ACCEPTED:
@@ -432,6 +371,13 @@ def record_provider_result(
             phase=ReceiptPhase.TERMINAL,
             outcome=ReplayReceiptOutcome.FAILED_SAFE,
             reason=DenialReason.PROVIDER_PRECONDITION_FAILED,
+        )
+    if result is ProviderAttemptResult.REQUEST_REJECTED:
+        return replace(
+            receipt,
+            phase=ReceiptPhase.TERMINAL,
+            outcome=ReplayReceiptOutcome.FAILED_SAFE,
+            reason=DenialReason.PROVIDER_REQUEST_REJECTED,
         )
     return replace(
         receipt,
@@ -577,9 +523,7 @@ __all__ = [
     "decide_replay",
     "decide_transport_failure",
     "deny_before_dispatch",
-    "mark_provider_attempted",
     "mutation_identity",
-    "record_pre_dispatch_failure",
     "record_provider_result",
     "record_readback",
 ]

@@ -12,15 +12,16 @@ import pytest
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreCorruptRecord,
     AuthorityStoreUnavailable,
+    DirectReceiptCreate,
     FinalAuthoritySnapshot,
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
 from controlgraph_canary.application.execution import (
     DefinitiveFreshClaimLeaseFactory,
-    DefinitiveReceiptCreate,
     FinalAuthorityDenial,
     FinalMutationGate,
+    FinalMutationResult,
     MutationPermit,
     ReceiptDispatchLease,
 )
@@ -260,10 +261,12 @@ def _claimed(verified: VerifiedMutation) -> StoredRecord[ExecutionReceipt]:
         epoch=intent.epoch,
         action=intent.action,
         provider_etag=intent.provider_etag,
+        dispatch_not_after=verified.request.expires_at,
         outcome=ReceiptOutcome.CLAIMED,
         reason_code=None,
         provider_operation=None,
         observed_etag=None,
+        observed_authority_epoch=None,
         created_at="2026-08-19T12:02:01Z",
         updated_at="2026-08-19T12:02:01Z",
         evidence_ids=("evidence-receipt-claimed",),
@@ -302,10 +305,10 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
         "claim_request_id": "request-claim",
         "claim_evidence_id": "evidence-claim",
         "claimed_at": "2026-08-19T12:01:01Z",
-        "released_by": "controlgraph.operator/v1" if released else None,
-        "release_request_id": "request-release" if released else None,
-        "release_evidence_id": "evidence-release" if released else None,
-        "released_at": "2026-08-19T12:02:00Z" if released else None,
+        "released_by": authority.changed_by if released else None,
+        "release_request_id": authority.request_id if released else None,
+        "release_evidence_id": authority.evidence_id if released else None,
+        "released_at": authority.changed_at if released else None,
     }
     claim = ServiceClaimRecord(**claim_values)  # type: ignore[arg-type]
     return FinalAuthoritySnapshot(
@@ -316,7 +319,7 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
 
 
 def _lease(verified: VerifiedMutation) -> ReceiptDispatchLease:
-    created = DefinitiveReceiptCreate._from_confirmed_create(
+    created = DirectReceiptCreate._from_direct_store_create(
         _claimed(verified),
         _binding(verified),
     )
@@ -415,7 +418,10 @@ def test_exact_executor_and_recovery_actions_dispatch_once(
             clock=lambda: NOW,
         )
 
-        assert await gate.execute(_lease(verified), verified) == "mutated"
+        assert await gate.execute(_lease(verified), verified) == FinalMutationResult(
+            "mutated",
+            1,
+        )
         assert len(adapter.calls) == 1
         assert type(adapter.calls[0]) is MutationPermit
         assert adapter.intents == [verified.request.intent]
@@ -472,6 +478,7 @@ def test_stale_and_future_epoch_are_denied_without_adapter_call(
 
         assert isinstance(result, FinalAuthorityDenial)
         assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.observed_authority_epoch == authority_epoch
         assert adapter.calls == []
 
     asyncio.run(scenario())
@@ -489,6 +496,60 @@ def test_released_claim_is_denied_without_adapter_call() -> None:
 
         assert isinstance(result, FinalAuthorityDenial)
         assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.observed_authority_epoch == 2
+        assert adapter.calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["unadvanced", "wrong-cause"])
+def test_released_claim_requires_the_exact_atomic_revocation_authority(
+    mode: str,
+) -> None:
+    async def scenario() -> None:
+        base = _snapshot(epoch=1 if mode == "unadvanced" else 2)
+        authority = base.authority.value
+        if mode == "unadvanced":
+            authority = EpochAuthorityRecord(
+                **{
+                    **authority.model_dump(mode="python"),
+                    "changed_at": "2026-08-19T12:02:00Z",
+                }
+            )
+        if mode == "wrong-cause":
+            authority = EpochAuthorityRecord(
+                **{
+                    **authority.model_dump(mode="python"),
+                    "cause": EpochChangeCause.RECOVERY,
+                }
+            )
+        claim = ServiceClaimRecord(
+            **{
+                **base.service_claim.value.model_dump(mode="python"),
+                "status": ServiceClaimStatus.RELEASED,
+                "released_by": authority.changed_by,
+                "release_request_id": authority.request_id,
+                "release_evidence_id": authority.evidence_id,
+                "released_at": authority.changed_at,
+            }
+        )
+        snapshot = FinalAuthoritySnapshot(
+            root=base.root,
+            service_claim=StoredRecord(claim, 1),
+            authority=StoredRecord(authority, authority.revision),
+        )
+        verified = _verified()
+        adapter = _Adapter(ServiceRole.EXECUTOR)
+
+        result = await FinalMutationGate(
+            authority_reader=_Reader(snapshot),
+            adapter=adapter,
+            clock=lambda: NOW,
+        ).execute(_lease(verified), verified)
+
+        assert isinstance(result, FinalAuthorityDenial)
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
         assert adapter.calls == []
 
     asyncio.run(scenario())
@@ -540,7 +601,8 @@ def test_final_snapshot_revision_corruption_is_denied_without_adapter_call() -> 
         ).execute(_lease(verified), verified)
 
         assert isinstance(result, FinalAuthorityDenial)
-        assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
         assert adapter.calls == []
 
     asyncio.run(scenario())
@@ -563,7 +625,8 @@ def test_active_claim_at_noninitial_revision_is_denied_without_adapter_call() ->
         ).execute(_lease(verified), verified)
 
         assert isinstance(result, FinalAuthorityDenial)
-        assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
         assert adapter.calls == []
 
     asyncio.run(scenario())
@@ -606,7 +669,7 @@ def test_receipt_dispatch_lease_is_exactly_one_use_sequentially() -> None:
         )
         lease = _lease(verified)
 
-        assert await gate.execute(lease, verified) == "mutated"
+        assert await gate.execute(lease, verified) == FinalMutationResult("mutated", 1)
         repeated = await gate.execute(lease, verified)
 
         assert isinstance(repeated, FinalAuthorityDenial)
@@ -635,7 +698,7 @@ def test_receipt_dispatch_lease_is_exactly_one_use_concurrently() -> None:
         second = await gate.execute(lease, verified)
         reader.continue_read.set()
 
-        assert await first == "mutated"
+        assert await first == FinalMutationResult("mutated", 1)
         assert isinstance(second, FinalAuthorityDenial)
         assert second.reason_code is ReasonCode.RECEIPT_IN_PROGRESS
         assert len(adapter.calls) == 1
@@ -768,7 +831,7 @@ def test_final_snapshot_is_followed_by_adapter_mutation_as_the_next_await() -> N
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
-        assert result == "mutated"
+        assert result == FinalMutationResult("mutated", 1)
         assert events == ["authority", "mutation"]
 
     asyncio.run(scenario())
@@ -884,7 +947,7 @@ def test_capability_lineage_must_not_predate_current_authority() -> None:
         ).execute(_lease(verified), verified)
 
         assert isinstance(result, FinalAuthorityDenial)
-        assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
         assert adapter.calls == []
 
     asyncio.run(scenario())
@@ -913,7 +976,8 @@ def test_authority_epoch_must_equal_persistence_revision_plus_one() -> None:
         ).execute(_lease(verified), verified)
 
         assert isinstance(result, FinalAuthorityDenial)
-        assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
         assert adapter.calls == []
 
     asyncio.run(scenario())
@@ -924,7 +988,7 @@ def test_lease_and_permit_construction_require_internal_proof() -> None:
     claimed = _claimed(verified)
 
     with pytest.raises(TypeError):
-        DefinitiveReceiptCreate(claimed)  # type: ignore[call-arg,arg-type]
+        DirectReceiptCreate(claimed)  # type: ignore[call-arg,arg-type]
     with pytest.raises(TypeError):
         DefinitiveFreshClaimLeaseFactory.mint(claimed)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
@@ -942,7 +1006,7 @@ def test_lease_and_permit_construction_require_internal_proof() -> None:
 
 def test_definitive_create_proof_mints_only_one_lease() -> None:
     verified = _verified()
-    created = DefinitiveReceiptCreate._from_confirmed_create(
+    created = DirectReceiptCreate._from_direct_store_create(
         _claimed(verified),
         _binding(verified),
     )
@@ -955,7 +1019,7 @@ def test_definitive_create_proof_mints_only_one_lease() -> None:
 def test_definitive_create_proof_has_one_concurrent_mint_winner() -> None:
     async def scenario() -> None:
         verified = _verified()
-        created = DefinitiveReceiptCreate._from_confirmed_create(
+        created = DirectReceiptCreate._from_direct_store_create(
             _claimed(verified),
             _binding(verified),
         )
@@ -980,11 +1044,12 @@ def test_definitive_create_proof_rejects_noninitial_receipt_state() -> None:
             **claimed.value.model_dump(mode="python"),
             "outcome": ReceiptOutcome.DENIED,
             "reason_code": ReasonCode.EPOCH_MISMATCH,
+            "observed_authority_epoch": 2,
         }
     )
 
     with pytest.raises(ValueError, match="initial claim"):
-        DefinitiveReceiptCreate._from_confirmed_create(
+        DirectReceiptCreate._from_direct_store_create(
             StoredRecord(denied, 1),
             _binding(verified),
         )
@@ -998,7 +1063,7 @@ def test_definitive_create_proof_rejects_a_changed_mutation_binding() -> None:
     )
 
     with pytest.raises(ValueError, match="mutation binding"):
-        DefinitiveReceiptCreate._from_confirmed_create(
+        DirectReceiptCreate._from_direct_store_create(
             _claimed(verified),
             changed,
         )
