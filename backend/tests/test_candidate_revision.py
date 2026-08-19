@@ -255,6 +255,7 @@ async def test_exact_candidate_read_returns_frozen_attestation() -> None:
     "target",
     [
         _target(project_id="other-project-a1b2c3"),
+        _target(project_id="controlgraph-canary-reconcile"),
         _target(region="europe-west1"),
         _target(environment="acceptance"),
         _target(service_name="other-reference-target"),

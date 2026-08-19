@@ -227,6 +227,7 @@ def _validate_target(target: object) -> None:
         raise TypeError("candidate validation requires an exact configured target")
     if (
         _CONTROLGRAPH_PROJECT_ID.fullmatch(target.project_id) is None
+        or "reconcile" in target.project_id
         or target.region != "us-central1"
         or target.environment != _CONTROLGRAPH_ENVIRONMENT
         or target.service_name != _REFERENCE_SERVICE
