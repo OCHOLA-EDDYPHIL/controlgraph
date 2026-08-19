@@ -34,6 +34,8 @@ def test_runtime_settings_bind_role_and_environment() -> None:
     assert settings.role == "executor"
     assert settings.service_name == "controlgraph-executor"
     assert settings.mutations_enabled is False
+    assert settings.evidence_key_version is None
+    assert settings.signing_algorithm is None
 
 
 @pytest.mark.parametrize(

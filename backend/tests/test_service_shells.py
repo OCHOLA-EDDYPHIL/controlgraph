@@ -14,6 +14,7 @@ from controlgraph_canary.application.identity import (
     CallerRole,
     RouteAuthenticationPolicy,
     runtime_route_policy,
+    runtime_service_name,
 )
 from controlgraph_canary.http.service import (
     PRODUCT_CONTRACT_VERSION,
@@ -31,6 +32,7 @@ ROLE_MODULES = (
     (ServiceRole.EXECUTOR, "controlgraph_canary.services.executor.app"),
     (ServiceRole.RECOVERY, "controlgraph_canary.services.recovery.app"),
     (ServiceRole.VERIFIER, "controlgraph_canary.services.verifier.app"),
+    (ServiceRole.EVIDENCE_WRITER, "controlgraph_canary.services.evidence_writer.app"),
 )
 
 PROJECT_ID = "controlgraph-canary-abc123"
@@ -43,6 +45,7 @@ CALLER_ROLES = {
     ServiceRole.EXECUTOR: CallerRole.EXECUTION_TASK_CALLER,
     ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
     ServiceRole.VERIFIER: CallerRole.COORDINATOR,
+    ServiceRole.EVIDENCE_WRITER: CallerRole.COORDINATOR,
 }
 CALLER_ACCOUNT_IDS = {
     CallerRole.API: "controlgraph-api",
@@ -60,11 +63,11 @@ def _caller_email(role: CallerRole) -> str:
 
 def _environment(role: ServiceRole) -> dict[str, str]:
     caller_role = CALLER_ROLES[role]
-    return {
+    environment = {
         "CONTROLGRAPH_PROJECT_ID": PROJECT_ID,
         "CONTROLGRAPH_PROJECT_NUMBER": PROJECT_NUMBER,
         "CONTROLGRAPH_REGION": "us-central1",
-        "CONTROLGRAPH_SERVICE_NAME": f"controlgraph-{role.value}",
+        "CONTROLGRAPH_SERVICE_NAME": runtime_service_name(role),
         "CONTROLGRAPH_CONTROLLER_ID": f"{PROJECT_ID}:us-central1:{role.value}",
         "CONTROLGRAPH_ROLE": role.value,
         "CONTROLGRAPH_BUILD_DIGEST": f"sha256:{'a' * 64}",
@@ -73,12 +76,23 @@ def _environment(role: ServiceRole) -> dict[str, str]:
         "CONTROLGRAPH_MUTATIONS_ENABLED": "false",
         "CONTROLGRAPH_ENVIRONMENT": "nonprod",
         "CONTROLGRAPH_AUTH_AUDIENCE": (
-            f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+            f"https://{runtime_service_name(role)}-{PROJECT_NUMBER}.us-central1.run.app"
         ),
         "CONTROLGRAPH_AUTH_CALLER_ROLE": caller_role.value,
         "CONTROLGRAPH_AUTH_CALLER_EMAIL": _caller_email(caller_role),
         "CONTROLGRAPH_AUTH_CALLER_SUBJECT": SUBJECT,
     }
+    if role is ServiceRole.EVIDENCE_WRITER:
+        environment.update(
+            {
+                "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+                    f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
+                    "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
+                ),
+                "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
+            }
+        )
+    return environment
 
 
 class _ExactTestAuthenticator:
@@ -168,7 +182,12 @@ def test_every_protected_route_remains_disabled_without_reading_sensitive_body(
             },
         )
         assert response.status_code == 503
-        assert response.json()["code"] == "MUTATION_DISABLED"
+        expected_code = (
+            "EVIDENCE_SIGNING_CONFIGURATION_INVALID"
+            if role is ServiceRole.EVIDENCE_WRITER
+            else "MUTATION_DISABLED"
+        )
+        assert response.json()["code"] == expected_code
         assert re.fullmatch(r"[0-9a-f]{32}", response.json()["correlation_id"])
         assert (
             response.headers["x-controlgraph-correlation-id"] == response.json()["correlation_id"]

@@ -14,6 +14,7 @@ import pytest
         "controlgraph_canary.reference_target",
         "controlgraph_canary.services.coordinator",
         "controlgraph_canary.services.executor",
+        "controlgraph_canary.services.evidence_writer",
         "controlgraph_canary.services.issuer",
         "controlgraph_canary.services.recovery",
         "controlgraph_canary.services.verifier",

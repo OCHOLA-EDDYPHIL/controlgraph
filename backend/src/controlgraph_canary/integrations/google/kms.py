@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Sequence
 from typing import Protocol, cast
@@ -21,6 +22,7 @@ _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _TRUST_BUNDLE_PUBLISHER_ROLE = "api"
 _TRUST_BUNDLE_PURPOSES = frozenset({SigningPurpose.CAPABILITY, SigningPurpose.EVIDENCE})
 _MAX_TRUST_BUNDLE_PROFILES = 32
+_KMS_REQUEST_TIMEOUT_SECONDS = 5.0
 
 
 class _KmsClient(Protocol):
@@ -29,6 +31,24 @@ class _KmsClient(Protocol):
     def asymmetric_sign(self, request: dict[str, object]) -> object: ...
 
     def get_public_key(self, request: dict[str, object]) -> object: ...
+
+
+class _AsyncKmsClient(Protocol):
+    async def get_crypto_key_version(
+        self,
+        request: dict[str, object],
+        *,
+        retry: object,
+        timeout: float,
+    ) -> object: ...
+
+    async def asymmetric_sign(
+        self,
+        request: dict[str, object],
+        *,
+        retry: object,
+        timeout: float,
+    ) -> object: ...
 
 
 class _VersionResponse(Protocol):
@@ -85,6 +105,17 @@ def _default_client() -> _KmsClient:
         ) from None
 
 
+def _default_async_client() -> _AsyncKmsClient:
+    try:
+        from google.cloud import kms_v1
+
+        return cast(_AsyncKmsClient, kms_v1.KeyManagementServiceAsyncClient())
+    except Exception:
+        raise _error(
+            SigningErrorCode.PROVIDER_FAILURE, "KMS client initialization failed"
+        ) from None
+
+
 def _crc32c(value: bytes) -> int:
     try:
         import google_crc32c
@@ -132,6 +163,35 @@ def _load_version(
     raise _error(SigningErrorCode.KEY_VERSION_DISABLED, "KMS key version is not enabled")
 
 
+async def _load_version_async(
+    client: _AsyncKmsClient,
+    profile: SigningProfile,
+) -> None:
+    try:
+        raw_response = await client.get_crypto_key_version(
+            {"name": profile.key_version},
+            retry=None,
+            timeout=_KMS_REQUEST_TIMEOUT_SECONDS,
+        )
+        response = cast(_VersionResponse, raw_response)
+        name = response.name
+        state_name = _enum_name(response.state)
+        algorithm_name = _enum_name(response.algorithm)
+    except asyncio.CancelledError:
+        raise
+    except SigningError:
+        raise
+    except Exception:
+        raise _error(SigningErrorCode.PROVIDER_FAILURE, "KMS version lookup failed") from None
+
+    if type(name) is not str or name != profile.key_version:
+        raise _error(SigningErrorCode.KEY_VERSION_MISMATCH, "KMS returned another key version")
+    if algorithm_name != SIGNING_ALGORITHM or algorithm_name != profile.algorithm:
+        raise _error(SigningErrorCode.ALGORITHM_MISMATCH, "KMS key algorithm is invalid")
+    if state_name != SigningKeyState.ENABLED.value:
+        raise _error(SigningErrorCode.KEY_VERSION_DISABLED, "KMS key version is not enabled")
+
+
 class GoogleKmsDigestSigner:
     """Sign only SHA-256 digests with one exact KMS key version and algorithm."""
 
@@ -162,6 +222,64 @@ class GoogleKmsDigestSigner:
             signature = response.signature
             signature_crc32c = response.signature_crc32c
             verified_digest_crc32c = response.verified_digest_crc32c
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(SigningErrorCode.PROVIDER_FAILURE, "KMS signing failed") from None
+
+        if type(response_name) is not str or response_name != self._profile.key_version:
+            raise _error(
+                SigningErrorCode.KEY_VERSION_MISMATCH, "KMS signed with another key version"
+            )
+        if verified_digest_crc32c is not True:
+            raise _error(SigningErrorCode.CRC_MISMATCH, "KMS did not verify the digest CRC32C")
+        if type(signature) is not bytes or not signature or len(signature) > 256:
+            raise _error(SigningErrorCode.SIGNATURE_INVALID, "KMS signature is invalid")
+        if type(signature_crc32c) is not int or signature_crc32c != _crc32c(signature):
+            raise _error(SigningErrorCode.CRC_MISMATCH, "KMS signature CRC32C is invalid")
+        return signature
+
+
+class GoogleKmsAsyncDigestSigner:
+    """Asynchronously sign one digest with no retries and bounded cancellation."""
+
+    def __init__(self, profile: SigningProfile, *, client: object | None = None) -> None:
+        if type(profile) is not SigningProfile:
+            raise _error(SigningErrorCode.PROFILE_INVALID, "KMS profile is invalid")
+        self._profile = profile
+        self._client = None if client is None else cast(_AsyncKmsClient, client)
+
+    @property
+    def profile(self) -> SigningProfile:
+        return self._profile
+
+    async def sign_digest(self, digest: bytes) -> bytes:
+        if type(digest) is not bytes or len(digest) != 32:
+            raise _error(SigningErrorCode.DIGEST_MISMATCH, "signing digest must be SHA-256")
+        client = self._client
+        if client is None:
+            client = _default_async_client()
+            self._client = client
+        await _load_version_async(client, self._profile)
+        digest_crc32c = _crc32c(digest)
+        request: dict[str, object] = {
+            "name": self._profile.key_version,
+            "digest": {"sha256": digest},
+            "digest_crc32c": digest_crc32c,
+        }
+        try:
+            raw_response = await client.asymmetric_sign(
+                request,
+                retry=None,
+                timeout=_KMS_REQUEST_TIMEOUT_SECONDS,
+            )
+            response = cast(_SignResponse, raw_response)
+            response_name = response.name
+            signature = response.signature
+            signature_crc32c = response.signature_crc32c
+            verified_digest_crc32c = response.verified_digest_crc32c
+        except asyncio.CancelledError:
+            raise
         except SigningError:
             raise
         except Exception:
@@ -288,4 +406,8 @@ class GoogleKmsTrustBundlePublisher:
         return selected_profiles
 
 
-__all__ = ["GoogleKmsDigestSigner", "GoogleKmsTrustBundlePublisher"]
+__all__ = [
+    "GoogleKmsAsyncDigestSigner",
+    "GoogleKmsDigestSigner",
+    "GoogleKmsTrustBundlePublisher",
+]

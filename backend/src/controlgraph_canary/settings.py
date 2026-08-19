@@ -7,6 +7,9 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from controlgraph_canary.application.identity import ServiceRole, runtime_service_name
+from controlgraph_canary.application.signing import SIGNING_ALGORITHM
+
 REQUIRED_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_PROJECT_ID",
     "CONTROLGRAPH_PROJECT_NUMBER",
@@ -25,10 +28,24 @@ REQUIRED_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_AUTH_CALLER_SUBJECT",
 )
 
-RUNTIME_ROLES = frozenset({"api", "coordinator", "issuer", "executor", "recovery", "verifier"})
+EVIDENCE_WRITER_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+    "CONTROLGRAPH_SIGNING_ALGORITHM",
+)
+
+RUNTIME_ROLES = frozenset(role.value for role in ServiceRole)
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]:
+    """Return the exact startup key set required by the selected role."""
+
+    role = environment.get("CONTROLGRAPH_ROLE")
+    if type(role) is str and role.strip() == ServiceRole.EVIDENCE_WRITER.value:
+        return REQUIRED_ENVIRONMENT_KEYS + EVIDENCE_WRITER_ENVIRONMENT_KEYS
+    return REQUIRED_ENVIRONMENT_KEYS
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,11 +63,17 @@ class ControllerSettings:
     firestore_database: str
     mutations_enabled: bool
     environment: str
+    evidence_key_version: str | None
+    signing_algorithm: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
         source = os.environ if environment is None else environment
-        missing = [key for key in REQUIRED_ENVIRONMENT_KEYS if not source.get(key, "").strip()]
+        missing = [
+            key
+            for key in required_environment_keys(source)
+            if type(source.get(key)) is not str or not source[key].strip()
+        ]
         if missing:
             raise ValueError(f"missing environment variables: {', '.join(missing)}")
         project_id = source["CONTROLGRAPH_PROJECT_ID"].strip()
@@ -71,9 +94,11 @@ class ControllerSettings:
             raise ValueError("CONTROLGRAPH_PROJECT_NUMBER is invalid")
         if region != "us-central1":
             raise ValueError("CONTROLGRAPH_REGION must be us-central1")
-        if role not in RUNTIME_ROLES:
-            raise ValueError("CONTROLGRAPH_ROLE is not a closed runtime role")
-        if service_name != f"controlgraph-{role}":
+        try:
+            service_role = ServiceRole(role)
+        except ValueError:
+            raise ValueError("CONTROLGRAPH_ROLE is not a closed runtime role") from None
+        if service_name != runtime_service_name(service_role):
             raise ValueError("CONTROLGRAPH_SERVICE_NAME does not match its runtime role")
         if controller_id != f"{project_id}:{region}:{role}":
             raise ValueError("CONTROLGRAPH_CONTROLLER_ID does not match its bound coordinates")
@@ -90,6 +115,21 @@ class ControllerSettings:
         if environment_name != "nonprod":
             raise ValueError("CONTROLGRAPH_ENVIRONMENT must be nonprod")
 
+        evidence_key_version: str | None = None
+        signing_algorithm: str | None = None
+        if service_role is ServiceRole.EVIDENCE_WRITER:
+            evidence_key_version = source["CONTROLGRAPH_EVIDENCE_KEY_VERSION"].strip()
+            signing_algorithm = source["CONTROLGRAPH_SIGNING_ALGORITHM"].strip()
+            expected_key_version = re.compile(
+                rf"^projects/{re.escape(project_id)}/locations/us-central1/"
+                r"keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
+                r"cryptoKeyVersions/[1-9][0-9]*$"
+            )
+            if expected_key_version.fullmatch(evidence_key_version) is None:
+                raise ValueError("CONTROLGRAPH_EVIDENCE_KEY_VERSION is outside its purpose")
+            if signing_algorithm != SIGNING_ALGORITHM:
+                raise ValueError("CONTROLGRAPH_SIGNING_ALGORITHM is unsupported")
+
         return cls(
             project_id=project_id,
             project_number=project_number,
@@ -102,4 +142,6 @@ class ControllerSettings:
             firestore_database=firestore_database,
             mutations_enabled=False,
             environment=environment_name,
+            evidence_key_version=evidence_key_version,
+            signing_algorithm=signing_algorithm,
         )
