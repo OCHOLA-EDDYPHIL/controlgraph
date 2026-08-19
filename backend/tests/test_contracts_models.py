@@ -60,9 +60,57 @@ def snapshot() -> StableSnapshot:
         service_generation=7,
         provider_etag="etag-stable-7",
         configuration_sha256=ZERO_DIGEST,
+        stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
         captured_by="operator@example.com",
     )
+
+
+def test_stable_snapshot_accepts_one_explicit_unserved_revision() -> None:
+    value = StableSnapshot(
+        **{
+            **snapshot().model_dump(mode="python"),
+            "traffic": (
+                TrafficAllocation(revision="canary-target-stable", percent=100),
+                TrafficAllocation(revision="canary-target-candidate", percent=0),
+            ),
+        }
+    )
+
+    assert value.traffic[1].percent == 0
+
+
+def test_stable_snapshot_requires_an_explicit_revision_configuration_digest() -> None:
+    data = snapshot().model_dump(mode="python")
+    del data["stable_revision_configuration_sha256"]
+
+    with pytest.raises(ValidationError):
+        StableSnapshot.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "traffic",
+    [
+        (
+            TrafficAllocation(revision="canary-target-stable", percent=100),
+            TrafficAllocation(revision="canary-target-candidate", percent=1),
+        ),
+        (
+            TrafficAllocation(revision="canary-target-stable", percent=100),
+            TrafficAllocation(revision="canary-target-stable", percent=0),
+        ),
+    ],
+)
+def test_stable_snapshot_rejects_nonzero_or_duplicate_unserved_revision(
+    traffic: tuple[TrafficAllocation, ...],
+) -> None:
+    with pytest.raises(ValidationError, match="distinct zero-percent"):
+        StableSnapshot(
+            **{
+                **snapshot().model_dump(mode="python"),
+                "traffic": traffic,
+            }
+        )
 
 
 def root() -> RolloutRoot:

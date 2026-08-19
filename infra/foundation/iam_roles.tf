@@ -61,7 +61,6 @@ locals {
       description = "Read one bound service and its immutable revisions."
       permissions = [
         "run.revisions.get",
-        "run.revisions.list",
         "run.services.get",
       ]
     }
@@ -100,6 +99,16 @@ resource "google_project_iam_custom_role" "controlgraph" {
 
   lifecycle {
     prevent_destroy = true
+  }
+}
+
+check "run_snapshot_reader_is_get_only" {
+  assert {
+    condition = toset(local.custom_iam_roles.run_snapshot_reader.permissions) == toset([
+      "run.revisions.get",
+      "run.services.get",
+    ])
+    error_message = "The snapshot reader role must contain only exact Cloud Run get permissions."
   }
 }
 

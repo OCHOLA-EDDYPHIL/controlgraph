@@ -43,7 +43,7 @@ def binding() -> MutationBinding:
         request_id="request-001",
         root_id="root-001",
         root_sha256=(
-            "b0bcadaa29f4c27b88c539111208aa53982d164b0a11f222d2c626863778ea2f"
+            "0e818e3c0435c2743ad7954ae0bcdd6925bb9d1bcd950d745300cafab0ecf0aa"
         ),
         epoch=7,
         action=MutationAction.APPLY_CANARY,
@@ -56,10 +56,10 @@ def binding() -> MutationBinding:
         provider_precondition="etag-stable-7",
         plan_sha256=TWO_DIGEST,
         capability_sha256=(
-            "1e2ca40d331c567abc31064b6d00539b881177033006d0593e0bf100927706ef"
+            "2eed196f05ef954e93eaa31313b68a44930fb95aeefb60af95543d0a8d4c04c3"
         ),
         payload_sha256=(
-            "72d6eb1bfe9fb262933a1e1fcecac50ca3be875330722b90e150ad62132effbc"
+            "0035f0477ba773bd57db97ff279dd4917ba6bcb4e51de3b71d6901eb6f815f25"
         ),
         expected_poststate_sha256=THREE_DIGEST,
     )
@@ -117,7 +117,7 @@ def test_mutation_identity_is_stable_for_the_canonical_intent_fixture() -> None:
     assert value == binding()
     assert mutation_identity(value) == mutation_identity(value)
     assert mutation_identity(value) == (
-        "203c9d70fe064c62efadbccef1a49d5ead623ba04d001b87698d316163d8d3c4"
+        "7896ab8877fa405bca7e325b31a17145112e94d21124c654227db88ac37c4bbe"
     )
 
 

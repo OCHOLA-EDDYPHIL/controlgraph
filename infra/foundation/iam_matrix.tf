@@ -158,7 +158,6 @@ locals {
       "kms_capability_version_read",
       "run_operation_read",
       "run_target_canary_or_promote",
-      "run_target_snapshot",
     ])
     recovery = toset([
       "firestore_authority_read",
@@ -166,7 +165,6 @@ locals {
       "kms_capability_version_read",
       "run_operation_read",
       "run_target_restore_stable",
-      "run_target_snapshot",
     ])
     verifier = toset([
       "firestore_authority_read",
@@ -174,6 +172,7 @@ locals {
       "kms_capability_version_read",
       "monitoring_health_read",
       "run_reference_invoke",
+      "run_target_snapshot",
     ])
     evidence_writer = toset([
       "kms_evidence_sign",
@@ -247,6 +246,7 @@ locals {
         "kms_capability_public_key_read",
         "kms_capability_version_read",
         "run_reference_invoke",
+        "run_target_snapshot",
       ])
       evidence_writer = toset([
         "kms_evidence_sign",

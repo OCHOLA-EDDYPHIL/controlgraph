@@ -121,16 +121,21 @@ class StableSnapshot(StrictContractModel):
     service_generation: NonNegativeSafeInteger
     provider_etag: OpaqueToken
     configuration_sha256: Sha256Digest
+    stable_revision_configuration_sha256: Sha256Digest
     captured_at: UtcSecond
     captured_by: BoundedText
 
     @model_validator(mode="after")
     def validate_stable_baseline(self) -> Self:
-        if len(self.traffic) != 1:
-            raise ValueError("stable snapshot must have one traffic allocation")
-        allocation = self.traffic[0]
-        if allocation.revision != self.stable_revision or allocation.percent != 100:
+        stable = self.traffic[0]
+        if stable.revision != self.stable_revision or stable.percent != 100:
             raise ValueError("stable snapshot must route 100 percent to the stable revision")
+        if len(self.traffic) == 2:
+            unserved = self.traffic[1]
+            if unserved.revision == self.stable_revision or unserved.percent != 0:
+                raise ValueError(
+                    "stable snapshot may contain only one distinct zero-percent revision"
+                )
         return self
 
 

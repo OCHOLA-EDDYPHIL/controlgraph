@@ -11,18 +11,23 @@ from google.api_core import exceptions as api_exceptions
 from google.cloud import run_v2
 
 from controlgraph_canary.application.cloud_run import (
+    CloudRunExecutionEnvironment,
+    CloudRunHttpProbe,
     CloudRunMutationOutcome,
     CloudRunMutationReason,
     CloudRunMutationResult,
+    CloudRunNetworkInterface,
     CloudRunReadError,
     CloudRunReadErrorCode,
+    CloudRunReadyState,
+    CloudRunRevisionConfiguration,
     CloudRunRevisionState,
     CloudRunServiceState,
     CloudRunTargetConfiguration,
     CloudRunTargetState,
     CloudRunTrafficAllocation,
     CloudRunTrafficStatus,
-    DeclaredRevision,
+    CloudRunVpcEgress,
 )
 from controlgraph_canary.application.execution import MutationPermit
 from controlgraph_canary.application.identity import ServiceRole
@@ -184,11 +189,12 @@ class CloudRunV2Adapter:
         except (TypeError, ValueError):
             raise CloudRunReadError(CloudRunReadErrorCode.CORRUPT_RESPONSE) from None
 
-    async def read_revision(self, declared: DeclaredRevision) -> CloudRunRevisionState:
-        """Read one of the two constructor-declared immutable revisions."""
+    async def read_revision(self, revision_name: str) -> CloudRunRevisionState:
+        """Read one exact service-owned immutable revision by name."""
 
-        revision_name = self._configuration.revision(declared)
-        request = run_v2.GetRevisionRequest(name=self._configuration.revision_resource(declared))
+        request = run_v2.GetRevisionRequest(
+            name=self._configuration.revision_resource_name(revision_name)
+        )
         try:
             client = await self._revisions_client()
             async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
@@ -215,8 +221,8 @@ class CloudRunV2Adapter:
 
         service, stable, candidate = await asyncio.gather(
             self.read_service(),
-            self.read_revision(DeclaredRevision.STABLE),
-            self.read_revision(DeclaredRevision.CANDIDATE),
+            self.read_revision(self._configuration.stable_revision),
+            self.read_revision(self._configuration.candidate_revision),
         )
         if (
             stable.revision != self._configuration.stable_revision
@@ -408,65 +414,7 @@ class CloudRunV2Adapter:
         return self._revisions
 
     def _decode_service(self, value: object) -> CloudRunServiceState:
-        if type(value) is not run_v2.Service:
-            raise TypeError("Cloud Run service response type is invalid")
-        configuration = self._configuration
-        declared = {
-            configuration.stable_revision: "stable",
-            configuration.candidate_revision: "candidate",
-        }
-        revision_order = {
-            configuration.stable_revision: 0,
-            configuration.candidate_revision: 1,
-        }
-        traffic = tuple(
-            sorted(
-                (_decode_traffic(item, declared=declared) for item in value.traffic),
-                key=lambda item: revision_order[item.revision],
-            )
-        )
-        traffic_statuses = tuple(
-            sorted(
-                (
-                    _decode_traffic_status(item, declared=declared)
-                    for item in value.traffic_statuses
-                ),
-                key=lambda item: revision_order[item.revision],
-            )
-        )
-        state = CloudRunServiceState(
-            target=configuration.target,
-            resource_name=value.name,
-            uid=value.uid,
-            etag=value.etag,
-            generation=value.generation,
-            observed_generation=value.observed_generation,
-            reconciling=value.reconciling,
-            latest_ready_revision=value.latest_ready_revision,
-            latest_created_revision=value.latest_created_revision,
-            template_revision=value.template.revision,
-            template_concurrency=value.template.max_instance_request_concurrency,
-            traffic=traffic,
-            traffic_statuses=traffic_statuses,
-            uri=value.uri,
-        )
-        if any(
-            revision not in {configuration.stable_revision, configuration.candidate_revision}
-            for revision in (
-                state.latest_ready_revision,
-                state.latest_created_revision,
-                state.template_revision,
-            )
-        ):
-            raise ValueError("Cloud Run service references an undeclared revision")
-        expected_template_concurrency = (
-            configuration.stable_concurrency
-            if state.template_revision == configuration.stable_revision
-            else configuration.candidate_concurrency
-        )
-        if state.template_concurrency != expected_template_concurrency:
-            raise ValueError("Cloud Run service template concurrency is not declared")
-        return state
+        return _decode_service(value, configuration=self._configuration)
 
     def _decode_revision(
         self,
@@ -474,63 +422,383 @@ class CloudRunV2Adapter:
         *,
         expected_revision: str,
     ) -> CloudRunRevisionState:
-        if type(value) is not run_v2.Revision:
-            raise TypeError("Cloud Run revision response type is invalid")
-        configuration = self._configuration
-        state = CloudRunRevisionState(
-            target=configuration.target,
-            revision=expected_revision,
-            resource_name=value.name,
-            service_resource=value.service,
-            uid=value.uid,
-            etag=value.etag,
-            generation=value.generation,
-            observed_generation=value.observed_generation,
-            reconciling=value.reconciling,
-            concurrency=value.max_instance_request_concurrency,
+        return _decode_revision(
+            value,
+            configuration=self._configuration,
+            expected_revision=expected_revision,
         )
-        expected_concurrency = (
-            configuration.stable_concurrency
-            if expected_revision == configuration.stable_revision
-            else configuration.candidate_concurrency
+
+
+class CloudRunV2SnapshotReader:
+    """Verifier-only read surface for one fixed reference target."""
+
+    def __init__(
+        self,
+        *,
+        configuration: CloudRunTargetConfiguration,
+        service_role: ServiceRole,
+        configured_project_id: str,
+        services_client_factory: ServicesClientFactory | None = None,
+        revisions_client_factory: RevisionsClientFactory | None = None,
+    ) -> None:
+        if type(configuration) is not CloudRunTargetConfiguration:
+            raise TypeError("an exact Cloud Run target configuration is required")
+        if service_role is not ServiceRole.VERIFIER:
+            raise ValueError("Cloud Run snapshot reads require the verifier role")
+        target = configuration.target
+        if (
+            type(configured_project_id) is not str
+            or _CONTROLGRAPH_PROJECT_ID.fullmatch(configured_project_id) is None
+            or target.project_id != configured_project_id
+        ):
+            raise ValueError("Cloud Run project is not the configured ControlGraph project")
+        if target.region != CLOUD_RUN_REGION:
+            raise ValueError("Cloud Run target must use us-central1")
+        if target.service_name != CLOUD_RUN_REFERENCE_SERVICE:
+            raise ValueError("Cloud Run snapshot reader is sealed to the reference service")
+        if services_client_factory is not None and not callable(services_client_factory):
+            raise TypeError("Cloud Run services client factory must be callable")
+        if revisions_client_factory is not None and not callable(revisions_client_factory):
+            raise TypeError("Cloud Run revisions client factory must be callable")
+        self._configuration = configuration
+        self._service_role = service_role
+        self._services_client_factory = services_client_factory or _default_services_client_factory
+        self._revisions_client_factory = (
+            revisions_client_factory or _default_revisions_client_factory
         )
-        if state.concurrency != expected_concurrency:
-            raise ValueError("Cloud Run revision concurrency is not declared")
-        return state
+        self._services: _ServicesClientPort | None = None
+        self._revisions: _RevisionsClientPort | None = None
+        self._services_lock = asyncio.Lock()
+        self._revisions_lock = asyncio.Lock()
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._configuration.target
+
+    @property
+    def service_role(self) -> ServiceRole:
+        return self._service_role
+
+    @property
+    def reader_identity(self) -> str:
+        return f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
+
+    async def read_service(self) -> CloudRunServiceState:
+        """Read only the exact configured service resource."""
+
+        request = run_v2.GetServiceRequest(name=self._configuration.service_resource)
+        try:
+            client = await self._services_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                service = await client.get_service(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            raise
+        except api_exceptions.NotFound:
+            raise CloudRunReadError(CloudRunReadErrorCode.NOT_FOUND) from None
+        except CloudRunReadError:
+            raise
+        except Exception:
+            raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+        try:
+            return _decode_service(service, configuration=self._configuration)
+        except (TypeError, ValueError):
+            raise CloudRunReadError(CloudRunReadErrorCode.CORRUPT_RESPONSE) from None
+
+    async def read_revision(self, revision_name: str) -> CloudRunRevisionState:
+        """Read one traffic-selected revision under the configured service."""
+
+        request = run_v2.GetRevisionRequest(
+            name=self._configuration.revision_resource_name(revision_name)
+        )
+        try:
+            client = await self._revisions_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                revision = await client.get_revision(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            raise
+        except api_exceptions.NotFound:
+            raise CloudRunReadError(CloudRunReadErrorCode.NOT_FOUND) from None
+        except CloudRunReadError:
+            raise
+        except Exception:
+            raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+        try:
+            return _decode_revision(
+                revision,
+                configuration=self._configuration,
+                expected_revision=revision_name,
+            )
+        except (TypeError, ValueError):
+            raise CloudRunReadError(CloudRunReadErrorCode.CORRUPT_RESPONSE) from None
+
+    async def _services_client(self) -> _ServicesClientPort:
+        if self._services is not None:
+            return self._services
+        async with self._services_lock:
+            if self._services is None:
+                try:
+                    client = self._services_client_factory()
+                    if not callable(getattr(client, "get_service", None)):
+                        raise TypeError("Cloud Run services client is incomplete")
+                except Exception:
+                    raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+                self._services = client
+        return self._services
+
+    async def _revisions_client(self) -> _RevisionsClientPort:
+        if self._revisions is not None:
+            return self._revisions
+        async with self._revisions_lock:
+            if self._revisions is None:
+                try:
+                    client = self._revisions_client_factory()
+                    if not callable(getattr(client, "get_revision", None)):
+                        raise TypeError("Cloud Run revisions client is incomplete")
+                except Exception:
+                    raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+                self._revisions = client
+        return self._revisions
+
+
+def _decode_service(
+    value: object,
+    *,
+    configuration: CloudRunTargetConfiguration,
+) -> CloudRunServiceState:
+    if type(value) is not run_v2.Service:
+        raise TypeError("Cloud Run service response type is invalid")
+    prefix = f"{configuration.target.service_name}-"
+    declared_order = {
+        configuration.stable_revision: 0,
+        configuration.candidate_revision: 1,
+    }
+    traffic = tuple(
+        sorted(
+            (_decode_traffic(item, revision_prefix=prefix) for item in value.traffic),
+            key=lambda item: (declared_order.get(item.revision, 2), item.revision),
+        )
+    )
+    traffic_statuses = tuple(
+        sorted(
+            (
+                _decode_traffic_status(item, revision_prefix=prefix)
+                for item in value.traffic_statuses
+            ),
+            key=lambda item: (declared_order.get(item.revision, 2), item.revision),
+        )
+    )
+    return CloudRunServiceState(
+        target=configuration.target,
+        resource_name=value.name,
+        uid=value.uid,
+        etag=value.etag,
+        generation=value.generation,
+        observed_generation=value.observed_generation,
+        reconciling=value.reconciling,
+        ready_state=_decode_ready_condition(value.terminal_condition),
+        latest_ready_revision=value.latest_ready_revision,
+        latest_created_revision=value.latest_created_revision,
+        template_revision=value.template.revision,
+        template_concurrency=value.template.max_instance_request_concurrency,
+        traffic=traffic,
+        traffic_statuses=traffic_statuses,
+        uri=value.uri,
+    )
+
+
+def _decode_revision(
+    value: object,
+    *,
+    configuration: CloudRunTargetConfiguration,
+    expected_revision: str,
+) -> CloudRunRevisionState:
+    if type(value) is not run_v2.Revision:
+        raise TypeError("Cloud Run revision response type is invalid")
+    ready_conditions = tuple(
+        condition for condition in value.conditions if condition.type_ == "Ready"
+    )
+    if len(ready_conditions) != 1:
+        raise ValueError("Cloud Run revision does not have one authoritative Ready condition")
+    immutable_configuration = _decode_revision_configuration(value)
+    configuration.validate_revision_configuration(immutable_configuration)
+    return CloudRunRevisionState(
+        target=configuration.target,
+        revision=expected_revision,
+        resource_name=value.name,
+        service_resource=value.service,
+        uid=value.uid,
+        etag=value.etag,
+        generation=value.generation,
+        observed_generation=value.observed_generation,
+        reconciling=value.reconciling,
+        ready_state=_decode_ready_condition(ready_conditions[0]),
+        concurrency=value.max_instance_request_concurrency,
+        configuration=immutable_configuration,
+    )
+
+
+def _decode_ready_condition(value: object) -> CloudRunReadyState:
+    if type(value) is not run_v2.Condition or value.type_ != "Ready":
+        raise ValueError("Cloud Run Ready condition is missing")
+    if value.state == run_v2.Condition.State.CONDITION_SUCCEEDED:
+        return CloudRunReadyState.READY
+    if value.state in {
+        run_v2.Condition.State.CONDITION_PENDING,
+        run_v2.Condition.State.CONDITION_RECONCILING,
+    }:
+        return CloudRunReadyState.NOT_READY
+    if value.state == run_v2.Condition.State.CONDITION_FAILED:
+        return CloudRunReadyState.FAILED
+    raise ValueError("Cloud Run Ready condition state is unknown")
+
+
+def _decode_revision_configuration(
+    value: run_v2.Revision,
+) -> CloudRunRevisionConfiguration:
+    provider = run_v2.Revision.pb(value)
+    if (
+        value.volumes
+        or len(value.containers) != 1
+        or not provider.HasField("scaling")
+        or not provider.HasField("vpc_access")
+        or not provider.HasField("timeout")
+        or value.encryption_key
+        or provider.HasField("service_mesh")
+        or value.encryption_key_revocation_action
+        or value.encryption_key_shutdown_duration.total_seconds() != 0
+        or value.session_affinity
+        or provider.HasField("node_selector")
+        or value.gpu_zonal_redundancy_disabled
+    ):
+        raise ValueError("Cloud Run revision contains unsupported execution configuration")
+    container = value.containers[0]
+    container_provider = run_v2.Container.pb(container)
+    if (
+        container_provider.HasField("source_code")
+        or container.env
+        or container.volume_mounts
+        or len(container.ports) != 1
+        or container_provider.HasField("readiness_probe")
+        or container.depends_on
+        or container.base_image_uri
+        or container_provider.HasField("build_info")
+    ):
+        raise ValueError("Cloud Run container contains unsupported execution configuration")
+    limits = dict(container.resources.limits)
+    if set(limits) != {"cpu", "memory"}:
+        raise ValueError("Cloud Run container resources are not the closed supported set")
+    timeout_seconds = value.timeout.total_seconds()
+    if not timeout_seconds.is_integer():
+        raise ValueError("Cloud Run revision timeout must use whole seconds")
+    execution_environment = {
+        run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN1: (
+            CloudRunExecutionEnvironment.GEN1
+        ),
+        run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN2: (
+            CloudRunExecutionEnvironment.GEN2
+        ),
+    }.get(value.execution_environment)
+    if execution_environment is None:
+        raise ValueError("Cloud Run revision execution environment is unknown")
+    vpc_egress = {
+        run_v2.VpcAccess.VpcEgress.ALL_TRAFFIC: CloudRunVpcEgress.ALL_TRAFFIC,
+        run_v2.VpcAccess.VpcEgress.PRIVATE_RANGES_ONLY: (
+            CloudRunVpcEgress.PRIVATE_RANGES_ONLY
+        ),
+    }.get(value.vpc_access.egress)
+    if vpc_egress is None:
+        raise ValueError("Cloud Run revision VPC egress is unknown")
+    network_interfaces = tuple(
+        CloudRunNetworkInterface(
+            network=interface.network,
+            subnetwork=interface.subnetwork,
+            tags=tuple(sorted(set(interface.tags))),
+        )
+        for interface in value.vpc_access.network_interfaces
+    )
+    working_dir = container.working_dir or None
+    connector = value.vpc_access.connector or None
+    port = container.ports[0]
+    return CloudRunRevisionConfiguration(
+        image=container.image,
+        service_account=value.service_account,
+        execution_environment=execution_environment,
+        timeout_seconds=int(timeout_seconds),
+        concurrency=value.max_instance_request_concurrency,
+        min_instance_count=value.scaling.min_instance_count,
+        max_instance_count=value.scaling.max_instance_count,
+        container_name=container.name,
+        command=tuple(container.command),
+        args=tuple(container.args),
+        working_dir=working_dir,
+        port_name=port.name,
+        container_port=port.container_port,
+        cpu_limit=limits["cpu"],
+        memory_limit=limits["memory"],
+        cpu_idle=container.resources.cpu_idle,
+        startup_cpu_boost=container.resources.startup_cpu_boost,
+        startup_probe=_decode_http_probe(container.startup_probe),
+        liveness_probe=_decode_http_probe(container.liveness_probe),
+        vpc_connector=connector,
+        vpc_egress=vpc_egress,
+        network_interfaces=network_interfaces,
+    )
+
+
+def _decode_http_probe(value: object) -> CloudRunHttpProbe:
+    if type(value) is not run_v2.Probe:
+        raise TypeError("Cloud Run probe response type is invalid")
+    provider = run_v2.Probe.pb(value)
+    if provider.WhichOneof("probe_type") != "http_get" or value.http_get.http_headers:
+        raise ValueError("Cloud Run probe is not one header-free HTTP probe")
+    return CloudRunHttpProbe(
+        path=value.http_get.path,
+        port=value.http_get.port,
+        initial_delay_seconds=value.initial_delay_seconds,
+        timeout_seconds=value.timeout_seconds,
+        period_seconds=value.period_seconds,
+        failure_threshold=value.failure_threshold,
+    )
 
 
 def _decode_traffic(
     value: run_v2.TrafficTarget,
     *,
-    declared: dict[str, str],
+    revision_prefix: str,
 ) -> CloudRunTrafficAllocation:
     if type(value) is not run_v2.TrafficTarget or value.type_ != _REVISION_ALLOCATION:
         raise ValueError("Cloud Run traffic target is not revision-bound")
-    expected_tag = declared.get(value.revision)
-    if expected_tag is None or value.tag != expected_tag:
-        raise ValueError("Cloud Run traffic target is not declared")
+    if not value.revision.startswith(revision_prefix):
+        raise ValueError("Cloud Run traffic revision is outside the configured service")
     return CloudRunTrafficAllocation(
         revision=value.revision,
         percent=value.percent,
-        tag=value.tag,
+        tag=value.tag or None,
     )
 
 
 def _decode_traffic_status(
     value: run_v2.TrafficTargetStatus,
     *,
-    declared: dict[str, str],
+    revision_prefix: str,
 ) -> CloudRunTrafficStatus:
     if type(value) is not run_v2.TrafficTargetStatus or value.type_ != _REVISION_ALLOCATION:
         raise ValueError("Cloud Run traffic status is not revision-bound")
-    expected_tag = declared.get(value.revision)
-    if expected_tag is None or value.tag != expected_tag:
-        raise ValueError("Cloud Run traffic status is not declared")
+    if not value.revision.startswith(revision_prefix):
+        raise ValueError("Cloud Run traffic status revision is outside the configured service")
     return CloudRunTrafficStatus(
         revision=value.revision,
         percent=value.percent,
-        tag=value.tag,
-        uri=value.uri,
+        tag=value.tag or None,
+        uri=value.uri or None,
     )
 
 
@@ -582,6 +850,7 @@ __all__ = [
     "CLOUD_RUN_REGION",
     "CLOUD_RUN_RPC_TIMEOUT_SECONDS",
     "CloudRunV2Adapter",
+    "CloudRunV2SnapshotReader",
     "RevisionsClientFactory",
     "ServicesClientFactory",
 ]
