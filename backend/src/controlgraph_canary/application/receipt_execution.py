@@ -639,7 +639,7 @@ def _expected_target_state(verified: VerifiedMutation) -> TargetConfigurationPro
     root = verified.root
     return target_configuration_projection(
         intent,
-        expected_concurrency=root.stable_snapshot.concurrency,
+        expected_concurrency=root.content.authority_bounds.concurrency,
     )
 
 

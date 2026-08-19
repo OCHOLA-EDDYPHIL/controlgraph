@@ -10,10 +10,10 @@ from typing import Any, cast
 import pytest
 from google.api_core import exceptions as api_exceptions
 from google.cloud import run_v2
+from root_v2_support import RootBundle, root_bundle, root_records
 
 from controlgraph_canary.application.authority_store import (
     DirectReceiptCreate,
-    FinalAuthoritySnapshot,
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
@@ -34,7 +34,6 @@ from controlgraph_canary.application.cloud_run import (
     TargetConfigurationProjection,
     cloud_run_revision_configuration_sha256,
     target_configuration_projection,
-    target_configuration_projection_sha256,
     target_configuration_sha256,
 )
 from controlgraph_canary.application.execution import (
@@ -65,25 +64,16 @@ from controlgraph_canary.contracts.codec import (
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
-    EpochAuthorityRecord,
-    EpochChangeCause,
     ExecutionReceipt,
     MutationIntent,
     ReasonCode,
     ReceiptOutcome,
-    RolloutRoot,
     SignedCapability,
-    StableSnapshot,
     TargetBinding,
     TaskRequest,
-    TrafficAllocation,
 )
-from controlgraph_canary.contracts.storage import (
-    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
-    ServiceClaimRecord,
-    ServiceClaimStatus,
-    execution_receipt_logical_id,
-)
+from controlgraph_canary.contracts.root_creation import RolloutRootV2
+from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.integrations.google.cloud_run import (
     CloudRunV2Adapter,
     CloudRunV2SnapshotReader,
@@ -172,36 +162,16 @@ def _root(
     *,
     concurrency: int = 8,
     candidate_revision: str = CANDIDATE,
-) -> RolloutRoot:
-    target = _target()
-    stable = StableSnapshot(
-        schema_version="controlgraph.stable-snapshot/v1",
-        target=target,
+) -> RolloutRootV2:
+    root, _, _, _ = root_records(
+        target=_target(),
         stable_revision=STABLE,
-        traffic=(TrafficAllocation(revision=STABLE, percent=100),),
-        concurrency=concurrency,
-        service_generation=7,
-        provider_etag="etag-before-7",
-        configuration_sha256=ZERO_DIGEST,
-        stable_revision_configuration_sha256=ONE_DIGEST,
-        captured_at="2026-08-19T12:00:00Z",
-        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
-    )
-    return RolloutRoot(
-        schema_version="controlgraph.rollout-root/v1",
-        root_id="root-cloud-run-adapter",
-        target=target,
-        stable_snapshot=stable,
         candidate_revision=candidate_revision,
-        stable_percent=90,
-        candidate_percent=10,
-        health_policy_sha256=ONE_DIGEST,
-        maximum_recovery_attempts=1,
-        initial_epoch=1,
-        plan_sha256=TWO_DIGEST,
-        approved_by="controlgraph.operator/v1",
-        approved_at="2026-08-19T12:01:00Z",
+        concurrency=concurrency,
+        provider_etag="etag-before-7",
+        candidate_revision_configuration_sha256=THREE_DIGEST,
     )
+    return root
 
 
 def _action_shape(action: CapabilityAction, concurrency: int) -> tuple[int, int, int | None]:
@@ -236,18 +206,18 @@ def _verified(
         issuer=f"controlgraph-issuer@{PROJECT_ID}.iam.gserviceaccount.com",
         subject=f"controlgraph-{role.value}@{PROJECT_ID}.iam.gserviceaccount.com",
         audience=audience,
-        target=root.target,
+        target=root.content.target,
         root_id=root.root_id,
-        root_sha256=canonical_sha256(root),
+        root_sha256=root.root_sha256,
         epoch=1,
         action=action,
-        stable_revision=root.stable_snapshot.stable_revision,
-        candidate_revision=root.candidate_revision,
+        stable_revision=root.content.rollout_plan.stable_revision,
+        candidate_revision=root.content.rollout_plan.candidate_revision,
         stable_percent=stable_percent,
         candidate_percent=candidate_percent,
         concurrency=concurrency,
-        plan_sha256=root.plan_sha256,
-        provider_etag=root.stable_snapshot.provider_etag,
+        plan_sha256=canonical_sha256(root.content.rollout_plan),
+        provider_etag=root.content.stable_snapshot.provider_etag,
         request_id=f"request-{action.value.lower()}",
         idempotency_key=f"intent-{action.value.lower()}",
         parent_capability_sha256=None,
@@ -283,7 +253,7 @@ def _verified(
     request = TaskRequest(
         schema_version="controlgraph.task-request/v1",
         task_id=f"task-{action.value.lower()}",
-        queue_region=root.target.region,
+        queue_region=root.content.target.region,
         handler_audience=audience,
         scheduled_at=claims.not_before,
         expires_at=claims.expires_at,
@@ -307,6 +277,14 @@ def _verified(
     return VerifiedMutation(
         request=request,
         root=root,
+        lineage_anchor=root_records(
+            target=_target(),
+            stable_revision=STABLE,
+            candidate_revision=candidate_revision,
+            concurrency=root_concurrency,
+            provider_etag="etag-before-7",
+            candidate_revision_configuration_sha256=THREE_DIGEST,
+        )[1],
         caller=caller,
         capability_sha256=canonical_sha256(capability),
         claims_sha256=capability.claims_sha256,
@@ -368,94 +346,42 @@ def _claimed(verified: VerifiedMutation) -> StoredRecord[ExecutionReceipt]:
     return StoredRecord(receipt, 0)
 
 
-def _snapshot(root: RolloutRoot) -> FinalAuthoritySnapshot:
-    root_sha256 = canonical_sha256(root)
-    authority = EpochAuthorityRecord(
-        schema_version="controlgraph.epoch-authority/v1",
-        root_id=root.root_id,
-        root_sha256=root_sha256,
-        target=root.target,
-        current_epoch=1,
-        previous_epoch=None,
-        revision=0,
-        cause=EpochChangeCause.ROOT_CREATED,
-        changed_by=root.approved_by,
-        request_id="request-authority-1",
-        evidence_id="evidence-authority-1",
-        changed_at="2026-08-19T12:01:00Z",
-    )
-    stable_target_configuration_sha256 = target_configuration_projection_sha256(
-        TargetConfigurationProjection(
-            target=root.target,
-            stable_revision=root.stable_snapshot.stable_revision,
-            candidate_revision=root.candidate_revision,
-            stable_percent=100,
-            candidate_percent=0,
-            concurrency=root.stable_snapshot.concurrency,
-        )
-    )
-    candidate_target_configuration_sha256 = target_configuration_projection_sha256(
-        TargetConfigurationProjection(
-            target=root.target,
-            stable_revision=root.stable_snapshot.stable_revision,
-            candidate_revision=root.candidate_revision,
-            stable_percent=0,
-            candidate_percent=100,
-            concurrency=root.stable_snapshot.concurrency,
-        )
-    )
-    claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v2",
-        target=root.target,
-        root_id=root.root_id,
-        root_sha256=root_sha256,
-        stable_revision=root.stable_snapshot.stable_revision,
-        candidate_revision=root.candidate_revision,
-        initial_epoch=root.initial_epoch,
-        baseline_service_generation=root.stable_snapshot.service_generation,
-        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
-        baseline_revision_configuration_sha256=(
-            root.stable_snapshot.stable_revision_configuration_sha256
+def _snapshot(root: RolloutRootV2) -> RootBundle:
+    generated_root, anchor, claim, authority = root_records(
+        target=root.content.target,
+        stable_revision=root.content.rollout_plan.stable_revision,
+        candidate_revision=root.content.rollout_plan.candidate_revision,
+        concurrency=root.content.rollout_plan.concurrency,
+        service_generation=root.content.stable_snapshot.service_generation,
+        provider_etag=root.content.stable_snapshot.provider_etag,
+        baseline_configuration_sha256=(
+            root.content.stable_snapshot.configuration_sha256
         ),
-        candidate_revision_configuration_sha256=THREE_DIGEST,
-        stable_target_configuration_sha256=stable_target_configuration_sha256,
-        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
-        operator_owner=root.approved_by,
-        workload_creator="controlgraph.api/v1",
-        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
-        status=ServiceClaimStatus.ACTIVE,
-        claim_request_id="request-claim",
-        claim_evidence_id="evidence-claim",
-        claimed_at="2026-08-19T12:01:01Z",
-        release_fence_epoch=None,
-        release_fence_authority_revision=None,
-        release_fenced_by=None,
-        release_fence_request_id=None,
-        release_fence_evidence_id=None,
-        release_fenced_at=None,
-        released_by=None,
-        release_request_id=None,
-        release_evidence_id=None,
-        released_at=None,
-        terminal_root_proof=None,
-        target_classification_proof=None,
+        stable_revision_configuration_sha256=(
+            root.content.rollout_plan.stable_revision_configuration_sha256
+        ),
+        candidate_revision_configuration_sha256=(
+            root.content.rollout_plan.candidate_revision_configuration_sha256
+        ),
     )
-    return FinalAuthoritySnapshot(
-        root=StoredRecord(root, 0),
-        service_claim=StoredRecord(claim, 0),
-        authority=StoredRecord(authority, 0),
+    assert generated_root == root
+    return root_bundle(
+        root=root,
+        anchor=anchor,
+        claim=claim,
+        authority=authority,
     )
 
 
 class _Reader:
-    def __init__(self, root: RolloutRoot) -> None:
-        self.target = root.target
+    def __init__(self, root: RolloutRootV2) -> None:
+        self.target = root.content.target
         self.snapshot = _snapshot(root)
 
-    async def read_final_authority_snapshot(
+    async def read_root_creation_bundle(
         self,
         root_id: str,
-    ) -> FinalAuthoritySnapshot | None:
+    ) -> RootBundle | None:
         assert root_id == self.snapshot.root.value.root_id
         return self.snapshot
 

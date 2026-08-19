@@ -11,13 +11,14 @@ from enum import StrEnum
 from typing import Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
-from controlgraph_canary.application.authority_store import (
-    AuthorityStore,
-    AuthorityStoreError,
-    IssuanceStateSnapshot,
-)
-from controlgraph_canary.application.cloud_run import (
-    rollout_root_target_configuration_sha256,
+from controlgraph_canary.application.authority_store import AuthorityStoreError
+from controlgraph_canary.application.root_authority import (
+    RootAuthorityBundleReader,
+    TrustedRootAuthority,
+    capability_claims_match_root_authority,
+    capability_scope_from_claims,
+    inspect_root_authority_bundle,
+    operator_lineage_anchor,
 )
 from controlgraph_canary.application.signing import (
     DETACHED_SIGNATURE_V1,
@@ -32,12 +33,7 @@ from controlgraph_canary.application.signing import (
 )
 from controlgraph_canary.authority.policy import (
     MAX_LINEAGE_DEPTH,
-    CanaryAction,
     CapabilityGrant,
-    CapabilityScope,
-    IntegerBounds,
-    OperatorRootAnchor,
-    TimeBounds,
     check_attenuation,
     validate_lineage,
 )
@@ -52,15 +48,14 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
     EpochAuthorityRecord,
-    RolloutRoot,
     SignedCapability,
     TargetBinding,
 )
-from controlgraph_canary.contracts.storage import (
-    ServiceClaimRecord,
-    ServiceClaimStatus,
-    active_service_claim_matches_root,
+from controlgraph_canary.contracts.root_creation import (
+    CapabilityLineageAnchorV1,
+    RolloutRootV2,
 )
+from controlgraph_canary.contracts.storage import ServiceClaimStatus
 
 CAPABILITY_IDENTITY_V1 = "controlgraph.capability-identity/v1"
 CAPABILITY_IDENTITY_DOMAIN = b"controlgraph.capability-identity/v1\0"
@@ -270,75 +265,10 @@ class TrustBundleCapabilityVerifier:
 
 @dataclass(frozen=True, slots=True)
 class _TrustedIssuanceState:
-    snapshot: IssuanceStateSnapshot
-    root: RolloutRoot
-    root_sha256: str
+    snapshot: TrustedRootAuthority
+    root: RolloutRootV2
+    lineage_anchor: CapabilityLineageAnchorV1
     authority: EpochAuthorityRecord
-    service_claim: ServiceClaimRecord
-
-
-def _scope_from_claims(claims: CapabilityClaims, root: RolloutRoot) -> CapabilityScope:
-    concurrency = claims.concurrency or root.stable_snapshot.concurrency
-    return CapabilityScope(
-        project_id=claims.target.project_id,
-        region=claims.target.region,
-        environment=claims.target.environment,
-        service_name=claims.target.service_name,
-        root_id=claims.root_id,
-        root_sha256=claims.root_sha256,
-        epoch=claims.epoch,
-        plan_sha256=claims.plan_sha256,
-        provider_precondition=claims.provider_etag,
-        request_id=claims.request_id,
-        idempotency_key=claims.idempotency_key,
-        callers=frozenset({claims.subject}),
-        audiences=frozenset({claims.audience}),
-        stable_revision=claims.stable_revision,
-        candidate_revision=claims.candidate_revision,
-        revisions=frozenset({claims.stable_revision, claims.candidate_revision}),
-        actions=frozenset({CanaryAction(claims.action.value)}),
-        traffic_percent=IntegerBounds(claims.candidate_percent, claims.candidate_percent),
-        concurrency=IntegerBounds(concurrency, concurrency),
-        validity=TimeBounds(
-            _parse_utc_second(claims.not_before),
-            _parse_utc_second(claims.expires_at),
-        ),
-    )
-
-
-def _root_anchor(
-    state: _TrustedIssuanceState,
-    configuration: CapabilityIssuerConfiguration,
-    request: CapabilityIssuanceRequest,
-    validity: TimeBounds,
-) -> OperatorRootAnchor:
-    root = state.root
-    concurrency = root.stable_snapshot.concurrency
-    return OperatorRootAnchor(
-        root_sha256=state.root_sha256,
-        scope=CapabilityScope(
-            project_id=root.target.project_id,
-            region=root.target.region,
-            environment=root.target.environment,
-            service_name=root.target.service_name,
-            root_id=root.root_id,
-            root_sha256=state.root_sha256,
-            epoch=state.authority.current_epoch,
-            plan_sha256=root.plan_sha256,
-            provider_precondition=root.stable_snapshot.provider_etag,
-            request_id=request.request_id,
-            idempotency_key=request.idempotency_key,
-            callers=frozenset({configuration.subject_identity}),
-            audiences=frozenset({configuration.handler_audience}),
-            stable_revision=root.stable_snapshot.stable_revision,
-            candidate_revision=root.candidate_revision,
-            revisions=frozenset({root.stable_snapshot.stable_revision, root.candidate_revision}),
-            actions=frozenset({CanaryAction.APPLY_CANARY}),
-            traffic_percent=IntegerBounds(root.candidate_percent, root.candidate_percent),
-            concurrency=IntegerBounds(concurrency, concurrency),
-            validity=validity,
-        ),
-    )
 
 
 def _capability_id(claim_material: RestrictedJson) -> str:
@@ -353,7 +283,7 @@ class CapabilityIssuer:
     def __init__(
         self,
         *,
-        store: AuthorityStore,
+        store: RootAuthorityBundleReader,
         signer: PurposeSealedSigner,
         configuration: CapabilityIssuerConfiguration,
         lineage_resolver: CapabilityLineageResolver | None = None,
@@ -412,14 +342,18 @@ class CapabilityIssuer:
             expires_at=expires_at,
             parent_digest=parent_digest,
         )
-        child_scope = _scope_from_claims(claims, state.root)
+        child_scope = capability_scope_from_claims(claims, state.root)
         if lineage:
-            parent_scope = _scope_from_claims(lineage[-1].claims, state.root)
+            parent_scope = capability_scope_from_claims(lineage[-1].claims, state.root)
             attenuation = check_attenuation(parent_scope, child_scope)
             if not attenuation.allowed:
                 raise _deny(CapabilityIssuanceErrorCode.LINEAGE_INVALID)
         else:
-            anchor = _root_anchor(state, self._configuration, request, child_scope.validity)
+            anchor = operator_lineage_anchor(
+                state.root,
+                state.lineage_anchor,
+                claims,
+            )
             attenuation = check_attenuation(anchor.scope, child_scope)
             if not attenuation.allowed:
                 raise _deny(CapabilityIssuanceErrorCode.LINEAGE_INVALID)
@@ -464,80 +398,45 @@ class CapabilityIssuer:
         issued_second: int,
     ) -> _TrustedIssuanceState:
         try:
-            snapshot = await self._store.read_issuance_state(root_id)
+            snapshot = await self._store.read_root_creation_bundle(root_id)
         except AuthorityStoreError:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
         if snapshot is None:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
-        if type(snapshot) is not IssuanceStateSnapshot:
+        state = inspect_root_authority_bundle(
+            snapshot,
+            target=self._configuration.target,
+        )
+        if state is None:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
-        root_record = snapshot.root
-        claim_record = snapshot.service_claim
-        authority_record = snapshot.authority
-        root = root_record.value
-        claim = claim_record.value
-        authority = authority_record.value
-        if (
-            type(root) is not RolloutRoot
-            or type(claim) is not ServiceClaimRecord
-            or type(authority) is not EpochAuthorityRecord
-        ):
-            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
-        root_sha256 = canonical_sha256(root)
-        try:
-            stable_target_configuration_sha256 = (
-                rollout_root_target_configuration_sha256(
-                    root,
-                    stable_percent=100,
-                    candidate_percent=0,
-                )
-            )
-            candidate_target_configuration_sha256 = (
-                rollout_root_target_configuration_sha256(
-                    root,
-                    stable_percent=0,
-                    candidate_percent=100,
-                )
-            )
-        except (TypeError, ValueError):
-            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        root = state.root
+        claim = state.service_claim
+        authority = state.authority
+        content = root.content
+        bounds = content.authority_bounds
         if (
             root.root_id != root_id
-            or root.target != self._configuration.target
-            or root_record.revision != 0
             or claim.status is not ServiceClaimStatus.ACTIVE
-            or claim_record.revision % 3 != 0
-            or claim.target != root.target
-            or claim.root_id != root.root_id
-            or claim.root_sha256 != root_sha256
-            or not active_service_claim_matches_root(
-                claim,
-                root,
-                stable_target_configuration_sha256=(
-                    stable_target_configuration_sha256
-                ),
-                candidate_target_configuration_sha256=(
-                    candidate_target_configuration_sha256
-                ),
-            )
-            or authority.target != root.target
-            or authority.root_id != root.root_id
-            or authority.root_sha256 != root_sha256
-            or authority_record.revision != authority.revision
-            or authority.current_epoch != authority.revision + 1
-            or _FORBIDDEN_RESOURCE_NAME in root.stable_snapshot.stable_revision.lower()
-            or _FORBIDDEN_RESOURCE_NAME in root.candidate_revision.lower()
-            or _parse_utc_second(root.approved_at) > issued_second
+            or bounds.issuer_identity != self._configuration.issuer_identity
+            or bounds.executor_identity != self._configuration.subject_identity
+            or bounds.executor_audience != self._configuration.handler_audience
+            or bounds.apply_canary.subject_identity != self._configuration.subject_identity
+            or bounds.apply_canary.audience != self._configuration.handler_audience
+            or bounds.capability_signing_key_version != self._signer.profile.key_version
+            or self._configuration.lifetime_seconds
+            > bounds.maximum_capability_lifetime_seconds
+            or _FORBIDDEN_RESOURCE_NAME in content.rollout_plan.stable_revision.lower()
+            or _FORBIDDEN_RESOURCE_NAME in content.rollout_plan.candidate_revision.lower()
+            or _parse_utc_second(content.approved_at) > issued_second
             or _parse_utc_second(claim.claimed_at) > issued_second
             or _parse_utc_second(authority.changed_at) > issued_second
         ):
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return _TrustedIssuanceState(
-            snapshot=snapshot,
+            snapshot=state,
             root=root,
-            root_sha256=root_sha256,
+            lineage_anchor=state.lineage_anchor,
             authority=authority,
-            service_claim=claim,
         )
 
     async def _resolve_lineage(
@@ -589,7 +488,7 @@ class CapabilityIssuer:
     ) -> tuple[str | None, int | None]:
         if not lineage:
             return None, None
-        root_approved_second = _parse_utc_second(state.root.approved_at)
+        root_approved_second = _parse_utc_second(state.root.content.approved_at)
         authority_changed_second = _parse_utc_second(state.authority.changed_at)
         previous_claims: CapabilityClaims | None = None
         for capability in lineage:
@@ -625,15 +524,24 @@ class CapabilityIssuer:
                 CapabilityGrant(
                     capability_sha256=capability.claims_sha256,
                     parent_capability_sha256=capability.claims.parent_capability_sha256,
-                    scope=_scope_from_claims(capability.claims, state.root),
+                    scope=capability_scope_from_claims(capability.claims, state.root),
                 )
                 for capability in lineage
             )
-            anchor = _root_anchor(
-                state,
-                self._configuration,
-                request,
-                grants[0].scope.validity,
+            first_claims = lineage[0].claims
+            if any(
+                not capability_claims_match_root_authority(
+                    capability.claims,
+                    state.root,
+                    state.lineage_anchor,
+                )
+                for capability in lineage
+            ):
+                raise ValueError("lineage exceeds the persisted root authority")
+            anchor = operator_lineage_anchor(
+                state.root,
+                state.lineage_anchor,
+                first_claims,
             )
             result = validate_lineage(anchor, grants)
         except (TypeError, ValueError):
@@ -651,6 +559,8 @@ class CapabilityIssuer:
         parent_digest: str | None,
     ) -> CapabilityClaims:
         root = state.root
+        content = root.content
+        plan = content.rollout_plan
         identity_material: RestrictedJson = {
             "action": CapabilityAction.APPLY_CANARY.value,
             "audience": self._configuration.handler_audience,
@@ -661,11 +571,11 @@ class CapabilityIssuer:
             "parent_capability_sha256": parent_digest,
             "request_id": request.request_id,
             "root_id": root.root_id,
-            "root_sha256": state.root_sha256,
+            "root_sha256": root.root_sha256,
             "schema_version": CAPABILITY_IDENTITY_V1,
             "signing_key_version": self._signer.profile.key_version,
             "subject": self._configuration.subject_identity,
-            "target": root.target.model_dump(mode="json"),
+            "target": content.target.model_dump(mode="json"),
         }
         return CapabilityClaims(
             schema_version=CAPABILITY_CLAIMS_V1,
@@ -673,18 +583,18 @@ class CapabilityIssuer:
             issuer=self._configuration.issuer_identity,
             subject=self._configuration.subject_identity,
             audience=self._configuration.handler_audience,
-            target=root.target,
+            target=content.target,
             root_id=root.root_id,
-            root_sha256=state.root_sha256,
+            root_sha256=root.root_sha256,
             epoch=state.authority.current_epoch,
             action=CapabilityAction.APPLY_CANARY,
-            stable_revision=root.stable_snapshot.stable_revision,
-            candidate_revision=root.candidate_revision,
-            stable_percent=root.stable_percent,
-            candidate_percent=root.candidate_percent,
+            stable_revision=plan.stable_revision,
+            candidate_revision=plan.candidate_revision,
+            stable_percent=plan.stable_percent,
+            candidate_percent=plan.candidate_percent,
             concurrency=None,
-            plan_sha256=root.plan_sha256,
-            provider_etag=root.stable_snapshot.provider_etag,
+            plan_sha256=canonical_sha256(plan),
+            provider_etag=content.stable_snapshot.provider_etag,
             request_id=request.request_id,
             idempotency_key=request.idempotency_key,
             parent_capability_sha256=parent_digest,

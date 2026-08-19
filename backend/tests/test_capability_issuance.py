@@ -7,11 +7,10 @@ from typing import cast
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
+from root_v2_support import RootBundle, root_bundle, root_records, service_audience
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreUnavailable,
-    IssuanceStateSnapshot,
-    StoredRecord,
 )
 from controlgraph_canary.application.capability_issuance import (
     MAX_CAPABILITY_LIFETIME_SECONDS,
@@ -23,10 +22,6 @@ from controlgraph_canary.application.capability_issuance import (
     CapabilityIssuer,
     CapabilityIssuerConfiguration,
     TrustBundleCapabilityVerifier,
-)
-from controlgraph_canary.application.cloud_run import (
-    TargetConfigurationProjection,
-    target_configuration_projection_sha256,
 )
 from controlgraph_canary.application.signing import (
     DigestSigningBackend,
@@ -46,17 +41,14 @@ from controlgraph_canary.contracts import (
     CapabilityClaims,
     EpochAuthorityRecord,
     EpochChangeCause,
-    RolloutRoot,
+    RolloutRootV2,
     SignedCapability,
-    StableSnapshot,
     TargetBinding,
-    TrafficAllocation,
     canonical_sha256,
     encode_base64url,
 )
 from controlgraph_canary.contracts.storage import (
     SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
-    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
     SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
     ServiceClaimRecord,
     ServiceClaimStatus,
@@ -71,7 +63,7 @@ ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
 TWO_DIGEST = "2" * 64
 NOW = datetime(2026, 8, 19, 12, 2, tzinfo=UTC)
-AUDIENCE = "https://controlgraph-executor-abc123-uc.a.run.app"
+AUDIENCE = service_audience("executor")
 CAPABILITY_KEY_VERSION = (
     f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
@@ -97,105 +89,8 @@ def target(
     )
 
 
-def trusted_records() -> tuple[RolloutRoot, ServiceClaimRecord, EpochAuthorityRecord]:
-    bound_target = target()
-    snapshot = StableSnapshot(
-        schema_version="controlgraph.stable-snapshot/v1",
-        target=bound_target,
-        stable_revision="controlgraph-reference-target-stable-v1",
-        traffic=(
-            TrafficAllocation(
-                revision="controlgraph-reference-target-stable-v1",
-                percent=100,
-            ),
-        ),
-        concurrency=40,
-        service_generation=7,
-        provider_etag="etag-stable-7",
-        configuration_sha256=ZERO_DIGEST,
-        stable_revision_configuration_sha256=ONE_DIGEST,
-        captured_at="2026-08-19T12:00:00Z",
-        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
-    )
-    root = RolloutRoot(
-        schema_version="controlgraph.rollout-root/v1",
-        root_id="root-001",
-        target=bound_target,
-        stable_snapshot=snapshot,
-        candidate_revision="controlgraph-reference-target-candidate-v1",
-        stable_percent=90,
-        candidate_percent=10,
-        health_policy_sha256=ONE_DIGEST,
-        maximum_recovery_attempts=1,
-        initial_epoch=1,
-        plan_sha256=TWO_DIGEST,
-        approved_by="controlgraph.operator/v1",
-        approved_at="2026-08-19T12:01:00Z",
-    )
-    root_sha256 = canonical_sha256(root)
-
-    def target_configuration_sha256(stable_percent: int, candidate_percent: int) -> str:
-        return target_configuration_projection_sha256(
-            TargetConfigurationProjection(
-                target=root.target,
-                stable_revision=root.stable_snapshot.stable_revision,
-                candidate_revision=root.candidate_revision,
-                stable_percent=stable_percent,
-                candidate_percent=candidate_percent,
-                concurrency=root.stable_snapshot.concurrency,
-            )
-        )
-
-    claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v2",
-        target=bound_target,
-        root_id=root.root_id,
-        root_sha256=root_sha256,
-        stable_revision=root.stable_snapshot.stable_revision,
-        candidate_revision=root.candidate_revision,
-        initial_epoch=root.initial_epoch,
-        baseline_service_generation=root.stable_snapshot.service_generation,
-        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
-        baseline_revision_configuration_sha256=(
-            root.stable_snapshot.stable_revision_configuration_sha256
-        ),
-        candidate_revision_configuration_sha256=TWO_DIGEST,
-        stable_target_configuration_sha256=target_configuration_sha256(100, 0),
-        candidate_target_configuration_sha256=target_configuration_sha256(0, 100),
-        operator_owner=root.approved_by,
-        workload_creator="controlgraph.api/v1",
-        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
-        status=ServiceClaimStatus.ACTIVE,
-        claim_request_id="request-root-001",
-        claim_evidence_id="evidence-root-001",
-        claimed_at="2026-08-19T12:01:00Z",
-        release_fence_epoch=None,
-        release_fence_authority_revision=None,
-        release_fenced_by=None,
-        release_fence_request_id=None,
-        release_fence_evidence_id=None,
-        release_fenced_at=None,
-        released_by=None,
-        release_request_id=None,
-        release_evidence_id=None,
-        released_at=None,
-        terminal_root_proof=None,
-        target_classification_proof=None,
-    )
-    authority = EpochAuthorityRecord(
-        schema_version="controlgraph.epoch-authority/v1",
-        root_id=root.root_id,
-        root_sha256=root_sha256,
-        target=bound_target,
-        current_epoch=1,
-        previous_epoch=None,
-        revision=0,
-        cause=EpochChangeCause.ROOT_CREATED,
-        changed_by=root.approved_by,
-        request_id="request-root-001",
-        evidence_id="evidence-root-001",
-        changed_at="2026-08-19T12:01:00Z",
-    )
+def trusted_records() -> tuple[RolloutRootV2, ServiceClaimRecord, EpochAuthorityRecord]:
+    root, _, claim, authority = root_records()
     return root, claim, authority
 
 
@@ -257,33 +152,34 @@ class FakeAuthorityStore:
     def __init__(
         self,
         *,
-        root: RolloutRoot | None = None,
+        root: RolloutRootV2 | None = None,
         claim: ServiceClaimRecord | None = None,
         authority: EpochAuthorityRecord | None = None,
         fail: bool = False,
     ) -> None:
         default_root, default_claim, default_authority = trusted_records()
+        _, default_anchor, _, _ = root_records()
         self._root = default_root if root is None else root
+        self._anchor = default_anchor
         self._claim = default_claim if claim is None else claim
         self._authority = default_authority if authority is None else authority
         self._claim_revision = 0 if self._claim.status is ServiceClaimStatus.ACTIVE else 2
         self._fail = fail
-        self.target = default_root.target
+        self.target = default_root.content.target
         self.reads: list[str] = []
 
-    async def read_issuance_state(self, root_id: str) -> IssuanceStateSnapshot | None:
+    async def read_root_creation_bundle(self, root_id: str) -> RootBundle | None:
         self.reads.append(f"snapshot:{root_id}")
         if self._fail:
             raise AuthorityStoreUnavailable
         if root_id != self._root.root_id:
             return None
-        return IssuanceStateSnapshot(
-            root=StoredRecord(value=self._root, revision=0),
-            service_claim=StoredRecord(value=self._claim, revision=self._claim_revision),
-            authority=StoredRecord(
-                value=self._authority,
-                revision=self._authority.revision,
-            ),
+        return root_bundle(
+            root=self._root,
+            anchor=self._anchor,
+            claim=self._claim,
+            authority=self._authority,
+            claim_revision=self._claim_revision,
         )
 
     def replace_authority(self, replacement: EpochAuthorityRecord) -> None:
@@ -374,7 +270,7 @@ def configuration(**overrides: object) -> CapabilityIssuerConfiguration:
 
 def request(**overrides: object) -> CapabilityIssuanceRequest:
     values: dict[str, object] = {
-        "root_id": "root-001",
+        "root_id": trusted_records()[0].root_id,
         "request_id": "request-issue-001",
         "idempotency_key": "intent-apply-001",
     }
@@ -436,17 +332,17 @@ def test_issues_exact_canonical_root_bound_claims_through_capability_signer() ->
     assert claims.issuer == f"controlgraph-issuer@{PROJECT_ID}.iam.gserviceaccount.com"
     assert claims.subject == f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
     assert claims.audience == AUDIENCE
-    assert claims.target == root.target
+    assert claims.target == root.content.target
     assert claims.root_id == root.root_id
-    assert claims.root_sha256 == canonical_sha256(root)
+    assert claims.root_sha256 == root.root_sha256
     assert claims.epoch == authority.current_epoch
     assert claims.action is CapabilityAction.APPLY_CANARY
-    assert claims.stable_revision == root.stable_snapshot.stable_revision
-    assert claims.candidate_revision == root.candidate_revision
+    assert claims.stable_revision == root.content.rollout_plan.stable_revision
+    assert claims.candidate_revision == root.content.rollout_plan.candidate_revision
     assert (claims.stable_percent, claims.candidate_percent) == (90, 10)
     assert claims.concurrency is None
-    assert claims.plan_sha256 == root.plan_sha256
-    assert claims.provider_etag == root.stable_snapshot.provider_etag
+    assert claims.plan_sha256 == canonical_sha256(root.content.rollout_plan)
+    assert claims.provider_etag == root.content.stable_snapshot.provider_etag
     assert claims.request_id == "request-issue-001"
     assert claims.idempotency_key == "intent-apply-001"
     assert claims.parent_capability_sha256 is None
@@ -456,7 +352,7 @@ def test_issues_exact_canonical_root_bound_claims_through_capability_signer() ->
     assert claims.signing_key_version == CAPABILITY_KEY_VERSION
     assert envelope.claims_sha256 == canonical_sha256(claims)
     assert backend.digests == [build_signing_input(backend.profile, claims).digest]
-    assert store.reads == ["snapshot:root-001", "snapshot:root-001"]
+    assert store.reads == [f"snapshot:{root.root_id}", f"snapshot:{root.root_id}"]
 
 
 def test_claims_and_signing_input_are_deterministic_for_identical_trusted_inputs() -> None:
@@ -530,7 +426,7 @@ def test_authority_change_during_signing_never_returns_current_authority(
 
     assert denied.value.code is CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID
     assert len(backend.digests) == 1
-    assert store.reads == ["snapshot:root-001", "snapshot:root-001"]
+    assert store.reads == [f"snapshot:{root.root_id}", f"snapshot:{root.root_id}"]
 
 
 def test_release_after_issuance_atomically_makes_the_capability_epoch_stale() -> None:
@@ -554,7 +450,7 @@ def test_release_after_issuance_atomically_makes_the_capability_epoch_stale() ->
     released = released_claim(claim, revoked)
 
     store.release(released, revoked)
-    current = asyncio.run(store.read_issuance_state(root.root_id))
+    current = asyncio.run(store.read_root_creation_bundle(root.root_id))
     assert current is not None
     epoch_check = check_epoch(
         token_root_id=envelope.claims.root_id,
@@ -784,30 +680,20 @@ def test_released_service_claim_cannot_issue_new_authority() -> None:
 
 def test_trusted_root_cannot_introduce_an_unrelated_revision_resource() -> None:
     root, claim, authority = trusted_records()
-    altered_root = RolloutRoot(
-        **{
-            **root.model_dump(mode="python"),
-            "candidate_revision": "reconcile-candidate",
-        }
+    altered_plan = root.content.rollout_plan.model_copy(
+        update={"candidate_revision": "reconcile-candidate"}
     )
-    altered_digest = canonical_sha256(altered_root)
-    altered_claim = ServiceClaimRecord(
-        **{
-            **claim.model_dump(mode="python"),
-            "root_sha256": altered_digest,
-        }
+    altered_content = root.content.model_copy(
+        update={"rollout_plan": altered_plan}
     )
-    altered_authority = EpochAuthorityRecord(
-        **{
-            **authority.model_dump(mode="python"),
-            "root_sha256": altered_digest,
-        }
+    altered_root = root.model_copy(
+        update={"content": altered_content}
     )
     value, backend, _ = issuer(
         store=FakeAuthorityStore(
             root=altered_root,
-            claim=altered_claim,
-            authority=altered_authority,
+            claim=claim,
+            authority=authority,
         )
     )
 
@@ -1015,7 +901,7 @@ def test_parent_scope_cannot_be_switched_to_another_fixed_handler() -> None:
     with pytest.raises(CapabilityIssuanceError) as denied:
         issue(value, request(parent_capability_id=parent.claims.capability_id))
 
-    assert denied.value.code is CapabilityIssuanceErrorCode.LINEAGE_INVALID
+    assert denied.value.code is CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID
     assert backend.digests == []
 
 

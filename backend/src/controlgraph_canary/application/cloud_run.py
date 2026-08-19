@@ -11,6 +11,7 @@ from typing import Final
 from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 from controlgraph_canary.contracts.codec import RestrictedJson, canonical_json_value_bytes
 from controlgraph_canary.contracts.models import MutationIntent, RolloutRoot, TargetBinding
+from controlgraph_canary.contracts.root_creation import RolloutRootV2
 
 TARGET_CONFIGURATION_DOMAIN: Final = b"controlgraph.target-configuration-sha256/v1\0"
 TARGET_CONFIGURATION_V1: Final = "controlgraph.target-configuration/v1"
@@ -455,6 +456,29 @@ def rollout_root_target_configuration_sha256(
     )
 
 
+def rollout_root_v2_target_configuration_sha256(
+    root: RolloutRootV2,
+    *,
+    stable_percent: int,
+    candidate_percent: int,
+) -> str:
+    """Hash one v2 root-bound target traffic state without provider types."""
+
+    if type(root) is not RolloutRootV2:
+        raise TypeError("an exact v2 rollout root is required")
+    plan = root.content.rollout_plan
+    return target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.content.target,
+            stable_revision=plan.stable_revision,
+            candidate_revision=plan.candidate_revision,
+            stable_percent=stable_percent,
+            candidate_percent=candidate_percent,
+            concurrency=plan.concurrency,
+        )
+    )
+
+
 def cloud_run_revision_configuration_sha256(
     configuration: CloudRunRevisionConfiguration,
 ) -> str:
@@ -782,6 +806,7 @@ __all__ = [
     "TargetConfigurationProjection",
     "cloud_run_revision_configuration_sha256",
     "rollout_root_target_configuration_sha256",
+    "rollout_root_v2_target_configuration_sha256",
     "target_configuration_projection",
     "target_configuration_projection_sha256",
     "target_configuration_sha256",

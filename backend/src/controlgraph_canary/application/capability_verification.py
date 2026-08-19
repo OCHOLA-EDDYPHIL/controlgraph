@@ -9,14 +9,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
-from controlgraph_canary.application.authority_store import (
-    AuthorityStoreError,
-    StoredRecord,
-)
+from controlgraph_canary.application.authority_store import AuthorityStoreError
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     RouteAuthenticationPolicy,
     ServiceRole,
+)
+from controlgraph_canary.application.root_authority import (
+    RootAuthorityBundleReader,
+    TrustedRootAuthority,
+    capability_claims_match_root_authority,
+    capability_scope_from_claims,
+    inspect_root_authority_bundle,
+    operator_lineage_anchor,
 )
 from controlgraph_canary.application.signing import (
     DETACHED_SIGNATURE_V1,
@@ -30,12 +35,7 @@ from controlgraph_canary.application.signing import (
 )
 from controlgraph_canary.authority.policy import (
     MAX_LINEAGE_DEPTH,
-    CanaryAction,
     CapabilityGrant,
-    CapabilityScope,
-    IntegerBounds,
-    OperatorRootAnchor,
-    TimeBounds,
     validate_lineage,
 )
 from controlgraph_canary.contracts.codec import (
@@ -48,10 +48,13 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
     ReasonCode,
-    RolloutRoot,
     SignedCapability,
     TargetBinding,
     TaskRequest,
+)
+from controlgraph_canary.contracts.root_creation import (
+    CapabilityLineageAnchorV1,
+    RolloutRootV2,
 )
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
@@ -70,16 +73,6 @@ class CapabilityVerificationError(Exception):
 
 def _deny(code: ReasonCode) -> CapabilityVerificationError:
     return CapabilityVerificationError(code)
-
-
-@runtime_checkable
-class TrustedRolloutRootReader(Protocol):
-    """Read immutable approved roots without exposing receipt write operations."""
-
-    @property
-    def target(self) -> TargetBinding: ...
-
-    async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None: ...
 
 
 @runtime_checkable
@@ -161,7 +154,8 @@ class VerifiedMutation:
     """Immutable task authority proven before any receipt or provider side effect."""
 
     request: TaskRequest
-    root: RolloutRoot
+    root: RolloutRootV2
+    lineage_anchor: CapabilityLineageAnchorV1
     caller: AuthenticationContext
     capability_sha256: str
     claims_sha256: str
@@ -174,7 +168,7 @@ class CapabilityVerifier:
     def __init__(
         self,
         *,
-        root_reader: TrustedRolloutRootReader,
+        root_reader: RootAuthorityBundleReader,
         trust_verifier: TrustBundleVerifier,
         configuration: CapabilityVerifierConfiguration,
         lineage_reader: CapabilityLineageReader | None = None,
@@ -228,17 +222,21 @@ class CapabilityVerifier:
         self._verify_envelope(request.capability)
         self._validate_time(request, now_second)
         self._validate_route_and_identity(request)
-        root = await self._read_root(request.intent.root_id)
-        self._validate_root_bindings(request, root, now_second)
+        root_state = await self._read_root_boundary(request.intent.root_id)
+        root = root_state.root
+        anchor = root_state.lineage_anchor
+        self._validate_root_bindings(request, root, anchor, now_second)
         ancestors = await self._read_ancestors(request.capability)
         earliest_lineage_issued_at = self._validate_lineage(
             (*ancestors, request.capability),
             root,
+            anchor,
             now_second,
         )
         return VerifiedMutation(
             request=request,
             root=root,
+            lineage_anchor=anchor,
             caller=caller,
             capability_sha256=canonical_sha256(request.capability),
             claims_sha256=request.capability.claims_sha256,
@@ -328,66 +326,71 @@ class CapabilityVerifier:
         if claims.action not in configuration.admitted_actions:
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
 
-    async def _read_root(self, root_id: str) -> RolloutRoot:
+    async def _read_root_boundary(self, root_id: str) -> TrustedRootAuthority:
         try:
-            record = await self._root_reader.read_rollout_root(root_id)
+            bundle = await self._root_reader.read_root_creation_bundle(root_id)
         except AuthorityStoreError:
             raise _deny(ReasonCode.AUTHORITY_UNAVAILABLE) from None
         except Exception:
             raise _deny(ReasonCode.AUTHORITY_UNAVAILABLE) from None
-        if record is None:
+        if bundle is None:
             raise _deny(ReasonCode.LINEAGE_INVALID)
-        if (
-            type(record) is not StoredRecord
-            or record.revision != 0
-            or type(record.value) is not RolloutRoot
-        ):
+        state = inspect_root_authority_bundle(
+            bundle,
+            target=self._configuration.target,
+        )
+        if state is None:
             raise _deny(ReasonCode.AUTHORITY_UNAVAILABLE)
-        return record.value
+        return state
 
     def _validate_root_bindings(
         self,
         request: TaskRequest,
-        root: RolloutRoot,
+        root: RolloutRootV2,
+        anchor: CapabilityLineageAnchorV1,
         now_second: int,
     ) -> None:
         claims = request.capability.claims
         intent = request.intent
         configuration = self._configuration
-        root_sha256 = canonical_sha256(root)
-        if root.target != configuration.target or claims.target != configuration.target:
+        content = root.content
+        plan = content.rollout_plan
+        if content.target != configuration.target or claims.target != configuration.target:
             raise _deny(ReasonCode.TARGET_BINDING_MISMATCH)
         if intent.target != configuration.target:
             raise _deny(ReasonCode.TARGET_BINDING_MISMATCH)
         if (
             claims.root_id != root.root_id
             or intent.root_id != root.root_id
-            or claims.root_sha256 != root_sha256
-            or intent.root_sha256 != root_sha256
+            or claims.root_sha256 != root.root_sha256
+            or intent.root_sha256 != root.root_sha256
         ):
             raise _deny(ReasonCode.LINEAGE_INVALID)
         if (
-            claims.stable_revision != root.stable_snapshot.stable_revision
-            or claims.candidate_revision != root.candidate_revision
-            or intent.stable_revision != root.stable_snapshot.stable_revision
-            or intent.candidate_revision != root.candidate_revision
+            claims.stable_revision != plan.stable_revision
+            or claims.candidate_revision != plan.candidate_revision
+            or intent.stable_revision != plan.stable_revision
+            or intent.candidate_revision != plan.candidate_revision
         ):
             raise _deny(ReasonCode.TARGET_BINDING_MISMATCH)
-        if claims.plan_sha256 != root.plan_sha256 or intent.plan_sha256 != root.plan_sha256:
+        plan_sha256 = canonical_sha256(plan)
+        if claims.plan_sha256 != plan_sha256 or intent.plan_sha256 != plan_sha256:
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
         if (
             claims.action is CapabilityAction.APPLY_CANARY
-            and claims.provider_etag != root.stable_snapshot.provider_etag
+            and claims.provider_etag != content.stable_snapshot.provider_etag
         ):
             raise _deny(ReasonCode.TARGET_BINDING_MISMATCH)
         if claims.action is CapabilityAction.RECOVER_STABLE:
-            if claims.concurrency != root.stable_snapshot.concurrency:
+            if claims.concurrency != content.authority_bounds.concurrency:
                 raise _deny(ReasonCode.TARGET_BINDING_MISMATCH)
         elif claims.concurrency is not None:
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
-        if _parse_utc_second(root.approved_at) > now_second:
+        if not capability_claims_match_root_authority(claims, root, anchor):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
+        if _parse_utc_second(content.approved_at) > now_second:
             raise _deny(ReasonCode.LINEAGE_INVALID)
-        if _parse_utc_second(claims.issued_at) < _parse_utc_second(root.approved_at):
+        if _parse_utc_second(claims.issued_at) < _parse_utc_second(content.approved_at):
             raise _deny(ReasonCode.LINEAGE_INVALID)
 
     async def _read_ancestors(
@@ -417,12 +420,13 @@ class CapabilityVerifier:
     def _validate_lineage(
         self,
         lineage: tuple[SignedCapability, ...],
-        root: RolloutRoot,
+        root: RolloutRootV2,
+        anchor_record: CapabilityLineageAnchorV1,
         now_second: int,
     ) -> int:
         if not lineage or len(lineage) > MAX_LINEAGE_DEPTH:
             raise _deny(ReasonCode.LINEAGE_INVALID)
-        root_approved_second = _parse_utc_second(root.approved_at)
+        root_approved_second = _parse_utc_second(root.content.approved_at)
         earliest_issued_at = _parse_utc_second(lineage[0].claims.issued_at)
         previous_claims: CapabilityClaims | None = None
         capability_ids: set[str] = set()
@@ -431,10 +435,16 @@ class CapabilityVerifier:
             if index < len(lineage) - 1:
                 self._verify_envelope(capability)
             self._validate_lineage_claim_identity(capability.claims)
-            _validate_claim_time(capability.claims, now_second)
             issued_at = _parse_utc_second(capability.claims.issued_at)
             if issued_at < root_approved_second:
                 raise _deny(ReasonCode.LINEAGE_INVALID)
+            if not capability_claims_match_root_authority(
+                capability.claims,
+                root,
+                anchor_record,
+            ):
+                raise _deny(ReasonCode.SCOPE_AMPLIFICATION)
+            _validate_claim_time(capability.claims, now_second)
             if previous_claims is not None and not (
                 _parse_utc_second(previous_claims.not_before)
                 <= issued_at
@@ -450,41 +460,20 @@ class CapabilityVerifier:
                     CapabilityGrant(
                         capability_sha256=capability.claims_sha256,
                         parent_capability_sha256=capability.claims.parent_capability_sha256,
-                        scope=_scope_from_claims(capability.claims, root),
+                        scope=capability_scope_from_claims(capability.claims, root),
                     )
                 )
             except (TypeError, ValueError):
                 raise _deny(ReasonCode.LINEAGE_INVALID) from None
 
-        first_scope = grants[0].scope
-        leaf_scope = grants[-1].scope
-        anchor = OperatorRootAnchor(
-            root_sha256=canonical_sha256(root),
-            scope=CapabilityScope(
-                project_id=root.target.project_id,
-                region=root.target.region,
-                environment=root.target.environment,
-                service_name=root.target.service_name,
-                root_id=root.root_id,
-                root_sha256=canonical_sha256(root),
-                epoch=leaf_scope.epoch,
-                plan_sha256=root.plan_sha256,
-                provider_precondition=first_scope.provider_precondition,
-                request_id=leaf_scope.request_id,
-                idempotency_key=leaf_scope.idempotency_key,
-                callers=frozenset({self._configuration.subject_identity}),
-                audiences=frozenset({self._configuration.route_policy.audience}),
-                stable_revision=root.stable_snapshot.stable_revision,
-                candidate_revision=root.candidate_revision,
-                revisions=frozenset(
-                    {root.stable_snapshot.stable_revision, root.candidate_revision}
-                ),
-                actions=leaf_scope.actions,
-                traffic_percent=leaf_scope.traffic_percent,
-                concurrency=leaf_scope.concurrency,
-                validity=first_scope.validity,
-            ),
-        )
+        try:
+            anchor = operator_lineage_anchor(
+                root,
+                anchor_record,
+                lineage[0].claims,
+            )
+        except (TypeError, ValueError):
+            raise _deny(ReasonCode.LINEAGE_INVALID) from None
         result = validate_lineage(anchor, tuple(grants))
         if not result.allowed:
             reason = (
@@ -507,36 +496,6 @@ class CapabilityVerifier:
             or claims.audience != configuration.route_policy.audience
         ):
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
-
-
-def _scope_from_claims(claims: CapabilityClaims, root: RolloutRoot) -> CapabilityScope:
-    concurrency = claims.concurrency or root.stable_snapshot.concurrency
-    return CapabilityScope(
-        project_id=claims.target.project_id,
-        region=claims.target.region,
-        environment=claims.target.environment,
-        service_name=claims.target.service_name,
-        root_id=claims.root_id,
-        root_sha256=claims.root_sha256,
-        epoch=claims.epoch,
-        plan_sha256=claims.plan_sha256,
-        provider_precondition=claims.provider_etag,
-        request_id=claims.request_id,
-        idempotency_key=claims.idempotency_key,
-        callers=frozenset({claims.subject}),
-        audiences=frozenset({claims.audience}),
-        stable_revision=claims.stable_revision,
-        candidate_revision=claims.candidate_revision,
-        revisions=frozenset({claims.stable_revision, claims.candidate_revision}),
-        actions=frozenset({CanaryAction(claims.action.value)}),
-        traffic_percent=IntegerBounds(claims.candidate_percent, claims.candidate_percent),
-        concurrency=IntegerBounds(concurrency, concurrency),
-        validity=TimeBounds(
-            _parse_utc_second(claims.not_before),
-            _parse_utc_second(claims.expires_at),
-        ),
-    )
-
 
 def _validate_claim_time(claims: CapabilityClaims, now_second: int) -> None:
     if now_second < _parse_utc_second(claims.not_before):
@@ -586,6 +545,5 @@ __all__ = [
     "CapabilityVerificationError",
     "CapabilityVerifier",
     "CapabilityVerifierConfiguration",
-    "TrustedRolloutRootReader",
     "VerifiedMutation",
 ]
