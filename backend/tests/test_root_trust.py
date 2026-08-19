@@ -34,6 +34,7 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     runtime_route_policy,
 )
+from controlgraph_canary.application.root_relay import CoordinatorRootCreationRelay
 from controlgraph_canary.application.root_trust import (
     CoordinatorEvidenceClient,
     CoordinatorInternalRoute,
@@ -793,6 +794,10 @@ def test_coordinator_settings_and_runtime_compose_only_exact_trust_clients() -> 
         kms_client=object(),
     )
     assert isinstance(app.state.controlgraph_trust_clients, CoordinatorTrustClients)
+    assert isinstance(
+        app.state.controlgraph_root_creation_relay,
+        CoordinatorRootCreationRelay,
+    )
 
     substituted = dict(environment)
     substituted["CONTROLGRAPH_VERIFIER_URL"] = EVIDENCE_AUDIENCE

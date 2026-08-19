@@ -16,6 +16,10 @@ from controlgraph_canary.application.identity import (
     runtime_route_policy,
     runtime_service_name,
 )
+from controlgraph_canary.application.root_relay import (
+    ApiRootCreationClient,
+    CoordinatorRootCreationRelay,
+)
 from controlgraph_canary.http.service import (
     PRODUCT_CONTRACT_VERSION,
     SERVICE_SHELL_VERSION,
@@ -172,6 +176,17 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
         monkeypatch.setenv(key, value)
     module = importlib.import_module(module_name)
     client = TestClient(module.app)
+
+    if role is ServiceRole.API:
+        assert isinstance(
+            module.app.state.controlgraph_root_creation_client,
+            ApiRootCreationClient,
+        )
+    if role is ServiceRole.COORDINATOR:
+        assert isinstance(
+            module.app.state.controlgraph_root_creation_relay,
+            CoordinatorRootCreationRelay,
+        )
 
     health = client.get("/healthz")
     metadata = client.get("/v1/metadata")
@@ -397,6 +412,25 @@ def test_service_app_rejects_a_policy_for_another_role() -> None:
             ServiceRole.EXECUTOR,
             authenticator=_ExactTestAuthenticator("Bearer exact.test.credential"),
             authentication_policy=policy,
+        )
+
+
+@pytest.mark.parametrize(
+    "role",
+    tuple(
+        role
+        for role in ServiceRole
+        if role not in {ServiceRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER}
+    ),
+)
+def test_runtime_rejects_kms_clients_outside_evidence_trust_roles(
+    role: ServiceRole,
+) -> None:
+    with pytest.raises(ValueError, match="KMS dependencies"):
+        create_runtime_service_app(
+            role,
+            environment=_environment(role),
+            kms_client=object(),
         )
 
 
