@@ -48,6 +48,7 @@ CAPABILITY_LINEAGE_ANCHOR_V1: Final = "controlgraph.capability-lineage-anchor/v1
 SIGNED_EVIDENCE_EVENT_V1: Final = "controlgraph.signed-evidence-event/v1"
 ROOT_CREATION_RESULT_V1: Final = "controlgraph.root-creation-result/v1"
 ROOT_CREATION_EVIDENCE_SUBJECT_V1: Final = "controlgraph.root-creation-evidence-subject/v1"
+ROOT_CREATION_COMMAND_V1: Final = "controlgraph.root-creation-command/v1"
 
 SIGNATURE_INPUT_V1: Final = "controlgraph.signature-input/v1"
 P256_SIGNING_ALGORITHM: Final = "EC_SIGN_P256_SHA256"
@@ -84,6 +85,14 @@ class _RootCreationRequestProjection(StrictContractModel):
     def validate_operator(self) -> Self:
         _validate_operator_identity(self.operator_identity)
         return self
+
+
+class RootCreationCommandV1(StrictContractModel):
+    """Caller-controlled identifiers for one authenticated root approval."""
+
+    schema_version: Literal["controlgraph.root-creation-command/v1"]
+    request_id: Identifier
+    idempotency_key: Identifier
 
 
 class RolloutHealthPolicyV1(StrictContractModel):
@@ -688,6 +697,7 @@ __all__ = [
     "ROLLOUT_ROOT_V2",
     "ROOT_ACTION_GRANT_V1",
     "ROOT_AUTHORITY_BOUNDS_V1",
+    "ROOT_CREATION_COMMAND_V1",
     "ROOT_CREATION_EVIDENCE_SUBJECT_V1",
     "ROOT_CREATION_RESULT_V1",
     "SIGNED_EVIDENCE_EVENT_V1",
@@ -698,6 +708,7 @@ __all__ = [
     "RolloutRootV2",
     "RootActionGrantV1",
     "RootAuthorityBoundsV1",
+    "RootCreationCommandV1",
     "RootCreationEvidenceSubjectV1",
     "RootCreationResultV1",
     "SignedEvidenceEventV1",
