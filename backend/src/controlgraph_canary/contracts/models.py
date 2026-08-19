@@ -121,6 +121,7 @@ class StableSnapshot(StrictContractModel):
     service_generation: NonNegativeSafeInteger
     provider_etag: OpaqueToken
     configuration_sha256: Sha256Digest
+    stable_revision_configuration_sha256: Sha256Digest
     captured_at: UtcSecond
     captured_by: BoundedText
 

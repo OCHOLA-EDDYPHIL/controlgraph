@@ -18,16 +18,21 @@ from controlgraph_canary.application.authority_store import (
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
 from controlgraph_canary.application.cloud_run import (
+    CLOUD_RUN_REVISION_CONFIGURATION_DOMAIN,
+    CLOUD_RUN_REVISION_CONFIGURATION_V1,
     TARGET_CONFIGURATION_DOMAIN,
     TARGET_CONFIGURATION_V1,
+    CloudRunExecutionEnvironment,
     CloudRunMutationOutcome,
     CloudRunMutationReason,
     CloudRunMutationResult,
     CloudRunReadError,
     CloudRunReadErrorCode,
+    CloudRunReadyState,
     CloudRunTargetConfiguration,
     DeclaredRevision,
     TargetConfigurationProjection,
+    cloud_run_revision_configuration_sha256,
     target_configuration_projection,
     target_configuration_sha256,
 )
@@ -77,7 +82,10 @@ from controlgraph_canary.contracts.storage import (
     ServiceClaimStatus,
     execution_receipt_logical_id,
 )
-from controlgraph_canary.integrations.google.cloud_run import CloudRunV2Adapter
+from controlgraph_canary.integrations.google.cloud_run import (
+    CloudRunV2Adapter,
+    CloudRunV2SnapshotReader,
+)
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
@@ -93,6 +101,14 @@ KEY_VERSION = (
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
 )
 NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
+REFERENCE_IMAGE = (
+    f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-images/reference-target"
+    f"@sha256:{'1' * 64}"
+)
+NETWORK_RESOURCE = f"projects/{PROJECT_ID}/global/networks/controlgraph"
+SUBNETWORK_RESOURCE = (
+    f"projects/{PROJECT_ID}/regions/us-central1/subnetworks/controlgraph"
+)
 
 
 def _async_test[**P](
@@ -128,13 +144,25 @@ def _configuration(
     candidate_revision: str = CANDIDATE,
     stable_concurrency: int = 8,
     candidate_concurrency: int = 8,
+    network_resource: str | None = None,
+    subnetwork_resource: str | None = None,
 ) -> CloudRunTargetConfiguration:
+    configured_target = target or _target()
     return CloudRunTargetConfiguration(
-        target=target or _target(),
+        target=configured_target,
         stable_revision=stable_revision,
         candidate_revision=candidate_revision,
         stable_concurrency=stable_concurrency,
         candidate_concurrency=candidate_concurrency,
+        network_resource=network_resource
+        or (
+            f"projects/{configured_target.project_id}/global/networks/controlgraph"
+        ),
+        subnetwork_resource=subnetwork_resource
+        or (
+            f"projects/{configured_target.project_id}/regions/{configured_target.region}/"
+            "subnetworks/controlgraph"
+        ),
     )
 
 
@@ -153,6 +181,7 @@ def _root(
         service_generation=7,
         provider_etag="etag-before-7",
         configuration_sha256=ZERO_DIGEST,
+        stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
         captured_by="controlgraph.operator/v1",
     )
@@ -478,6 +507,9 @@ def _service(
     template_revision: str = CANDIDATE,
     concurrency: int = 8,
     etag: str = "etag-after-8",
+    ready_state: run_v2.Condition.State = run_v2.Condition.State.CONDITION_SUCCEEDED,
+    traffic_tags: tuple[str, str] = ("stable", "candidate"),
+    status_tags: tuple[str, str] = ("stable", "candidate"),
 ) -> run_v2.Service:
     return run_v2.Service(
         name=resource_name,
@@ -486,6 +518,8 @@ def _service(
         observed_generation=8,
         etag=etag,
         reconciling=False,
+        terminal_condition=run_v2.Condition(type_="Ready", state=ready_state),
+        conditions=[run_v2.Condition(type_="Ready", state=ready_state)],
         latest_ready_revision=candidate_revision,
         latest_created_revision=candidate_revision,
         template=run_v2.RevisionTemplate(
@@ -497,13 +531,13 @@ def _service(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=stable_revision,
                 percent=stable_percent,
-                tag="stable",
+                tag=traffic_tags[0],
             ),
             run_v2.TrafficTarget(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=candidate_revision,
                 percent=candidate_percent,
-                tag="candidate",
+                tag=traffic_tags[1],
             ),
         ],
         traffic_statuses=[
@@ -511,31 +545,93 @@ def _service(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=stable_revision,
                 percent=stable_percent,
-                tag="stable",
-                uri="https://stable.example.test",
+                tag=status_tags[0],
+                uri=(
+                    "https://stable.example.test" if status_tags[0] else ""
+                ),
             ),
             run_v2.TrafficTargetStatus(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=candidate_revision,
                 percent=candidate_percent,
-                tag="candidate",
-                uri="https://candidate.example.test",
+                tag=status_tags[1],
+                uri=(
+                    "https://candidate.example.test" if status_tags[1] else ""
+                ),
             ),
         ],
         uri="https://service.example.test",
     )
 
 
-def _revision(revision: str, concurrency: int = 8) -> run_v2.Revision:
+def _revision(
+    revision: str,
+    concurrency: int = 8,
+    *,
+    ready_state: run_v2.Condition.State = run_v2.Condition.State.CONDITION_SUCCEEDED,
+    image: str = REFERENCE_IMAGE,
+    env: list[run_v2.EnvVar] | None = None,
+    volumes: list[run_v2.Volume] | None = None,
+    containers: list[run_v2.Container] | None = None,
+    service_account: str | None = None,
+    network_resource: str = NETWORK_RESOURCE,
+    subnetwork_resource: str = SUBNETWORK_RESOURCE,
+    labels: dict[str, str] | None = None,
+    annotations: dict[str, str] | None = None,
+) -> run_v2.Revision:
+    container = run_v2.Container(
+        name="reference-target",
+        image=image,
+        env=[] if env is None else env,
+        ports=[run_v2.ContainerPort(name="http1", container_port=8080)],
+        resources=run_v2.ResourceRequirements(
+            limits={"cpu": "1", "memory": "256Mi"},
+            cpu_idle=True,
+            startup_cpu_boost=False,
+        ),
+        startup_probe=run_v2.Probe(
+            initial_delay_seconds=0,
+            timeout_seconds=2,
+            period_seconds=5,
+            failure_threshold=12,
+            http_get=run_v2.HTTPGetAction(path="/healthz", port=8080),
+        ),
+        liveness_probe=run_v2.Probe(
+            initial_delay_seconds=5,
+            timeout_seconds=2,
+            period_seconds=10,
+            failure_threshold=3,
+            http_get=run_v2.HTTPGetAction(path="/healthz", port=8080),
+        ),
+    )
     return run_v2.Revision(
         name=f"{SERVICE_RESOURCE}/revisions/{revision}",
         service=SERVICE_RESOURCE,
         uid=f"synthetic-{revision}-uid",
+        labels={} if labels is None else labels,
+        annotations={} if annotations is None else annotations,
         etag=f"etag-{revision}",
         generation=1,
         observed_generation=1,
         reconciling=False,
+        conditions=[run_v2.Condition(type_="Ready", state=ready_state)],
         max_instance_request_concurrency=concurrency,
+        service_account=service_account
+        or f"controlgraph-reference@{PROJECT_ID}.iam.gserviceaccount.com",
+        execution_environment=run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN2,
+        timeout="5s",
+        scaling=run_v2.RevisionScaling(min_instance_count=0, max_instance_count=1),
+        containers=[container] if containers is None else containers,
+        volumes=[] if volumes is None else volumes,
+        vpc_access=run_v2.VpcAccess(
+            egress=run_v2.VpcAccess.VpcEgress.ALL_TRAFFIC,
+            network_interfaces=[
+                run_v2.VpcAccess.NetworkInterface(
+                    network=network_resource,
+                    subnetwork=subnetwork_resource,
+                )
+            ],
+        ),
     )
 
 
@@ -549,6 +645,22 @@ def _adapter(
     revision_client = revisions or _FakeRevisionsClient()
     return CloudRunV2Adapter(
         configuration=configuration or _configuration(),
+        service_role=role,
+        configured_project_id=PROJECT_ID,
+        services_client_factory=lambda: services,
+        revisions_client_factory=lambda: revision_client,
+    )
+
+
+def _snapshot_reader(
+    services: _FakeServicesClient,
+    *,
+    revisions: _FakeRevisionsClient | None = None,
+    role: ServiceRole = ServiceRole.VERIFIER,
+) -> CloudRunV2SnapshotReader:
+    revision_client = revisions or _FakeRevisionsClient()
+    return CloudRunV2SnapshotReader(
+        configuration=_configuration(),
         service_role=role,
         configured_project_id=PROJECT_ID,
         services_client_factory=lambda: services,
@@ -643,6 +755,7 @@ async def test_exact_service_and_revision_reads_use_only_fixed_resources() -> No
     assert target.service.etag == "etag-after-8"
     assert target.service.generation == 8
     assert target.service.observed_generation == 8
+    assert target.service.ready_state is CloudRunReadyState.READY
     assert [(item.revision, item.percent) for item in target.service.traffic] == [
         (STABLE, 90),
         (CANDIDATE, 10),
@@ -651,14 +764,79 @@ async def test_exact_service_and_revision_reads_use_only_fixed_resources() -> No
     assert target.candidate_revision.revision == CANDIDATE
     assert target.stable_revision.concurrency == 8
     assert target.candidate_revision.concurrency == 8
+    assert target.stable_revision.ready_state is CloudRunReadyState.READY
+    assert target.stable_revision.configuration.image == REFERENCE_IMAGE
+    assert (
+        target.stable_revision.configuration.execution_environment
+        is CloudRunExecutionEnvironment.GEN2
+    )
+    assert (
+        CLOUD_RUN_REVISION_CONFIGURATION_V1
+        == "controlgraph.cloud-run-revision-configuration/v1"
+    )
+    assert CLOUD_RUN_REVISION_CONFIGURATION_DOMAIN == (
+        b"controlgraph.cloud-run-revision-configuration-sha256/v1\0"
+    )
     assert [(call[0].name, call[1]) for call in services.get_calls] == [(SERVICE_RESOURCE, None)]
     assert {call[0].name for call in revisions.calls} == {
         f"{SERVICE_RESOURCE}/revisions/{STABLE}",
         f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     }
-    with pytest.raises(TypeError, match="declared revision selector"):
-        await adapter.read_revision("stable")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="configured service"):
+        await adapter.read_revision("stable")
     assert len(revisions.calls) == 2
+
+
+@_async_test
+async def test_verifier_snapshot_reader_has_only_exact_read_operations() -> None:
+    services = _FakeServicesClient(service=_service(100, 0))
+    revisions = _FakeRevisionsClient()
+    reader = _snapshot_reader(services, revisions=revisions)
+
+    service = await reader.read_service()
+    revision = await reader.read_revision(STABLE)
+
+    assert reader.service_role is ServiceRole.VERIFIER
+    assert reader.reader_identity == (
+        f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
+    )
+    assert service.target == _target()
+    assert revision.revision == STABLE
+    assert services.update_calls == []
+    public_callables = {
+        name
+        for name in dir(reader)
+        if not name.startswith("_") and callable(getattr(reader, name))
+    }
+    assert public_callables == {"read_revision", "read_service"}
+    assert not hasattr(reader, "mutate")
+    assert not hasattr(reader, "read_target")
+
+
+@_async_test
+async def test_snapshot_reader_gets_the_exact_positive_traffic_revision() -> None:
+    traffic_revision = f"{SERVICE}-retained-v0"
+    services = _FakeServicesClient(
+        service=_service(100, 0, stable_revision=traffic_revision)
+    )
+    revisions = _FakeRevisionsClient()
+    resource = f"{SERVICE_RESOURCE}/revisions/{traffic_revision}"
+    revisions.responses[resource] = _revision(traffic_revision)
+    reader = _snapshot_reader(services, revisions=revisions)
+
+    service = await reader.read_service()
+    positive = next(allocation for allocation in service.traffic if allocation.percent > 0)
+    revision = await reader.read_revision(positive.revision)
+
+    assert positive.revision == traffic_revision
+    assert revision.revision == traffic_revision
+    assert [call[0].name for call in revisions.calls] == [resource]
+
+
+@pytest.mark.parametrize("role", [ServiceRole.EXECUTOR, ServiceRole.RECOVERY])
+def test_snapshot_reader_rejects_mutation_roles(role: ServiceRole) -> None:
+    with pytest.raises(ValueError, match="verifier role"):
+        _snapshot_reader(_FakeServicesClient(), role=role)
 
 
 @_async_test
@@ -687,21 +865,178 @@ async def test_read_failures_are_sanitized_and_corrupt_state_is_rejected() -> No
 
 
 @pytest.mark.parametrize(
-    "service",
+    ("ready_state", "expected"),
     [
-        _service(candidate_revision=f"{SERVICE}-undeclared-v1"),
-        _service(concurrency=9),
-        _service(stable_percent=80, candidate_percent=10),
+        (run_v2.Condition.State.CONDITION_PENDING, CloudRunReadyState.NOT_READY),
+        (run_v2.Condition.State.CONDITION_RECONCILING, CloudRunReadyState.NOT_READY),
+        (run_v2.Condition.State.CONDITION_FAILED, CloudRunReadyState.FAILED),
     ],
 )
 @_async_test
-async def test_read_rejects_undeclared_revision_concurrency_and_traffic(
+async def test_revision_read_decodes_authoritative_ready_condition(
+    ready_state: run_v2.Condition.State,
+    expected: CloudRunReadyState,
+) -> None:
+    revisions = _FakeRevisionsClient()
+    revisions.responses[f"{SERVICE_RESOURCE}/revisions/{STABLE}"] = _revision(
+        STABLE,
+        ready_state=ready_state,
+    )
+
+    state = await _adapter(_FakeServicesClient(), revisions=revisions).read_revision(STABLE)
+
+    assert state.ready_state is expected
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        _revision(STABLE, ready_state=run_v2.Condition.State.STATE_UNSPECIFIED),
+        _revision(STABLE, image="example.test/reference-target:latest"),
+        _revision(STABLE, env=[run_v2.EnvVar(name="PLAIN", value="unsupported")]),
+        _revision(
+            STABLE,
+            env=[
+                run_v2.EnvVar(
+                    name="SECRET",
+                    value_source=run_v2.EnvVarSource(
+                        secret_key_ref=run_v2.SecretKeySelector(
+                            secret="synthetic-secret",
+                            version="1",
+                        )
+                    ),
+                )
+            ],
+        ),
+        _revision(STABLE, volumes=[run_v2.Volume(name="unsupported-volume")]),
+        _revision(
+            STABLE,
+            containers=[
+                run_v2.Container(name="first", image=REFERENCE_IMAGE),
+                run_v2.Container(name="second", image=REFERENCE_IMAGE),
+            ],
+        ),
+        _revision(
+            STABLE,
+            service_account=(
+                f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
+            ),
+        ),
+        _revision(
+            STABLE,
+            network_resource=(
+                "projects/controlgraph-canary-b2c3d4/global/networks/controlgraph"
+            ),
+        ),
+        _revision(
+            STABLE,
+            subnetwork_resource=(
+                "projects/controlgraph-canary-b2c3d4/regions/us-central1/"
+                "subnetworks/controlgraph"
+            ),
+        ),
+    ],
+)
+@_async_test
+async def test_revision_read_rejects_unknown_readiness_or_unsupported_configuration(
+    revision: run_v2.Revision,
+) -> None:
+    revisions = _FakeRevisionsClient()
+    revisions.responses[f"{SERVICE_RESOURCE}/revisions/{STABLE}"] = revision
+
+    with pytest.raises(CloudRunReadError) as failure:
+        await _adapter(_FakeServicesClient(), revisions=revisions).read_revision(STABLE)
+
+    assert failure.value.code is CloudRunReadErrorCode.CORRUPT_RESPONSE
+
+
+@_async_test
+async def test_revision_configuration_digest_excludes_provider_display_metadata() -> None:
+    first_revisions = _FakeRevisionsClient()
+    second_revisions = _FakeRevisionsClient()
+    first_provider_revision = _revision(
+        STABLE,
+        labels={"display": "first"},
+        annotations={"display.example/annotation": "first"},
+    )
+    first_provider_revision.create_time = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    first_provider_revision.update_time = datetime(2026, 8, 19, 12, 1, tzinfo=UTC)
+    first_provider_revision.log_uri = "https://console.example.test/first"
+    first_provider_revision.creator = "first@example.test"
+    second_provider_revision = _revision(
+        STABLE,
+        labels={"display": "second"},
+        annotations={"display.example/annotation": "second"},
+    )
+    second_provider_revision.create_time = datetime(2026, 8, 19, 13, 0, tzinfo=UTC)
+    second_provider_revision.update_time = datetime(2026, 8, 19, 13, 1, tzinfo=UTC)
+    second_provider_revision.log_uri = "https://console.example.test/second"
+    second_provider_revision.creator = "second@example.test"
+    first_revisions.responses[
+        f"{SERVICE_RESOURCE}/revisions/{STABLE}"
+    ] = first_provider_revision
+    second_revisions.responses[
+        f"{SERVICE_RESOURCE}/revisions/{STABLE}"
+    ] = second_provider_revision
+
+    first = await _adapter(
+        _FakeServicesClient(), revisions=first_revisions
+    ).read_revision(STABLE)
+    second = await _adapter(
+        _FakeServicesClient(), revisions=second_revisions
+    ).read_revision(STABLE)
+
+    assert first.configuration == second.configuration
+    assert cloud_run_revision_configuration_sha256(first.configuration) == (
+        cloud_run_revision_configuration_sha256(second.configuration)
+    )
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        _service(candidate_revision="unrelated-service-candidate-v1"),
+        _service(stable_percent=80, candidate_percent=10),
+        _service(ready_state=run_v2.Condition.State.STATE_UNSPECIFIED),
+    ],
+)
+@_async_test
+async def test_read_rejects_unbound_traffic_or_unknown_readiness(
     service: run_v2.Service,
 ) -> None:
     adapter = _adapter(_FakeServicesClient(service=service))
     with pytest.raises(CloudRunReadError) as error:
         await adapter.read_service()
     assert error.value.code is CloudRunReadErrorCode.CORRUPT_RESPONSE
+
+
+@_async_test
+async def test_service_read_ignores_display_aliases_and_decodes_not_ready_states() -> None:
+    services = _FakeServicesClient(
+        service=_service(
+            candidate_revision=f"{SERVICE}-new-display-v2",
+            template_revision=f"{SERVICE}-template-display-v3",
+            concurrency=99,
+            traffic_tags=("", "renamed"),
+            status_tags=("different", ""),
+            ready_state=run_v2.Condition.State.CONDITION_FAILED,
+        )
+    )
+
+    state = await _adapter(services).read_service()
+
+    assert state.ready_state is CloudRunReadyState.FAILED
+    assert state.template_concurrency == 99
+    assert {allocation.revision: allocation.tag for allocation in state.traffic} == {
+        STABLE: None,
+        f"{SERVICE}-new-display-v2": "renamed",
+    }
+    assert {
+        allocation.revision: allocation.tag for allocation in state.traffic_statuses
+    } == {
+        STABLE: "different",
+        f"{SERVICE}-new-display-v2": None,
+    }
 
 
 @pytest.mark.parametrize(

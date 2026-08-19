@@ -10,14 +10,21 @@ from typing import Any
 import pytest
 
 from controlgraph_canary.application.cloud_run import (
+    CloudRunExecutionEnvironment,
+    CloudRunHttpProbe,
+    CloudRunNetworkInterface,
     CloudRunReadError,
     CloudRunReadErrorCode,
+    CloudRunReadyState,
+    CloudRunRevisionConfiguration,
     CloudRunRevisionState,
     CloudRunServiceState,
     CloudRunTrafficAllocation,
     CloudRunTrafficStatus,
-    DeclaredRevision,
+    CloudRunVpcEgress,
+    cloud_run_revision_configuration_sha256,
 )
+from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.application.stable_snapshot import (
     MAX_STABLE_CAPTURE_ATTEMPTS,
     STABLE_CONFIGURATION_DOMAIN,
@@ -38,6 +45,10 @@ CANDIDATE = f"{SERVICE}-candidate-v1"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 READER_IDENTITY = f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+IMAGE = (
+    f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-images/reference-target"
+    f"@sha256:{'1' * 64}"
+)
 
 
 def _async_test[**P](
@@ -62,6 +73,60 @@ def _target(**changes: str) -> TargetBinding:
     return TargetBinding(**values)  # type: ignore[arg-type]
 
 
+def _revision_configuration(**changes: object) -> CloudRunRevisionConfiguration:
+    values: dict[str, object] = {
+        "image": IMAGE,
+        "service_account": (
+            f"controlgraph-reference@{PROJECT_ID}.iam.gserviceaccount.com"
+        ),
+        "execution_environment": CloudRunExecutionEnvironment.GEN2,
+        "timeout_seconds": 5,
+        "concurrency": 8,
+        "min_instance_count": 0,
+        "max_instance_count": 1,
+        "container_name": "reference-target",
+        "command": (),
+        "args": (),
+        "working_dir": None,
+        "port_name": "http1",
+        "container_port": 8080,
+        "cpu_limit": "1",
+        "memory_limit": "256Mi",
+        "cpu_idle": True,
+        "startup_cpu_boost": False,
+        "startup_probe": CloudRunHttpProbe(
+            path="/healthz",
+            port=8080,
+            initial_delay_seconds=0,
+            timeout_seconds=2,
+            period_seconds=5,
+            failure_threshold=12,
+        ),
+        "liveness_probe": CloudRunHttpProbe(
+            path="/healthz",
+            port=8080,
+            initial_delay_seconds=5,
+            timeout_seconds=2,
+            period_seconds=10,
+            failure_threshold=3,
+        ),
+        "vpc_connector": None,
+        "vpc_egress": CloudRunVpcEgress.ALL_TRAFFIC,
+        "network_interfaces": (
+            CloudRunNetworkInterface(
+                network="projects/controlgraph-canary-a1b2c3/global/networks/controlgraph",
+                subnetwork=(
+                    "projects/controlgraph-canary-a1b2c3/regions/us-central1/"
+                    "subnetworks/controlgraph"
+                ),
+                tags=(),
+            ),
+        ),
+    }
+    values.update(changes)
+    return CloudRunRevisionConfiguration(**values)  # type: ignore[arg-type]
+
+
 def _service(
     *,
     target: TargetBinding | None = None,
@@ -70,10 +135,11 @@ def _service(
     etag: str | None = None,
     uid: str = "service-uid-001",
     reconciling: bool = False,
+    ready_state: CloudRunReadyState = CloudRunReadyState.READY,
     traffic: tuple[tuple[str, int], ...] = ((STABLE, 100),),
     status_traffic: tuple[tuple[str, int], ...] | None = None,
-    tags: tuple[str, ...] | None = None,
-    status_tags: tuple[str, ...] | None = None,
+    tags: tuple[str | None, ...] | None = None,
+    status_tags: tuple[str | None, ...] | None = None,
     latest_ready_revision: str = CANDIDATE,
     latest_created_revision: str = CANDIDATE,
     template_revision: str = CANDIDATE,
@@ -81,8 +147,12 @@ def _service(
 ) -> CloudRunServiceState:
     selected_target = target or _target()
     selected_status = traffic if status_traffic is None else status_traffic
-    selected_tags = tags or tuple(f"route-{index}" for index in range(len(traffic)))
-    selected_status_tags = status_tags or selected_tags
+    selected_tags = (
+        tuple(f"route-{index}" for index in range(len(traffic)))
+        if tags is None
+        else tags
+    )
+    selected_status_tags = selected_tags if status_tags is None else status_tags
     return CloudRunServiceState(
         target=selected_target,
         resource_name=(
@@ -96,6 +166,7 @@ def _service(
             generation if observed_generation is None else observed_generation
         ),
         reconciling=reconciling,
+        ready_state=ready_state,
         latest_ready_revision=latest_ready_revision,
         latest_created_revision=latest_created_revision,
         template_revision=template_revision,
@@ -109,7 +180,7 @@ def _service(
                 revision=revision,
                 percent=percent,
                 tag=tag,
-                uri=f"https://{tag}.example.test",
+                uri=None if tag is None else f"https://{tag}.example.test",
             )
             for (revision, percent), tag in zip(
                 selected_status,
@@ -130,9 +201,18 @@ def _revision(
     etag: str = "stable-revision-etag-1",
     uid: str = "stable-revision-uid-001",
     reconciling: bool = False,
+    ready_state: CloudRunReadyState = CloudRunReadyState.READY,
     concurrency: int = 8,
+    configuration: CloudRunRevisionConfiguration | None = None,
 ) -> CloudRunRevisionState:
     selected_target = target or _target()
+    selected_configuration = configuration or _revision_configuration(
+        image=IMAGE.replace(PROJECT_ID, selected_target.project_id),
+        service_account=(
+            f"controlgraph-reference@{selected_target.project_id}.iam.gserviceaccount.com"
+        ),
+        concurrency=concurrency,
+    )
     service_resource = (
         f"projects/{selected_target.project_id}/locations/{selected_target.region}/services/"
         f"{selected_target.service_name}"
@@ -149,7 +229,9 @@ def _revision(
             generation if observed_generation is None else observed_generation
         ),
         reconciling=reconciling,
+        ready_state=ready_state,
         concurrency=concurrency,
+        configuration=selected_configuration,
     )
 
 
@@ -160,8 +242,10 @@ class _FakeReader:
         revisions: list[object],
         *,
         target: TargetBinding | None = None,
+        service_role: ServiceRole = ServiceRole.VERIFIER,
     ) -> None:
         self._target = target or _target()
+        self._service_role = service_role
         self.services = list(services)
         self.revisions = list(revisions)
         self.calls: list[str] = []
@@ -171,6 +255,14 @@ class _FakeReader:
     def target(self) -> TargetBinding:
         return self._target
 
+    @property
+    def service_role(self) -> ServiceRole:
+        return self._service_role
+
+    @property
+    def reader_identity(self) -> str:
+        return f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
+
     async def read_service(self) -> CloudRunServiceState:
         self.calls.append("service")
         value = self.services.pop(0)
@@ -178,8 +270,8 @@ class _FakeReader:
             raise value
         return value  # type: ignore[return-value]
 
-    async def read_revision(self, declared: DeclaredRevision) -> CloudRunRevisionState:
-        self.calls.append(f"revision:{declared.value}")
+    async def read_revision(self, revision_name: str) -> CloudRunRevisionState:
+        self.calls.append(f"revision:{revision_name}")
         value = self.revisions.pop(0)
         if isinstance(value, BaseException):
             raise value
@@ -210,14 +302,14 @@ def _capturer(
 @_async_test
 async def test_capture_uses_two_matching_reads_and_ignores_mutable_aliases() -> None:
     first = _service(
-        tags=("old-stable-alias",),
+        tags=(None,),
         status_tags=("old-stable-alias",),
         latest_ready_revision=CANDIDATE,
         template_revision=CANDIDATE,
     )
     second = _service(
         tags=("new-stable-alias",),
-        status_tags=("new-stable-alias",),
+        status_tags=(None,),
         latest_ready_revision=STABLE,
         latest_created_revision=STABLE,
         template_revision=STABLE,
@@ -234,11 +326,36 @@ async def test_capture_uses_two_matching_reads_and_ignores_mutable_aliases() -> 
     assert snapshot.service_generation == 7
     assert snapshot.provider_etag == "service-etag-7"
     assert snapshot.configuration_sha256 == (
-        "e1061a02863f17c7261b0467cb2f02ece28689b673998ba48ac816c4174335e9"
+        "1bc47ea73f678cdccc22dbab383ba3e7820944ab9b421b42b355c085db444847"
+    )
+    assert snapshot.stable_revision_configuration_sha256 == (
+        cloud_run_revision_configuration_sha256(_revision_configuration())
     )
     assert snapshot.captured_at == "2026-08-19T12:00:00Z"
     assert snapshot.captured_by == READER_IDENTITY
-    assert reader.calls == ["service", "revision:STABLE", "service"]
+    assert reader.calls == ["service", f"revision:{STABLE}", "service"]
+    assert reader.mutation_calls == 0
+
+
+@_async_test
+async def test_capture_reads_the_single_positive_revision_name_not_a_declared_alias() -> None:
+    service = _service(traffic=((CANDIDATE, 100),), template_revision=STABLE)
+    reader = _FakeReader(
+        [service, service],
+        [
+            _revision(
+                revision=CANDIDATE,
+                etag="candidate-revision-etag-1",
+                uid="candidate-revision-uid-001",
+            )
+        ],
+    )
+
+    snapshot = await _capturer(reader).capture()
+
+    assert snapshot.stable_revision == CANDIDATE
+    assert snapshot.traffic == (TrafficAllocation(revision=CANDIDATE, percent=100),)
+    assert reader.calls == ["service", f"revision:{CANDIDATE}", "service"]
     assert reader.mutation_calls == 0
 
 
@@ -257,7 +374,7 @@ async def test_capture_preserves_optional_zero_percent_candidate() -> None:
         TrafficAllocation(revision=CANDIDATE, percent=0),
     )
     assert snapshot.configuration_sha256 != (
-        "e1061a02863f17c7261b0467cb2f02ece28689b673998ba48ac816c4174335e9"
+        "1bc47ea73f678cdccc22dbab383ba3e7820944ab9b421b42b355c085db444847"
     )
     assert reader.mutation_calls == 0
 
@@ -277,10 +394,10 @@ async def test_generation_change_restarts_the_complete_capture() -> None:
     assert snapshot.provider_etag == "service-etag-8"
     assert reader.calls == [
         "service",
-        "revision:STABLE",
+        f"revision:{STABLE}",
         "service",
         "service",
-        "revision:STABLE",
+        f"revision:{STABLE}",
         "service",
     ]
     assert reader.mutation_calls == 0
@@ -311,10 +428,10 @@ async def test_any_source_version_or_baseline_change_restarts_capture(
     assert snapshot.provider_etag == stable.etag
     assert reader.calls == [
         "service",
-        "revision:STABLE",
+        f"revision:{STABLE}",
         "service",
         "service",
-        "revision:STABLE",
+        f"revision:{STABLE}",
         "service",
     ]
     assert reader.mutation_calls == 0
@@ -339,7 +456,7 @@ async def test_source_change_restarts_are_bounded_without_mutation() -> None:
 
     assert failure.value.reason is StableCaptureReason.SOURCE_CHANGED
     assert reader.calls.count("service") == MAX_STABLE_CAPTURE_ATTEMPTS * 2
-    assert reader.calls.count("revision:STABLE") == MAX_STABLE_CAPTURE_ATTEMPTS
+    assert reader.calls.count(f"revision:{STABLE}") == MAX_STABLE_CAPTURE_ATTEMPTS
     assert reader.mutation_calls == 0
 
 
@@ -424,6 +541,14 @@ async def test_revision_read_failures_have_closed_sanitized_reasons(
             StableCaptureReason.SERVICE_NOT_READY,
         ),
         (
+            _service(ready_state=CloudRunReadyState.NOT_READY),
+            StableCaptureReason.SERVICE_NOT_READY,
+        ),
+        (
+            _service(ready_state=CloudRunReadyState.FAILED),
+            StableCaptureReason.SERVICE_NOT_READY,
+        ),
+        (
             _service(
                 traffic=((STABLE, 100), (CANDIDATE, 0)),
                 status_traffic=((STABLE, 0), (CANDIDATE, 100)),
@@ -474,6 +599,14 @@ async def test_ineligible_service_baselines_are_rejected(
             _revision(generation=2, observed_generation=1),
             StableCaptureReason.REVISION_NOT_READY,
         ),
+        (
+            _revision(ready_state=CloudRunReadyState.NOT_READY),
+            StableCaptureReason.REVISION_NOT_READY,
+        ),
+        (
+            _revision(ready_state=CloudRunReadyState.FAILED),
+            StableCaptureReason.REVISION_NOT_READY,
+        ),
     ],
 )
 @_async_test
@@ -514,7 +647,7 @@ async def test_second_read_target_substitution_is_not_retried() -> None:
         await _capturer(reader).capture()
 
     assert failure.value.reason is StableCaptureReason.TARGET_MISMATCH
-    assert reader.calls == ["service", "revision:STABLE", "service"]
+    assert reader.calls == ["service", f"revision:{STABLE}", "service"]
 
 
 @_async_test
@@ -542,7 +675,26 @@ def test_configuration_digest_binds_immutable_revision_and_serving_state() -> No
             replace(revision, generation=2, observed_generation=2),
             traffic,
         ),
-        (service, replace(revision, concurrency=9), traffic),
+        (
+            service,
+            replace(
+                revision,
+                concurrency=9,
+                configuration=replace(revision.configuration, concurrency=9),
+            ),
+            traffic,
+        ),
+        (
+            service,
+            replace(
+                revision,
+                configuration=replace(
+                    revision.configuration,
+                    image=revision.configuration.image.replace("1" * 64, "2" * 64),
+                ),
+            ),
+            traffic,
+        ),
         (
             _service(traffic=((STABLE, 100), (CANDIDATE, 0))),
             revision,
@@ -555,11 +707,172 @@ def test_configuration_digest_binds_immutable_revision_and_serving_state() -> No
 
     assert STABLE_CONFIGURATION_V1 == "controlgraph.stable-configuration/v1"
     assert STABLE_CONFIGURATION_DOMAIN == b"controlgraph.stable-configuration-sha256/v1\0"
-    assert baseline == "e1061a02863f17c7261b0467cb2f02ece28689b673998ba48ac816c4174335e9"
+    assert baseline == "1bc47ea73f678cdccc22dbab383ba3e7820944ab9b421b42b355c085db444847"
     assert all(
         stable_configuration_sha256(changed_service, changed_revision, changed_traffic)
         != baseline
         for changed_service, changed_revision, changed_traffic in changes
+    )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        _revision_configuration(image=IMAGE.replace("1" * 64, "2" * 64)),
+        _revision_configuration(
+            service_account=(
+                "controlgraph-reference@controlgraph-canary-b2c3d4.iam.gserviceaccount.com"
+            )
+        ),
+        _revision_configuration(execution_environment=CloudRunExecutionEnvironment.GEN1),
+        _revision_configuration(timeout_seconds=6),
+        _revision_configuration(concurrency=9),
+        _revision_configuration(min_instance_count=1),
+        _revision_configuration(max_instance_count=2),
+        _revision_configuration(container_name="reference-target-v2"),
+        _revision_configuration(command=("/app/reference-target",)),
+        _revision_configuration(args=("--synthetic",)),
+        _revision_configuration(working_dir="/app"),
+        _revision_configuration(port_name="http2"),
+        _revision_configuration(
+            container_port=8081,
+            startup_probe=CloudRunHttpProbe(
+                path="/healthz",
+                port=8081,
+                initial_delay_seconds=0,
+                timeout_seconds=2,
+                period_seconds=5,
+                failure_threshold=12,
+            ),
+            liveness_probe=CloudRunHttpProbe(
+                path="/healthz",
+                port=8081,
+                initial_delay_seconds=5,
+                timeout_seconds=2,
+                period_seconds=10,
+                failure_threshold=3,
+            ),
+        ),
+        _revision_configuration(cpu_limit="2"),
+        _revision_configuration(memory_limit="512Mi"),
+        _revision_configuration(cpu_idle=False),
+        _revision_configuration(startup_cpu_boost=True),
+        _revision_configuration(
+            startup_probe=CloudRunHttpProbe(
+                path="/ready",
+                port=8080,
+                initial_delay_seconds=0,
+                timeout_seconds=2,
+                period_seconds=5,
+                failure_threshold=12,
+            )
+        ),
+        _revision_configuration(
+            startup_probe=replace(
+                _revision_configuration().startup_probe,
+                initial_delay_seconds=1,
+            )
+        ),
+        _revision_configuration(
+            startup_probe=replace(
+                _revision_configuration().startup_probe,
+                timeout_seconds=3,
+            )
+        ),
+        _revision_configuration(
+            startup_probe=replace(
+                _revision_configuration().startup_probe,
+                period_seconds=6,
+            )
+        ),
+        _revision_configuration(
+            startup_probe=replace(
+                _revision_configuration().startup_probe,
+                failure_threshold=13,
+            )
+        ),
+        _revision_configuration(
+            liveness_probe=CloudRunHttpProbe(
+                path="/live",
+                port=8080,
+                initial_delay_seconds=5,
+                timeout_seconds=2,
+                period_seconds=10,
+                failure_threshold=3,
+            )
+        ),
+        _revision_configuration(
+            liveness_probe=replace(
+                _revision_configuration().liveness_probe,
+                initial_delay_seconds=6,
+            )
+        ),
+        _revision_configuration(
+            liveness_probe=replace(
+                _revision_configuration().liveness_probe,
+                timeout_seconds=3,
+            )
+        ),
+        _revision_configuration(
+            liveness_probe=replace(
+                _revision_configuration().liveness_probe,
+                period_seconds=11,
+            )
+        ),
+        _revision_configuration(
+            liveness_probe=replace(
+                _revision_configuration().liveness_probe,
+                failure_threshold=4,
+            )
+        ),
+        _revision_configuration(
+            vpc_connector=(
+                "projects/controlgraph-canary-a1b2c3/locations/us-central1/"
+                "connectors/controlgraph"
+            ),
+            network_interfaces=(),
+        ),
+        _revision_configuration(vpc_egress=CloudRunVpcEgress.PRIVATE_RANGES_ONLY),
+        _revision_configuration(
+            network_interfaces=(
+                CloudRunNetworkInterface(
+                    network="projects/controlgraph-canary-a1b2c3/global/networks/other",
+                    subnetwork=(
+                        "projects/controlgraph-canary-a1b2c3/regions/us-central1/"
+                        "subnetworks/controlgraph"
+                    ),
+                    tags=(),
+                ),
+            )
+        ),
+        _revision_configuration(
+            network_interfaces=(
+                replace(
+                    _revision_configuration().network_interfaces[0],
+                    subnetwork=(
+                        "projects/controlgraph-canary-a1b2c3/regions/us-central1/"
+                        "subnetworks/other"
+                    ),
+                ),
+            )
+        ),
+        _revision_configuration(
+            network_interfaces=(
+                replace(
+                    _revision_configuration().network_interfaces[0],
+                    tags=("egress",),
+                ),
+            )
+        ),
+    ],
+)
+def test_immutable_revision_configuration_digest_binds_every_admitted_field(
+    changed: CloudRunRevisionConfiguration,
+) -> None:
+    baseline = _revision_configuration()
+
+    assert cloud_run_revision_configuration_sha256(changed) != (
+        cloud_run_revision_configuration_sha256(baseline)
     )
 
 
@@ -642,6 +955,14 @@ def test_capturer_requires_reader_bound_to_the_same_target() -> None:
         _capturer(reader)
 
 
+@pytest.mark.parametrize("role", [ServiceRole.EXECUTOR, ServiceRole.RECOVERY])
+def test_capturer_rejects_mutation_capable_reader_roles(role: ServiceRole) -> None:
+    reader = _FakeReader([], [], service_role=role)
+
+    with pytest.raises(ValueError, match="configured target"):
+        _capturer(reader)
+
+
 @_async_test
 async def test_invalid_clock_is_rejected_after_matching_reads() -> None:
     service = _service()
@@ -653,7 +974,7 @@ async def test_invalid_clock_is_rejected_after_matching_reads() -> None:
             clock=lambda: NOW.replace(microsecond=1),
         ).capture()
 
-    assert reader.calls == ["service", "revision:STABLE", "service"]
+    assert reader.calls == ["service", f"revision:{STABLE}", "service"]
     assert reader.mutation_calls == 0
 
 

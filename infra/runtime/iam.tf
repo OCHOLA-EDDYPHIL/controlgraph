@@ -95,3 +95,23 @@ resource "google_cloud_run_v2_service_iam_member" "invoker" {
   role     = "roles/run.invoker"
   member   = each.value.member
 }
+
+resource "google_cloud_run_v2_service_iam_member" "verifier_target_snapshot" {
+  project  = var.project_id
+  location = var.region
+  name     = module.reference_target.target.name
+  role     = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_snapshot_reader
+  member   = "serviceAccount:${local.service_accounts.verifier}"
+}
+
+check "verifier_snapshot_reader_is_service_scoped" {
+  assert {
+    condition = (
+      google_cloud_run_v2_service_iam_member.verifier_target_snapshot.project == var.project_id &&
+      google_cloud_run_v2_service_iam_member.verifier_target_snapshot.location == var.region &&
+      google_cloud_run_v2_service_iam_member.verifier_target_snapshot.name == module.reference_target.target.name &&
+      google_cloud_run_v2_service_iam_member.verifier_target_snapshot.member == "serviceAccount:${local.service_accounts.verifier}"
+    )
+    error_message = "The verifier snapshot role must remain bound only on the fixed reference service."
+  }
+}

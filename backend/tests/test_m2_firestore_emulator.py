@@ -69,6 +69,7 @@ def _initial_records(
         service_generation=12,
         provider_etag="etag-stable-12",
         configuration_sha256=ZERO_DIGEST,
+        stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
         captured_by="controlgraph.operator/v1",
     )

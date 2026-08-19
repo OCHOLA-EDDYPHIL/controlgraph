@@ -14,10 +14,12 @@ from typing import Final, Protocol, runtime_checkable
 from controlgraph_canary.application.cloud_run import (
     CloudRunReadError,
     CloudRunReadErrorCode,
+    CloudRunReadyState,
     CloudRunRevisionState,
     CloudRunServiceState,
-    DeclaredRevision,
+    cloud_run_revision_configuration_sha256,
 )
+from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.contracts.codec import RestrictedJson, canonical_json_value_bytes
 from controlgraph_canary.contracts.models import (
     STABLE_SNAPSHOT_V1,
@@ -71,9 +73,15 @@ class StableSnapshotReader(Protocol):
     @property
     def target(self) -> TargetBinding: ...
 
+    @property
+    def service_role(self) -> ServiceRole: ...
+
+    @property
+    def reader_identity(self) -> str: ...
+
     async def read_service(self) -> CloudRunServiceState: ...
 
-    async def read_revision(self, declared: DeclaredRevision) -> CloudRunRevisionState: ...
+    async def read_revision(self, revision_name: str) -> CloudRunRevisionState: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +126,12 @@ def stable_configuration_sha256(
     projected_traffic = {(allocation.revision, allocation.percent) for allocation in traffic}
     if (
         service.target != revision.target
+        or service.reconciling
+        or service.observed_generation != service.generation
+        or service.ready_state is not CloudRunReadyState.READY
+        or revision.reconciling
+        or revision.observed_generation != revision.generation
+        or revision.ready_state is not CloudRunReadyState.READY
         or not traffic
         or len(traffic) > 2
         or any(type(item) is not TrafficAllocation for item in traffic)
@@ -145,6 +159,9 @@ def stable_configuration_sha256(
         "stable_revision": revision.revision,
         "stable_revision_etag": revision.etag,
         "stable_revision_generation": revision.generation,
+        "stable_revision_configuration_sha256": (
+            cloud_run_revision_configuration_sha256(revision.configuration)
+        ),
         "stable_revision_uid": revision.uid,
         "target": service.target.model_dump(mode="json"),
         "traffic": traffic_value,
@@ -168,6 +185,8 @@ class StableSnapshotCapturer:
             raise TypeError("an exact stable-capture configuration is required")
         try:
             reader_target = reader.target
+            reader_role = reader.service_role
+            reader_identity = reader.reader_identity
             read_service = reader.read_service
             read_revision = reader.read_revision
         except Exception:
@@ -175,6 +194,8 @@ class StableSnapshotCapturer:
         if (
             type(reader_target) is not TargetBinding
             or reader_target != configuration.target
+            or reader_role is not ServiceRole.VERIFIER
+            or reader_identity != configuration.reader_identity
             or not callable(read_service)
             or not callable(read_revision)
         ):
@@ -203,7 +224,7 @@ class StableSnapshotCapturer:
     async def _capture_once(self) -> StableSnapshot:
         first = await self._read_service()
         first_traffic = self._stable_traffic(first)
-        stable_revision = await self._read_stable_revision()
+        stable_revision = await self._read_stable_revision(first_traffic[0].revision)
         if stable_revision.target != self.target:
             raise StableCaptureError(StableCaptureReason.TARGET_MISMATCH)
         if stable_revision.revision != first_traffic[0].revision:
@@ -211,6 +232,7 @@ class StableSnapshotCapturer:
         if (
             stable_revision.reconciling
             or stable_revision.observed_generation != stable_revision.generation
+            or stable_revision.ready_state is not CloudRunReadyState.READY
         ):
             raise StableCaptureError(StableCaptureReason.REVISION_NOT_READY)
 
@@ -233,6 +255,9 @@ class StableSnapshotCapturer:
             raise _SourceChanged
 
         captured_at = _utc_second(self._clock())
+        revision_configuration_sha256 = cloud_run_revision_configuration_sha256(
+            stable_revision.configuration
+        )
         configuration_sha256 = stable_configuration_sha256(
             second,
             stable_revision,
@@ -247,6 +272,7 @@ class StableSnapshotCapturer:
             service_generation=second.generation,
             provider_etag=second.etag,
             configuration_sha256=configuration_sha256,
+            stable_revision_configuration_sha256=revision_configuration_sha256,
             captured_at=captured_at,
             captured_by=self._configuration.reader_identity,
         )
@@ -268,9 +294,9 @@ class StableSnapshotCapturer:
             raise StableCaptureError(StableCaptureReason.SOURCE_INVALID)
         return value
 
-    async def _read_stable_revision(self) -> CloudRunRevisionState:
+    async def _read_stable_revision(self, revision_name: str) -> CloudRunRevisionState:
         try:
-            value = await self._reader.read_revision(DeclaredRevision.STABLE)
+            value = await self._reader.read_revision(revision_name)
         except asyncio.CancelledError:
             raise
         except CloudRunReadError as error:
@@ -291,14 +317,18 @@ class StableSnapshotCapturer:
     ) -> tuple[TrafficAllocation, ...]:
         if service.target != self.target:
             raise StableCaptureError(StableCaptureReason.TARGET_MISMATCH)
-        if service.reconciling or service.observed_generation != service.generation:
+        if (
+            service.reconciling
+            or service.observed_generation != service.generation
+            or service.ready_state is not CloudRunReadyState.READY
+        ):
             raise StableCaptureError(StableCaptureReason.SERVICE_NOT_READY)
         traffic_resolution = {
-            (allocation.revision, allocation.percent, allocation.tag)
+            (allocation.revision, allocation.percent)
             for allocation in service.traffic
         }
         status_resolution = {
-            (allocation.revision, allocation.percent, allocation.tag)
+            (allocation.revision, allocation.percent)
             for allocation in service.traffic_statuses
         }
         if traffic_resolution != status_resolution:
