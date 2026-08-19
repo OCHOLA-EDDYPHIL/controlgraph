@@ -143,7 +143,7 @@ class TrustedRootPreflight:
 
 @dataclass(frozen=True, slots=True)
 class CoordinatorInternalRoute:
-    """Fixed coordinator caller, audience, role, and path for one private service."""
+    """Fixed internal caller, audience, role, and path for one private service."""
 
     project_id: str
     project_number: str
@@ -158,9 +158,12 @@ class CoordinatorInternalRoute:
             or "reconcile" in self.project_id
             or type(self.project_number) is not str
             or _PROJECT_NUMBER.fullmatch(self.project_number) is None
-            or self.caller_role is not CallerRole.COORDINATOR
-            or self.service_role
-            not in {ServiceRole.VERIFIER, ServiceRole.EVIDENCE_WRITER}
+            or (self.caller_role, self.service_role)
+            not in {
+                (CallerRole.API, ServiceRole.COORDINATOR),
+                (CallerRole.COORDINATOR, ServiceRole.VERIFIER),
+                (CallerRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER),
+            }
         ):
             raise ValueError("coordinator internal route coordinates are invalid")
         expected = (
@@ -191,6 +194,9 @@ class CoordinatorInternalRoute:
     @property
     def url(self) -> str:
         return f"{self.audience}{self.path}"
+
+
+InternalServiceRoute = CoordinatorInternalRoute
 
 
 class RootPreflightService:
@@ -492,6 +498,7 @@ __all__ = [
     "CoordinatorInternalRoute",
     "CoordinatorRootPreflightClient",
     "ExactEvidenceSignatureVerifier",
+    "InternalServiceRoute",
     "RootPreflightError",
     "RootPreflightErrorCode",
     "RootPreflightReader",

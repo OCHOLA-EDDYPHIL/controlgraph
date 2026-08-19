@@ -49,6 +49,7 @@ from controlgraph_canary.contracts.root_creation import (
     evidence_signing_input_sha256,
     root_creation_request_sha256,
 )
+from controlgraph_canary.contracts.root_relay import RootCreationInvocationV1
 from controlgraph_canary.contracts.root_trust import (
     RootCandidateAttestationV1,
     RootPreflightRequestV1,
@@ -84,6 +85,7 @@ __all__ = [
     "RootCandidateAttestationV1",
     "RootCreationCommandV1",
     "RootCreationEvidenceSubjectV1",
+    "RootCreationInvocationV1",
     "RootCreationResultV1",
     "RootPreflightRequestV1",
     "RootPreflightResultV1",

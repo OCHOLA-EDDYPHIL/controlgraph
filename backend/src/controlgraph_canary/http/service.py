@@ -35,6 +35,12 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     protected_path,
 )
+from controlgraph_canary.application.root_relay import (
+    ApiRootCreationClient,
+    CoordinatorRootCreationRelay,
+    RootRelayError,
+    RootRelayErrorCode,
+)
 from controlgraph_canary.application.root_trust import (
     RootPreflightError,
     RootPreflightErrorCode,
@@ -47,6 +53,8 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
+from controlgraph_canary.contracts.root_creation import RootCreationCommandV1
+from controlgraph_canary.contracts.root_relay import RootCreationInvocationV1
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
@@ -123,6 +131,15 @@ class RootPreflightDenied(BaseModel):
     correlation_id: str
 
 
+class RootCreationDenied(BaseModel):
+    """Payload-free root-creation relay failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -136,6 +153,8 @@ def create_service_app(
     verified_task_handler: VerifiedTaskHandler | None = None,
     evidence_signing_service: EvidenceSigningService | None = None,
     root_preflight_service: RootPreflightService | None = None,
+    api_root_creation_client: ApiRootCreationClient | None = None,
+    coordinator_root_creation_relay: CoordinatorRootCreationRelay | None = None,
 ) -> FastAPI:
     """Create one authenticated role shell with no enabled mutation operation."""
 
@@ -156,6 +175,13 @@ def create_service_app(
         raise ValueError("evidence signing is limited to the evidence-writer route")
     if root_preflight_service is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("root preflight is limited to the verifier route")
+    if api_root_creation_client is not None and role is not ServiceRole.API:
+        raise ValueError("operator root creation is limited to the API route")
+    if (
+        coordinator_root_creation_relay is not None
+        and role is not ServiceRole.COORDINATOR
+    ):
+        raise ValueError("root creation coordination is limited to the coordinator route")
     if build_digest is None:
         build_digest = os.environ.get("CONTROLGRAPH_BUILD_DIGEST")
     if build_digest is not None and _DIGEST.fullmatch(build_digest) is None:
@@ -241,6 +267,62 @@ def create_service_app(
                 correlation_id,
             )
         request.state.authentication = context
+        if role is ServiceRole.API and api_root_creation_client is not None:
+            try:
+                body = await _read_contract_body(request)
+                command = decode_contract(body, RootCreationCommandV1)
+                creation_result = await api_root_creation_client.create(command, context)
+                response_body = canonical_json_bytes(creation_result)
+            except asyncio.CancelledError:
+                raise
+            except CapabilityVerificationError:
+                return _root_creation_denial("CONTRACT_INVALID", correlation_id)
+            except ContractError as error:
+                return _root_creation_denial(error.code.value, correlation_id)
+            except RootRelayError as error:
+                return _root_creation_denial(error.code.value, correlation_id)
+            except Exception:
+                return _root_creation_denial(
+                    RootRelayErrorCode.CREATION_UNAVAILABLE.value,
+                    correlation_id,
+                )
+            return Response(
+                content=response_body,
+                status_code=200,
+                media_type="application/json",
+                headers={"X-ControlGraph-Correlation-Id": correlation_id},
+            )
+        if (
+            role is ServiceRole.COORDINATOR
+            and coordinator_root_creation_relay is not None
+        ):
+            try:
+                body = await _read_contract_body(request)
+                invocation = decode_contract(body, RootCreationInvocationV1)
+                creation_result = await coordinator_root_creation_relay.create(
+                    invocation,
+                    context,
+                )
+                response_body = canonical_json_bytes(creation_result)
+            except asyncio.CancelledError:
+                raise
+            except CapabilityVerificationError:
+                return _root_creation_denial("CONTRACT_INVALID", correlation_id)
+            except ContractError as error:
+                return _root_creation_denial(error.code.value, correlation_id)
+            except RootRelayError as error:
+                return _root_creation_denial(error.code.value, correlation_id)
+            except Exception:
+                return _root_creation_denial(
+                    RootRelayErrorCode.CREATION_UNAVAILABLE.value,
+                    correlation_id,
+                )
+            return Response(
+                content=response_body,
+                status_code=200,
+                media_type="application/json",
+                headers={"X-ControlGraph-Correlation-Id": correlation_id},
+            )
         if role is ServiceRole.EVIDENCE_WRITER:
             if evidence_signing_service is None:
                 return _evidence_signing_denial(
@@ -275,11 +357,11 @@ def create_service_app(
             try:
                 body = await _read_contract_body(request)
                 preflight_request = decode_contract(body, RootPreflightRequestV1)
-                result = await root_preflight_service.preflight(
+                preflight_result = await root_preflight_service.preflight(
                     preflight_request,
                     context,
                 )
-                response_body = canonical_json_bytes(result)
+                response_body = canonical_json_bytes(preflight_result)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
@@ -417,6 +499,30 @@ def _root_preflight_denial(code: str, correlation_id: str) -> JSONResponse:
     )
 
 
+def _root_creation_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = RootCreationDenied(code=code, correlation_id=correlation_id)
+    if code in {"CONTRACT_INVALID", "CONTRACT_VERSION_UNSUPPORTED"}:
+        status_code = 400
+    elif code in {
+        RootRelayErrorCode.CALLER_DENIED.value,
+        RootRelayErrorCode.OPERATOR_DENIED.value,
+        RootRelayErrorCode.COMMAND_DENIED.value,
+    }:
+        status_code = 403
+    elif code in {
+        RootRelayErrorCode.CREATION_CONFLICT.value,
+        RootRelayErrorCode.CREATION_DENIED.value,
+    }:
+        status_code = 409
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
 async def _read_contract_body(request: Request) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
@@ -459,6 +565,7 @@ __all__ = [
     "CapabilityDenied",
     "DisabledWork",
     "EvidenceSigningDenied",
+    "RootCreationDenied",
     "RootPreflightDenied",
     "ServiceHealth",
     "ServiceMetadata",
