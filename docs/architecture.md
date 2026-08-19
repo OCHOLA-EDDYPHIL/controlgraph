@@ -138,7 +138,9 @@ content-addressed and immutable; revocation updates a separate authority record.
 Child capabilities must be equal to or narrower than their parent across caller, audience,
 project, region, environment, service, root, epoch, action, revision, traffic, concurrency,
 provider precondition, lifetime, plan, and request identity. Lineage ends at the approved root and
-rejects missing, cyclic, unknown, or widened ancestry.
+rejects missing, cyclic, unknown, or widened ancestry. Each derived capability names the canonical
+digest of its signed parent; the first capability has no parent capability and is checked directly
+against the exact approved root digest and maximum scope.
 
 ## Identity and signing
 
@@ -175,15 +177,17 @@ mask from a capability holder.
 
 ## Receipts, replay, and uncertain outcomes
 
-The deterministic idempotency identity binds root, epoch, action, target, provider precondition,
-plan, and canonical payload. A Firestore transaction gives one exact request ownership of its safe
-execution phase.
+The deterministic idempotency identity binds request identity, capability digest, root, epoch,
+action, target, provider precondition, plan, canonical payload, and expected canonical poststate.
+A Firestore transaction gives one exact request ownership of its safe execution phase.
 
 An exact duplicate returns or adopts the existing result. Reuse with different canonical content
 is an attack and is denied. A timeout, connection loss, malformed operation result, or other
 unknown provider response becomes `AMBIGUOUS`. The adapter does not retry the mutation merely
 because delivery or HTTP failed. Exact readback may adopt only the expected canonical poststate;
-otherwise uncertainty remains explicit.
+otherwise uncertainty remains explicit. Failures proven to occur before dispatch consume a
+durable bounded attempt count; exhaustion becomes a terminal failed-safe receipt so later
+duplicates cannot restart the retry budget.
 
 ## Cloud boundary
 
