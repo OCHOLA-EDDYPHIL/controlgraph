@@ -2,19 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import UTC, datetime
+from threading import Event, Lock
 from typing import cast
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
+from fastapi import Response
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from httpx import Response as ClientResponse
 
 from controlgraph_canary.application.authority_store import (
+    AuthorityStoreConflict,
     AuthorityStoreUnavailable,
+    DirectReceiptCreate,
+    FinalAuthoritySnapshot,
+    ReceiptClaimAdopted,
+    ReceiptClaimConflict,
+    ReceiptClaimCreated,
+    ReceiptClaimResult,
     StoredRecord,
+    validate_receipt_claim_binding,
 )
 from controlgraph_canary.application.capability_verification import (
     CapabilityLineageReader,
@@ -23,6 +35,15 @@ from controlgraph_canary.application.capability_verification import (
     CapabilityVerifierConfiguration,
     VerifiedMutation,
 )
+from controlgraph_canary.application.cloud_run import (
+    CloudRunMutationOutcome,
+    CloudRunMutationReason,
+    CloudRunMutationResult,
+    CloudRunTrafficAllocation,
+    TargetConfigurationProjection,
+    target_configuration_projection,
+)
+from controlgraph_canary.application.execution import FinalMutationGate, MutationPermit
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     CallerBinding,
@@ -30,6 +51,11 @@ from controlgraph_canary.application.identity import (
     RouteAuthenticationPolicy,
     ServiceRole,
     protected_path,
+)
+from controlgraph_canary.application.receipt_execution import (
+    ReceiptClassifyingMutationAdapter,
+    ReceiptExecutionCoordinator,
+    ReceiptReadbackResult,
 )
 from controlgraph_canary.application.signing import (
     DigestSigningBackend,
@@ -41,11 +67,16 @@ from controlgraph_canary.application.signing import (
     VerificationProfile,
     make_trust_bundle_entry,
 )
+from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts import (
     CapabilityAction,
     CapabilityClaims,
+    EpochAuthorityRecord,
+    EpochChangeCause,
+    ExecutionReceipt,
     MutationIntent,
     ReasonCode,
+    ReceiptOutcome,
     RolloutRoot,
     SignedCapability,
     StableSnapshot,
@@ -56,6 +87,11 @@ from controlgraph_canary.contracts import (
     canonical_sha256,
     encode_base64url,
 )
+from controlgraph_canary.contracts.storage import (
+    ServiceClaimRecord,
+    ServiceClaimStatus,
+)
+from controlgraph_canary.http.receipt import create_receipt_task_handler
 from controlgraph_canary.http.service import create_service_app
 
 PROJECT_ID = "controlgraph-canary-abc123"
@@ -298,15 +334,19 @@ class _RootReader:
         *,
         fail: bool = False,
         revision: int = 0,
+        events: list[str] | None = None,
     ) -> None:
         self.root = _root() if root is None else root
         self.target = _root().target
         self.fail = fail
         self.revision = revision
+        self.events = events
         self.reads: list[str] = []
         self.receipt_claims = 0
 
     async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None:
+        if self.events is not None:
+            self.events.append("root-read")
         self.reads.append(root_id)
         if self.fail:
             raise AuthorityStoreUnavailable()
@@ -619,8 +659,13 @@ def test_widened_child_lifetime_is_scope_amplification() -> None:
 
 
 class _ExactAuthenticator:
-    def __init__(self, context: AuthenticationContext) -> None:
+    def __init__(
+        self,
+        context: AuthenticationContext,
+        events: list[str] | None = None,
+    ) -> None:
         self.context = context
+        self.events = events
         self.calls = 0
 
     def authenticate(
@@ -628,6 +673,8 @@ class _ExactAuthenticator:
         authorization_header: str | None,
         policy: RouteAuthenticationPolicy,
     ) -> AuthenticationContext:
+        if self.events is not None:
+            self.events.append("caller-admission")
         self.calls += 1
         assert authorization_header == "Bearer exact.test.credential"
         return self.context
@@ -641,6 +688,302 @@ def _canonical_raw(value: dict[str, object]) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _joined_final_snapshot(*, epoch: int = 1) -> FinalAuthoritySnapshot:
+    root = _root()
+    root_sha256 = canonical_sha256(root)
+    claim = ServiceClaimRecord(
+        schema_version="controlgraph.service-claim/v1",
+        target=root.target,
+        root_id=root.root_id,
+        root_sha256=root_sha256,
+        status=ServiceClaimStatus.ACTIVE,
+        claimed_by="controlgraph.api/v1",
+        claim_request_id="request-claim-001",
+        claim_evidence_id="evidence-claim-001",
+        claimed_at="2026-08-19T12:01:01Z",
+        released_by=None,
+        release_request_id=None,
+        release_evidence_id=None,
+        released_at=None,
+    )
+    authority = EpochAuthorityRecord(
+        schema_version="controlgraph.epoch-authority/v1",
+        root_id=root.root_id,
+        root_sha256=root_sha256,
+        target=root.target,
+        current_epoch=epoch,
+        previous_epoch=None if epoch == 1 else epoch - 1,
+        revision=epoch - 1,
+        cause=(EpochChangeCause.ROOT_CREATED if epoch == 1 else EpochChangeCause.RECOVERY),
+        changed_by="controlgraph.operator/v1",
+        request_id=f"request-authority-{epoch}",
+        evidence_id=f"evidence-authority-{epoch}",
+        changed_at=f"2026-08-19T12:0{epoch}:00Z",
+    )
+    return FinalAuthoritySnapshot(
+        root=StoredRecord(root, 0),
+        service_claim=StoredRecord(claim, 0),
+        authority=StoredRecord(authority, authority.revision),
+    )
+
+
+def _initial_target_state() -> TargetConfigurationProjection:
+    root = _root()
+    return TargetConfigurationProjection(
+        target=root.target,
+        stable_revision=root.stable_snapshot.stable_revision,
+        candidate_revision=root.candidate_revision,
+        stable_percent=100,
+        candidate_percent=0,
+        concurrency=root.stable_snapshot.concurrency,
+    )
+
+
+def _receipt_binding(receipt: ExecutionReceipt) -> tuple[object, ...]:
+    return (
+        receipt.receipt_id,
+        receipt.request_id,
+        receipt.idempotency_key,
+        receipt.capability_sha256,
+        receipt.mutation_sha256,
+        receipt.plan_sha256,
+        receipt.expected_poststate_sha256,
+        receipt.target,
+        receipt.root_id,
+        receipt.root_sha256,
+        receipt.epoch,
+        receipt.action,
+        receipt.provider_etag,
+        receipt.dispatch_not_after,
+    )
+
+
+class _JoinedReceiptStore:
+    def __init__(self, events: list[str], *, fail_claim: bool = False) -> None:
+        self.target = _target()
+        self.events = events
+        self.fail_claim = fail_claim
+        self.record: StoredRecord[ExecutionReceipt] | None = None
+        self._lock = Lock()
+
+    async def claim_or_adopt_receipt(
+        self,
+        receipt: ExecutionReceipt,
+        binding: MutationBinding,
+    ) -> ReceiptClaimResult:
+        self.events.append("receipt-claim")
+        if self.fail_claim:
+            raise AuthorityStoreUnavailable()
+        validate_receipt_claim_binding(receipt, binding)
+        with self._lock:
+            if self.record is None:
+                self.record = StoredRecord(receipt, 0)
+                proof = DirectReceiptCreate._from_direct_store_create(
+                    self.record,
+                    binding,
+                )
+                return ReceiptClaimCreated(self.record, proof)
+            if _receipt_binding(self.record.value) == _receipt_binding(receipt):
+                return ReceiptClaimAdopted(self.record)
+            return ReceiptClaimConflict()
+
+    async def read_receipt(
+        self,
+        idempotency_key: str,
+    ) -> StoredRecord[ExecutionReceipt] | None:
+        self.events.append("receipt-read")
+        with self._lock:
+            if self.record is None or self.record.value.idempotency_key != idempotency_key:
+                return None
+            return self.record
+
+    async def compare_and_set_receipt(
+        self,
+        expected: StoredRecord[ExecutionReceipt],
+        replacement: ExecutionReceipt,
+    ) -> StoredRecord[ExecutionReceipt]:
+        self.events.append("receipt-cas")
+        with self._lock:
+            if self.record != expected:
+                raise AuthorityStoreConflict()
+            self.record = StoredRecord(replacement, expected.revision + 1)
+            return self.record
+
+
+class _JoinedFinalAuthorityReader:
+    def __init__(
+        self,
+        events: list[str],
+        snapshot: FinalAuthoritySnapshot,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.target = _target()
+        self.events = events
+        self._snapshot = snapshot
+        self._snapshot_lock = Lock()
+        self.error = error
+        self.pause = False
+        self.started = Event()
+        self.resume = Event()
+
+    async def read_final_authority_snapshot(
+        self,
+        root_id: str,
+    ) -> FinalAuthoritySnapshot:
+        assert root_id == _root().root_id
+        self.events.append("final-authority-read")
+        self.started.set()
+        if self.pause:
+            resumed = await asyncio.to_thread(self.resume.wait, 2)
+            if not resumed:
+                raise AuthorityStoreUnavailable()
+        if self.error is not None:
+            raise self.error
+        with self._snapshot_lock:
+            return self._snapshot
+
+    def replace_snapshot(self, snapshot: FinalAuthoritySnapshot) -> None:
+        if type(snapshot) is not FinalAuthoritySnapshot:
+            raise TypeError("an exact final authority snapshot is required")
+        with self._snapshot_lock:
+            self._snapshot = snapshot
+
+
+class _JoinedCloudRunAdapter:
+    def __init__(self, role: ServiceRole, events: list[str]) -> None:
+        self.target = _target()
+        self.service_role = role
+        self.events = events
+        self.calls: list[MutationIntent] = []
+        self._state = _initial_target_state()
+        self._lock = Lock()
+
+    @property
+    def state(self) -> TargetConfigurationProjection:
+        with self._lock:
+            return self._state
+
+    async def mutate(self, permit: MutationPermit) -> CloudRunMutationResult:
+        self.events.append("cloud-run-adapter")
+        intent = permit.intent
+        projected = target_configuration_projection(
+            intent,
+            expected_concurrency=_root().stable_snapshot.concurrency,
+        )
+        with self._lock:
+            self.calls.append(intent)
+            self._state = projected
+        return CloudRunMutationResult(
+            outcome=CloudRunMutationOutcome.AMBIGUOUS,
+            requested_traffic=(
+                CloudRunTrafficAllocation(
+                    revision=intent.stable_revision,
+                    percent=intent.stable_percent,
+                    tag="stable",
+                ),
+                CloudRunTrafficAllocation(
+                    revision=intent.candidate_revision,
+                    percent=intent.candidate_percent,
+                    tag="candidate",
+                ),
+            ),
+            expected_concurrency=projected.concurrency,
+            operation_name="operations/joined-conformance-001",
+            service=None,
+            reason=CloudRunMutationReason.OUTCOME_UNKNOWN,
+        )
+
+
+class _JoinedReadback:
+    def __init__(self, adapter: _JoinedCloudRunAdapter, events: list[str]) -> None:
+        self.target = _target()
+        self.adapter = adapter
+        self.events = events
+
+    async def readback(
+        self,
+        expected: TargetConfigurationProjection,
+    ) -> ReceiptReadbackResult:
+        self.events.append("target-readback")
+        state = self.adapter.state
+        return ReceiptReadbackResult(
+            state=state,
+            observed_etag=("etag-after-joined-8" if state == expected else "etag-stable-7"),
+        )
+
+
+class _JoinedConformancePath:
+    def __init__(
+        self,
+        role: ServiceRole,
+        private_key: ec.EllipticCurvePrivateKey,
+        root_reader: _RootReader,
+        caller: AuthenticationContext,
+        lineage_reader: _LineageReader | None = None,
+        *,
+        final_snapshot: FinalAuthoritySnapshot | None = None,
+        final_error: Exception | None = None,
+        fail_claim: bool = False,
+    ) -> None:
+        self.events: list[str] = []
+        self.handler_entries: list[VerifiedMutation] = []
+        root_reader.events = self.events
+        self.store = _JoinedReceiptStore(self.events, fail_claim=fail_claim)
+        self.final_reader = _JoinedFinalAuthorityReader(
+            self.events,
+            final_snapshot or _joined_final_snapshot(),
+            error=final_error,
+        )
+        self.cloud_run_adapter = _JoinedCloudRunAdapter(role, self.events)
+        classifying_adapter = ReceiptClassifyingMutationAdapter(self.cloud_run_adapter)
+        coordinator = ReceiptExecutionCoordinator(
+            store=self.store,
+            final_gate=FinalMutationGate(
+                authority_reader=self.final_reader,
+                adapter=classifying_adapter,
+                clock=lambda: NOW,
+            ),
+            readback=_JoinedReadback(self.cloud_run_adapter, self.events),
+            clock=lambda: NOW,
+        )
+        receipt_handler = create_receipt_task_handler(coordinator)
+
+        async def traced_handler(verified: VerifiedMutation) -> Response:
+            self.events.append("verified-handler")
+            self.handler_entries.append(verified)
+            return await receipt_handler(verified)
+
+        self.authenticator = _ExactAuthenticator(caller, self.events)
+        self.app = create_service_app(
+            role,
+            authenticator=self.authenticator,
+            authentication_policy=_policy(role),
+            capability_verifier=_verifier(
+                role,
+                private_key,
+                root_reader,
+                lineage_reader,
+            ),
+            verified_task_handler=traced_handler,
+        )
+
+
+def _post_task(
+    client: TestClient,
+    role: ServiceRole,
+    payload: bytes,
+) -> ClientResponse:
+    return client.post(
+        protected_path(role),
+        content=payload,
+        headers={
+            "Authorization": "Bearer exact.test.credential",
+            "Content-Type": "application/json",
+        },
+    )
 
 
 def _denial_scenario(
@@ -695,6 +1038,12 @@ def _denial_scenario(
         raw = request.model_dump(mode="json")
         raw["capability"]["public_key_url"] = "https://keys.example.test/key.pem"
         payload = _canonical_raw(raw)
+    elif name == "target_injection":
+        raw = request.model_dump(mode="json")
+        raw["intent"]["target"]["provider_resource"] = (
+            f"projects/{PROJECT_ID}/locations/us-central1/services/other-target"
+        )
+        payload = _canonical_raw(raw)
     elif name == "algorithm":
         raw = request.model_dump(mode="json")
         raw["capability"]["claims"]["signing_algorithm"] = "RS256"
@@ -719,9 +1068,7 @@ def _denial_scenario(
         payload = canonical_json_bytes(_task(altered))
         expected = ReasonCode.CLAIM_BINDING_MISMATCH
     elif name == "audience":
-        alternate_audience = (
-            f"https://controlgraph-{role.value}-999999999999.us-central1.run.app"
-        )
+        alternate_audience = f"https://controlgraph-{role.value}-999999999999.us-central1.run.app"
         altered = _signed(_claims(role, audience=alternate_audience), private_key)
         payload = canonical_json_bytes(_task(altered))
         expected = ReasonCode.CLAIM_BINDING_MISMATCH
@@ -819,9 +1166,7 @@ def _denial_scenario(
         payload = canonical_json_bytes(_task(altered))
         expected = ReasonCode.CAPABILITY_EXPIRED
     elif name == "task_expired":
-        payload = canonical_json_bytes(
-            _task(capability, expires_at="2026-08-19T12:03:00Z")
-        )
+        payload = canonical_json_bytes(_task(capability, expires_at="2026-08-19T12:03:00Z"))
         expected = ReasonCode.CAPABILITY_EXPIRED
     elif name == "root_id":
         altered = _signed(_claims(role, root_id="root-other"), private_key)
@@ -916,6 +1261,7 @@ _DENIAL_SCENARIOS = (
     "signature",
     "key_version",
     "public_key_url",
+    "target_injection",
     "algorithm",
     "caller",
     "caller_expired",
@@ -962,48 +1308,28 @@ def test_initial_and_retried_denials_never_enter_handler_or_claim_receipt(
         scenario,
         private_key,
     )
-    authenticator = _ExactAuthenticator(caller)
-    handler_entries: list[VerifiedMutation] = []
-
-    async def protected_handler(verified: VerifiedMutation) -> JSONResponse:
-        handler_entries.append(verified)
-        root_reader.record_receipt_claim()
-        return JSONResponse(status_code=202, content={"status": "accepted"})
-
-    client = TestClient(
-        create_service_app(
-            role,
-            authenticator=authenticator,
-            authentication_policy=_policy(role),
-            capability_verifier=_verifier(
-                role,
-                private_key,
-                root_reader,
-                lineage_reader,
-            ),
-            verified_task_handler=protected_handler,
-        )
+    joined = _JoinedConformancePath(
+        role,
+        private_key,
+        root_reader,
+        caller,
+        lineage_reader,
     )
-
-    responses = [
-        client.post(
-            protected_path(role),
-            content=payload,
-            headers={
-                "Authorization": "Bearer exact.test.credential",
-                "Content-Type": "application/json",
-            },
-        )
-        for _ in range(2)
-    ]
+    with TestClient(joined.app) as client:
+        responses = [_post_task(client, role, payload) for _ in range(2)]
 
     assert [response.json()["code"] for response in responses] == [
         expected.value,
         expected.value,
     ]
-    assert handler_entries == []
-    assert root_reader.receipt_claims == 0
-    assert authenticator.calls == 2
+    assert joined.handler_entries == []
+    assert joined.store.record is None
+    assert joined.cloud_run_adapter.calls == []
+    assert joined.cloud_run_adapter.state == _initial_target_state()
+    assert "receipt-claim" not in joined.events
+    assert "final-authority-read" not in joined.events
+    assert "cloud-run-adapter" not in joined.events
+    assert joined.authenticator.calls == 2
 
 
 @pytest.mark.parametrize(
@@ -1020,38 +1346,226 @@ def test_initial_and_retried_valid_tasks_share_the_verified_handler_gate(
     private_key = ec.generate_private_key(ec.SECP256R1())
     root_reader = _RootReader()
     request = _task(_signed(_claims(role, action=action), private_key))
-    handler_entries: list[VerifiedMutation] = []
+    payload = canonical_json_bytes(request)
+    joined = _JoinedConformancePath(
+        role,
+        private_key,
+        root_reader,
+        _caller(role),
+    )
+    with TestClient(joined.app) as client:
+        responses = [_post_task(client, role, payload) for _ in range(2)]
 
-    async def protected_handler(verified: VerifiedMutation) -> JSONResponse:
-        handler_entries.append(verified)
-        root_reader.record_receipt_claim()
-        return JSONResponse(status_code=202, content={"status": "accepted"})
-
-    client = TestClient(
-        create_service_app(
-            role,
-            authenticator=_ExactAuthenticator(_caller(role)),
-            authentication_policy=_policy(role),
-            capability_verifier=_verifier(role, private_key, root_reader),
-            verified_task_handler=protected_handler,
-        )
+    assert [response.status_code for response in responses] == [200, 200]
+    assert responses[0].content == responses[1].content
+    assert responses[0].json()["schema_version"] == ("controlgraph.receipt-task-response/v1")
+    assert responses[0].json()["receipt"]["outcome"] == ReceiptOutcome.VERIFIED.value
+    assert responses[0].json()["storage_revision"] == 2
+    assert responses[0].json()["receipt"]["provider_operation"] == (
+        "operations/joined-conformance-001"
+    )
+    assert responses[0].json()["receipt"]["observed_etag"] == "etag-after-joined-8"
+    assert responses[0].json()["receipt"]["observed_authority_epoch"] == 1
+    assert [entry.request for entry in joined.handler_entries] == [request, request]
+    assert len(joined.cloud_run_adapter.calls) == 1
+    assert joined.cloud_run_adapter.state == target_configuration_projection(
+        request.intent,
+        expected_concurrency=_root().stable_snapshot.concurrency,
     )
 
-    responses = [
-        client.post(
-            protected_path(role),
-            content=canonical_json_bytes(request),
-            headers={
-                "Authorization": "Bearer exact.test.credential",
-                "Content-Type": "application/json",
-            },
-        )
-        for _ in range(2)
-    ]
 
-    assert [response.status_code for response in responses] == [202, 202]
-    assert [entry.request for entry in handler_entries] == [request, request]
-    assert root_reader.receipt_claims == 2
+def test_delayed_stale_task_is_fenced_when_epoch_advances_at_final_read() -> None:
+    role = ServiceRole.EXECUTOR
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    request = _task(_signed(_claims(role), private_key))
+    payload = canonical_json_bytes(request)
+    joined = _JoinedConformancePath(
+        role,
+        private_key,
+        _RootReader(),
+        _caller(role),
+    )
+    joined.final_reader.pause = True
+
+    with (
+        TestClient(joined.app) as client,
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        response_future = executor.submit(_post_task, client, role, payload)
+        assert joined.final_reader.started.wait(2)
+        joined.final_reader.replace_snapshot(_joined_final_snapshot(epoch=2))
+        joined.final_reader.resume.set()
+        first = response_future.result(timeout=3)
+        first_trace = tuple(joined.events)
+        replay = _post_task(client, role, payload)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert first.content == replay.content
+    body = first.json()
+    assert body["schema_version"] == "controlgraph.receipt-task-response/v1"
+    assert body["storage_revision"] == 1
+    assert body["receipt"]["outcome"] == ReceiptOutcome.DENIED.value
+    assert body["receipt"]["reason_code"] == ReasonCode.EPOCH_MISMATCH.value
+    assert body["receipt"]["observed_authority_epoch"] == 2
+    assert body["receipt"]["request_id"] == request.intent.request_id
+    assert body["receipt"]["root_sha256"] == request.intent.root_sha256
+    assert first_trace == (
+        "caller-admission",
+        "root-read",
+        "verified-handler",
+        "receipt-claim",
+        "final-authority-read",
+        "receipt-cas",
+    )
+    assert tuple(joined.events[len(first_trace) :]) == (
+        "caller-admission",
+        "root-read",
+        "verified-handler",
+        "receipt-claim",
+    )
+    assert joined.cloud_run_adapter.calls == []
+    assert joined.cloud_run_adapter.state == _initial_target_state()
+
+
+@pytest.mark.parametrize("stage", ["claim", "final-authority"])
+def test_postverification_store_uncertainty_fails_closed_at_its_exact_boundary(
+    stage: str,
+) -> None:
+    role = ServiceRole.EXECUTOR
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    request = _task(_signed(_claims(role), private_key))
+    joined = _JoinedConformancePath(
+        role,
+        private_key,
+        _RootReader(),
+        _caller(role),
+        fail_claim=stage == "claim",
+        final_error=(AuthorityStoreUnavailable() if stage == "final-authority" else None),
+    )
+
+    with TestClient(joined.app) as client:
+        response = _post_task(client, role, canonical_json_bytes(request))
+
+    assert joined.cloud_run_adapter.calls == []
+    assert joined.cloud_run_adapter.state == _initial_target_state()
+    if stage == "claim":
+        assert response.status_code == 503
+        assert response.json() == {
+            "schema_version": "controlgraph.receipt-task-denial/v1",
+            "code": ReasonCode.AUTHORITY_UNAVAILABLE.value,
+        }
+        assert joined.store.record is None
+        assert joined.events == [
+            "caller-admission",
+            "root-read",
+            "verified-handler",
+            "receipt-claim",
+        ]
+    else:
+        assert response.status_code == 200
+        assert response.json()["receipt"]["outcome"] == ReceiptOutcome.DENIED.value
+        assert response.json()["receipt"]["reason_code"] == (ReasonCode.AUTHORITY_UNAVAILABLE.value)
+        assert response.json()["receipt"]["observed_authority_epoch"] is None
+        assert joined.store.record is not None
+        assert joined.events == [
+            "caller-admission",
+            "root-read",
+            "verified-handler",
+            "receipt-claim",
+            "final-authority-read",
+            "receipt-cas",
+        ]
+
+
+def test_conflicting_verified_payload_cannot_overwrite_the_first_receipt() -> None:
+    role = ServiceRole.EXECUTOR
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    original = _task(_signed(_claims(role), private_key))
+    conflicting = _task(
+        _signed(
+            _claims(
+                role,
+                capability_id="cgcap-conflicting-001",
+                request_id="request-conflicting-001",
+            ),
+            private_key,
+        )
+    )
+    joined = _JoinedConformancePath(
+        role,
+        private_key,
+        _RootReader(),
+        _caller(role),
+        final_snapshot=_joined_final_snapshot(epoch=2),
+    )
+
+    with TestClient(joined.app) as client:
+        first = _post_task(client, role, canonical_json_bytes(original))
+        first_record = joined.store.record
+        trace_boundary = len(joined.events)
+        denied = _post_task(client, role, canonical_json_bytes(conflicting))
+
+    assert first.status_code == 200
+    assert denied.status_code == 409
+    assert denied.json() == {
+        "schema_version": "controlgraph.receipt-task-denial/v1",
+        "code": ReasonCode.IDEMPOTENCY_CONFLICT.value,
+    }
+    assert joined.store.record == first_record
+    assert joined.store.record is not None
+    assert joined.store.record.value.request_id == original.intent.request_id
+    assert tuple(joined.events[trace_boundary:]) == (
+        "caller-admission",
+        "root-read",
+        "verified-handler",
+        "receipt-claim",
+    )
+    assert joined.cloud_run_adapter.calls == []
+    assert joined.cloud_run_adapter.state == _initial_target_state()
+
+
+def test_concurrent_exact_duplicate_has_one_joined_cloud_run_dispatch() -> None:
+    role = ServiceRole.EXECUTOR
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    request = _task(_signed(_claims(role), private_key))
+    payload = canonical_json_bytes(request)
+    joined = _JoinedConformancePath(
+        role,
+        private_key,
+        _RootReader(),
+        _caller(role),
+    )
+    joined.final_reader.pause = True
+
+    with (
+        TestClient(joined.app) as first_client,
+        TestClient(joined.app) as duplicate_client,
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        winner_future = executor.submit(_post_task, first_client, role, payload)
+        assert joined.final_reader.started.wait(2)
+        duplicate = _post_task(duplicate_client, role, payload)
+        joined.final_reader.resume.set()
+        winner = winner_future.result(timeout=3)
+        replay = _post_task(duplicate_client, role, payload)
+
+    assert duplicate.status_code == 202
+    assert duplicate.json()["receipt"]["outcome"] == ReceiptOutcome.CLAIMED.value
+    assert duplicate.json()["storage_revision"] == 0
+    assert winner.status_code == 200
+    assert winner.json()["receipt"]["outcome"] == ReceiptOutcome.VERIFIED.value
+    assert winner.content == replay.content
+    assert len(joined.cloud_run_adapter.calls) == 1
+    assert joined.events.count("final-authority-read") == 1
+    assert joined.events.count("cloud-run-adapter") == 1
+    assert joined.events.count("target-readback") == 1
+    assert joined.events.count("receipt-cas") == 2
+
+
+def test_receipt_http_composition_rejects_a_noncoordinator_bypass() -> None:
+    with pytest.raises(TypeError, match="exact receipt execution coordinator"):
+        create_receipt_task_handler(cast(ReceiptExecutionCoordinator, object()))
 
 
 def test_http_composition_cannot_install_a_task_handler_without_the_verifier() -> None:
@@ -1128,9 +1642,7 @@ def test_configured_target_substitution_precedes_signature_and_root_lookup(
 ) -> None:
     private_key = ec.generate_private_key(ec.SECP256R1())
     reader = _RootReader(fail=True)
-    capability = _unchecked_envelope(
-        _claims(ServiceRole.EXECUTOR, target=target)
-    )
+    capability = _unchecked_envelope(_claims(ServiceRole.EXECUTOR, target=target))
 
     with pytest.raises(CapabilityVerificationError) as denied:
         _verify(
