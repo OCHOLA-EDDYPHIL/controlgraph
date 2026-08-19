@@ -1,5 +1,57 @@
 """Dependency-free authority primitives."""
 
-from controlgraph_canary.authority.epoch import EpochFence, EpochMismatchError
+from controlgraph_canary.authority.epoch import (
+    INITIAL_EPOCH,
+    EpochAdvanceCause,
+    EpochAdvanceOutcome,
+    EpochAdvanceRequest,
+    EpochAdvanceResult,
+    EpochAuthority,
+    EpochCheckOutcome,
+    EpochCheckResult,
+    EpochFence,
+    EpochMismatchError,
+    EpochTransition,
+    check_epoch,
+    compare_and_advance,
+    initial_authority,
+)
+from controlgraph_canary.authority.reducer import (
+    DenialReason,
+    FactStatus,
+    ProviderOutcome,
+    ReducerFacts,
+    ReducerInput,
+    ReducerOutput,
+    RolloutCommand,
+    RolloutEvent,
+    RolloutState,
+    reduce_rollout,
+)
 
-__all__ = ["EpochFence", "EpochMismatchError"]
+__all__ = [
+    "INITIAL_EPOCH",
+    "DenialReason",
+    "EpochAdvanceCause",
+    "EpochAdvanceOutcome",
+    "EpochAdvanceRequest",
+    "EpochAdvanceResult",
+    "EpochAuthority",
+    "EpochCheckOutcome",
+    "EpochCheckResult",
+    "EpochFence",
+    "EpochMismatchError",
+    "EpochTransition",
+    "FactStatus",
+    "ProviderOutcome",
+    "ReducerFacts",
+    "ReducerInput",
+    "ReducerOutput",
+    "RolloutCommand",
+    "RolloutEvent",
+    "RolloutState",
+    "check_epoch",
+    "compare_and_advance",
+    "initial_authority",
+    "reduce_rollout",
+]

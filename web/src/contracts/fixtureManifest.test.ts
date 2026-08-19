@@ -7,7 +7,7 @@ describe("shared contract fixtures", () => {
     expect(manifest).toEqual({
       canonical_encoding: "controlgraph.canonical-json/v1",
       fixture_version: "controlgraph.contract-fixtures/v1",
-      fixtures: [],
+      fixture_sets: [{ manifest: "v1/manifest.json", name: "v1" }],
     });
   });
 });
