@@ -28,6 +28,7 @@ from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
+    EpochChangeCause,
     ExecutionReceipt,
     MutationIntent,
     ReasonCode,
@@ -545,6 +546,17 @@ def _coherent_authority_epoch(
             or (
                 claim.status is ServiceClaimStatus.RELEASED
                 and snapshot.service_claim.revision == 1
+            )
+        )
+        or (
+            claim.status is ServiceClaimStatus.RELEASED
+            and (
+                authority.revision < 1
+                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+                or claim.released_by != authority.changed_by
+                or claim.release_request_id != authority.request_id
+                or claim.release_evidence_id != authority.evidence_id
+                or claim.released_at != authority.changed_at
             )
         )
         or authority.target != target

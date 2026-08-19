@@ -18,6 +18,9 @@ from controlgraph_canary.application.authority_store import (
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
 from controlgraph_canary.application.cloud_run import (
+    CloudRunMutationOutcome,
+    CloudRunMutationReason,
+    CloudRunMutationResult,
     TargetConfigurationProjection,
     target_configuration_projection,
     target_configuration_sha256,
@@ -27,7 +30,10 @@ from controlgraph_canary.application.execution import (
     FinalAuthorityDenial,
     FinalMutationGate,
     FinalMutationResult,
+    MutationPermit,
+    TargetBoundMutationAdapter,
 )
+from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.authority.replay import (
     MutationAction,
     MutationBinding,
@@ -74,7 +80,7 @@ class ReceiptMutationResult:
             if self.reason_code is not None or self.provider_operation is None:
                 raise ValueError("applied mutation result shape is invalid")
         elif self.status is ReceiptMutationStatus.FAILED_SAFE:
-            if self.reason_code not in {
+            if self.provider_operation is not None or self.reason_code not in {
                 ReasonCode.PROVIDER_PRECONDITION_FAILED,
                 ReasonCode.TARGET_BINDING_MISMATCH,
                 ReasonCode.PROVIDER_REQUEST_REJECTED,
@@ -82,6 +88,75 @@ class ReceiptMutationResult:
                 raise ValueError("failed-safe mutation result shape is invalid")
         elif self.reason_code is not ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS:
             raise ValueError("ambiguous mutation result shape is invalid")
+
+
+def map_cloud_run_mutation_result(
+    result: CloudRunMutationResult,
+) -> ReceiptMutationResult:
+    """Map one sanitized Cloud Run outcome without losing its stable classification."""
+
+    if type(result) is not CloudRunMutationResult:
+        raise TypeError("an exact Cloud Run mutation result is required")
+    if result.outcome is CloudRunMutationOutcome.APPLIED:
+        return ReceiptMutationResult(
+            status=ReceiptMutationStatus.APPLIED,
+            provider_operation=result.operation_name,
+            reason_code=None,
+        )
+    if result.outcome is CloudRunMutationOutcome.AMBIGUOUS:
+        return ReceiptMutationResult(
+            status=ReceiptMutationStatus.AMBIGUOUS,
+            provider_operation=result.operation_name,
+            reason_code=ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
+        )
+    reason_codes = {
+        CloudRunMutationReason.PRECONDITION_FAILED: (
+            ReasonCode.PROVIDER_PRECONDITION_FAILED
+        ),
+        CloudRunMutationReason.DECLARATION_MISMATCH: ReasonCode.TARGET_BINDING_MISMATCH,
+        CloudRunMutationReason.PROVIDER_REJECTED: ReasonCode.PROVIDER_REQUEST_REJECTED,
+    }
+    if result.reason is None:
+        raise ValueError("failed-safe Cloud Run mutation reason is invalid")
+    reason_code = reason_codes.get(result.reason)
+    if reason_code is None:
+        raise ValueError("failed-safe Cloud Run mutation reason is invalid")
+    return ReceiptMutationResult(
+        status=ReceiptMutationStatus.FAILED_SAFE,
+        provider_operation=None,
+        reason_code=reason_code,
+    )
+
+
+class ReceiptClassifyingMutationAdapter:
+    """Preserve target and role while mapping one Cloud Run adapter result."""
+
+    def __init__(
+        self,
+        delegate: TargetBoundMutationAdapter[CloudRunMutationResult],
+    ) -> None:
+        try:
+            target = delegate.target
+            service_role = delegate.service_role
+        except Exception:
+            raise TypeError("receipt mutation delegate must be target-bound") from None
+        if type(target) is not TargetBinding or type(service_role) is not ServiceRole:
+            raise TypeError("receipt mutation delegate binding is invalid")
+        self._delegate = delegate
+        self._target = target
+        self._service_role = service_role
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    @property
+    def service_role(self) -> ServiceRole:
+        return self._service_role
+
+    async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
+        result = await self._delegate.mutate(permit)
+        return map_cloud_run_mutation_result(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +249,7 @@ class ReceiptExecutionDenied:
             ReasonCode.IDEMPOTENCY_CONFLICT,
             ReasonCode.AUTHORITY_UNAVAILABLE,
             ReasonCode.CAPABILITY_EXPIRED,
+            ReasonCode.TARGET_BINDING_MISMATCH,
         }:
             raise ValueError("receipt execution denial reason is invalid")
 
@@ -219,11 +295,18 @@ class ReceiptExecutionCoordinator:
 
         if type(verified) is not VerifiedMutation:
             raise TypeError("receipt execution requires one verified mutation")
-        expected_state = _expected_target_state(verified)
-        binding = _mutation_binding(verified, expected_state)
+        try:
+            expected_state = _expected_target_state(verified)
+            binding = _mutation_binding(verified, expected_state)
+        except (TypeError, ValueError):
+            return ReceiptExecutionDenied(ReasonCode.TARGET_BINDING_MISMATCH)
         now = _require_utc_second(self._clock())
         if _utc_second_text(now) >= verified.request.expires_at:
-            return ReceiptExecutionDenied(ReasonCode.CAPABILITY_EXPIRED)
+            return await self._adopt_expired_replay(
+                verified,
+                expected_state,
+                binding,
+            )
         claimed = _claimed_receipt(verified, binding, now)
         try:
             claim = await self._store.claim_or_adopt_receipt(claimed, binding)
@@ -329,8 +412,11 @@ class ReceiptExecutionCoordinator:
 
         if type(verified) is not VerifiedMutation:
             raise TypeError("orphan recovery requires one previously verified mutation")
-        expected_state = _expected_target_state(verified)
-        binding = _mutation_binding(verified, expected_state)
+        try:
+            expected_state = _expected_target_state(verified)
+            binding = _mutation_binding(verified, expected_state)
+        except (TypeError, ValueError):
+            return ReceiptExecutionDenied(ReasonCode.TARGET_BINDING_MISMATCH)
         try:
             stored = await self._store.read_receipt(
                 verified.request.intent.idempotency_key
@@ -341,6 +427,31 @@ class ReceiptExecutionCoordinator:
             return ReceiptExecutionDenied(ReasonCode.AUTHORITY_UNAVAILABLE)
         if not _valid_adopted_receipt(stored, binding, verified):
             return ReceiptExecutionDenied(ReasonCode.IDEMPOTENCY_CONFLICT)
+        return await self._handle_existing(
+            stored,
+            expected_state,
+            binding,
+            verified,
+        )
+
+    async def _adopt_expired_replay(
+        self,
+        verified: VerifiedMutation,
+        expected_state: TargetConfigurationProjection,
+        binding: MutationBinding,
+    ) -> ReceiptExecutionResponse:
+        try:
+            stored = await self._store.read_receipt(
+                verified.request.intent.idempotency_key
+            )
+        except Exception:
+            return ReceiptExecutionDenied(ReasonCode.AUTHORITY_UNAVAILABLE)
+        if stored is None:
+            return ReceiptExecutionDenied(ReasonCode.CAPABILITY_EXPIRED)
+        if not _valid_adopted_receipt(stored, binding, verified):
+            return ReceiptExecutionDenied(ReasonCode.IDEMPOTENCY_CONFLICT)
+        if stored.value.outcome is ReceiptOutcome.CLAIMED:
+            return ReceiptExecutionDenied(ReasonCode.CAPABILITY_EXPIRED)
         return await self._handle_existing(
             stored,
             expected_state,
@@ -490,36 +601,45 @@ class ReceiptExecutionCoordinator:
             or not _valid_monotonic_resolution(expected, replacement_record)
         ):
             return None
-        try:
-            committed = await self._store.compare_and_set_receipt(expected, replacement)
-            if committed != replacement_record:
+        for attempt in range(2):
+            try:
+                committed = await self._store.compare_and_set_receipt(
+                    expected,
+                    replacement,
+                )
+                if committed != replacement_record:
+                    return None
+                return committed
+            except AuthorityStoreError:
+                pass
+            except Exception:
+                pass
+            try:
+                current = await self._store.read_receipt(
+                    expected.value.idempotency_key
+                )
+            except Exception:
                 return None
-            return committed
-        except AuthorityStoreError:
-            pass
-        except Exception:
-            pass
-        try:
-            current = await self._store.read_receipt(expected.value.idempotency_key)
-        except Exception:
-            return None
-        if type(current) is not StoredRecord or type(current.value) is not ExecutionReceipt:
-            return None
-        if (
-            not _valid_adopted_receipt(current, binding, verified)
-            or not _valid_monotonic_resolution(expected, current)
-        ):
-            return None
-        return current
+            if type(current) is not StoredRecord or type(current.value) is not ExecutionReceipt:
+                return None
+            if (
+                not _valid_adopted_receipt(current, binding, verified)
+                or not _valid_monotonic_resolution(expected, current)
+            ):
+                return None
+            if current != expected:
+                return current
+            if attempt == 1:
+                return None
+        return None
 
 
 def _expected_target_state(verified: VerifiedMutation) -> TargetConfigurationProjection:
     intent = verified.request.intent
     root = verified.root
-    concurrency = intent.concurrency or root.stable_snapshot.concurrency
     return target_configuration_projection(
         intent,
-        expected_concurrency=concurrency,
+        expected_concurrency=root.stable_snapshot.concurrency,
     )
 
 
@@ -677,6 +797,14 @@ def _valid_monotonic_resolution(
         and after.observed_authority_epoch is not None
     ):
         return False
+    if before.provider_operation is not None:
+        if after.provider_operation != before.provider_operation:
+            return False
+    elif (
+        before.outcome is not ReceiptOutcome.CLAIMED
+        and after.provider_operation is not None
+    ):
+        return False
     reachable = {
         ReceiptOutcome.CLAIMED: {
             ReceiptOutcome.DENIED,
@@ -798,6 +926,7 @@ def _now_utc_second() -> datetime:
 
 
 __all__ = [
+    "ReceiptClassifyingMutationAdapter",
     "ReceiptExecutionCoordinator",
     "ReceiptExecutionDenied",
     "ReceiptExecutionResponse",
@@ -807,4 +936,5 @@ __all__ = [
     "ReceiptReadbackResult",
     "ReceiptStore",
     "TargetBoundReceiptReadback",
+    "map_cloud_run_mutation_result",
 ]

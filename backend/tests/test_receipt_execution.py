@@ -9,6 +9,7 @@ import pytest
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
     AuthorityStoreOutcomeUnknown,
+    AuthorityStoreUnavailable,
     DirectReceiptCreate,
     FinalAuthoritySnapshot,
     ReceiptClaimAdopted,
@@ -20,12 +21,17 @@ from controlgraph_canary.application.authority_store import (
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
 from controlgraph_canary.application.cloud_run import (
+    CloudRunMutationOutcome,
+    CloudRunMutationReason,
+    CloudRunMutationResult,
+    CloudRunTrafficAllocation,
     TargetConfigurationProjection,
     target_configuration_projection,
 )
 from controlgraph_canary.application.execution import (
     FinalMutationGate,
     MutationPermit,
+    TargetBoundMutationAdapter,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
@@ -33,12 +39,14 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
 )
 from controlgraph_canary.application.receipt_execution import (
+    ReceiptClassifyingMutationAdapter,
     ReceiptExecutionCoordinator,
     ReceiptExecutionDenied,
     ReceiptExecutionStored,
     ReceiptMutationResult,
     ReceiptMutationStatus,
     ReceiptReadbackResult,
+    map_cloud_run_mutation_result,
 )
 from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64url
@@ -279,6 +287,7 @@ class _Store:
         self.adopt_fresh = adopt_fresh
         self.record: StoredRecord[ExecutionReceipt] | None = None
         self.cas_unknown_once = False
+        self.cas_unavailable_before_commit = 0
         self._lock = asyncio.Lock()
 
     async def claim_or_adopt_receipt(
@@ -319,6 +328,9 @@ class _Store:
         self.events.append("cas")
         if self.record != expected:
             raise AuthorityStoreConflict
+        if self.cas_unavailable_before_commit:
+            self.cas_unavailable_before_commit -= 1
+            raise AuthorityStoreUnavailable
         self.record = StoredRecord(replacement, expected.revision + 1)
         if self.cas_unknown_once:
             self.cas_unknown_once = False
@@ -365,6 +377,26 @@ class _ConflictingResolutionStore(_Store):
         raise AuthorityStoreOutcomeUnknown
 
 
+class _OperationSubstitutionStore(_Store):
+    async def compare_and_set_receipt(
+        self,
+        expected: StoredRecord[ExecutionReceipt],
+        replacement: ExecutionReceipt,
+    ) -> StoredRecord[ExecutionReceipt]:
+        if expected.value.outcome is not ReceiptOutcome.APPLIED:
+            return await super().compare_and_set_receipt(expected, replacement)
+        self.events.append("cas")
+        assert self.record == expected
+        substituted = ExecutionReceipt(
+            **{
+                **replacement.model_dump(mode="python"),
+                "provider_operation": "operations/substituted",
+            }
+        )
+        self.record = StoredRecord(substituted, expected.revision + 1)
+        raise AuthorityStoreOutcomeUnknown
+
+
 class _Reader:
     def __init__(
         self,
@@ -407,6 +439,29 @@ class _Adapter:
 
     async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
         self.events.append("adapter")
+        self.calls.append(permit.intent)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _CloudRunAdapterSpy:
+    def __init__(
+        self,
+        result: CloudRunMutationResult,
+        events: list[str],
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.target = _target()
+        self.service_role = ServiceRole.EXECUTOR
+        self.result = result
+        self.events = events
+        self.error = error
+        self.calls: list[MutationIntent] = []
+
+    async def mutate(self, permit: MutationPermit) -> CloudRunMutationResult:
+        self.events.append("cloud-run-adapter")
         self.calls.append(permit.intent)
         if self.error is not None:
             raise self.error
@@ -461,7 +516,7 @@ def _exact_readback() -> ReceiptReadbackResult:
 def _coordinator(
     store: _Store,
     reader: _Reader,
-    adapter: _Adapter,
+    adapter: TargetBoundMutationAdapter[ReceiptMutationResult],
     readback: _Readback,
     clock: _Clock,
 ) -> ReceiptExecutionCoordinator:
@@ -474,6 +529,33 @@ def _coordinator(
         ),
         readback=readback,
         clock=clock,
+    )
+
+
+def _cloud_run_result(
+    outcome: CloudRunMutationOutcome,
+    *,
+    reason: CloudRunMutationReason | None,
+    operation_name: str | None = None,
+) -> CloudRunMutationResult:
+    return CloudRunMutationResult(
+        outcome=outcome,
+        requested_traffic=(
+            CloudRunTrafficAllocation(
+                revision="reference-target-stable",
+                percent=90,
+                tag="stable",
+            ),
+            CloudRunTrafficAllocation(
+                revision="reference-target-candidate",
+                percent=10,
+                tag="candidate",
+            ),
+        ),
+        expected_concurrency=40,
+        operation_name=operation_name,
+        service=None,
+        reason=reason,
     )
 
 
@@ -711,6 +793,200 @@ def test_adapter_exception_and_receipt_cas_ambiguity_use_readback_without_retry(
     asyncio.run(cas_unknown_scenario())
 
 
+def test_precommit_receipt_failure_retries_result_persistence_before_readback() -> None:
+    async def failed_safe_scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        store.cas_unavailable_before_commit = 1
+        failed = ReceiptMutationResult(
+            status=ReceiptMutationStatus.FAILED_SAFE,
+            provider_operation=None,
+            reason_code=ReasonCode.TARGET_BINDING_MISMATCH,
+        )
+        adapter = _Adapter(failed, events)
+        readback = _Readback([_exact_readback()], events)
+
+        result = await _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            adapter,
+            readback,
+            _Clock(),
+        ).execute(_verified())
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.FAILED_SAFE
+        assert result.receipt.value.reason_code is ReasonCode.TARGET_BINDING_MISMATCH
+        assert result.receipt.value.observed_authority_epoch == 1
+        assert events.count("cas") == 2
+        assert readback.calls == []
+
+    async def applied_scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        store.cas_unavailable_before_commit = 1
+        readback = _Readback([_exact_readback()], events)
+
+        result = await _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            _Adapter(_applied(), events),
+            readback,
+            _Clock(),
+        ).execute(_verified())
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.VERIFIED
+        assert result.receipt.value.provider_operation == "operations/apply-canary-001"
+        assert result.receipt.value.observed_authority_epoch == 1
+        assert events.count("cas") == 3
+
+    async def authority_denial_scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        store.cas_unavailable_before_commit = 1
+        adapter = _Adapter(_applied(), events)
+        readback = _Readback([_exact_readback()], events)
+
+        result = await _coordinator(
+            store,
+            _Reader(_snapshot(epoch=2), events),
+            adapter,
+            readback,
+            _Clock(),
+        ).execute(_verified())
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.DENIED
+        assert result.receipt.value.reason_code is ReasonCode.EPOCH_MISMATCH
+        assert result.receipt.value.observed_authority_epoch == 2
+        assert events.count("cas") == 2
+        assert adapter.calls == []
+        assert readback.calls == []
+
+    asyncio.run(failed_safe_scenario())
+    asyncio.run(applied_scenario())
+    asyncio.run(authority_denial_scenario())
+
+
+def test_cloud_run_wrapper_composes_final_gate_and_receipt_classification_once() -> None:
+    async def failed_safe_scenario() -> None:
+        events: list[str] = []
+        delegate = _CloudRunAdapterSpy(
+            _cloud_run_result(
+                CloudRunMutationOutcome.FAILED_SAFE,
+                reason=CloudRunMutationReason.DECLARATION_MISMATCH,
+            ),
+            events,
+        )
+        adapter = ReceiptClassifyingMutationAdapter(delegate)
+        result = await _coordinator(
+            _Store(events),
+            _Reader(_snapshot(), events),
+            adapter,
+            _Readback([_exact_readback()], events),
+            _Clock(),
+        ).execute(_verified())
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.FAILED_SAFE
+        assert result.reason_code is ReasonCode.TARGET_BINDING_MISMATCH
+        assert len(delegate.calls) == 1
+        assert events.count("cloud-run-adapter") == 1
+
+    async def ambiguous_scenario() -> None:
+        events: list[str] = []
+        delegate = _CloudRunAdapterSpy(
+            _cloud_run_result(
+                CloudRunMutationOutcome.AMBIGUOUS,
+                reason=CloudRunMutationReason.OUTCOME_UNKNOWN,
+                operation_name="operations/unknown-001",
+            ),
+            events,
+        )
+        mismatch = ReceiptReadbackResult(
+            state=replace(_expected_state(), stable_percent=0, candidate_percent=100),
+            observed_etag="etag-other",
+        )
+        result = await _coordinator(
+            _Store(events),
+            _Reader(_snapshot(), events),
+            ReceiptClassifyingMutationAdapter(delegate),
+            _Readback([mismatch], events),
+            _Clock(),
+        ).execute(_verified())
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.AMBIGUOUS
+        assert result.receipt.value.provider_operation == "operations/unknown-001"
+        assert len(delegate.calls) == 1
+
+    asyncio.run(failed_safe_scenario())
+    asyncio.run(ambiguous_scenario())
+
+
+def test_cloud_run_wrapper_propagates_cancellation_without_a_second_call() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        delegate = _CloudRunAdapterSpy(
+            _cloud_run_result(
+                CloudRunMutationOutcome.AMBIGUOUS,
+                reason=CloudRunMutationReason.OUTCOME_UNKNOWN,
+            ),
+            events,
+            error=asyncio.CancelledError(),
+        )
+        coordinator = _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            ReceiptClassifyingMutationAdapter(delegate),
+            _Readback([_exact_readback()], events),
+            _Clock(),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator.execute(_verified())
+
+        assert len(delegate.calls) == 1
+        assert store.record is not None
+        assert store.record.value.outcome is ReceiptOutcome.CLAIMED
+
+    asyncio.run(scenario())
+
+
+def test_unpersisted_known_result_never_falls_through_to_success_readback() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        store.cas_unavailable_before_commit = 2
+        adapter = _Adapter(
+            ReceiptMutationResult(
+                status=ReceiptMutationStatus.FAILED_SAFE,
+                provider_operation=None,
+                reason_code=ReasonCode.PROVIDER_REQUEST_REJECTED,
+            ),
+            events,
+        )
+        readback = _Readback([_exact_readback()], events)
+
+        result = await _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            adapter,
+            readback,
+            _Clock(),
+        ).execute(_verified())
+
+        assert result == ReceiptExecutionDenied(ReasonCode.AUTHORITY_UNAVAILABLE)
+        assert store.record is not None
+        assert store.record.value.outcome is ReceiptOutcome.CLAIMED
+        assert readback.calls == []
+        assert len(adapter.calls) == 1
+
+    asyncio.run(scenario())
+
+
 def test_substituted_claim_and_conflicting_cas_readback_never_gain_authority() -> None:
     async def substituted_claim_scenario() -> None:
         events: list[str] = []
@@ -746,6 +1022,25 @@ def test_substituted_claim_and_conflicting_cas_readback_never_gain_authority() -
 
     asyncio.run(substituted_claim_scenario())
     asyncio.run(conflicting_readback_scenario())
+
+
+def test_cas_readback_cannot_substitute_the_provider_operation() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _OperationSubstitutionStore(events)
+        result = await _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            _Adapter(_applied(), events),
+            _Readback([_exact_readback()], events),
+            _Clock(),
+        ).execute(_verified())
+
+        assert result == ReceiptExecutionDenied(ReasonCode.AUTHORITY_UNAVAILABLE)
+        assert store.record is not None
+        assert store.record.value.provider_operation == "operations/substituted"
+
+    asyncio.run(scenario())
 
 
 def test_stale_epoch_denial_records_issued_and_observed_epochs() -> None:
@@ -853,6 +1148,63 @@ def test_failed_safe_mutation_result_accepts_only_sanitized_reasons(
             provider_operation=None,
             reason_code=ReasonCode.AUTHORITY_UNAVAILABLE,
         )
+    with pytest.raises(ValueError, match="failed-safe mutation result"):
+        ReceiptMutationResult(
+            status=ReceiptMutationStatus.FAILED_SAFE,
+            provider_operation="operations/forbidden",
+            reason_code=reason,
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider_reason", "receipt_reason"),
+    [
+        (
+            CloudRunMutationReason.PRECONDITION_FAILED,
+            ReasonCode.PROVIDER_PRECONDITION_FAILED,
+        ),
+        (
+            CloudRunMutationReason.DECLARATION_MISMATCH,
+            ReasonCode.TARGET_BINDING_MISMATCH,
+        ),
+        (
+            CloudRunMutationReason.PROVIDER_REJECTED,
+            ReasonCode.PROVIDER_REQUEST_REJECTED,
+        ),
+    ],
+)
+def test_cloud_run_failed_safe_mapping_is_lossless(
+    provider_reason: CloudRunMutationReason,
+    receipt_reason: ReasonCode,
+) -> None:
+    traffic = (
+        CloudRunTrafficAllocation(
+            revision="reference-target-stable",
+            percent=90,
+            tag="stable",
+        ),
+        CloudRunTrafficAllocation(
+            revision="reference-target-candidate",
+            percent=10,
+            tag="candidate",
+        ),
+    )
+    mapped = map_cloud_run_mutation_result(
+        CloudRunMutationResult(
+            outcome=CloudRunMutationOutcome.FAILED_SAFE,
+            requested_traffic=traffic,
+            expected_concurrency=40,
+            operation_name=None,
+            service=None,
+            reason=provider_reason,
+        )
+    )
+
+    assert mapped == ReceiptMutationResult(
+        status=ReceiptMutationStatus.FAILED_SAFE,
+        provider_operation=None,
+        reason_code=receipt_reason,
+    )
 
 
 def test_expired_verified_input_creates_no_receipt_and_malformed_input_is_rejected() -> None:
@@ -872,6 +1224,59 @@ def test_expired_verified_input_creates_no_receipt_and_malformed_input_is_reject
         )
         with pytest.raises(TypeError, match="verified mutation"):
             await coordinator.execute(object())  # type: ignore[arg-type]
+        assert store.record is None
+        assert events == ["receipt-read"]
+
+    asyncio.run(scenario())
+
+
+def test_expired_exact_replay_returns_original_terminal_receipt() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        clock = _Clock()
+        store = _Store(events)
+        adapter = _Adapter(_applied(), events)
+        coordinator = _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            adapter,
+            _Readback([_exact_readback()], events),
+            clock,
+        )
+        terminal = await coordinator.execute(_verified())
+        assert type(terminal) is ReceiptExecutionStored
+        event_count = len(events)
+        clock.value = datetime(2026, 8, 19, 12, 6, tzinfo=UTC)
+
+        replay = await coordinator.execute(_verified())
+
+        assert replay == terminal
+        assert events[event_count:] == ["receipt-read"]
+        assert len(adapter.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_forged_recovery_concurrency_is_denied_before_receipt_claim() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        verified = _verified()
+        intent = verified.request.intent.model_copy(update={"concurrency": 41})
+        forged = replace(
+            verified,
+            request=verified.request.model_copy(update={"intent": intent}),
+        )
+
+        result = await _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            _Adapter(_applied(), events),
+            _Readback([_exact_readback()], events),
+            _Clock(),
+        ).execute(forged)
+
+        assert result == ReceiptExecutionDenied(ReasonCode.TARGET_BINDING_MISMATCH)
         assert store.record is None
         assert events == []
 

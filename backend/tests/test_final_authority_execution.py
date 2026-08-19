@@ -305,10 +305,10 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
         "claim_request_id": "request-claim",
         "claim_evidence_id": "evidence-claim",
         "claimed_at": "2026-08-19T12:01:01Z",
-        "released_by": "controlgraph.operator/v1" if released else None,
-        "release_request_id": "request-release" if released else None,
-        "release_evidence_id": "evidence-release" if released else None,
-        "released_at": "2026-08-19T12:02:00Z" if released else None,
+        "released_by": authority.changed_by if released else None,
+        "release_request_id": authority.request_id if released else None,
+        "release_evidence_id": authority.evidence_id if released else None,
+        "released_at": authority.changed_at if released else None,
     }
     claim = ServiceClaimRecord(**claim_values)  # type: ignore[arg-type]
     return FinalAuthoritySnapshot(
@@ -497,6 +497,59 @@ def test_released_claim_is_denied_without_adapter_call() -> None:
         assert isinstance(result, FinalAuthorityDenial)
         assert result.reason_code is ReasonCode.EPOCH_MISMATCH
         assert result.observed_authority_epoch == 2
+        assert adapter.calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["unadvanced", "wrong-cause"])
+def test_released_claim_requires_the_exact_atomic_revocation_authority(
+    mode: str,
+) -> None:
+    async def scenario() -> None:
+        base = _snapshot(epoch=1 if mode == "unadvanced" else 2)
+        authority = base.authority.value
+        if mode == "unadvanced":
+            authority = EpochAuthorityRecord(
+                **{
+                    **authority.model_dump(mode="python"),
+                    "changed_at": "2026-08-19T12:02:00Z",
+                }
+            )
+        if mode == "wrong-cause":
+            authority = EpochAuthorityRecord(
+                **{
+                    **authority.model_dump(mode="python"),
+                    "cause": EpochChangeCause.RECOVERY,
+                }
+            )
+        claim = ServiceClaimRecord(
+            **{
+                **base.service_claim.value.model_dump(mode="python"),
+                "status": ServiceClaimStatus.RELEASED,
+                "released_by": authority.changed_by,
+                "release_request_id": authority.request_id,
+                "release_evidence_id": authority.evidence_id,
+                "released_at": authority.changed_at,
+            }
+        )
+        snapshot = FinalAuthoritySnapshot(
+            root=base.root,
+            service_claim=StoredRecord(claim, 1),
+            authority=StoredRecord(authority, authority.revision),
+        )
+        verified = _verified()
+        adapter = _Adapter(ServiceRole.EXECUTOR)
+
+        result = await FinalMutationGate(
+            authority_reader=_Reader(snapshot),
+            adapter=adapter,
+            clock=lambda: NOW,
+        ).execute(_lease(verified), verified)
+
+        assert isinstance(result, FinalAuthorityDenial)
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
         assert adapter.calls == []
 
     asyncio.run(scenario())

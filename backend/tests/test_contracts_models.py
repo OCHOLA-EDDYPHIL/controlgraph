@@ -423,6 +423,51 @@ def test_failed_safe_receipt_rejects_unrelated_reason() -> None:
         ExecutionReceipt.model_validate(receipt_data)
 
 
+@pytest.mark.parametrize(
+    ("outcome", "changes", "message"),
+    [
+        (
+            ReceiptOutcome.DENIED,
+            {"provider_operation": "operations/forbidden"},
+            "denied receipt",
+        ),
+        (
+            ReceiptOutcome.DENIED,
+            {"observed_etag": "etag-forbidden"},
+            "denied receipt",
+        ),
+        (
+            ReceiptOutcome.APPLIED,
+            {
+                "reason_code": None,
+                "provider_operation": None,
+                "observed_authority_epoch": 7,
+            },
+            "applied receipt",
+        ),
+        (
+            ReceiptOutcome.FAILED_SAFE,
+            {
+                "reason_code": ReasonCode.PROVIDER_REQUEST_REJECTED,
+                "provider_operation": "operations/forbidden",
+                "observed_authority_epoch": 7,
+            },
+            "failed-safe receipt",
+        ),
+    ],
+)
+def test_receipt_outcomes_reject_impossible_provider_result_shapes(
+    outcome: ReceiptOutcome,
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    receipt_data = all_contracts()[8].model_dump(mode="python")  # type: ignore[union-attr]
+    receipt_data.update(outcome=outcome, **changes)
+
+    with pytest.raises(ValidationError, match=message):
+        ExecutionReceipt.model_validate(receipt_data)
+
+
 def test_oversized_input_is_rejected_before_schema_validation() -> None:
     payload = b"{" + b" " * MAX_CONTRACT_BYTES + b"}"
     with pytest.raises(ContractError) as error:

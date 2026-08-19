@@ -387,9 +387,12 @@ class CloudRunMutationResult:
             raise ValueError("ambiguous mutation requires an unknown-outcome reason")
         if (
             self.outcome is CloudRunMutationOutcome.FAILED_SAFE
-            and self.reason is CloudRunMutationReason.OUTCOME_UNKNOWN
+            and (
+                self.reason is CloudRunMutationReason.OUTCOME_UNKNOWN
+                or self.operation_name is not None
+            )
         ):
-            raise ValueError("failed-safe mutation cannot retain an unknown outcome")
+            raise ValueError("failed-safe mutation result shape is invalid")
 
 
 class CloudRunReadErrorCode(StrEnum):

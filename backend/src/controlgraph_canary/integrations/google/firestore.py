@@ -480,6 +480,7 @@ def _validate_claim_release_authority(
         or replacement_claim.release_request_id != replacement_authority.request_id
         or replacement_claim.release_evidence_id != replacement_authority.evidence_id
         or replacement_claim.released_at != replacement_authority.changed_at
+        or replacement_authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
     ):
         raise ValueError("service claim release and authority advance are not one transition")
 
@@ -576,6 +577,15 @@ def _validate_receipt_replacement(
         and replacement.observed_authority_epoch is not None
     ):
         raise ValueError("receipt replacement changes its final authority observation")
+    if (
+        current.provider_operation is not None
+        and replacement.provider_operation != current.provider_operation
+    ) or (
+        current.outcome is not ReceiptOutcome.CLAIMED
+        and current.provider_operation is None
+        and replacement.provider_operation is not None
+    ):
+        raise ValueError("receipt replacement changes its provider operation")
     if replacement == current:
         raise ValueError("receipt replacement does not change durable state")
 

@@ -41,6 +41,11 @@ from controlgraph_canary.application.identity import (
     CallerRole,
     ServiceRole,
 )
+from controlgraph_canary.application.receipt_execution import (
+    ReceiptMutationResult,
+    ReceiptMutationStatus,
+    map_cloud_run_mutation_result,
+)
 from controlgraph_canary.authority.replay import (
     MutationAction,
     MutationBinding,
@@ -58,6 +63,7 @@ from controlgraph_canary.contracts.models import (
     EpochChangeCause,
     ExecutionReceipt,
     MutationIntent,
+    ReasonCode,
     ReceiptOutcome,
     RolloutRoot,
     SignedCapability,
@@ -725,6 +731,11 @@ async def test_mutation_uses_one_traffic_only_conditional_request(
     assert result.service is not None
     assert result.service.etag == "etag-after-8"
     assert result.expected_concurrency == 8
+    assert map_cloud_run_mutation_result(result) == ReceiptMutationResult(
+        status=ReceiptMutationStatus.APPLIED,
+        provider_operation="operations/update-traffic-1",
+        reason_code=None,
+    )
     assert [(item.revision, item.percent, item.tag) for item in result.requested_traffic] == [
         (STABLE, stable_percent, "stable"),
         (CANDIDATE, candidate_percent, "candidate"),
@@ -804,6 +815,19 @@ async def test_known_rejections_are_failed_safe_without_retry(
     assert result.reason is reason
     assert result.operation_name is None
     assert len(services.update_calls) == 1
+    with pytest.raises(ValueError, match="failed-safe mutation result"):
+        replace(result, operation_name="operations/forbidden")
+    expected_reason = {
+        CloudRunMutationReason.PRECONDITION_FAILED: (
+            ReasonCode.PROVIDER_PRECONDITION_FAILED
+        ),
+        CloudRunMutationReason.PROVIDER_REJECTED: ReasonCode.PROVIDER_REQUEST_REJECTED,
+    }[reason]
+    assert map_cloud_run_mutation_result(result) == ReceiptMutationResult(
+        status=ReceiptMutationStatus.FAILED_SAFE,
+        provider_operation=None,
+        reason_code=expected_reason,
+    )
 
 
 @pytest.mark.parametrize(
@@ -826,6 +850,11 @@ async def test_unknown_initial_provider_outcome_is_ambiguous_without_retry(
     assert result.reason is CloudRunMutationReason.OUTCOME_UNKNOWN
     assert result.operation_name is None
     assert len(services.update_calls) == 1
+    assert map_cloud_run_mutation_result(result) == ReceiptMutationResult(
+        status=ReceiptMutationStatus.AMBIGUOUS,
+        provider_operation=None,
+        reason_code=ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
+    )
 
 
 @_async_test
@@ -864,6 +893,11 @@ async def test_unknown_or_mismatched_operation_result_preserves_ambiguity(
     assert result.operation_name == "operations/update-traffic-1"
     assert len(services.update_calls) == 1
     assert operation.calls == [30.0]
+    assert map_cloud_run_mutation_result(result) == ReceiptMutationResult(
+        status=ReceiptMutationStatus.AMBIGUOUS,
+        provider_operation="operations/update-traffic-1",
+        reason_code=ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
+    )
 
 
 @_async_test

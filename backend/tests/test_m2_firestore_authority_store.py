@@ -890,6 +890,40 @@ def test_receipt_cas_rejects_binding_changes_and_terminal_regression() -> None:
     asyncio.run(scenario())
 
 
+def test_receipt_cas_cannot_replace_a_recorded_provider_operation() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        receipt = claimed_receipt("provider-operation-immutable")
+        claimed = await claim_or_adopt(store, receipt)
+        assert type(claimed) is ReceiptClaimCreated
+        applied = ExecutionReceipt(
+            **{
+                **receipt.model_dump(mode="python"),
+                "outcome": ReceiptOutcome.APPLIED,
+                "provider_operation": "operations/original",
+                "observed_authority_epoch": 1,
+                "updated_at": "2026-08-19T12:02:01Z",
+            }
+        )
+        stored = await store.compare_and_set_receipt(claimed.receipt, applied)
+        substituted = ExecutionReceipt(
+            **{
+                **applied.model_dump(mode="python"),
+                "outcome": ReceiptOutcome.AMBIGUOUS,
+                "reason_code": ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
+                "provider_operation": "operations/substituted",
+                "updated_at": "2026-08-19T12:02:02Z",
+            }
+        )
+
+        with pytest.raises(ValueError, match="provider operation"):
+            await store.compare_and_set_receipt(stored, substituted)
+
+        assert await store.read_receipt(receipt.idempotency_key) == stored
+
+    asyncio.run(scenario())
+
+
 def test_ambiguous_commit_is_adopted_only_after_exact_readback() -> None:
     async def scenario() -> None:
         store, _, runner = store_fixture()

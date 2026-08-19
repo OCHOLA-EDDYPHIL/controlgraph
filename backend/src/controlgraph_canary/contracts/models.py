@@ -379,6 +379,18 @@ class ExecutionReceipt(StrictContractModel):
             or self.observed_authority_epoch is not None
         ):
             raise ValueError("claimed receipt cannot contain a provider result")
+        if self.outcome is ReceiptOutcome.DENIED and (
+            self.provider_operation is not None or self.observed_etag is not None
+        ):
+            raise ValueError("denied receipt cannot contain a provider result")
+        if self.outcome is ReceiptOutcome.APPLIED and (
+            self.provider_operation is None or self.observed_etag is not None
+        ):
+            raise ValueError("applied receipt result shape is invalid")
+        if self.outcome is ReceiptOutcome.FAILED_SAFE and (
+            self.provider_operation is not None or self.observed_etag is not None
+        ):
+            raise ValueError("failed-safe receipt cannot contain a provider result")
         if (
             self.reason_code is ReasonCode.EPOCH_MISMATCH
             and (
