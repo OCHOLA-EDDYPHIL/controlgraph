@@ -83,6 +83,10 @@ def root() -> RolloutRoot:
     )
 
 
+def root_digest() -> str:
+    return canonical_sha256(root())
+
+
 def claims() -> CapabilityClaims:
     return CapabilityClaims(
         schema_version="controlgraph.capability-claims/v1",
@@ -92,6 +96,7 @@ def claims() -> CapabilityClaims:
         audience="https://executor.example.test/internal/v1/execute",
         target=target(),
         root_id="root-001",
+        root_sha256=root_digest(),
         epoch=7,
         action=CapabilityAction.APPLY_CANARY,
         stable_revision="canary-target-stable",
@@ -132,6 +137,7 @@ def intent() -> MutationIntent:
         idempotency_key="intent-001",
         target=target(),
         root_id="root-001",
+        root_sha256=root_digest(),
         epoch=7,
         action=CapabilityAction.APPLY_CANARY,
         stable_revision="canary-target-stable",
@@ -152,6 +158,7 @@ def all_contracts() -> tuple[object, ...]:
         EpochAuthorityRecord(
             schema_version="controlgraph.epoch-authority/v1",
             root_id="root-001",
+            root_sha256=root_digest(),
             target=target(),
             current_epoch=1,
             previous_epoch=None,
@@ -182,8 +189,11 @@ def all_contracts() -> tuple[object, ...]:
             idempotency_key="intent-001",
             capability_sha256=ZERO_DIGEST,
             mutation_sha256=ONE_DIGEST,
+            plan_sha256=TWO_DIGEST,
+            expected_poststate_sha256=ZERO_DIGEST,
             target=target(),
             root_id="root-001",
+            root_sha256=root_digest(),
             epoch=7,
             action=CapabilityAction.APPLY_CANARY,
             provider_etag="etag-stable-7",
@@ -198,6 +208,7 @@ def all_contracts() -> tuple[object, ...]:
         HealthInput(
             schema_version="controlgraph.health-input/v1",
             root_id="root-001",
+            root_sha256=root_digest(),
             target=target(),
             epoch=7,
             window_started_at="2026-08-19T12:02:00Z",
@@ -215,6 +226,7 @@ def all_contracts() -> tuple[object, ...]:
             schema_version="controlgraph.recovery-plan/v1",
             request_id="request-recovery-001",
             root_id="root-001",
+            root_sha256=root_digest(),
             target=target(),
             epoch=7,
             stable_revision="canary-target-stable",
@@ -234,6 +246,7 @@ def all_contracts() -> tuple[object, ...]:
             evidence_id="evidence-root-001",
             sequence=0,
             root_id="root-001",
+            root_sha256=root_digest(),
             target=target(),
             epoch=7,
             kind=EvidenceKind.ROOT_CREATED,
@@ -251,6 +264,7 @@ def all_contracts() -> tuple[object, ...]:
 
 
 def test_every_contract_round_trips_canonical_bytes() -> None:
+    assert claims().root_sha256 == canonical_sha256(root())
     for value in all_contracts():
         assert hasattr(value, "schema_version")
         encoded = canonical_json_bytes(value)  # type: ignore[arg-type]
@@ -341,8 +355,23 @@ def test_cross_field_inconsistencies_are_rejected() -> None:
     with pytest.raises(ValidationError):
         EpochAuthorityRecord.model_validate(authority_data)
 
+    receipt_data = all_contracts()[8].model_dump(mode="python")  # type: ignore[union-attr]
+    del receipt_data["plan_sha256"]
+    with pytest.raises(ValidationError):
+        ExecutionReceipt.model_validate(receipt_data)
+
+    receipt_data = all_contracts()[8].model_dump(mode="python")  # type: ignore[union-attr]
+    del receipt_data["expected_poststate_sha256"]
+    with pytest.raises(ValidationError):
+        ExecutionReceipt.model_validate(receipt_data)
+
     task_data = all_contracts()[7].model_dump(mode="python")  # type: ignore[union-attr]
     task_data["handler_audience"] = "https://other.example.test/internal/v1/execute"
+    with pytest.raises(ValidationError):
+        TaskRequest.model_validate(task_data)
+
+    task_data = all_contracts()[7].model_dump(mode="python")  # type: ignore[union-attr]
+    task_data["intent"]["root_sha256"] = ZERO_DIGEST  # type: ignore[index]
     with pytest.raises(ValidationError):
         TaskRequest.model_validate(task_data)
 

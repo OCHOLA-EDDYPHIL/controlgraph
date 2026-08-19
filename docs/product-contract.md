@@ -117,8 +117,9 @@ authorization or epoch facts return a denial rather than being inferred.
 
 ## Receipt outcomes
 
-An execution receipt is bound to the capability digest, rollout root, epoch, action, target,
-provider precondition, plan digest, canonical mutation digest, and idempotency key.
+An execution receipt is bound to the request identity, capability digest, rollout root, epoch,
+action, target, provider precondition, plan digest, canonical mutation digest, expected canonical
+post-state digest, and idempotency key.
 
 | Outcome | Completion rule |
 |---|---|
@@ -156,6 +157,7 @@ families are:
 | `EPOCH_MISMATCH` | The signed epoch is not exactly current. |
 | `IDEMPOTENCY_CONFLICT` | A request identity or key was reused for different canonical work. |
 | `RECEIPT_IN_PROGRESS` | Another exact delivery already owns the safe execution phase. |
+| `TRANSPORT_UNAVAILABLE` | Bounded delivery attempts ended before provider dispatch was possible. |
 | `PROVIDER_PRECONDITION_FAILED` | The target changed from the approved snapshot. |
 | `PROVIDER_OUTCOME_AMBIGUOUS` | A provider response cannot prove whether the mutation committed. |
 | `TRANSITION_INVALID` | The requested state transition is not legal. |

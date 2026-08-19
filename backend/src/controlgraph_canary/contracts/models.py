@@ -78,6 +78,7 @@ class ReasonCode(StrEnum):
     EPOCH_MISMATCH = "EPOCH_MISMATCH"
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
     RECEIPT_IN_PROGRESS = "RECEIPT_IN_PROGRESS"
+    TRANSPORT_UNAVAILABLE = "TRANSPORT_UNAVAILABLE"
     PROVIDER_PRECONDITION_FAILED = "PROVIDER_PRECONDITION_FAILED"
     PROVIDER_OUTCOME_AMBIGUOUS = "PROVIDER_OUTCOME_AMBIGUOUS"
     TRANSITION_INVALID = "TRANSITION_INVALID"
@@ -159,6 +160,7 @@ class RolloutRoot(StrictContractModel):
 class EpochAuthorityRecord(StrictContractModel):
     schema_version: Literal["controlgraph.epoch-authority/v1"]
     root_id: Identifier
+    root_sha256: Sha256Digest
     target: TargetBinding
     current_epoch: PositiveSafeInteger
     previous_epoch: PositiveSafeInteger | None
@@ -201,6 +203,7 @@ class CapabilityClaims(StrictContractModel):
     audience: Audience
     target: TargetBinding
     root_id: Identifier
+    root_sha256: Sha256Digest
     epoch: PositiveSafeInteger
     action: CapabilityAction
     stable_revision: CloudRunName
@@ -260,6 +263,7 @@ class MutationIntent(StrictContractModel):
     idempotency_key: Identifier
     target: TargetBinding
     root_id: Identifier
+    root_sha256: Sha256Digest
     epoch: PositiveSafeInteger
     action: CapabilityAction
     stable_revision: CloudRunName
@@ -300,6 +304,7 @@ class TaskRequest(StrictContractModel):
         if (
             claims.target != intent.target
             or claims.root_id != intent.root_id
+            or claims.root_sha256 != intent.root_sha256
             or claims.epoch != intent.epoch
             or claims.action is not intent.action
             or claims.stable_revision != intent.stable_revision
@@ -323,8 +328,11 @@ class ExecutionReceipt(StrictContractModel):
     idempotency_key: Identifier
     capability_sha256: Sha256Digest
     mutation_sha256: Sha256Digest
+    plan_sha256: Sha256Digest
+    expected_poststate_sha256: Sha256Digest
     target: TargetBinding
     root_id: Identifier
+    root_sha256: Sha256Digest
     epoch: PositiveSafeInteger
     action: CapabilityAction
     provider_etag: OpaqueToken
@@ -361,6 +369,7 @@ class ExecutionReceipt(StrictContractModel):
 class HealthInput(StrictContractModel):
     schema_version: Literal["controlgraph.health-input/v1"]
     root_id: Identifier
+    root_sha256: Sha256Digest
     target: TargetBinding
     epoch: PositiveSafeInteger
     window_started_at: UtcSecond
@@ -391,6 +400,7 @@ class RecoveryPlan(StrictContractModel):
     schema_version: Literal["controlgraph.recovery-plan/v1"]
     request_id: Identifier
     root_id: Identifier
+    root_sha256: Sha256Digest
     target: TargetBinding
     epoch: PositiveSafeInteger
     stable_revision: CloudRunName
@@ -417,6 +427,7 @@ class EvidenceEvent(StrictContractModel):
     evidence_id: Identifier
     sequence: NonNegativeSafeInteger
     root_id: Identifier
+    root_sha256: Sha256Digest
     target: TargetBinding
     epoch: PositiveSafeInteger
     kind: EvidenceKind
