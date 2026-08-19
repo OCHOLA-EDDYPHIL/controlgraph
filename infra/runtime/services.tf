@@ -92,6 +92,32 @@ module "verifier" {
     CONTROLGRAPH_SERVICE_NAME           = local.service_names.verifier
     CONTROLGRAPH_CONTROLLER_ID          = "${var.project_id}:${var.region}:verifier"
     CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+  })
+}
+
+module "evidence_writer" {
+  source = "../modules/cloud_run_service"
+
+  depends_on = [google_artifact_registry_repository_iam_member.cloud_run_image_reader]
+
+  project_id      = var.project_id
+  region          = var.region
+  service_name    = local.service_names.evidence_writer
+  description     = "Private ControlGraph evidence signer."
+  container_image = var.controller_image
+  service_account = local.service_accounts.evidence_writer
+  ingress         = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  network         = data.terraform_remote_state.foundation.outputs.network.network_id
+  subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
+  vpc_egress      = "ALL_TRAFFIC"
+  labels          = merge(local.common_labels, { component = "evidence-writer" })
+  environment = merge(local.common_environment, local.identity_environment.evidence_writer, {
+    CONTROLGRAPH_ROLE                 = "evidence_writer"
+    CONTROLGRAPH_SERVICE_NAME         = local.service_names.evidence_writer
+    CONTROLGRAPH_CONTROLLER_ID        = "${var.project_id}:${var.region}:evidence_writer"
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_SIGNING_ALGORITHM    = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.algorithm
   })
 }
 
@@ -117,6 +143,7 @@ module "coordinator" {
     CONTROLGRAPH_CONTROLLER_ID         = "${var.project_id}:${var.region}:coordinator"
     CONTROLGRAPH_ISSUER_URL            = local.service_audiences.issuer
     CONTROLGRAPH_VERIFIER_URL          = local.service_audiences.verifier
+    CONTROLGRAPH_EVIDENCE_WRITER_URL   = local.service_audiences.evidence_writer
     CONTROLGRAPH_EXECUTOR_URL          = local.service_audiences.executor
     CONTROLGRAPH_RECOVERY_URL          = local.service_audiences.recovery
     CONTROLGRAPH_EXECUTION_QUEUE       = local.execution_queue.name

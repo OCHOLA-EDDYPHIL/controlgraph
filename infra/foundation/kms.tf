@@ -21,6 +21,7 @@ locals {
   evidence_version_readers = toset([
     "api",
     "evidence_writer",
+    "verifier",
   ])
 }
 
@@ -103,6 +104,12 @@ resource "google_kms_crypto_key_iam_member" "evidence_public_key_viewer" {
   crypto_key_id = google_kms_crypto_key.signing["evidence"].id
   role          = "roles/cloudkms.publicKeyViewer"
   member        = google_service_account.workloads["api"].member
+}
+
+resource "google_kms_crypto_key_iam_member" "evidence_public_key_verifier" {
+  crypto_key_id = google_kms_crypto_key.signing["evidence"].id
+  role          = "roles/cloudkms.publicKeyViewer"
+  member        = google_service_account.workloads["verifier"].member
 }
 
 resource "google_kms_crypto_key_iam_member" "capability_version_reader" {

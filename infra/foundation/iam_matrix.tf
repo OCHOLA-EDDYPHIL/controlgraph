@@ -72,6 +72,10 @@ locals {
       api      = "run.googleapis.com"
       boundary = "the fixed execution task handler"
     }
+    run_evidence_writer_invoke = {
+      api      = "run.googleapis.com"
+      boundary = "the internal evidence-writer service"
+    }
     run_issuer_invoke = {
       api      = "run.googleapis.com"
       boundary = "the internal capability issuer service"
@@ -142,6 +146,7 @@ locals {
       "firestore_authority_read",
       "firestore_authority_write",
       "run_issuer_invoke",
+      "run_evidence_writer_invoke",
       "run_verifier_invoke",
       "task_caller_act_as",
       "tasks_execution_enqueue",
@@ -170,6 +175,8 @@ locals {
       "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
+      "kms_evidence_public_key_read",
+      "kms_evidence_version_read",
       "monitoring_health_read",
       "run_reference_invoke",
       "run_target_snapshot",
@@ -221,6 +228,7 @@ locals {
         "firestore_authority_read",
         "firestore_authority_write",
         "run_issuer_invoke",
+        "run_evidence_writer_invoke",
         "run_verifier_invoke",
         "task_caller_act_as",
         "tasks_execution_enqueue",
@@ -245,6 +253,8 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
+        "kms_evidence_public_key_read",
+        "kms_evidence_version_read",
         "run_reference_invoke",
         "run_target_snapshot",
       ])
@@ -358,10 +368,13 @@ check "verifier_and_evidence_writer_are_separated" {
     condition = (
       !contains(local.identity_expected_allows.verifier, "firestore_authority_write") &&
       !contains(local.identity_expected_allows.verifier, "kms_evidence_sign") &&
+      contains(local.identity_expected_allows.verifier, "kms_evidence_public_key_read") &&
+      contains(local.identity_expected_allows.verifier, "kms_evidence_version_read") &&
       local.identity_expected_allows.evidence_writer == toset([
         "kms_evidence_sign",
         "kms_evidence_version_read",
-      ])
+      ]) &&
+      local.identity_implemented_allows.evidence_writer == local.identity_expected_allows.evidence_writer
     )
     error_message = "Verification, authority writes, and evidence signing must remain separate."
   }
