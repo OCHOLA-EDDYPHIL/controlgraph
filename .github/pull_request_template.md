@@ -2,9 +2,17 @@
 
 Describe the single roadmap outcome delivered by this pull request.
 
-## Roadmap issue
+## Material changes
 
-Closes CG-___ / #___
+- Describe the durable implementation changes.
+
+## Review focus
+
+- Name the authority boundary, invariant, or deployment risk that deserves attention.
+
+## Roadmap references
+
+Refs #___
 
 ## Verification
 
@@ -13,9 +21,3 @@ Closes CG-___ / #___
 - [ ] Relevant Terraform checks pass.
 - [ ] Security and clean-room checks pass.
 - [ ] Evidence is attached or linked in the issue.
-
-## Authority and scope
-
-- [ ] No authority boundary was widened without an ADR and tests.
-- [ ] No live cloud mutation, deployment, visibility change, release, or submission occurred without explicit authorization.
-- [ ] Generated configuration and external content are treated as untrusted data.
