@@ -13,6 +13,11 @@ output "operator_principal" {
   value       = var.operator_principal
 }
 
+output "operator_subject" {
+  description = "Exact Google identity subject selected for the human operator."
+  value       = var.operator_subject
+}
+
 output "region" {
   description = "Sole regional boundary for managed resources."
   value       = var.region

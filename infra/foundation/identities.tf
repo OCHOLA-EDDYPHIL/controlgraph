@@ -94,3 +94,8 @@ output "service_account_names" {
   description = "ControlGraph workload service-account resource names keyed by role."
   value       = { for role, account in google_service_account.workloads : role => account.name }
 }
+
+output "service_account_subjects" {
+  description = "Immutable Google identity subjects keyed by ControlGraph workload role."
+  value       = { for role, account in google_service_account.workloads : role => account.unique_id }
+}

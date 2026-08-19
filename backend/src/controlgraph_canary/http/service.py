@@ -8,7 +8,6 @@ import re
 import sys
 import uuid
 from collections.abc import Awaitable, Callable
-from enum import StrEnum
 from typing import Final
 
 from fastapi import FastAPI, Request, Response
@@ -16,25 +15,26 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from controlgraph_canary import __version__
-from controlgraph_canary.application.tasks import (
-    EXECUTION_HANDLER_PATH,
-    RECOVERY_HANDLER_PATH,
+from controlgraph_canary.application.capability_verification import (
+    CapabilityRequestVerifier,
+    CapabilityVerificationError,
+    VerifiedMutation,
 )
+from controlgraph_canary.application.identity import (
+    AuthenticationContext,
+    AuthenticationDenialCode,
+    AuthenticationError,
+    IdentityAuthenticator,
+    RouteAuthenticationPolicy,
+    ServiceRole,
+    protected_path,
+)
+from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
+from controlgraph_canary.contracts.models import ReasonCode
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-
-
-class ServiceRole(StrEnum):
-    """Private runtime roles with separate deployment identities."""
-
-    API = "api"
-    COORDINATOR = "coordinator"
-    ISSUER = "issuer"
-    EXECUTOR = "executor"
-    RECOVERY = "recovery"
-    VERIFIER = "verifier"
 
 
 class ServiceHealth(BaseModel):
@@ -70,13 +70,51 @@ class DisabledWork(BaseModel):
     correlation_id: str
 
 
+class AuthenticationDenied(BaseModel):
+    """Credential-free authentication denial returned before protected work."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: AuthenticationDenialCode
+    correlation_id: str
+
+
+class CapabilityDenied(BaseModel):
+    """Payload-free capability denial returned before protected handler entry."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: ReasonCode
+    correlation_id: str
+
+
+type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
+
+
 def create_service_app(
     role: ServiceRole,
     *,
     build_digest: str | None = None,
+    authenticator: IdentityAuthenticator | None = None,
+    authentication_policy: RouteAuthenticationPolicy | None = None,
+    capability_verifier: CapabilityRequestVerifier | None = None,
+    verified_task_handler: VerifiedTaskHandler | None = None,
 ) -> FastAPI:
-    """Create one private role shell with no enabled protected operation."""
+    """Create one authenticated role shell with no enabled mutation operation."""
 
+    if type(role) is not ServiceRole:
+        raise ValueError("service role is invalid")
+    if (authenticator is None) != (authentication_policy is None):
+        raise ValueError("authenticator and authentication policy must be configured together")
+    if authentication_policy is not None and authentication_policy.service_role is not role:
+        raise ValueError("authentication policy does not match the service role")
+    if verified_task_handler is not None and capability_verifier is None:
+        raise ValueError("a protected task handler requires capability verification")
+    if (capability_verifier is not None or verified_task_handler is not None) and role not in {
+        ServiceRole.EXECUTOR,
+        ServiceRole.RECOVERY,
+    }:
+        raise ValueError("capability verification is limited to protected task routes")
     if build_digest is None:
         build_digest = os.environ.get("CONTROLGRAPH_BUILD_DIGEST")
     if build_digest is not None and _DIGEST.fullmatch(build_digest) is None:
@@ -133,39 +171,125 @@ def create_service_app(
             correlation_id=correlation_id,
         )
 
-    def disabled_work() -> JSONResponse:
+    async def protected_work(request: Request) -> Response:
         correlation_id = _correlation_id()
-        response = DisabledWork(
+        if authenticator is None or authentication_policy is None:
+            return _authentication_denial(
+                AuthenticationDenialCode.CONFIGURATION_INVALID,
+                correlation_id,
+            )
+        authorization_headers = request.headers.getlist("authorization")
+        if len(authorization_headers) > 1:
+            return _authentication_denial(
+                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
+                correlation_id,
+            )
+        authorization_header = authorization_headers[0] if authorization_headers else None
+        try:
+            context = authenticator.authenticate(authorization_header, authentication_policy)
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if type(context) is not AuthenticationContext:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        request.state.authentication = context
+        if capability_verifier is not None:
+            try:
+                body = await _read_contract_body(request)
+                verified = await capability_verifier.verify(body, context)
+            except CapabilityVerificationError as error:
+                return _capability_denial(error.code, correlation_id)
+            except Exception:
+                return _capability_denial(ReasonCode.AUTHORITY_UNAVAILABLE, correlation_id)
+            if type(verified) is not VerifiedMutation:
+                return _capability_denial(ReasonCode.AUTHORITY_UNAVAILABLE, correlation_id)
+            request.state.verified_mutation = verified
+            if verified_task_handler is not None:
+                handler_response = await verified_task_handler(verified)
+                if not isinstance(handler_response, Response):
+                    return _capability_denial(ReasonCode.AUTHORITY_UNAVAILABLE, correlation_id)
+                handler_response.headers.setdefault("X-ControlGraph-Correlation-Id", correlation_id)
+                return handler_response
+        disabled_response = DisabledWork(
             code="MUTATION_DISABLED",
             correlation_id=correlation_id,
         )
         return JSONResponse(
             status_code=503,
-            content=response.model_dump(mode="json"),
+            content=disabled_response.model_dump(mode="json"),
             headers={"X-ControlGraph-Correlation-Id": correlation_id},
         )
 
     for path in protected_paths(role):
-        app.add_api_route(path, disabled_work, methods=["POST"], include_in_schema=False)
+        app.add_api_route(path, protected_work, methods=["POST"], include_in_schema=False)
     return app
 
 
 def protected_paths(role: ServiceRole) -> tuple[str, ...]:
     """Return the closed route set for deployment and local conformance checks."""
 
-    if role is ServiceRole.API:
-        return ("/v1/operator/commands",)
-    if role is ServiceRole.COORDINATOR:
-        return ("/v1/internal/coordinate",)
-    if role is ServiceRole.ISSUER:
-        return ("/v1/internal/issue",)
-    if role is ServiceRole.EXECUTOR:
-        return (EXECUTION_HANDLER_PATH,)
-    if role is ServiceRole.RECOVERY:
-        return (RECOVERY_HANDLER_PATH,)
-    if role is ServiceRole.VERIFIER:
-        return ("/v1/internal/verify",)
-    raise ValueError("unsupported service role")
+    return (protected_path(role),)
+
+
+def _authentication_denial(
+    code: AuthenticationDenialCode,
+    correlation_id: str,
+) -> JSONResponse:
+    response = AuthenticationDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        AuthenticationDenialCode.CONFIGURATION_INVALID,
+        AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+    }:
+        status_code = 503
+    elif code is AuthenticationDenialCode.CALLER_DENIED:
+        status_code = 403
+    else:
+        status_code = 401
+    headers = {"X-ControlGraph-Correlation-Id": correlation_id}
+    if status_code == 401:
+        headers["WWW-Authenticate"] = "Bearer"
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers=headers,
+    )
+
+
+def _capability_denial(code: ReasonCode, correlation_id: str) -> JSONResponse:
+    response = CapabilityDenied(code=code, correlation_id=correlation_id)
+    status_code = 503 if code is ReasonCode.AUTHORITY_UNAVAILABLE else 403
+    if code in {
+        ReasonCode.CONTRACT_INVALID,
+        ReasonCode.CONTRACT_VERSION_UNSUPPORTED,
+    }:
+        status_code = 400
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+async def _read_contract_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if type(chunk) is not bytes or len(body) + len(chunk) > MAX_CONTRACT_BYTES:
+            raise _deny_contract()
+        body.extend(chunk)
+    if not body:
+        raise _deny_contract()
+    return bytes(body)
+
+
+def _deny_contract() -> CapabilityVerificationError:
+    return CapabilityVerificationError(ReasonCode.CONTRACT_INVALID)
 
 
 def _correlation_id() -> str:
@@ -191,10 +315,13 @@ def _emit_service_event(
 __all__ = [
     "PRODUCT_CONTRACT_VERSION",
     "SERVICE_SHELL_VERSION",
+    "AuthenticationDenied",
+    "CapabilityDenied",
     "DisabledWork",
     "ServiceHealth",
     "ServiceMetadata",
     "ServiceRole",
+    "VerifiedTaskHandler",
     "create_service_app",
     "protected_paths",
 ]

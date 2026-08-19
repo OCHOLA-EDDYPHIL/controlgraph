@@ -184,6 +184,8 @@ class EpochAuthorityRecord(StrictContractModel):
             or self.revision < 1
         ):
             raise ValueError("authority transition must advance exactly one epoch")
+        if self.current_epoch != self.revision + 1:
+            raise ValueError("authority epoch and revision must advance together")
         return self
 
 

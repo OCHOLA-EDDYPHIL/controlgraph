@@ -7,3 +7,4 @@ reference_target_stable_image       = "us-central1-docker.pkg.dev/controlgraph-c
 reference_target_candidate_image    = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
 reference_target_deployment_phase   = "stable"
 operator_principal                  = "user:operator@example.com"
+operator_subject                    = "123456789012345678901"

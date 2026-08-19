@@ -15,8 +15,8 @@ output "task_queues" {
   value = {
     execution = {
       id                    = google_cloud_tasks_queue.execution.id
-      handler               = "${module.executor.service.uri}${local.execution_queue.handler_path}"
-      audience              = module.executor.service.uri
+      handler               = "${local.service_audiences.executor}${local.execution_queue.handler_path}"
+      audience              = local.service_audiences.executor
       caller                = local.service_accounts.execution_task_caller
       max_dispatches_second = 1
       max_concurrency       = 1
@@ -25,8 +25,8 @@ output "task_queues" {
     }
     recovery = {
       id                    = google_cloud_tasks_queue.recovery.id
-      handler               = "${module.recovery.service.uri}${local.recovery_queue.handler_path}"
-      audience              = module.recovery.service.uri
+      handler               = "${local.service_audiences.recovery}${local.recovery_queue.handler_path}"
+      audience              = local.service_audiences.recovery
       caller                = local.service_accounts.recovery_task_caller
       max_dispatches_second = 1
       max_concurrency       = 1

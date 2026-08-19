@@ -75,6 +75,32 @@ class CreatedRollout:
     authority: StoredRecord[EpochAuthorityRecord]
 
 
+@dataclass(frozen=True, slots=True)
+class IssuanceStateSnapshot:
+    """One transactionally consistent view of issuance-bearing authority state."""
+
+    root: StoredRecord[RolloutRoot]
+    service_claim: StoredRecord[ServiceClaimRecord]
+    authority: StoredRecord[EpochAuthorityRecord]
+
+
+@dataclass(frozen=True, slots=True)
+class FinalAuthoritySnapshot:
+    """One atomic view used immediately before a protected mutation."""
+
+    root: StoredRecord[RolloutRoot]
+    service_claim: StoredRecord[ServiceClaimRecord]
+    authority: StoredRecord[EpochAuthorityRecord]
+
+
+@dataclass(frozen=True, slots=True)
+class ReleasedServiceClaim:
+    """The claim release and epoch advance committed by one transaction."""
+
+    service_claim: StoredRecord[ServiceClaimRecord]
+    authority: StoredRecord[EpochAuthorityRecord]
+
+
 @runtime_checkable
 class AuthorityStore(Protocol):
     """Narrow persistence operations required by ControlGraph authority flows."""
@@ -98,6 +124,16 @@ class AuthorityStore(Protocol):
         root_id: str,
     ) -> StoredRecord[EpochAuthorityRecord] | None: ...
 
+    async def read_issuance_state(
+        self,
+        root_id: str,
+    ) -> IssuanceStateSnapshot | None: ...
+
+    async def read_final_authority_snapshot(
+        self,
+        root_id: str,
+    ) -> FinalAuthoritySnapshot | None: ...
+
     async def advance_authority(
         self,
         expected: StoredRecord[EpochAuthorityRecord],
@@ -106,9 +142,11 @@ class AuthorityStore(Protocol):
 
     async def release_service_claim(
         self,
-        expected: StoredRecord[ServiceClaimRecord],
-        replacement: ServiceClaimRecord,
-    ) -> StoredRecord[ServiceClaimRecord]: ...
+        expected_claim: StoredRecord[ServiceClaimRecord],
+        replacement_claim: ServiceClaimRecord,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+        replacement_authority: EpochAuthorityRecord,
+    ) -> ReleasedServiceClaim: ...
 
     async def read_receipt(
         self,
@@ -136,5 +174,8 @@ __all__ = [
     "AuthorityStoreOutcomeUnknown",
     "AuthorityStoreUnavailable",
     "CreatedRollout",
+    "FinalAuthoritySnapshot",
+    "IssuanceStateSnapshot",
+    "ReleasedServiceClaim",
     "StoredRecord",
 ]

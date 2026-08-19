@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol, Self, cast
@@ -20,6 +20,9 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
     CreatedRollout,
+    FinalAuthoritySnapshot,
+    IssuanceStateSnapshot,
+    ReleasedServiceClaim,
     StoredRecord,
 )
 from controlgraph_canary.contracts.base import StrictContractModel
@@ -121,6 +124,17 @@ class AsyncFirestoreAuthorityClientPort(Protocol):
 
     def document(self, *document_path: str) -> _DocumentReferencePort: ...
 
+    def get_all(
+        self,
+        references: Sequence[_DocumentReferencePort],
+        field_paths: object | None = None,
+        transaction: object | None = None,
+        retry: object | None = None,
+        timeout: float | None = None,
+        *,
+        read_time: datetime | None = None,
+    ) -> AsyncIterator[object]: ...
+
     def transaction(
         self,
         max_attempts: int = FIRESTORE_MAX_TRANSACTION_ATTEMPTS,
@@ -155,6 +169,22 @@ class _DecodedDocument[ModelT: StrictContractModel]:
     @property
     def stored(self) -> StoredRecord[ModelT]:
         return StoredRecord(value=self.value, revision=self.wrapper.revision)
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodedIssuanceState:
+    root: _DecodedDocument[RolloutRoot] | None
+    service_claim: _DecodedDocument[ServiceClaimRecord] | None
+    authority: _DecodedDocument[EpochAuthorityRecord] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalReadSpec:
+    reference: _DocumentReferencePort
+    kind: AuthorityStorageKind
+    logical_id: str
+    document_id: str
+    model_type: type[StrictContractModel]
 
 
 def _default_client_factory(
@@ -241,7 +271,10 @@ async def _default_transaction_runner(
 ) -> None:
     transaction = cast(
         firestore_v1.AsyncTransaction,
-        client.transaction(max_attempts=maximum_attempts),
+        client.transaction(
+            max_attempts=maximum_attempts,
+            read_only=expected_writes == 0,
+        ),
     )
 
     async def execute(value: firestore_v1.AsyncTransaction) -> None:
@@ -394,6 +427,34 @@ def _validate_claim_release(
         or not immutable_fields_match
     ):
         raise ValueError("service claim replacement is not an exact release")
+
+
+def _validate_claim_release_authority(
+    configured_target: TargetBinding,
+    expected_claim: StoredRecord[ServiceClaimRecord],
+    replacement_claim: ServiceClaimRecord,
+    expected_authority: StoredRecord[EpochAuthorityRecord],
+    replacement_authority: EpochAuthorityRecord,
+) -> None:
+    _validate_claim_release(configured_target, expected_claim, replacement_claim)
+    _validate_authority_advance(
+        configured_target,
+        expected_authority,
+        replacement_authority,
+    )
+    current_claim = expected_claim.value
+    current_authority = expected_authority.value
+    if (
+        current_claim.root_id != current_authority.root_id
+        or current_claim.root_sha256 != current_authority.root_sha256
+        or replacement_claim.root_id != replacement_authority.root_id
+        or replacement_claim.root_sha256 != replacement_authority.root_sha256
+        or replacement_claim.released_by != replacement_authority.changed_by
+        or replacement_claim.release_request_id != replacement_authority.request_id
+        or replacement_claim.release_evidence_id != replacement_authority.evidence_id
+        or replacement_claim.released_at != replacement_authority.changed_at
+    ):
+        raise ValueError("service claim release and authority advance are not one transition")
 
 
 _RECEIPT_TRANSITIONS: Final = {
@@ -592,7 +653,7 @@ class FirestoreAuthorityStore:
                     raise AuthorityStoreUnavailable from None
                 if any(
                     not callable(getattr(client, name, None))
-                    for name in ("document", "transaction")
+                    for name in ("document", "get_all", "transaction")
                 ):
                     raise AuthorityStoreUnavailable
                 try:
@@ -811,6 +872,23 @@ class FirestoreAuthorityStore:
             classification.add_done_callback(_consume_background_result)
             raise AuthorityStoreOutcomeUnknown from None
 
+    async def _run_consistent_read(self, body: _TransactionBody) -> None:
+        client = await self._client()
+        try:
+            async with asyncio.timeout(FIRESTORE_OPERATION_TIMEOUT_SECONDS):
+                await self._transaction_runner(
+                    client,
+                    FIRESTORE_MAX_TRANSACTION_ATTEMPTS,
+                    0,
+                    body,
+                )
+        except asyncio.CancelledError:
+            raise
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception:
+            raise AuthorityStoreUnavailable from None
+
     async def create_rollout(
         self,
         root: RolloutRoot,
@@ -900,6 +978,203 @@ class FirestoreAuthorityStore:
             raise AuthorityStoreCorruptRecord
         return None if decoded is None else decoded.stored
 
+    async def read_issuance_state(
+        self,
+        root_id: str,
+    ) -> IssuanceStateSnapshot | None:
+        decoded_state: _DecodedIssuanceState | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal decoded_state
+            client = await self._client()
+            root_document_id = rollout_root_document_id(root_id)
+            claim_logical_id = service_claim_logical_id(self._target)
+            claim_document_id = service_claim_document_id(self._target)
+            authority_document_id = epoch_authority_document_id(root_id)
+            root_reference = self._reference(
+                client,
+                AuthorityStorageKind.ROLLOUT_ROOT,
+                root_document_id,
+            )
+            claim_reference = self._reference(
+                client,
+                AuthorityStorageKind.SERVICE_CLAIM,
+                claim_document_id,
+            )
+            authority_reference = self._reference(
+                client,
+                AuthorityStorageKind.EPOCH_AUTHORITY,
+                authority_document_id,
+            )
+            decoded_state = _DecodedIssuanceState(
+                root=await self._transaction_read(
+                    transaction,
+                    reference=root_reference,
+                    kind=AuthorityStorageKind.ROLLOUT_ROOT,
+                    logical_id=root_id,
+                    document_id=root_document_id,
+                    model_type=RolloutRoot,
+                ),
+                service_claim=await self._transaction_read(
+                    transaction,
+                    reference=claim_reference,
+                    kind=AuthorityStorageKind.SERVICE_CLAIM,
+                    logical_id=claim_logical_id,
+                    document_id=claim_document_id,
+                    model_type=ServiceClaimRecord,
+                ),
+                authority=await self._transaction_read(
+                    transaction,
+                    reference=authority_reference,
+                    kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                    logical_id=root_id,
+                    document_id=authority_document_id,
+                    model_type=EpochAuthorityRecord,
+                ),
+            )
+
+        await self._run_consistent_read(read)
+        if decoded_state is None:
+            raise AuthorityStoreUnavailable
+        present = tuple(
+            value
+            for value in (
+                decoded_state.root,
+                decoded_state.service_claim,
+                decoded_state.authority,
+            )
+            if value is not None
+        )
+        if any(value.value.target != self._target for value in present):
+            raise AuthorityStoreCorruptRecord
+        if (
+            decoded_state.root is None
+            or decoded_state.service_claim is None
+            or decoded_state.authority is None
+        ):
+            return None
+        return IssuanceStateSnapshot(
+            root=decoded_state.root.stored,
+            service_claim=decoded_state.service_claim.stored,
+            authority=decoded_state.authority.stored,
+        )
+
+    async def read_final_authority_snapshot(
+        self,
+        root_id: str,
+    ) -> FinalAuthoritySnapshot | None:
+        """Read the complete final fence with one strongly consistent BatchGet RPC."""
+
+        client = await self._client()
+        root_document_id = rollout_root_document_id(root_id)
+        claim_logical_id = service_claim_logical_id(self._target)
+        claim_document_id = service_claim_document_id(self._target)
+        authority_document_id = epoch_authority_document_id(root_id)
+        specs = (
+            _FinalReadSpec(
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRoot,
+            ),
+            _FinalReadSpec(
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document_id,
+                model_type=ServiceClaimRecord,
+            ),
+            _FinalReadSpec(
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            ),
+        )
+        expected = {spec.reference.path: spec for spec in specs}
+        decoded: dict[str, _DecodedDocument[StrictContractModel] | None] = {}
+        previous_read_time: datetime | None = None
+        try:
+            async with asyncio.timeout(FIRESTORE_OPERATION_TIMEOUT_SECONDS):
+                snapshots = client.get_all(
+                    [spec.reference for spec in specs],
+                    field_paths=None,
+                    transaction=None,
+                    retry=None,
+                    timeout=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
+                    read_time=None,
+                )
+                async for snapshot in snapshots:
+                    try:
+                        provider_snapshot = cast(_ProviderSnapshotPort, snapshot)
+                        current_read_time = _aware_utc(provider_snapshot.read_time)
+                        path = provider_snapshot.reference.path
+                    except Exception:
+                        raise AuthorityStoreCorruptRecord from None
+                    if (
+                        previous_read_time is not None
+                        and current_read_time < previous_read_time
+                    ):
+                        raise AuthorityStoreCorruptRecord
+                    previous_read_time = current_read_time
+                    spec = expected.get(path)
+                    if spec is None or path in decoded:
+                        raise AuthorityStoreCorruptRecord
+                    decoded[path] = self._decode_snapshot(
+                        snapshot,
+                        reference=spec.reference,
+                        kind=spec.kind,
+                        logical_id=spec.logical_id,
+                        document_id=spec.document_id,
+                        model_type=spec.model_type,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception:
+            raise AuthorityStoreUnavailable from None
+        if set(decoded) != set(expected):
+            raise AuthorityStoreCorruptRecord
+        root = cast(
+            _DecodedDocument[RolloutRoot] | None,
+            decoded[specs[0].reference.path],
+        )
+        service_claim = cast(
+            _DecodedDocument[ServiceClaimRecord] | None,
+            decoded[specs[1].reference.path],
+        )
+        authority = cast(
+            _DecodedDocument[EpochAuthorityRecord] | None,
+            decoded[specs[2].reference.path],
+        )
+        present = tuple(
+            value for value in (root, service_claim, authority) if value is not None
+        )
+        if any(value.value.target != self._target for value in present):
+            raise AuthorityStoreCorruptRecord
+        if root is None or service_claim is None or authority is None:
+            return None
+        return FinalAuthoritySnapshot(
+            root=root.stored,
+            service_claim=service_claim.stored,
+            authority=authority.stored,
+        )
+
     async def advance_authority(
         self,
         expected: StoredRecord[EpochAuthorityRecord],
@@ -939,41 +1214,87 @@ class FirestoreAuthorityStore:
 
     async def release_service_claim(
         self,
-        expected: StoredRecord[ServiceClaimRecord],
-        replacement: ServiceClaimRecord,
-    ) -> StoredRecord[ServiceClaimRecord]:
-        _validate_claim_release(self._target, expected, replacement)
+        expected_claim: StoredRecord[ServiceClaimRecord],
+        replacement_claim: ServiceClaimRecord,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+        replacement_authority: EpochAuthorityRecord,
+    ) -> ReleasedServiceClaim:
+        _validate_claim_release_authority(
+            self._target,
+            expected_claim,
+            replacement_claim,
+            expected_authority,
+            replacement_authority,
+        )
         logical_id = service_claim_logical_id(self._target)
-        document = _prepared_document(
+        claim_document = _prepared_document(
             kind=AuthorityStorageKind.SERVICE_CLAIM,
             logical_id=logical_id,
             document_id=service_claim_document_id(self._target),
-            revision=expected.revision + 1,
-            value=replacement,
+            revision=expected_claim.revision + 1,
+            value=replacement_claim,
         )
-        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (document,)
+        authority_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=replacement_authority.root_id,
+            document_id=epoch_authority_document_id(replacement_authority.root_id),
+            revision=expected_authority.revision + 1,
+            value=replacement_authority,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            claim_document,
+            authority_document,
+        )
 
         async def update(transaction: _TransactionPort) -> None:
             client = await self._client()
-            reference = self._reference(
+            claim_reference = self._reference(
                 client,
                 AuthorityStorageKind.SERVICE_CLAIM,
                 service_claim_document_id(self._target),
             )
-            current = await self._transaction_read(
+            authority_reference = self._reference(
+                client,
+                AuthorityStorageKind.EPOCH_AUTHORITY,
+                epoch_authority_document_id(replacement_authority.root_id),
+            )
+            current_claim = await self._transaction_read(
                 transaction,
-                reference=reference,
+                reference=claim_reference,
                 kind=AuthorityStorageKind.SERVICE_CLAIM,
                 logical_id=logical_id,
-                document_id=document.document_id,
+                document_id=claim_document.document_id,
                 model_type=ServiceClaimRecord,
             )
-            if current is None or current.stored != expected:
+            current_authority = await self._transaction_read(
+                transaction,
+                reference=authority_reference,
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=replacement_authority.root_id,
+                document_id=authority_document.document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            if (
+                current_claim is None
+                or current_claim.stored != expected_claim
+                or current_authority is None
+                or current_authority.stored != expected_authority
+            ):
                 raise _ExpectedStateMismatch
-            transaction.update(reference, _document_data(document.wrapper))
+            transaction.update(
+                claim_reference,
+                _document_data(claim_document.wrapper),
+            )
+            transaction.update(
+                authority_reference,
+                _document_data(authority_document.wrapper),
+            )
 
         await self._run_transaction(documents, update)
-        return _stored(document)
+        return ReleasedServiceClaim(
+            service_claim=_stored(claim_document),
+            authority=_stored(authority_document),
+        )
 
     async def read_receipt(
         self,
