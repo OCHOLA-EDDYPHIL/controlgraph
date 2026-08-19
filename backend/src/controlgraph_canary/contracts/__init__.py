@@ -49,6 +49,13 @@ from controlgraph_canary.contracts.root_creation import (
     evidence_signing_input_sha256,
     root_creation_request_sha256,
 )
+from controlgraph_canary.contracts.root_trust import (
+    RootCandidateAttestationV1,
+    RootPreflightRequestV1,
+    RootPreflightResultV1,
+    root_preflight_request_sha256,
+    stable_snapshots_match,
+)
 
 __all__ = [
     "CANONICAL_ENCODING",
@@ -74,9 +81,12 @@ __all__ = [
     "RolloutRootV2",
     "RootActionGrantV1",
     "RootAuthorityBoundsV1",
+    "RootCandidateAttestationV1",
     "RootCreationCommandV1",
     "RootCreationEvidenceSubjectV1",
     "RootCreationResultV1",
+    "RootPreflightRequestV1",
+    "RootPreflightResultV1",
     "SignedCapability",
     "SignedEvidenceEventV1",
     "StableSnapshot",
@@ -94,4 +104,6 @@ __all__ = [
     "evidence_payload_sha256",
     "evidence_signing_input_sha256",
     "root_creation_request_sha256",
+    "root_preflight_request_sha256",
+    "stable_snapshots_match",
 ]

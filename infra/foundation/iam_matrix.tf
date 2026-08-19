@@ -145,6 +145,8 @@ locals {
     coordinator = toset([
       "firestore_authority_read",
       "firestore_authority_write",
+      "kms_evidence_public_key_read",
+      "kms_evidence_version_read",
       "run_issuer_invoke",
       "run_evidence_writer_invoke",
       "run_verifier_invoke",
@@ -227,6 +229,8 @@ locals {
       coordinator = toset([
         "firestore_authority_read",
         "firestore_authority_write",
+        "kms_evidence_public_key_read",
+        "kms_evidence_version_read",
         "run_issuer_invoke",
         "run_evidence_writer_invoke",
         "run_verifier_invoke",
@@ -370,6 +374,9 @@ check "verifier_and_evidence_writer_are_separated" {
       !contains(local.identity_expected_allows.verifier, "kms_evidence_sign") &&
       contains(local.identity_expected_allows.verifier, "kms_evidence_public_key_read") &&
       contains(local.identity_expected_allows.verifier, "kms_evidence_version_read") &&
+      !contains(local.identity_expected_allows.coordinator, "kms_evidence_sign") &&
+      contains(local.identity_expected_allows.coordinator, "kms_evidence_public_key_read") &&
+      contains(local.identity_expected_allows.coordinator, "kms_evidence_version_read") &&
       local.identity_expected_allows.evidence_writer == toset([
         "kms_evidence_sign",
         "kms_evidence_version_read",

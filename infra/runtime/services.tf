@@ -88,11 +88,13 @@ module "verifier" {
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "verifier" })
   environment = merge(local.common_environment, local.identity_environment.verifier, {
-    CONTROLGRAPH_ROLE                   = "verifier"
-    CONTROLGRAPH_SERVICE_NAME           = local.service_names.verifier
-    CONTROLGRAPH_CONTROLLER_ID          = "${var.project_id}:${var.region}:verifier"
-    CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
-    CONTROLGRAPH_EVIDENCE_KEY_VERSION   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_ROLE                       = "verifier"
+    CONTROLGRAPH_SERVICE_NAME               = local.service_names.verifier
+    CONTROLGRAPH_CONTROLLER_ID              = "${var.project_id}:${var.region}:verifier"
+    CONTROLGRAPH_CAPABILITY_KEY_VERSION     = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION       = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_TARGET_NETWORK_RESOURCE    = data.terraform_remote_state.foundation.outputs.network.network_id
+    CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   })
 }
 
@@ -144,6 +146,7 @@ module "coordinator" {
     CONTROLGRAPH_ISSUER_URL            = local.service_audiences.issuer
     CONTROLGRAPH_VERIFIER_URL          = local.service_audiences.verifier
     CONTROLGRAPH_EVIDENCE_WRITER_URL   = local.service_audiences.evidence_writer
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION  = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
     CONTROLGRAPH_EXECUTOR_URL          = local.service_audiences.executor
     CONTROLGRAPH_RECOVERY_URL          = local.service_audiences.recovery
     CONTROLGRAPH_EXECUTION_QUEUE       = local.execution_queue.name

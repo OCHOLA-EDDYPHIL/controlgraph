@@ -7,16 +7,22 @@ import re
 from collections.abc import Sequence
 from typing import Protocol, cast
 
+from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.application.signing import (
+    DETACHED_SIGNATURE_V1,
     SIGNING_ALGORITHM,
+    DetachedSignature,
     SigningError,
     SigningErrorCode,
     SigningKeyState,
     SigningProfile,
     SigningPurpose,
     TrustBundle,
+    TrustBundleVerifier,
+    VerificationProfile,
     make_trust_bundle_entry,
 )
+from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _TRUST_BUNDLE_PUBLISHER_ROLE = "api"
@@ -43,6 +49,14 @@ class _AsyncKmsClient(Protocol):
     ) -> object: ...
 
     async def asymmetric_sign(
+        self,
+        request: dict[str, object],
+        *,
+        retry: object,
+        timeout: float,
+    ) -> object: ...
+
+    async def get_public_key(
         self,
         request: dict[str, object],
         *,
@@ -298,6 +312,131 @@ class GoogleKmsAsyncDigestSigner:
         return signature
 
 
+class GoogleKmsEvidenceSignatureVerifier:
+    """Verify evidence against one live, exact, coordinator-readable KMS version."""
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        service_role: ServiceRole,
+        key_version: str,
+        client: object | None = None,
+    ) -> None:
+        if service_role is not ServiceRole.COORDINATOR:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "evidence verification role is invalid",
+            )
+        try:
+            profile = SigningProfile.evidence(project_id, key_version)
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "evidence verification profile is invalid",
+            ) from None
+        self._profile = profile
+        self._client = None if client is None else cast(_AsyncKmsClient, client)
+
+    @property
+    def project_id(self) -> str:
+        return self._profile.project_id
+
+    @property
+    def key_version(self) -> str:
+        return self._profile.key_version
+
+    async def verify(self, signed: SignedEvidenceEventV1) -> None:
+        """Load exact public material once and verify the canonical event signature."""
+
+        if (
+            type(signed) is not SignedEvidenceEventV1
+            or signed.signing_key_version != self._profile.key_version
+            or signed.event.target.project_id != self._profile.project_id
+        ):
+            raise _error(
+                SigningErrorCode.KEY_VERSION_UNTRUSTED,
+                "evidence signature key version is not trusted",
+            )
+        client = self._client
+        if client is None:
+            client = _default_async_client()
+            self._client = client
+        await _load_version_async(client, self._profile)
+        try:
+            raw_response = await client.get_public_key(
+                {"name": self._profile.key_version},
+                retry=None,
+                timeout=_KMS_REQUEST_TIMEOUT_SECONDS,
+            )
+            response = cast(_PublicKeyResponse, raw_response)
+            response_name = response.name
+            algorithm_name = _enum_name(response.algorithm)
+            public_key_pem = response.pem
+            public_key_crc32c = response.pem_crc32c
+        except asyncio.CancelledError:
+            raise
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(
+                SigningErrorCode.PROVIDER_FAILURE,
+                "KMS public key lookup failed",
+            ) from None
+        if type(response_name) is not str or response_name != self._profile.key_version:
+            raise _error(
+                SigningErrorCode.KEY_VERSION_MISMATCH,
+                "KMS returned another public key version",
+            )
+        if algorithm_name != SIGNING_ALGORITHM or algorithm_name != self._profile.algorithm:
+            raise _error(
+                SigningErrorCode.ALGORITHM_MISMATCH,
+                "KMS public key algorithm is invalid",
+            )
+        if type(public_key_pem) is not str:
+            raise _error(SigningErrorCode.PUBLIC_KEY_INVALID, "KMS public key PEM is invalid")
+        try:
+            public_key_bytes = public_key_pem.encode("ascii")
+        except UnicodeEncodeError:
+            raise _error(
+                SigningErrorCode.PUBLIC_KEY_INVALID,
+                "KMS public key PEM is invalid",
+            ) from None
+        if (
+            type(public_key_crc32c) is not int
+            or public_key_crc32c != _crc32c(public_key_bytes)
+        ):
+            raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
+        bundle = TrustBundle(
+            entries=(
+                make_trust_bundle_entry(
+                    profile=self._profile,
+                    state=SigningKeyState.ENABLED,
+                    public_key_pem=public_key_pem,
+                ),
+            )
+        )
+        detached = DetachedSignature(
+            schema_version=DETACHED_SIGNATURE_V1,
+            purpose=SigningPurpose.EVIDENCE,
+            key_version=signed.signing_key_version,
+            algorithm=signed.signing_algorithm,
+            payload_version=signed.event.schema_version,
+            payload_sha256=signed.payload_sha256,
+            digest_sha256=signed.signing_input_sha256,
+            signature=signed.signature,
+        )
+        TrustBundleVerifier(
+            VerificationProfile.evidence(
+                self._profile.project_id,
+                self._profile.key_resource,
+            ),
+            bundle,
+        ).verify(signed.event, detached)
+
+
 class GoogleKmsTrustBundlePublisher:
     """Publish both fixed-purpose trust sets through the API service role."""
 
@@ -409,5 +548,6 @@ class GoogleKmsTrustBundlePublisher:
 __all__ = [
     "GoogleKmsAsyncDigestSigner",
     "GoogleKmsDigestSigner",
+    "GoogleKmsEvidenceSignatureVerifier",
     "GoogleKmsTrustBundlePublisher",
 ]

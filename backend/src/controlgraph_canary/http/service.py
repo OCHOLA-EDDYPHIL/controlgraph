@@ -35,6 +35,11 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     protected_path,
 )
+from controlgraph_canary.application.root_trust import (
+    RootPreflightError,
+    RootPreflightErrorCode,
+    RootPreflightService,
+)
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
 from controlgraph_canary.contracts.codec import (
     ContractError,
@@ -42,6 +47,7 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
+from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
@@ -108,6 +114,15 @@ class EvidenceSigningDenied(BaseModel):
     correlation_id: str
 
 
+class RootPreflightDenied(BaseModel):
+    """Payload-free verifier preflight failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -120,6 +135,7 @@ def create_service_app(
     capability_verifier: CapabilityRequestVerifier | None = None,
     verified_task_handler: VerifiedTaskHandler | None = None,
     evidence_signing_service: EvidenceSigningService | None = None,
+    root_preflight_service: RootPreflightService | None = None,
 ) -> FastAPI:
     """Create one authenticated role shell with no enabled mutation operation."""
 
@@ -138,6 +154,8 @@ def create_service_app(
         raise ValueError("capability verification is limited to protected task routes")
     if evidence_signing_service is not None and role is not ServiceRole.EVIDENCE_WRITER:
         raise ValueError("evidence signing is limited to the evidence-writer route")
+    if root_preflight_service is not None and role is not ServiceRole.VERIFIER:
+        raise ValueError("root preflight is limited to the verifier route")
     if build_digest is None:
         build_digest = os.environ.get("CONTROLGRAPH_BUILD_DIGEST")
     if build_digest is not None and _DIGEST.fullmatch(build_digest) is None:
@@ -253,6 +271,34 @@ def create_service_app(
                 media_type="application/json",
                 headers={"X-ControlGraph-Correlation-Id": correlation_id},
             )
+        if role is ServiceRole.VERIFIER and root_preflight_service is not None:
+            try:
+                body = await _read_contract_body(request)
+                preflight_request = decode_contract(body, RootPreflightRequestV1)
+                result = await root_preflight_service.preflight(
+                    preflight_request,
+                    context,
+                )
+                response_body = canonical_json_bytes(result)
+            except asyncio.CancelledError:
+                raise
+            except CapabilityVerificationError:
+                return _root_preflight_denial("CONTRACT_INVALID", correlation_id)
+            except ContractError as error:
+                return _root_preflight_denial(error.code.value, correlation_id)
+            except RootPreflightError as error:
+                return _root_preflight_denial(error.code.value, correlation_id)
+            except Exception:
+                return _root_preflight_denial(
+                    RootPreflightErrorCode.UNAVAILABLE.value,
+                    correlation_id,
+                )
+            return Response(
+                content=response_body,
+                status_code=200,
+                media_type="application/json",
+                headers={"X-ControlGraph-Correlation-Id": correlation_id},
+            )
         if capability_verifier is not None:
             try:
                 body = await _read_contract_body(request)
@@ -348,6 +394,29 @@ def _evidence_signing_denial(code: str, correlation_id: str) -> JSONResponse:
     )
 
 
+def _root_preflight_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = RootPreflightDenied(code=code, correlation_id=correlation_id)
+    if code in {"CONTRACT_INVALID", "CONTRACT_VERSION_UNSUPPORTED"}:
+        status_code = 400
+    elif code in {
+        RootPreflightErrorCode.CALLER_DENIED.value,
+        RootPreflightErrorCode.REQUEST_DENIED.value,
+    }:
+        status_code = 403
+    elif code in {
+        RootPreflightErrorCode.STABLE_MISMATCH.value,
+        RootPreflightErrorCode.CANDIDATE_DENIED.value,
+    }:
+        status_code = 409
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
 async def _read_contract_body(request: Request) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
@@ -390,6 +459,7 @@ __all__ = [
     "CapabilityDenied",
     "DisabledWork",
     "EvidenceSigningDenied",
+    "RootPreflightDenied",
     "ServiceHealth",
     "ServiceMetadata",
     "ServiceRole",

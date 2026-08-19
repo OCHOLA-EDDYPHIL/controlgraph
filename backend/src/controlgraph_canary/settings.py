@@ -6,6 +6,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from controlgraph_canary.application.identity import ServiceRole, runtime_service_name
 from controlgraph_canary.application.signing import SIGNING_ALGORITHM
@@ -33,6 +34,17 @@ EVIDENCE_WRITER_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_SIGNING_ALGORITHM",
 )
 
+COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_VERIFIER_URL",
+    "CONTROLGRAPH_EVIDENCE_WRITER_URL",
+    "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+)
+
+VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_TARGET_NETWORK_RESOURCE",
+    "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE",
+)
+
 RUNTIME_ROLES = frozenset(role.value for role in ServiceRole)
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
@@ -45,6 +57,10 @@ def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]
     role = environment.get("CONTROLGRAPH_ROLE")
     if type(role) is str and role.strip() == ServiceRole.EVIDENCE_WRITER.value:
         return REQUIRED_ENVIRONMENT_KEYS + EVIDENCE_WRITER_ENVIRONMENT_KEYS
+    if type(role) is str and role.strip() == ServiceRole.COORDINATOR.value:
+        return REQUIRED_ENVIRONMENT_KEYS + COORDINATOR_TRUST_ENVIRONMENT_KEYS
+    if type(role) is str and role.strip() == ServiceRole.VERIFIER.value:
+        return REQUIRED_ENVIRONMENT_KEYS + VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS
     return REQUIRED_ENVIRONMENT_KEYS
 
 
@@ -65,6 +81,10 @@ class ControllerSettings:
     environment: str
     evidence_key_version: str | None
     signing_algorithm: str | None
+    verifier_url: str | None
+    evidence_writer_url: str | None
+    target_network_resource: str | None
+    target_subnetwork_resource: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
@@ -117,9 +137,12 @@ class ControllerSettings:
 
         evidence_key_version: str | None = None
         signing_algorithm: str | None = None
-        if service_role is ServiceRole.EVIDENCE_WRITER:
+        verifier_url: str | None = None
+        evidence_writer_url: str | None = None
+        target_network_resource: str | None = None
+        target_subnetwork_resource: str | None = None
+        if service_role in {ServiceRole.EVIDENCE_WRITER, ServiceRole.COORDINATOR}:
             evidence_key_version = source["CONTROLGRAPH_EVIDENCE_KEY_VERSION"].strip()
-            signing_algorithm = source["CONTROLGRAPH_SIGNING_ALGORITHM"].strip()
             expected_key_version = re.compile(
                 rf"^projects/{re.escape(project_id)}/locations/us-central1/"
                 r"keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
@@ -127,8 +150,34 @@ class ControllerSettings:
             )
             if expected_key_version.fullmatch(evidence_key_version) is None:
                 raise ValueError("CONTROLGRAPH_EVIDENCE_KEY_VERSION is outside its purpose")
+        if service_role is ServiceRole.EVIDENCE_WRITER:
+            signing_algorithm = source["CONTROLGRAPH_SIGNING_ALGORITHM"].strip()
             if signing_algorithm != SIGNING_ALGORITHM:
                 raise ValueError("CONTROLGRAPH_SIGNING_ALGORITHM is unsupported")
+        if service_role is ServiceRole.COORDINATOR:
+            verifier_url = source["CONTROLGRAPH_VERIFIER_URL"].strip()
+            evidence_writer_url = source["CONTROLGRAPH_EVIDENCE_WRITER_URL"].strip()
+            _validate_service_url(verifier_url, ServiceRole.VERIFIER, project_number)
+            _validate_service_url(
+                evidence_writer_url,
+                ServiceRole.EVIDENCE_WRITER,
+                project_number,
+            )
+        if service_role is ServiceRole.VERIFIER:
+            target_network_resource = source[
+                "CONTROLGRAPH_TARGET_NETWORK_RESOURCE"
+            ].strip()
+            target_subnetwork_resource = source[
+                "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"
+            ].strip()
+            _validate_target_resource(
+                target_network_resource,
+                prefix=f"projects/{project_id}/global/networks/",
+            )
+            _validate_target_resource(
+                target_subnetwork_resource,
+                prefix=f"projects/{project_id}/regions/us-central1/subnetworks/",
+            )
 
         return cls(
             project_id=project_id,
@@ -144,4 +193,42 @@ class ControllerSettings:
             environment=environment_name,
             evidence_key_version=evidence_key_version,
             signing_algorithm=signing_algorithm,
+            verifier_url=verifier_url,
+            evidence_writer_url=evidence_writer_url,
+            target_network_resource=target_network_resource,
+            target_subnetwork_resource=target_subnetwork_resource,
         )
+
+
+def _validate_service_url(value: str, role: ServiceRole, project_number: str) -> None:
+    expected = (
+        f"https://{runtime_service_name(role)}-{project_number}.us-central1.run.app"
+    )
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("internal service URL is invalid") from None
+    if (
+        value != expected
+        or parsed.scheme != "https"
+        or parsed.netloc != parsed.hostname
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+        or value.endswith("/")
+    ):
+        raise ValueError("internal service URL is invalid")
+
+
+def _validate_target_resource(value: str, *, prefix: str) -> None:
+    suffix = value.removeprefix(prefix)
+    if (
+        not value.startswith(prefix)
+        or not suffix
+        or len(suffix) > 63
+        or re.fullmatch(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", suffix) is None
+        or "reconcile" in value.lower()
+    ):
+        raise ValueError("verifier target network resource is invalid")

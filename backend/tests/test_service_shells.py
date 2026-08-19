@@ -92,6 +92,35 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
             }
         )
+    if role is ServiceRole.COORDINATOR:
+        environment.update(
+            {
+                "CONTROLGRAPH_VERIFIER_URL": (
+                    f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+                "CONTROLGRAPH_EVIDENCE_WRITER_URL": (
+                    "https://controlgraph-evidence-writer-"
+                    f"{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+                "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+                    f"projects/{PROJECT_ID}/locations/us-central1/"
+                    "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
+                    "cryptoKeyVersions/1"
+                ),
+            }
+        )
+    if role is ServiceRole.VERIFIER:
+        environment.update(
+            {
+                "CONTROLGRAPH_TARGET_NETWORK_RESOURCE": (
+                    f"projects/{PROJECT_ID}/global/networks/controlgraph"
+                ),
+                "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE": (
+                    f"projects/{PROJECT_ID}/regions/us-central1/"
+                    "subnetworks/controlgraph"
+                ),
+            }
+        )
     return environment
 
 
