@@ -114,11 +114,14 @@ class RootCreationConfiguration:
             project_id=self.target.project_id,
             key_name="evidence-signing",
         )
+        validation_stable_revision = f"{self.target.service_name}-stable-check"
+        if validation_stable_revision == self.candidate_revision:
+            validation_stable_revision = f"{self.target.service_name}-stable-check-2"
         validation_plan = RolloutPlanV1(
             schema_version=ROLLOUT_PLAN_V1,
             target=self.target,
             stable_snapshot_sha256="0" * 64,
-            stable_revision=f"{self.target.service_name}-stable-check",
+            stable_revision=validation_stable_revision,
             stable_revision_configuration_sha256="1" * 64,
             candidate_revision=self.candidate_revision,
             candidate_revision_configuration_sha256=(
@@ -190,6 +193,7 @@ def build_unsigned_root_creation(
     _validate_preflight(
         stable_snapshot,
         candidate_revision,
+        approved_snapshot=command.expected_stable_snapshot,
         configuration=configuration,
         created_at=created_at,
     )
@@ -512,14 +516,18 @@ def _validate_preflight(
     stable_snapshot: StableSnapshot,
     candidate_revision: CandidateRevisionAttestation,
     *,
+    approved_snapshot: StableSnapshot,
     configuration: RootCreationConfiguration,
     created_at: str,
 ) -> None:
     created = _parse_utc_second(created_at)
+    approved_captured = _parse_utc_second(approved_snapshot.captured_at)
     stable_captured = _parse_utc_second(stable_snapshot.captured_at)
     candidate_captured = _parse_utc_second(candidate_revision.captured_at)
     if (
-        stable_snapshot.target != configuration.target
+        type(approved_snapshot) is not StableSnapshot
+        or not _same_stable_state(approved_snapshot, stable_snapshot)
+        or stable_snapshot.target != configuration.target
         or candidate_revision.target != configuration.target
         or stable_snapshot.captured_by != configuration.verifier_identity
         or candidate_revision.reader_identity != configuration.verifier_identity
@@ -528,14 +536,32 @@ def _validate_preflight(
         != configuration.candidate_revision_configuration_sha256
         or stable_snapshot.concurrency != configuration.concurrency
         or candidate_revision.concurrency != configuration.concurrency
+        or approved_captured > candidate_captured
         or candidate_captured > stable_captured
         or stable_captured > created
+        or (created - approved_captured).total_seconds()
+        > ROOT_CREATION_MAX_SNAPSHOT_AGE_SECONDS
         or (created - stable_captured).total_seconds()
         > ROOT_CREATION_MAX_SNAPSHOT_AGE_SECONDS
         or (created - candidate_captured).total_seconds()
         > ROOT_CREATION_MAX_SNAPSHOT_AGE_SECONDS
     ):
         raise ValueError("root creation preflight does not match trusted fresh state")
+
+
+def _same_stable_state(first: StableSnapshot, second: StableSnapshot) -> bool:
+    return (
+        first.target == second.target
+        and first.stable_revision == second.stable_revision
+        and first.traffic == second.traffic
+        and first.concurrency == second.concurrency
+        and first.service_generation == second.service_generation
+        and first.provider_etag == second.provider_etag
+        and first.configuration_sha256 == second.configuration_sha256
+        and first.stable_revision_configuration_sha256
+        == second.stable_revision_configuration_sha256
+        and first.captured_by == second.captured_by
+    )
 
 
 def _validate_operator(identity: object, subject: object) -> None:

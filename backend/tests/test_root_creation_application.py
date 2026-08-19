@@ -142,21 +142,23 @@ def _candidate(
     )
 
 
-def _command() -> RootCreationCommandV1:
+def _command(*, request_id: str = "request-root-001") -> RootCreationCommandV1:
     return RootCreationCommandV1(
         schema_version=ROOT_CREATION_COMMAND_V1,
-        request_id="request-root-001",
+        request_id=request_id,
         idempotency_key="root-create-001",
+        expected_stable_snapshot=_snapshot(captured_at="2026-08-19T12:04:57Z"),
     )
 
 
 def _unsigned(
     *,
+    command: RootCreationCommandV1 | None = None,
     stable_snapshot: StableSnapshot | None = None,
     candidate_revision: CandidateRevisionAttestation | None = None,
 ):
     return build_unsigned_root_creation(
-        command=_command(),
+        command=command or _command(),
         operator_identity="operator@example.test",
         operator_subject="123456789012345678901",
         stable_snapshot=stable_snapshot or _snapshot(),
@@ -243,10 +245,7 @@ def test_rejects_operator_and_candidate_substitution() -> None:
 
 def test_rejects_signed_evidence_for_another_event() -> None:
     unsigned = _unsigned()
-    other = _unsigned(
-        stable_snapshot=_snapshot(captured_at="2026-08-19T12:04:57Z"),
-        candidate_revision=_candidate(captured_at="2026-08-19T12:04:56Z"),
-    )
+    other = _unsigned(command=_command(request_id="request-root-002"))
 
     with pytest.raises(ValueError, match="does not match"):
         complete_root_creation(unsigned, _signed(other))
@@ -269,6 +268,7 @@ def test_configuration_and_command_fail_closed_before_construction() -> None:
                 "schema_version": ROOT_CREATION_COMMAND_V1,
                 "request_id": "request-root-001",
                 "idempotency_key": "root-create-001",
+                "expected_stable_snapshot": _snapshot(),
                 "operator_identity": "other.operator@example.test",
             }
         )

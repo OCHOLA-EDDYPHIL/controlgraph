@@ -93,6 +93,7 @@ class RootCreationCommandV1(StrictContractModel):
     schema_version: Literal["controlgraph.root-creation-command/v1"]
     request_id: Identifier
     idempotency_key: Identifier
+    expected_stable_snapshot: StableSnapshot
 
 
 class RolloutHealthPolicyV1(StrictContractModel):
