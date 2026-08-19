@@ -733,7 +733,7 @@ def _denial_scenario(
         )
         altered_claims = _claims(role, target=target)
         payload = canonical_json_bytes(_task(_unchecked_envelope(altered_claims)))
-        expected = ReasonCode.KEY_VERSION_UNTRUSTED
+        expected = ReasonCode.TARGET_BINDING_MISMATCH
     elif name in {"environment", "service"}:
         target = (
             _target(environment="alternate")
@@ -1112,3 +1112,32 @@ def test_untrusted_key_version_is_not_reported_as_an_invalid_signature() -> None
         )
 
     assert denied.value.code is ReasonCode.KEY_VERSION_UNTRUSTED
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        _target(project_id=OTHER_PROJECT_ID),
+        _target(region="europe-west1"),
+        _target(environment="alternate"),
+        _target(service_name="other-target"),
+    ],
+)
+def test_configured_target_substitution_precedes_signature_and_root_lookup(
+    target: TargetBinding,
+) -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    reader = _RootReader(fail=True)
+    capability = _unchecked_envelope(
+        _claims(ServiceRole.EXECUTOR, target=target)
+    )
+
+    with pytest.raises(CapabilityVerificationError) as denied:
+        _verify(
+            _verifier(ServiceRole.EXECUTOR, private_key, reader),
+            canonical_json_bytes(_task(capability)),
+            _caller(ServiceRole.EXECUTOR),
+        )
+
+    assert denied.value.code is ReasonCode.TARGET_BINDING_MISMATCH
+    assert reader.reads == []

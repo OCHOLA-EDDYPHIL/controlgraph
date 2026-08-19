@@ -224,6 +224,7 @@ class CapabilityVerifier:
         now = _require_utc_second(self._clock())
         now_second = int(now.timestamp())
         self._validate_caller(caller, now_second)
+        self._precheck_target(request)
         self._verify_envelope(request.capability)
         self._validate_time(request, now_second)
         self._validate_route_and_identity(request)
@@ -259,6 +260,17 @@ class CapabilityVerifier:
             or not caller.issued_at <= now_second < caller.expires_at
         ):
             raise _deny(ReasonCode.CALLER_UNAUTHORIZED)
+
+    def _precheck_target(self, request: TaskRequest) -> None:
+        """Reject configured-target substitutions before any trust-material lookup."""
+
+        target = self._configuration.target
+        if (
+            request.capability.claims.target != target
+            or request.intent.target != target
+            or request.queue_region != target.region
+        ):
+            raise _deny(ReasonCode.TARGET_BINDING_MISMATCH)
 
     def _verify_envelope(self, capability: SignedCapability) -> None:
         if type(capability) is not SignedCapability:
