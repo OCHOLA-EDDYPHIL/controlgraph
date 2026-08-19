@@ -94,12 +94,12 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Check clean-room and secret boundaries
+      - name: Check provenance, source, and secret boundaries
         run: python scripts/check_clean_room.py
       - name: Audit Python dependencies
         run: |
           uv export --project backend --frozen --no-dev --no-emit-project --quiet --output-file /tmp/controlgraph-requirements.txt
-          uvx pip-audit --requirement /tmp/controlgraph-requirements.txt
+          uvx pip-audit==2.10.1 --requirement /tmp/controlgraph-requirements.txt
       - name: Set up Node.js
         uses: actions/setup-node@1e60f620b9541dca1515401f7a15dc71c2ad5e # v4.0.3
         with:

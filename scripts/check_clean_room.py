@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Fail CI on provenance leaks, linked files, or obvious committed secrets."""
+"""Fail CI on source-boundary violations, linked files, or committed secrets."""
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -40,9 +41,33 @@ SECRET_PATTERNS = {
     "service-account key": re.compile(r'"type"\s*:\s*"service_account"'),
 }
 FORBIDDEN_REFERENCES = {
-    "RECONCILE source path": re.compile(r"/home/reconcile/projectz/reconcile(?:/|\b)"),
     "copied Devpost state": re.compile(r"\.devpost-hackathon-state\.json"),
 }
+
+
+def sibling_imports(path: Path, text: str) -> list[str]:
+    """Return direct runtime imports from the sibling RECONCILE package."""
+
+    if path.suffix != ".py":
+        return []
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as error:
+        return [f"cannot inspect Python source {path.relative_to(ROOT)}: {error}"]
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imported = [node.module or ""]
+        else:
+            continue
+        if any(name == "reconcile" or name.startswith("reconcile.") for name in imported):
+            violations.append(
+                f"runtime sibling import found in {path.relative_to(ROOT)}"
+            )
+    return violations
 
 
 def candidate_files() -> list[Path]:
@@ -75,12 +100,13 @@ def main() -> int:
         for name, pattern in {**SECRET_PATTERNS, **FORBIDDEN_REFERENCES}.items():
             if pattern.search(text):
                 failures.append(f"{name} found in {relative}")
+        failures.extend(sibling_imports(path, text))
 
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}")
         return 1
-    print(f"clean-room check passed ({len(candidate_files())} text files inspected)")
+    print(f"source-boundary check passed ({len(candidate_files())} text files inspected)")
     return 0
 
 
