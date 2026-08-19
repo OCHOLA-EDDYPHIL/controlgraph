@@ -1,0 +1,35 @@
+{
+  "fixture_version": "controlgraph.contract-fixtures/v1",
+  "cases": [
+    {
+      "name": "duplicate-key",
+      "code": "CONTRACT_INVALID",
+      "text": "{\"schema_version\":\"controlgraph.target-binding/v1\",\"schema_version\":\"controlgraph.target-binding/v1\"}"
+    },
+    {
+      "name": "float",
+      "code": "CONTRACT_INVALID",
+      "text": "{\"schema_version\":\"controlgraph.target-binding/v1\",\"value\":1.0}"
+    },
+    {
+      "name": "unsafe-integer",
+      "code": "CONTRACT_INVALID",
+      "text": "{\"schema_version\":\"controlgraph.target-binding/v1\",\"value\":9007199254740992}"
+    },
+    {
+      "name": "whitespace",
+      "code": "CONTRACT_INVALID",
+      "text": "{ \"schema_version\":\"controlgraph.target-binding/v1\"}"
+    },
+    {
+      "name": "decomposed-unicode",
+      "code": "CONTRACT_INVALID",
+      "text": "{\"environment\":\"Café\",\"project_id\":\"demo-project-123\",\"region\":\"us-central1\",\"schema_version\":\"controlgraph.target-binding/v1\",\"service_name\":\"canary-target\"}"
+    },
+    {
+      "name": "unsupported-version",
+      "code": "CONTRACT_VERSION_UNSUPPORTED",
+      "text": "{\"environment\":\"acceptance\",\"project_id\":\"demo-project-123\",\"region\":\"us-central1\",\"schema_version\":\"controlgraph.target-binding/v2\",\"service_name\":\"canary-target\"}"
+    }
+  ]
+}

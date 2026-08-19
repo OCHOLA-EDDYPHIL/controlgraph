@@ -4,10 +4,12 @@
 
 This document freezes the version 1 product vocabulary and acceptance boundary for
 ControlGraph Canary. It is a contract for implementation, not a statement that every
-described component is already deployed. The current repository provides a local service
-scaffold, CLI, console shell, Terraform input contracts, and an exact-match epoch primitive.
-Hosted authority, signing, task delivery, Cloud Run mutation, deterministic health evaluation,
-promotion, recovery, and rendered evidence views require later implementation and acceptance.
+described component is already deployed. The current repository provides strict versioned
+contracts, cross-language canonical fixtures, a pure reducer, root-scoped exact-match epoch
+transitions, a local service and CLI, a console shell, and Terraform input contracts. Hosted
+authority persistence, signing, task delivery, Cloud Run mutation, deterministic health
+evaluation, promotion, recovery, and rendered evidence views require later implementation and
+acceptance.
 
 Version 1 controls one canary rollout for one Cloud Run service in one Google Cloud project and
 region. It is not a general deployment system, workflow engine, graph engine, or authorization
@@ -166,7 +168,7 @@ meanings must not be repurposed.
 
 All branches start by capturing an exact stable configuration, confirming the same provider
 resource version on a second read, claiming the service, and creating an immutable rollout root
-at epoch N.
+at epoch 1. Later steps refer to its then-current value as epoch N.
 
 ### Healthy branch
 

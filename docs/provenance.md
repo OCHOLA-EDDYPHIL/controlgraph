@@ -53,10 +53,12 @@ changes before a release claim is made.
 
 | Local artifact | Accepted source | Material changes | Verification |
 |---|---|---|---|
-| None recorded by this documentation-only foundation change. | Not applicable. | The accepted source set and rules are established; runtime code remains to be implemented through its numbered roadmap work. | Current repository checks describe only the scaffold. |
+| `backend/src/controlgraph_canary/contracts/base.py` | `reconcile/contracts/base.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Retains strict frozen models and bounded primitive validation; replaces RECONCILE security dependencies with ControlGraph NFC, safe-integer, UTC-second, audience, and domain limits. | Contract model, Unicode, timestamp, bound, and import-boundary tests. |
+| `backend/src/controlgraph_canary/contracts/codec.py` | `reconcile/contracts/codec.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Retains duplicate-key rejection, version-aware decoding, canonical bytes, and stable errors; adds a no-float cross-language subset, canonical-input enforcement, domain-separated hashes, byte/depth bounds, and canonical base64url. | Python malformed/canonical tests and byte-identical TypeScript golden vectors. |
+| `backend/src/controlgraph_canary/contracts/models.py` | Selected bounded-value and ambiguity patterns from `reconcile/contracts/common.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Replaces provider-neutral RECONCILE records with closed ControlGraph target, root, authority, capability, task, receipt, health, recovery, and evidence schemas. | ControlGraph cross-field, round-trip, fixture, and rejection tests. |
 
-Future entries replace the empty row with concrete local files. A broad entry such as "backend"
-is insufficient: each coherent adapted module or tightly related module group must be traceable.
+A broad entry such as "backend" is insufficient: each coherent adapted module or tightly related
+module group must remain traceable as later work is added.
 
 ## Repository-origin material
 
