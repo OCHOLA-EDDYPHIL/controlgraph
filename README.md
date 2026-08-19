@@ -48,10 +48,11 @@ npm run dev
 ### Terraform
 
 ```bash
-cd infra
-terraform fmt -check -recursive
-terraform init -backend=false
-terraform validate
+terraform -chdir=infra fmt -check -recursive
+terraform -chdir=infra/bootstrap init -backend=false
+terraform -chdir=infra/bootstrap validate
+terraform -chdir=infra/foundation init -backend=false
+terraform -chdir=infra/foundation validate
 ```
 
 Terraform must receive immutable container references in the form `...@sha256:...`. Plans
@@ -76,7 +77,9 @@ Run the same checks as CI:
 ```bash
 cd backend && uv sync --all-extras --dev && uv run ruff check . && uv run mypy src && uv run pytest
 cd web && npm run typecheck && npm test -- --run && npm run build
-cd infra && terraform fmt -check -recursive && terraform validate
+terraform -chdir=infra fmt -check -recursive
+terraform -chdir=infra/bootstrap init -backend=false && terraform -chdir=infra/bootstrap validate
+terraform -chdir=infra/foundation init -backend=false && terraform -chdir=infra/foundation validate
 python scripts/check_clean_room.py
 ```
 

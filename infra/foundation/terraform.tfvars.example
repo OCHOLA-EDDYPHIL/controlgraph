@@ -1,0 +1,13 @@
+project_id         = "controlgraph-canary-1234abcd"
+project_number     = "123456789012"
+organization_id    = "123456789012"
+region             = "us-central1"
+state_bucket_name  = "controlgraph-canary-1234abcd-tfstate"
+billing_account_id = "ABCDEF-123456-ABCDEF"
+
+github_repository    = "OCHOLA-EDDYPHIL/controlgraph"
+github_repository_id = "1338673889"
+github_owner_id       = "154631735"
+github_ref            = "refs/heads/main"
+github_workflow_ref   = "OCHOLA-EDDYPHIL/controlgraph/.github/workflows/deploy.yml@refs/heads/main"
+operator_principal    = "user:operator@example.com"

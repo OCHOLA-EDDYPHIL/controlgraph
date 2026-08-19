@@ -1,0 +1,6 @@
+# Apply this stack once with the default local backend. After the state bucket
+# exists, copy this file to backend.tf and migrate the state with:
+# terraform init -migrate-state -backend-config="bucket=<state_bucket_name>" -backend-config="prefix=bootstrap"
+terraform {
+  backend "gcs" {}
+}
