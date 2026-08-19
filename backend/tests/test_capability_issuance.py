@@ -39,6 +39,7 @@ from controlgraph_canary.application.signing import (
 from controlgraph_canary.authority import EpochCheckOutcome, check_epoch
 from controlgraph_canary.contracts import (
     CapabilityAction,
+    CapabilityClaims,
     EpochAuthorityRecord,
     EpochChangeCause,
     RolloutRoot,
@@ -712,6 +713,56 @@ def test_derived_child_uses_locally_computed_verified_parent_digest_and_narrower
     assert child.claims.not_before == "2026-08-19T12:03:00Z"
     assert child.claims.expires_at == parent.claims.expires_at
     assert child.claims.capability_id != parent.claims.capability_id
+
+
+@pytest.mark.parametrize(
+    ("parent_issued_at", "parent_not_before", "use_grandparent"),
+    [
+        ("2026-08-19T12:00:00Z", "2026-08-19T12:02:00Z", False),
+        ("2026-08-19T12:01:00Z", "2026-08-19T12:03:00Z", True),
+    ],
+)
+def test_issuance_rejects_preapproval_or_noncausal_parent_lineage(
+    parent_issued_at: str,
+    parent_not_before: str,
+    use_grandparent: bool,
+) -> None:
+    root_issuer, _, _ = issuer()
+    original = issue(root_issuer)
+    parent_claims = CapabilityClaims(
+        **{
+            **original.claims.model_dump(mode="python"),
+            "capability_id": "cgcap-temporal-parent",
+            "parent_capability_sha256": (
+                original.claims_sha256 if use_grandparent else None
+            ),
+            "issued_at": parent_issued_at,
+            "not_before": parent_not_before,
+            "expires_at": "2026-08-19T12:06:00Z",
+        }
+    )
+    parent = SignedCapability(
+        schema_version=original.schema_version,
+        claims=parent_claims,
+        claims_sha256=canonical_sha256(parent_claims),
+        signature=original.signature,
+    )
+    lineage = (original, parent) if use_grandparent else (parent,)
+    verifier = RecordingEnvelopeVerifier()
+    child_issuer, backend, _ = issuer(
+        resolver=FakeLineageResolver(lineage),
+        verifier=verifier,
+    )
+
+    with pytest.raises(CapabilityIssuanceError) as denied:
+        issue(
+            child_issuer,
+            request(parent_capability_id=parent.claims.capability_id),
+            now=datetime(2026, 8, 19, 12, 4, tzinfo=UTC),
+        )
+
+    assert denied.value.code is CapabilityIssuanceErrorCode.LINEAGE_INVALID
+    assert backend.digests == []
 
 
 def test_verified_claims_digest_is_stable_across_distinct_valid_ecdsa_signatures() -> None:

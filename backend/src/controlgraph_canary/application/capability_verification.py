@@ -165,6 +165,7 @@ class VerifiedMutation:
     caller: AuthenticationContext
     capability_sha256: str
     claims_sha256: str
+    earliest_lineage_issued_at: int
 
 
 class CapabilityVerifier:
@@ -229,13 +230,18 @@ class CapabilityVerifier:
         root = await self._read_root(request.intent.root_id)
         self._validate_root_bindings(request, root, now_second)
         ancestors = await self._read_ancestors(request.capability)
-        self._validate_lineage((*ancestors, request.capability), root, now_second)
+        earliest_lineage_issued_at = self._validate_lineage(
+            (*ancestors, request.capability),
+            root,
+            now_second,
+        )
         return VerifiedMutation(
             request=request,
             root=root,
             caller=caller,
             capability_sha256=canonical_sha256(request.capability),
             claims_sha256=request.capability.claims_sha256,
+            earliest_lineage_issued_at=earliest_lineage_issued_at,
         )
 
     def _validate_caller(self, caller: AuthenticationContext, now_second: int) -> None:
@@ -319,7 +325,11 @@ class CapabilityVerifier:
             raise _deny(ReasonCode.AUTHORITY_UNAVAILABLE) from None
         if record is None:
             raise _deny(ReasonCode.LINEAGE_INVALID)
-        if type(record) is not StoredRecord or type(record.value) is not RolloutRoot:
+        if (
+            type(record) is not StoredRecord
+            or record.revision != 0
+            or type(record.value) is not RolloutRoot
+        ):
             raise _deny(ReasonCode.AUTHORITY_UNAVAILABLE)
         return record.value
 
@@ -397,9 +407,12 @@ class CapabilityVerifier:
         lineage: tuple[SignedCapability, ...],
         root: RolloutRoot,
         now_second: int,
-    ) -> None:
+    ) -> int:
         if not lineage or len(lineage) > MAX_LINEAGE_DEPTH:
             raise _deny(ReasonCode.LINEAGE_INVALID)
+        root_approved_second = _parse_utc_second(root.approved_at)
+        earliest_issued_at = _parse_utc_second(lineage[0].claims.issued_at)
+        previous_claims: CapabilityClaims | None = None
         capability_ids: set[str] = set()
         grants: list[CapabilityGrant] = []
         for index, capability in enumerate(lineage):
@@ -407,6 +420,16 @@ class CapabilityVerifier:
                 self._verify_envelope(capability)
             self._validate_lineage_claim_identity(capability.claims)
             _validate_claim_time(capability.claims, now_second)
+            issued_at = _parse_utc_second(capability.claims.issued_at)
+            if issued_at < root_approved_second:
+                raise _deny(ReasonCode.LINEAGE_INVALID)
+            if previous_claims is not None and not (
+                _parse_utc_second(previous_claims.not_before)
+                <= issued_at
+                < _parse_utc_second(previous_claims.expires_at)
+            ):
+                raise _deny(ReasonCode.LINEAGE_INVALID)
+            previous_claims = capability.claims
             if capability.claims.capability_id in capability_ids:
                 raise _deny(ReasonCode.LINEAGE_INVALID)
             capability_ids.add(capability.claims.capability_id)
@@ -462,6 +485,7 @@ class CapabilityVerifier:
             except ValueError:
                 code = ReasonCode.LINEAGE_INVALID
             raise _deny(code)
+        return earliest_issued_at
 
     def _validate_lineage_claim_identity(self, claims: CapabilityClaims) -> None:
         configuration = self._configuration

@@ -292,10 +292,17 @@ def _task(
 
 
 class _RootReader:
-    def __init__(self, root: RolloutRoot | None = None, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        root: RolloutRoot | None = None,
+        *,
+        fail: bool = False,
+        revision: int = 0,
+    ) -> None:
         self.root = _root() if root is None else root
         self.target = _root().target
         self.fail = fail
+        self.revision = revision
         self.reads: list[str] = []
         self.receipt_claims = 0
 
@@ -305,7 +312,7 @@ class _RootReader:
             raise AuthorityStoreUnavailable()
         if root_id != self.root.root_id:
             return None
-        return StoredRecord(value=self.root, revision=0)
+        return StoredRecord(value=self.root, revision=self.revision)
 
     def record_receipt_claim(self) -> None:
         self.receipt_claims += 1
@@ -460,6 +467,114 @@ def test_complete_lineage_uses_verified_claim_digests() -> None:
 
     assert verified.claims_sha256 == child.claims_sha256
     assert lineage_reader.lookups == [parent.claims_sha256]
+
+
+def test_verified_lineage_records_its_earliest_causal_issuance() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    parent = _signed(
+        _claims(
+            ServiceRole.EXECUTOR,
+            capability_id="cgcap-parent-001",
+            issued_at="2026-08-19T12:02:00Z",
+            not_before="2026-08-19T12:02:00Z",
+            expires_at="2026-08-19T12:06:00Z",
+        ),
+        private_key,
+    )
+    child = _signed(
+        _claims(
+            ServiceRole.EXECUTOR,
+            capability_id="cgcap-child-001",
+            parent_capability_sha256=parent.claims_sha256,
+            issued_at="2026-08-19T12:03:00Z",
+            not_before="2026-08-19T12:03:00Z",
+            expires_at="2026-08-19T12:05:00Z",
+        ),
+        private_key,
+    )
+
+    verified = _verify(
+        _verifier(
+            ServiceRole.EXECUTOR,
+            private_key,
+            _RootReader(),
+            _LineageReader((parent,)),
+        ),
+        canonical_json_bytes(_task(child)),
+        _caller(ServiceRole.EXECUTOR),
+    )
+
+    assert verified.earliest_lineage_issued_at == int(
+        datetime(2026, 8, 19, 12, 2, tzinfo=UTC).timestamp()
+    )
+
+
+@pytest.mark.parametrize(
+    ("parent_issued_at", "parent_not_before", "child_issued_at"),
+    [
+        ("2026-08-19T12:02:00Z", "2026-08-19T12:02:00Z", "2026-08-19T12:01:00Z"),
+        ("2026-08-19T12:00:00Z", "2026-08-19T12:02:00Z", "2026-08-19T12:03:00Z"),
+    ],
+)
+def test_lineage_rejects_noncausal_or_preapproval_parent_issuance(
+    parent_issued_at: str,
+    parent_not_before: str,
+    child_issued_at: str,
+) -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    parent = _signed(
+        _claims(
+            ServiceRole.EXECUTOR,
+            capability_id="cgcap-parent-temporal",
+            issued_at=parent_issued_at,
+            not_before=parent_not_before,
+            expires_at="2026-08-19T12:06:00Z",
+        ),
+        private_key,
+    )
+    child = _signed(
+        _claims(
+            ServiceRole.EXECUTOR,
+            capability_id="cgcap-child-temporal",
+            parent_capability_sha256=parent.claims_sha256,
+            issued_at=child_issued_at,
+            not_before="2026-08-19T12:03:00Z",
+            expires_at="2026-08-19T12:05:00Z",
+        ),
+        private_key,
+    )
+
+    with pytest.raises(CapabilityVerificationError) as denied:
+        _verify(
+            _verifier(
+                ServiceRole.EXECUTOR,
+                private_key,
+                _RootReader(),
+                _LineageReader((parent,)),
+            ),
+            canonical_json_bytes(_task(child)),
+            _caller(ServiceRole.EXECUTOR),
+        )
+
+    assert denied.value.code is ReasonCode.LINEAGE_INVALID
+
+
+def test_nonzero_immutable_root_storage_revision_fails_closed() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    request = _task(_signed(_claims(ServiceRole.EXECUTOR), private_key))
+
+    with pytest.raises(CapabilityVerificationError) as denied:
+        _verify(
+            _verifier(
+                ServiceRole.EXECUTOR,
+                private_key,
+                _RootReader(revision=9),
+            ),
+            canonical_json_bytes(request),
+            _caller(ServiceRole.EXECUTOR),
+        )
+
+    assert denied.value.code is ReasonCode.AUTHORITY_UNAVAILABLE
 
 
 def test_widened_child_lifetime_is_scope_amplification() -> None:

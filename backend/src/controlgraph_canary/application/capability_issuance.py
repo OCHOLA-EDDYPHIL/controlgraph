@@ -490,6 +490,7 @@ class CapabilityIssuer:
             or authority.root_id != root.root_id
             or authority.root_sha256 != root_sha256
             or authority_record.revision != authority.revision
+            or authority.current_epoch != authority.revision + 1
             or _FORBIDDEN_RESOURCE_NAME in root.stable_snapshot.stable_revision.lower()
             or _FORBIDDEN_RESOURCE_NAME in root.candidate_revision.lower()
             or _parse_utc_second(root.approved_at) > issued_second
@@ -554,14 +555,27 @@ class CapabilityIssuer:
     ) -> tuple[str | None, int | None]:
         if not lineage:
             return None, None
+        root_approved_second = _parse_utc_second(state.root.approved_at)
+        authority_changed_second = _parse_utc_second(state.authority.changed_at)
+        previous_claims: CapabilityClaims | None = None
         for capability in lineage:
             claims = capability.claims
+            issued_at = _parse_utc_second(claims.issued_at)
             if (
                 claims.issuer != self._configuration.issuer_identity
+                or issued_at < root_approved_second
+                or issued_at < authority_changed_second
                 or _parse_utc_second(claims.not_before) > issued_second
                 or _parse_utc_second(claims.expires_at) <= issued_second
             ):
                 raise _deny(CapabilityIssuanceErrorCode.LINEAGE_INVALID)
+            if previous_claims is not None and not (
+                _parse_utc_second(previous_claims.not_before)
+                <= issued_at
+                < _parse_utc_second(previous_claims.expires_at)
+            ):
+                raise _deny(CapabilityIssuanceErrorCode.LINEAGE_INVALID)
+            previous_claims = claims
         self._validate_complete_lineage(state, request, lineage)
         parent = lineage[-1]
         return parent.claims_sha256, _parse_utc_second(parent.claims.expires_at)

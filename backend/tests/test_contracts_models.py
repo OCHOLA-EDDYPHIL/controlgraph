@@ -355,6 +355,16 @@ def test_cross_field_inconsistencies_are_rejected() -> None:
     with pytest.raises(ValidationError):
         EpochAuthorityRecord.model_validate(authority_data)
 
+    authority_data = all_contracts()[3].model_dump(mode="python")  # type: ignore[union-attr]
+    authority_data.update(
+        current_epoch=3,
+        previous_epoch=2,
+        revision=1,
+        cause=EpochChangeCause.OPERATOR_REVOCATION,
+    )
+    with pytest.raises(ValidationError, match="epoch and revision"):
+        EpochAuthorityRecord.model_validate(authority_data)
+
     receipt_data = all_contracts()[8].model_dump(mode="python")  # type: ignore[union-attr]
     del receipt_data["plan_sha256"]
     with pytest.raises(ValidationError):
