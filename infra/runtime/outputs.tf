@@ -40,3 +40,8 @@ output "runtime_image" {
   description = "Immutable controller image used by every private service shell."
   value       = var.controller_image
 }
+
+output "reference_target" {
+  description = "Private disposable target and its exact stable baseline reset definition."
+  value       = module.reference_target.target
+}

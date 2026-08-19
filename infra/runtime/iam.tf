@@ -79,6 +79,10 @@ locals {
       service = module.verifier.service.name
       member  = "serviceAccount:${local.service_accounts.coordinator}"
     }
+    reference = {
+      service = module.reference_target.target.name
+      member  = "serviceAccount:${local.service_accounts.verifier}"
+    }
   }
 }
 

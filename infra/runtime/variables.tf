@@ -55,6 +55,36 @@ variable "controller_image" {
   }
 }
 
+variable "reference_target_stable_image" {
+  description = "Stable reference-target image in the dedicated registry, pinned by digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^.+@sha256:[0-9a-f]{64}$", var.reference_target_stable_image))
+    error_message = "reference_target_stable_image must be pinned to a lowercase sha256 digest."
+  }
+}
+
+variable "reference_target_candidate_image" {
+  description = "Candidate reference-target image in the dedicated registry, pinned by digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^.+@sha256:[0-9a-f]{64}$", var.reference_target_candidate_image))
+    error_message = "reference_target_candidate_image must be pinned to a lowercase sha256 digest."
+  }
+}
+
+variable "reference_target_deployment_phase" {
+  description = "Explicit stable-then-candidate release phase; candidate is also the reset definition."
+  type        = string
+
+  validation {
+    condition     = contains(["stable", "candidate"], var.reference_target_deployment_phase)
+    error_message = "reference_target_deployment_phase must be stable or candidate."
+  }
+}
+
 variable "operator_principal" {
   description = "Exact human principal allowed to invoke the operator API."
   type        = string
