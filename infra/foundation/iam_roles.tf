@@ -12,12 +12,20 @@ locals {
     firestore_writer = {
       role_id     = "controlgraph.firestoreAuthorityWriter"
       title       = "ControlGraph Firestore authority writer"
-      description = "Create and update ControlGraph authority records without deletion permissions."
+      description = "Create and update authority records without deletion permissions."
       permissions = [
         "datastore.databases.get",
         "datastore.entities.create",
         "datastore.entities.get",
         "datastore.entities.update",
+      ]
+    }
+    kms_version_reader = {
+      role_id     = "controlgraph.kmsVersionReader"
+      title       = "ControlGraph KMS version metadata reader"
+      description = "Read the state and algorithm of an exact bound signing key version."
+      permissions = [
+        "cloudkms.cryptoKeyVersions.get",
       ]
     }
     tasks_enqueuer = {
@@ -37,6 +45,14 @@ locals {
         "cloudtasks.queues.get",
         "cloudtasks.queues.pause",
         "cloudtasks.queues.resume",
+      ]
+    }
+    task_oidc_actor = {
+      role_id     = "controlgraph.taskOidcActor"
+      title       = "ControlGraph task OIDC actor"
+      description = "Attach one exact task-caller identity without token minting or impersonation."
+      permissions = [
+        "iam.serviceAccounts.actAs",
       ]
     }
     run_snapshot_reader = {

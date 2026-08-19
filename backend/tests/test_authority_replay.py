@@ -24,6 +24,7 @@ from controlgraph_canary.authority import (
     deny_before_dispatch,
     mark_provider_attempted,
     mutation_identity,
+    receipt_claim_identity,
     record_pre_dispatch_failure,
     record_provider_result,
     record_readback,
@@ -130,6 +131,19 @@ def test_mutation_identity_changes_for_every_bound_field() -> None:
         identities.add(mutation_identity(changed))
 
     assert len(identities) == len(changed_bindings(value)) + 1
+
+
+def test_receipt_claim_identity_is_stable_only_for_one_target_key() -> None:
+    value = binding()
+    expected = receipt_claim_identity(value.target, value.idempotency_key)
+
+    assert claim_receipt(value).receipt_id == expected
+    for changed in changed_bindings(value):
+        actual = claim_receipt(changed).receipt_id
+        if changed.idempotency_key != value.idempotency_key or changed.target != value.target:
+            assert actual != expected
+        else:
+            assert actual == expected
 
 
 @pytest.mark.parametrize(

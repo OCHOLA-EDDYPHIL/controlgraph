@@ -1,0 +1,6 @@
+project_id        = "controlgraph-canary-1234abcd"
+region            = "us-central1"
+state_bucket_name = "controlgraph-canary-1234abcd-tfstate"
+
+controller_image  = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/controller@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+operator_principal = "user:operator@example.com"

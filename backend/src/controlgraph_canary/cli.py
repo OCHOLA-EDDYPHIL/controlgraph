@@ -73,8 +73,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve":
         import uvicorn
 
-        ControllerSettings.from_environment()
-        uvicorn.run("controlgraph_canary.api:app", host=args.host, port=args.port)
+        settings = ControllerSettings.from_environment()
+        app_path = f"controlgraph_canary.services.{settings.role}.app:app"
+        uvicorn.run(app_path, host=args.host, port=args.port, access_log=False)
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")

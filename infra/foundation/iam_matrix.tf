@@ -10,7 +10,7 @@ locals {
     }
     firestore_authority_write = {
       api      = "firestore.googleapis.com"
-      boundary = "create and update records in the named ControlGraph authority database"
+      boundary = "the coordinator authority facade for the named database"
     }
     github_impersonate_image_builder = {
       api      = "iamcredentials.googleapis.com"
@@ -32,6 +32,10 @@ locals {
       api      = "cloudkms.googleapis.com"
       boundary = "the configured capability-signing key version"
     }
+    kms_capability_version_read = {
+      api      = "cloudkms.googleapis.com"
+      boundary = "state and algorithm metadata for the configured capability-signing key version"
+    }
     kms_evidence_public_key_read = {
       api      = "cloudkms.googleapis.com"
       boundary = "the configured evidence-signing public key version"
@@ -39,6 +43,14 @@ locals {
     kms_evidence_sign = {
       api      = "cloudkms.googleapis.com"
       boundary = "the configured evidence-signing key version"
+    }
+    kms_evidence_version_read = {
+      api      = "cloudkms.googleapis.com"
+      boundary = "state and algorithm metadata for the configured evidence-signing key version"
+    }
+    kms_signing_key_admin = {
+      api      = "cloudkms.googleapis.com"
+      boundary = "the dedicated ControlGraph signing key ring without signature-use permission"
     }
     logging_audit_read = {
       api      = "logging.googleapis.com"
@@ -108,10 +120,22 @@ locals {
       api      = "cloudtasks.googleapis.com"
       boundary = "the fixed recovery queue"
     }
+    task_caller_act_as = {
+      api      = "iam.googleapis.com"
+      boundary = "the two fixed Cloud Tasks OIDC caller service accounts"
+    }
+    task_oidc_token_mint = {
+      api      = "iamcredentials.googleapis.com"
+      boundary = "OIDC tokens for only the two fixed task-caller service accounts"
+    }
   }
 
   identity_expected_allows = {
     api = toset([
+      "kms_capability_public_key_read",
+      "kms_capability_version_read",
+      "kms_evidence_public_key_read",
+      "kms_evidence_version_read",
       "run_coordinator_invoke",
     ])
     coordinator = toset([
@@ -119,36 +143,41 @@ locals {
       "firestore_authority_write",
       "run_issuer_invoke",
       "run_verifier_invoke",
+      "task_caller_act_as",
       "tasks_execution_enqueue",
       "tasks_recovery_enqueue",
     ])
     issuer = toset([
       "firestore_authority_read",
       "kms_capability_sign",
+      "kms_capability_version_read",
     ])
     executor = toset([
       "firestore_authority_read",
-      "firestore_authority_write",
       "kms_capability_public_key_read",
+      "kms_capability_version_read",
       "run_operation_read",
       "run_target_canary_or_promote",
       "run_target_snapshot",
     ])
     recovery = toset([
       "firestore_authority_read",
-      "firestore_authority_write",
       "kms_capability_public_key_read",
+      "kms_capability_version_read",
       "run_operation_read",
       "run_target_restore_stable",
       "run_target_snapshot",
     ])
     verifier = toset([
       "firestore_authority_read",
-      "firestore_authority_write",
       "kms_capability_public_key_read",
-      "kms_evidence_sign",
+      "kms_capability_version_read",
       "monitoring_health_read",
       "run_reference_invoke",
+    ])
+    evidence_writer = toset([
+      "kms_evidence_sign",
+      "kms_evidence_version_read",
     ])
     reference = toset([])
     execution_task_caller = toset([
@@ -165,19 +194,69 @@ locals {
     ci_terraform = toset([
       "github_impersonate_terraform",
       "github_oidc_exchange",
+      "kms_signing_key_admin",
       "storage_terraform_state",
     ])
     operator = toset([
       "run_api_invoke",
     ])
+    cloud_tasks_service_agent = toset([
+      "task_oidc_token_mint",
+    ])
   }
 
-  # Runtime resource bindings are added with #26-#29, when their exact resource
-  # names exist. Keeping implemented and pending domains distinct prevents this
-  # matrix from presenting a design-time allow as an effective IAM grant.
+  # Runtime bindings appear only when their exact resources exist. Keeping
+  # implemented and pending domains distinct prevents a design-time allow from
+  # being presented as an effective IAM grant.
   identity_implemented_allows = merge(
     { for identity in keys(local.identity_expected_allows) : identity => toset([]) },
     {
+      api = toset([
+        "kms_capability_public_key_read",
+        "kms_capability_version_read",
+        "kms_evidence_public_key_read",
+        "kms_evidence_version_read",
+        "run_coordinator_invoke",
+      ])
+      coordinator = toset([
+        "firestore_authority_read",
+        "firestore_authority_write",
+        "run_issuer_invoke",
+        "run_verifier_invoke",
+        "task_caller_act_as",
+        "tasks_execution_enqueue",
+        "tasks_recovery_enqueue",
+      ])
+      issuer = toset([
+        "firestore_authority_read",
+        "kms_capability_sign",
+        "kms_capability_version_read",
+      ])
+      executor = toset([
+        "firestore_authority_read",
+        "kms_capability_public_key_read",
+        "kms_capability_version_read",
+      ])
+      recovery = toset([
+        "firestore_authority_read",
+        "kms_capability_public_key_read",
+        "kms_capability_version_read",
+      ])
+      verifier = toset([
+        "firestore_authority_read",
+        "kms_capability_public_key_read",
+        "kms_capability_version_read",
+      ])
+      evidence_writer = toset([
+        "kms_evidence_sign",
+        "kms_evidence_version_read",
+      ])
+      execution_task_caller = toset([
+        "run_executor_invoke",
+      ])
+      recovery_task_caller = toset([
+        "run_recovery_invoke",
+      ])
       ci_image_builder = toset([
         "artifact_registry_images_write",
         "github_impersonate_image_builder",
@@ -186,14 +265,24 @@ locals {
       ci_terraform = toset([
         "github_impersonate_terraform",
         "github_oidc_exchange",
+        "kms_signing_key_admin",
         "storage_terraform_state",
+      ])
+      operator = toset([
+        "run_api_invoke",
+      ])
+      cloud_tasks_service_agent = toset([
+        "task_oidc_token_mint",
       ])
     },
   )
 
   controlgraph_identity_members = merge(
     { for role, account in google_service_account.workloads : role => account.member },
-    { operator = var.operator_principal },
+    {
+      operator                  = var.operator_principal
+      cloud_tasks_service_agent = "serviceAccount:service-${var.project_number}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+    },
   )
 
   iam_permission_matrix = {
@@ -260,6 +349,20 @@ check "iam_matrix_does_not_overstate_implemented_grants" {
       length(setsubtract(implemented, local.identity_expected_allows[identity])) == 0
     ])
     error_message = "Every implemented IAM domain must be a subset of that identity's reviewed expected allows."
+  }
+}
+
+check "verifier_and_evidence_writer_are_separated" {
+  assert {
+    condition = (
+      !contains(local.identity_expected_allows.verifier, "firestore_authority_write") &&
+      !contains(local.identity_expected_allows.verifier, "kms_evidence_sign") &&
+      local.identity_expected_allows.evidence_writer == toset([
+        "kms_evidence_sign",
+        "kms_evidence_version_read",
+      ])
+    )
+    error_message = "Verification, authority writes, and evidence signing must remain separate."
   }
 }
 

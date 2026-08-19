@@ -3,10 +3,10 @@
 ## Status
 
 This threat model defines the required security boundary for ControlGraph Canary. Controls named
-as requirements are not claims that the current scaffold has deployed them. The implemented
-scaffold currently provides only local exact-match epoch validation, read-only HTTP endpoints,
-and configuration contracts; it has no durable authority store, signing path, task delivery, or
-Cloud Run mutation capability.
+as requirements are not claims that the current scaffold has deployed them. The repository now
+contains local and emulator-tested authority persistence, signing, task-delivery, and
+mutation-disabled service boundaries. Those pieces are not yet composed into the M3 enforcement
+path or accepted in a hosted environment, and no Cloud Run mutation capability is enabled.
 
 ## Protected assets and safety outcomes
 
@@ -70,10 +70,10 @@ Optional Gemini/ADK advisor -- bounded read-only facade; never enters the author
 
 ### Identity boundary
 
-Operator, API, coordinator, issuer, executor, recovery, verifier, and task-caller identities are
-distinct. Cloud Run IAM determines who may invoke a service; application OIDC verification then
-checks exact issuer, audience, expiry, subject, and allowed service-account or operator identity.
-A verified caller still requires a valid capability.
+Operator, API, coordinator, issuer, executor, recovery, verifier, evidence-writer, and task-caller
+identities are distinct. Cloud Run IAM determines who may invoke a service; application OIDC
+verification then checks exact issuer, audience, expiry, subject, and allowed service-account or
+operator identity. A verified caller still requires a valid capability.
 
 ### Network boundary
 
@@ -84,9 +84,11 @@ console never invokes Google Cloud control-plane APIs directly.
 ### Firestore authority boundary
 
 Rollout roots are immutable. Service claims, current epochs, and receipts use fixed canonical
-document identities and transactional compare-and-set operations. Reads used to authorize a
-mutation are strongly consistent and never fall back to a cache. An unavailable or corrupt record
-denies mutation.
+document identities and transactional compare-and-set operations. Firestore IAM is
+database-granular, so only the coordinator authority facade receives write permission. Executors
+and recovery workers read authority directly but use narrow authenticated facade operations for
+receipt claims and compare-and-set transitions. Reads used to authorize a mutation are strongly
+consistent and never fall back to a cache. An unavailable or corrupt record denies mutation.
 
 ### KMS boundary
 
@@ -126,6 +128,7 @@ readback, immutable request bindings, and signed evidence make omission or alter
 | Executor | Apply approved canary or promotion traffic after all gates. | No deploy, retarget, or arbitrary service update. |
 | Recovery | Restore only the captured stable configuration. | Cannot promote, choose a revision, or widen recovery bounds. |
 | Verifier | Read exact target configuration and classify it. | No mutation or authority write. |
+| Evidence writer | Sign append-only evidence facts with the evidence key. | No authority-store write, capability signing, or target mutation. |
 | Task caller | Invoke one protected handler with the configured audience. | No mutation authority by identity alone. |
 | Optional Gemini/ADK advisor | Summarize bounded, already recorded facts. | No health, authority, safety, rollout, recovery, or execution decision. |
 

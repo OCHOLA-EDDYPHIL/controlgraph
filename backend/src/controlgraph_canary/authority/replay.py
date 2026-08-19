@@ -12,6 +12,7 @@ from typing import Final
 from controlgraph_canary.authority.reducer import DenialReason
 
 MUTATION_IDENTITY_DOMAIN: Final = b"controlgraph.mutation-identity/v1\0"
+RECEIPT_CLAIM_IDENTITY_DOMAIN: Final = b"controlgraph.receipt-claim-identity/v1\0"
 MAX_PRE_DISPATCH_TRANSPORT_ATTEMPTS: Final = 3
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -53,6 +54,31 @@ class MutationTargetKey:
         _require_text("region", self.region, maximum=64)
         _require_text("environment", self.environment, maximum=128)
         _require_text("service_name", self.service_name, maximum=128)
+
+
+def receipt_claim_identity(target: MutationTargetKey, idempotency_key: str) -> str:
+    """Return the stable receipt claim shared by every reuse of one target key."""
+
+    if not isinstance(target, MutationTargetKey):
+        raise TypeError("target must be a MutationTargetKey")
+    _require_text("idempotency_key", idempotency_key, maximum=128)
+    value = {
+        "idempotency_key": idempotency_key,
+        "schema_version": "controlgraph.receipt-claim-identity/v1",
+        "target": {
+            "environment": target.environment,
+            "project_id": target.project_id,
+            "region": target.region,
+            "service_name": target.service_name,
+        },
+    }
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(RECEIPT_CLAIM_IDENTITY_DOMAIN + encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +265,7 @@ class ReplayReceipt:
 
     @property
     def receipt_id(self) -> str:
-        return mutation_identity(self.binding)
+        return receipt_claim_identity(self.binding.target, self.binding.idempotency_key)
 
     @property
     def terminal(self) -> bool:
