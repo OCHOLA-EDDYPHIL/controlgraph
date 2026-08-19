@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 REQUIRED_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_PROJECT_ID",
+    "CONTROLGRAPH_PROJECT_NUMBER",
     "CONTROLGRAPH_REGION",
     "CONTROLGRAPH_SERVICE_NAME",
     "CONTROLGRAPH_CONTROLLER_ID",
@@ -18,10 +19,15 @@ REQUIRED_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_FIRESTORE_DATABASE",
     "CONTROLGRAPH_MUTATIONS_ENABLED",
     "CONTROLGRAPH_ENVIRONMENT",
+    "CONTROLGRAPH_AUTH_AUDIENCE",
+    "CONTROLGRAPH_AUTH_CALLER_EMAIL",
+    "CONTROLGRAPH_AUTH_CALLER_ROLE",
+    "CONTROLGRAPH_AUTH_CALLER_SUBJECT",
 )
 
 RUNTIME_ROLES = frozenset({"api", "coordinator", "issuer", "executor", "recovery", "verifier"})
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
+_PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -30,6 +36,7 @@ class ControllerSettings:
     """Validated common settings shared by every private service shell."""
 
     project_id: str
+    project_number: str
     region: str
     service_name: str
     controller_id: str
@@ -47,6 +54,7 @@ class ControllerSettings:
         if missing:
             raise ValueError(f"missing environment variables: {', '.join(missing)}")
         project_id = source["CONTROLGRAPH_PROJECT_ID"].strip()
+        project_number = source["CONTROLGRAPH_PROJECT_NUMBER"].strip()
         region = source["CONTROLGRAPH_REGION"].strip()
         service_name = source["CONTROLGRAPH_SERVICE_NAME"].strip()
         controller_id = source["CONTROLGRAPH_CONTROLLER_ID"].strip()
@@ -59,6 +67,8 @@ class ControllerSettings:
 
         if _PROJECT_ID.fullmatch(project_id) is None:
             raise ValueError("CONTROLGRAPH_PROJECT_ID is not a dedicated ControlGraph project")
+        if _PROJECT_NUMBER.fullmatch(project_number) is None:
+            raise ValueError("CONTROLGRAPH_PROJECT_NUMBER is invalid")
         if region != "us-central1":
             raise ValueError("CONTROLGRAPH_REGION must be us-central1")
         if role not in RUNTIME_ROLES:
@@ -82,6 +92,7 @@ class ControllerSettings:
 
         return cls(
             project_id=project_id,
+            project_number=project_number,
             region=region,
             service_name=service_name,
             controller_id=controller_id,

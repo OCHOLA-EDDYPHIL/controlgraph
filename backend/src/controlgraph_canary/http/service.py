@@ -8,7 +8,6 @@ import re
 import sys
 import uuid
 from collections.abc import Awaitable, Callable
-from enum import StrEnum
 from typing import Final
 
 from fastapi import FastAPI, Request, Response
@@ -16,25 +15,19 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from controlgraph_canary import __version__
-from controlgraph_canary.application.tasks import (
-    EXECUTION_HANDLER_PATH,
-    RECOVERY_HANDLER_PATH,
+from controlgraph_canary.application.identity import (
+    AuthenticationContext,
+    AuthenticationDenialCode,
+    AuthenticationError,
+    IdentityAuthenticator,
+    RouteAuthenticationPolicy,
+    ServiceRole,
+    protected_path,
 )
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-
-
-class ServiceRole(StrEnum):
-    """Private runtime roles with separate deployment identities."""
-
-    API = "api"
-    COORDINATOR = "coordinator"
-    ISSUER = "issuer"
-    EXECUTOR = "executor"
-    RECOVERY = "recovery"
-    VERIFIER = "verifier"
 
 
 class ServiceHealth(BaseModel):
@@ -70,13 +63,30 @@ class DisabledWork(BaseModel):
     correlation_id: str
 
 
+class AuthenticationDenied(BaseModel):
+    """Credential-free authentication denial returned before protected work."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: AuthenticationDenialCode
+    correlation_id: str
+
+
 def create_service_app(
     role: ServiceRole,
     *,
     build_digest: str | None = None,
+    authenticator: IdentityAuthenticator | None = None,
+    authentication_policy: RouteAuthenticationPolicy | None = None,
 ) -> FastAPI:
-    """Create one private role shell with no enabled protected operation."""
+    """Create one authenticated role shell with no enabled mutation operation."""
 
+    if type(role) is not ServiceRole:
+        raise ValueError("service role is invalid")
+    if (authenticator is None) != (authentication_policy is None):
+        raise ValueError("authenticator and authentication policy must be configured together")
+    if authentication_policy is not None and authentication_policy.service_role is not role:
+        raise ValueError("authentication policy does not match the service role")
     if build_digest is None:
         build_digest = os.environ.get("CONTROLGRAPH_BUILD_DIGEST")
     if build_digest is not None and _DIGEST.fullmatch(build_digest) is None:
@@ -133,8 +143,35 @@ def create_service_app(
             correlation_id=correlation_id,
         )
 
-    def disabled_work() -> JSONResponse:
+    def protected_work(request: Request) -> JSONResponse:
         correlation_id = _correlation_id()
+        if authenticator is None or authentication_policy is None:
+            return _authentication_denial(
+                AuthenticationDenialCode.CONFIGURATION_INVALID,
+                correlation_id,
+            )
+        authorization_headers = request.headers.getlist("authorization")
+        if len(authorization_headers) > 1:
+            return _authentication_denial(
+                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
+                correlation_id,
+            )
+        authorization_header = authorization_headers[0] if authorization_headers else None
+        try:
+            context = authenticator.authenticate(authorization_header, authentication_policy)
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if type(context) is not AuthenticationContext:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        request.state.authentication = context
         response = DisabledWork(
             code="MUTATION_DISABLED",
             correlation_id=correlation_id,
@@ -146,26 +183,38 @@ def create_service_app(
         )
 
     for path in protected_paths(role):
-        app.add_api_route(path, disabled_work, methods=["POST"], include_in_schema=False)
+        app.add_api_route(path, protected_work, methods=["POST"], include_in_schema=False)
     return app
 
 
 def protected_paths(role: ServiceRole) -> tuple[str, ...]:
     """Return the closed route set for deployment and local conformance checks."""
 
-    if role is ServiceRole.API:
-        return ("/v1/operator/commands",)
-    if role is ServiceRole.COORDINATOR:
-        return ("/v1/internal/coordinate",)
-    if role is ServiceRole.ISSUER:
-        return ("/v1/internal/issue",)
-    if role is ServiceRole.EXECUTOR:
-        return (EXECUTION_HANDLER_PATH,)
-    if role is ServiceRole.RECOVERY:
-        return (RECOVERY_HANDLER_PATH,)
-    if role is ServiceRole.VERIFIER:
-        return ("/v1/internal/verify",)
-    raise ValueError("unsupported service role")
+    return (protected_path(role),)
+
+
+def _authentication_denial(
+    code: AuthenticationDenialCode,
+    correlation_id: str,
+) -> JSONResponse:
+    response = AuthenticationDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        AuthenticationDenialCode.CONFIGURATION_INVALID,
+        AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+    }:
+        status_code = 503
+    elif code is AuthenticationDenialCode.CALLER_DENIED:
+        status_code = 403
+    else:
+        status_code = 401
+    headers = {"X-ControlGraph-Correlation-Id": correlation_id}
+    if status_code == 401:
+        headers["WWW-Authenticate"] = "Bearer"
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers=headers,
+    )
 
 
 def _correlation_id() -> str:
@@ -191,6 +240,7 @@ def _emit_service_event(
 __all__ = [
     "PRODUCT_CONTRACT_VERSION",
     "SERVICE_SHELL_VERSION",
+    "AuthenticationDenied",
     "DisabledWork",
     "ServiceHealth",
     "ServiceMetadata",

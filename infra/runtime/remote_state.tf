@@ -34,7 +34,8 @@ check "runtime_matches_foundation" {
       data.terraform_remote_state.foundation.outputs.project_id == var.project_id &&
       data.terraform_remote_state.foundation.outputs.region == var.region &&
       data.terraform_remote_state.foundation.outputs.state_bucket_name == var.state_bucket_name &&
-      data.terraform_remote_state.foundation.outputs.operator_principal == var.operator_principal
+      data.terraform_remote_state.foundation.outputs.operator_principal == var.operator_principal &&
+      data.terraform_remote_state.foundation.outputs.operator_subject == var.operator_subject
     )
     error_message = "Runtime coordinates and operator must match the reviewed foundation state."
   }

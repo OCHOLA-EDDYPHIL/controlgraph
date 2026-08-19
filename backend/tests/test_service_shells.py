@@ -7,6 +7,14 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
+from controlgraph_canary.application.identity import (
+    AuthenticationContext,
+    AuthenticationDenialCode,
+    AuthenticationError,
+    CallerRole,
+    RouteAuthenticationPolicy,
+    runtime_route_policy,
+)
 from controlgraph_canary.http.service import (
     PRODUCT_CONTRACT_VERSION,
     SERVICE_SHELL_VERSION,
@@ -14,6 +22,7 @@ from controlgraph_canary.http.service import (
     create_service_app,
     protected_paths,
 )
+from controlgraph_canary.services.runtime import create_runtime_service_app
 
 ROLE_MODULES = (
     (ServiceRole.API, "controlgraph_canary.services.api.app"),
@@ -24,12 +33,88 @@ ROLE_MODULES = (
     (ServiceRole.VERIFIER, "controlgraph_canary.services.verifier.app"),
 )
 
+PROJECT_ID = "controlgraph-canary-abc123"
+PROJECT_NUMBER = "123456789012"
+SUBJECT = "123456789012345678901"
+CALLER_ROLES = {
+    ServiceRole.API: CallerRole.OPERATOR,
+    ServiceRole.COORDINATOR: CallerRole.API,
+    ServiceRole.ISSUER: CallerRole.COORDINATOR,
+    ServiceRole.EXECUTOR: CallerRole.EXECUTION_TASK_CALLER,
+    ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
+    ServiceRole.VERIFIER: CallerRole.COORDINATOR,
+}
+CALLER_ACCOUNT_IDS = {
+    CallerRole.API: "controlgraph-api",
+    CallerRole.COORDINATOR: "controlgraph-coordinator",
+    CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
+    CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
+}
+
+
+def _caller_email(role: CallerRole) -> str:
+    if role is CallerRole.OPERATOR:
+        return "operator@example.com"
+    return f"{CALLER_ACCOUNT_IDS[role]}@{PROJECT_ID}.iam.gserviceaccount.com"
+
+
+def _environment(role: ServiceRole) -> dict[str, str]:
+    caller_role = CALLER_ROLES[role]
+    return {
+        "CONTROLGRAPH_PROJECT_ID": PROJECT_ID,
+        "CONTROLGRAPH_PROJECT_NUMBER": PROJECT_NUMBER,
+        "CONTROLGRAPH_REGION": "us-central1",
+        "CONTROLGRAPH_SERVICE_NAME": f"controlgraph-{role.value}",
+        "CONTROLGRAPH_CONTROLLER_ID": f"{PROJECT_ID}:us-central1:{role.value}",
+        "CONTROLGRAPH_ROLE": role.value,
+        "CONTROLGRAPH_BUILD_DIGEST": f"sha256:{'a' * 64}",
+        "CONTROLGRAPH_CONTRACT_VERSION": PRODUCT_CONTRACT_VERSION,
+        "CONTROLGRAPH_FIRESTORE_DATABASE": "controlgraph-authority",
+        "CONTROLGRAPH_MUTATIONS_ENABLED": "false",
+        "CONTROLGRAPH_ENVIRONMENT": "nonprod",
+        "CONTROLGRAPH_AUTH_AUDIENCE": (
+            f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        "CONTROLGRAPH_AUTH_CALLER_ROLE": caller_role.value,
+        "CONTROLGRAPH_AUTH_CALLER_EMAIL": _caller_email(caller_role),
+        "CONTROLGRAPH_AUTH_CALLER_SUBJECT": SUBJECT,
+    }
+
+
+class _ExactTestAuthenticator:
+    def __init__(self, expected_header: str) -> None:
+        self.expected_header = expected_header
+        self.calls: list[tuple[str | None, RouteAuthenticationPolicy]] = []
+
+    def authenticate(
+        self,
+        authorization_header: str | None,
+        policy: RouteAuthenticationPolicy,
+    ) -> AuthenticationContext:
+        self.calls.append((authorization_header, policy))
+        if authorization_header is None:
+            raise AuthenticationError(AuthenticationDenialCode.CREDENTIAL_MISSING)
+        if authorization_header != self.expected_header:
+            raise AuthenticationError(AuthenticationDenialCode.CREDENTIAL_INVALID)
+        return AuthenticationContext(
+            role=policy.caller.role,
+            email=policy.caller.email,
+            subject=policy.caller.subject,
+            issuer="https://accounts.google.com",
+            audience=policy.audience,
+            issued_at=1_776_236_340,
+            expires_at=1_776_239_400,
+        )
+
 
 @pytest.mark.parametrize(("role", "module_name"), ROLE_MODULES)
 def test_each_service_role_has_identity_safe_health_and_metadata(
     role: ServiceRole,
     module_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for key, value in _environment(role).items():
+        monkeypatch.setenv(key, value)
     module = importlib.import_module(module_name)
     client = TestClient(module.app)
 
@@ -46,7 +131,7 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
     assert metadata.json()["service_shell_version"] == SERVICE_SHELL_VERSION
     assert metadata.json()["service_role"] == role.value
     assert metadata.json()["mutation_enabled"] is False
-    assert metadata.json()["build_digest"] is None
+    assert metadata.json()["build_digest"] == _environment(role)["CONTROLGRAPH_BUILD_DIGEST"]
     assert re.fullmatch(r"[0-9a-f]{32}", metadata.json()["correlation_id"])
     assert metadata.headers["x-controlgraph-correlation-id"] == metadata.json()["correlation_id"]
     assert client.get("/docs").status_code == 404
@@ -59,8 +144,19 @@ def test_every_protected_route_remains_disabled_without_reading_sensitive_body(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     digest = f"sha256:{'c' * 64}"
-    client = TestClient(create_service_app(role, build_digest=digest))
-    sensitive_marker = "unmistakably-synthetic-capability-and-token"
+    policy = runtime_route_policy(role, _environment(role))
+    sensitive_marker = "unmistakably-synthetic-capability"
+    token_marker = "unmistakably-synthetic-token"
+    authorization = f"Bearer {token_marker}"
+    authenticator = _ExactTestAuthenticator(authorization)
+    client = TestClient(
+        create_service_app(
+            role,
+            build_digest=digest,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    )
 
     for path in protected_paths(role):
         response = client.post(
@@ -68,7 +164,7 @@ def test_every_protected_route_remains_disabled_without_reading_sensitive_body(
             content=f'{{"capability":"{sensitive_marker}"}}',
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {sensitive_marker}",
+                "Authorization": authorization,
             },
         )
         assert response.status_code == 503
@@ -78,15 +174,170 @@ def test_every_protected_route_remains_disabled_without_reading_sensitive_body(
             response.headers["x-controlgraph-correlation-id"] == response.json()["correlation_id"]
         )
         assert sensitive_marker not in response.text
+        assert token_marker not in response.text
 
-        duplicate = client.post(path, content=f'{{"capability":"{sensitive_marker}"}}')
-        assert duplicate.status_code == 503
-        assert duplicate.json()["code"] == "MUTATION_DISABLED"
+        missing = client.post(path, content=f'{{"capability":"{sensitive_marker}"}}')
+        assert missing.status_code == 401
+        assert missing.json()["code"] == "AUTH_CREDENTIAL_MISSING"
 
     metadata = client.get("/v1/metadata")
     assert metadata.json()["build_digest"] == digest
     assert metadata.json()["mutation_enabled"] is False
     assert sensitive_marker not in caplog.text
+    assert token_marker not in caplog.text
+    assert authenticator.calls
+
+
+def test_valid_identity_without_capability_cannot_enable_mutation() -> None:
+    role = ServiceRole.EXECUTOR
+    policy = runtime_route_policy(role, _environment(role))
+    authorization = "Bearer exact.test.credential"
+    authenticator = _ExactTestAuthenticator(authorization)
+    client = TestClient(
+        create_service_app(
+            role,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    )
+
+    response = client.post(
+        protected_paths(role)[0],
+        headers={"Authorization": authorization},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "MUTATION_DISABLED"
+    assert authenticator.calls == [(authorization, policy)]
+
+
+def test_retried_delivery_reenters_the_same_authentication_gate() -> None:
+    role = ServiceRole.RECOVERY
+    policy = runtime_route_policy(role, _environment(role))
+    authorization = "Bearer exact.retry.credential"
+    authenticator = _ExactTestAuthenticator(authorization)
+    client = TestClient(
+        create_service_app(
+            role,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    )
+
+    first = client.post(protected_paths(role)[0], headers={"Authorization": authorization})
+    retry = client.post(protected_paths(role)[0], headers={"Authorization": authorization})
+
+    assert first.status_code == 503
+    assert retry.status_code == 503
+    assert first.json()["code"] == "MUTATION_DISABLED"
+    assert retry.json()["code"] == "MUTATION_DISABLED"
+    assert authenticator.calls == [(authorization, policy), (authorization, policy)]
+
+
+def test_missing_authentication_configuration_and_duplicate_headers_fail_closed() -> None:
+    role = ServiceRole.EXECUTOR
+    path = protected_paths(role)[0]
+    unconfigured = TestClient(create_service_app(role)).post(path)
+    assert unconfigured.status_code == 503
+    assert unconfigured.json()["code"] == "AUTH_CONFIGURATION_INVALID"
+
+    policy = runtime_route_policy(role, _environment(role))
+    authenticator = _ExactTestAuthenticator("Bearer exact.test.credential")
+    configured = TestClient(
+        create_service_app(
+            role,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    )
+    duplicate = configured.post(
+        path,
+        headers=[
+            ("Authorization", "Bearer exact.test.credential"),
+            ("Authorization", "Bearer substituted.test.credential"),
+        ],
+    )
+
+    assert duplicate.status_code == 401
+    assert duplicate.json()["code"] == "AUTH_CREDENTIAL_MALFORMED"
+    assert authenticator.calls == []
+
+
+def test_runtime_composition_uses_startup_policy_for_google_verification() -> None:
+    role = ServiceRole.ISSUER
+    environment = _environment(role)
+    expected_audience = environment["CONTROLGRAPH_AUTH_AUDIENCE"]
+    calls: list[tuple[str, str]] = []
+
+    def verify_token(token: str, audience: str) -> dict[str, object]:
+        calls.append((token, audience))
+        return {
+            "iss": "https://accounts.google.com",
+            "aud": expected_audience,
+            "email": environment["CONTROLGRAPH_AUTH_CALLER_EMAIL"],
+            "email_verified": True,
+            "sub": SUBJECT,
+            "iat": 1_776_236_340,
+            "exp": 1_776_239_400,
+        }
+
+    client = TestClient(
+        create_runtime_service_app(
+            role,
+            environment=environment,
+            token_verifier=verify_token,
+            clock=lambda: 1_776_236_400.0,
+        )
+    )
+    response = client.post(
+        protected_paths(role)[0],
+        headers={"Authorization": "Bearer exact.test.credential"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "MUTATION_DISABLED"
+    assert calls == [("exact.test.credential", expected_audience)]
+
+
+def test_unexpected_verifier_failure_is_sanitized_and_fails_closed() -> None:
+    role = ServiceRole.EXECUTOR
+    policy = runtime_route_policy(role, _environment(role))
+    sensitive_marker = "unmistakably-synthetic-token"
+
+    class BrokenAuthenticator:
+        def authenticate(
+            self,
+            authorization_header: str | None,
+            route_policy: RouteAuthenticationPolicy,
+        ) -> AuthenticationContext:
+            raise RuntimeError(f"provider diagnostic contained {sensitive_marker}")
+
+    client = TestClient(
+        create_service_app(
+            role,
+            authenticator=BrokenAuthenticator(),
+            authentication_policy=policy,
+        )
+    )
+    response = client.post(
+        protected_paths(role)[0],
+        headers={"Authorization": f"Bearer {sensitive_marker}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "AUTH_VERIFICATION_UNAVAILABLE"
+    assert sensitive_marker not in response.text
+
+
+def test_service_app_rejects_a_policy_for_another_role() -> None:
+    policy = runtime_route_policy(ServiceRole.RECOVERY, _environment(ServiceRole.RECOVERY))
+
+    with pytest.raises(ValueError, match="service role"):
+        create_service_app(
+            ServiceRole.EXECUTOR,
+            authenticator=_ExactTestAuthenticator("Bearer exact.test.credential"),
+            authentication_policy=policy,
+        )
 
 
 @pytest.mark.parametrize(
@@ -110,13 +361,21 @@ def test_service_shell_rejects_an_unsupported_configured_contract(
 def test_service_shell_emits_payload_free_structured_correlation_event(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = TestClient(create_service_app(ServiceRole.EXECUTOR))
+    policy = runtime_route_policy(ServiceRole.EXECUTOR, _environment(ServiceRole.EXECUTOR))
     sensitive_marker = "unmistakably-synthetic-capability-and-token"
+    authorization = f"Bearer {sensitive_marker}"
+    client = TestClient(
+        create_service_app(
+            ServiceRole.EXECUTOR,
+            authenticator=_ExactTestAuthenticator(authorization),
+            authentication_policy=policy,
+        )
+    )
 
     response = client.post(
         protected_paths(ServiceRole.EXECUTOR)[0],
         content=f'{{"capability":"{sensitive_marker}"}}',
-        headers={"Authorization": f"Bearer {sensitive_marker}"},
+        headers={"Authorization": authorization},
     )
 
     emitted = capsys.readouterr().err.strip().splitlines()

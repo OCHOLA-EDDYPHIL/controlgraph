@@ -1,5 +1,6 @@
 """Executor service composition root."""
 
-from controlgraph_canary.http.service import ServiceRole, create_service_app
+from controlgraph_canary.application.identity import ServiceRole
+from controlgraph_canary.services.runtime import create_runtime_service_app
 
-app = create_service_app(ServiceRole.EXECUTOR)
+app = create_runtime_service_app(ServiceRole.EXECUTOR)

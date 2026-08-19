@@ -94,3 +94,13 @@ variable "operator_principal" {
     error_message = "operator_principal must be one explicit user email principal."
   }
 }
+
+variable "operator_subject" {
+  description = "Exact Google identity subject allowed to invoke the operator API."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]{5,31}$", var.operator_subject))
+    error_message = "operator_subject must be one explicit numeric Google identity subject."
+  }
+}

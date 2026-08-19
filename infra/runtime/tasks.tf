@@ -28,7 +28,7 @@ resource "google_cloud_tasks_queue" "execution" {
 
     uri_override {
       scheme                    = "HTTPS"
-      host                      = trimprefix(module.executor.service.uri, "https://")
+      host                      = trimprefix(local.service_audiences.executor, "https://")
       uri_override_enforce_mode = "ALWAYS"
 
       path_override {
@@ -42,7 +42,7 @@ resource "google_cloud_tasks_queue" "execution" {
 
     oidc_token {
       service_account_email = local.service_accounts.execution_task_caller
-      audience              = module.executor.service.uri
+      audience              = local.service_audiences.executor
     }
   }
 
@@ -90,7 +90,7 @@ resource "google_cloud_tasks_queue" "recovery" {
 
     uri_override {
       scheme                    = "HTTPS"
-      host                      = trimprefix(module.recovery.service.uri, "https://")
+      host                      = trimprefix(local.service_audiences.recovery, "https://")
       uri_override_enforce_mode = "ALWAYS"
 
       path_override {
@@ -104,7 +104,7 @@ resource "google_cloud_tasks_queue" "recovery" {
 
     oidc_token {
       service_account_email = local.service_accounts.recovery_task_caller
-      audience              = module.recovery.service.uri
+      audience              = local.service_audiences.recovery
     }
   }
 
