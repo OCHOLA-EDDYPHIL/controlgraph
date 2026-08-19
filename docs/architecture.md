@@ -6,11 +6,11 @@ ControlGraph Canary addresses stale authority at execution time. A request can b
 authenticated, correctly signed, and intact yet no longer be authorized because it was queued
 before an operator revoked its rollout epoch.
 
-The current repository is a pre-integration scaffold. It implements a local exact-match epoch
-primitive, read-only HTTP routes, a CLI diagnostic, a static React shell, Terraform input
-contracts, and local tests. It does not currently store authoritative epochs, sign capabilities,
-deliver authenticated tasks, mutate Cloud Run, evaluate hosted health, recover a service, or
-render a hosted evidence timeline.
+The current repository implements strict versioned contracts, cross-language canonical fixtures,
+a pure rollout reducer, root-scoped exact-match epochs, read-only HTTP routes, a CLI diagnostic,
+a static React shell, Terraform input contracts, and local tests. It does not currently persist
+authoritative epochs, sign capabilities, deliver authenticated tasks, mutate Cloud Run, evaluate
+hosted health, recover a service, or render a hosted evidence timeline.
 
 The architecture below fixes the boundary that later numbered implementation work must satisfy.
 It must not be read as evidence that the hosted path has already been deployed or accepted.
@@ -109,7 +109,8 @@ never becomes an authority implementation. The server remains the source of muta
 
 ## Epoch authority
 
-Each immutable rollout root has an independent non-negative, monotonically increasing epoch.
+Each immutable rollout root begins at epoch 1 and has an independent, monotonically increasing
+epoch.
 Authority changes compare an expected current epoch and advance it exactly once while recording
 the actor, cause, request identity, prior epoch, new epoch, and evidence identity.
 

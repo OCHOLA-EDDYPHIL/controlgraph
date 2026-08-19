@@ -9,5 +9,8 @@ def test_shared_contract_fixture_manifest_is_versioned() -> None:
     assert manifest == {
         "canonical_encoding": "controlgraph.canonical-json/v1",
         "fixture_version": "controlgraph.contract-fixtures/v1",
-        "fixtures": [],
+        "fixture_sets": [{"manifest": "v1/manifest.json", "name": "v1"}],
     }
+
+    for fixture_set in manifest["fixture_sets"]:
+        assert (manifest_path.parent / fixture_set["manifest"]).is_file()
