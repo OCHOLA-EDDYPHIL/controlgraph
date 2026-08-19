@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-  pull_request:
+    branches-ignore:
+      - dependabot/**
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,7 +16,7 @@ concurrency:
 jobs:
   backend:
     name: Python
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, controlgraph]
     timeout-minutes: 10
     defaults:
       run:
@@ -38,7 +40,7 @@ jobs:
 
   web:
     name: Web
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, controlgraph]
     timeout-minutes: 10
     defaults:
       run:
@@ -63,7 +65,7 @@ jobs:
 
   terraform:
     name: Terraform
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, controlgraph]
     timeout-minutes: 10
     defaults:
       run:
@@ -77,14 +79,28 @@ jobs:
           terraform_version: "1.10.3"
       - name: Check formatting
         run: terraform fmt -check -recursive
-      - name: Initialize without a backend
-        run: terraform init -backend=false
-      - name: Validate
-        run: terraform validate
+      - name: Initialize and validate every stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          stacks=()
+          if [[ -f versions.tf ]]; then
+            stacks+=(.)
+          fi
+          for stack in bootstrap foundation runtime; do
+            if [[ -f "$stack/versions.tf" ]]; then
+              stacks+=("$stack")
+            fi
+          done
+          test "${#stacks[@]}" -gt 0
+          for stack in "${stacks[@]}"; do
+            terraform -chdir="$stack" init -backend=false -lockfile=readonly
+            terraform -chdir="$stack" validate
+          done
 
   security:
     name: Security
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, controlgraph]
     timeout-minutes: 10
     steps:
       - name: Check out source
@@ -99,7 +115,7 @@ jobs:
       - name: Audit Python dependencies
         run: |
           uv export --project backend --frozen --no-dev --no-emit-project --quiet --output-file /tmp/controlgraph-requirements.txt
-          uvx pip-audit --requirement /tmp/controlgraph-requirements.txt
+          uvx pip-audit==2.10.1 --requirement /tmp/controlgraph-requirements.txt
       - name: Set up Node.js
         uses: actions/setup-node@1e60f620b9541dca1515401f7a15dc71c2ad5e # v4.0.3
         with:
