@@ -148,7 +148,7 @@ class _LeaseState(StrEnum):
 class ReceiptDispatchLease:
     """Exact one-use ownership of a definitively fresh receipt claim."""
 
-    __slots__ = ("_binding", "_claimed_receipt", "_state")
+    __slots__ = ("_binding", "_claimed_receipt", "_lock", "_state")
 
     def __init__(
         self,
@@ -166,16 +166,18 @@ class ReceiptDispatchLease:
             raise ValueError("receipt dispatch lease binding is invalid")
         self._claimed_receipt = claimed_receipt
         self._binding = binding
+        self._lock = Lock()
         self._state = _LeaseState.FRESH
 
     def _enter(self, verified: VerifiedMutation) -> ReasonCode | None:
-        if self._state is not _LeaseState.FRESH:
-            return ReasonCode.RECEIPT_IN_PROGRESS
-        self._state = _LeaseState.ENTERED
-        if not _binding_matches_verified(self._binding, verified):
-            self._state = _LeaseState.CLOSED
-            return ReasonCode.IDEMPOTENCY_CONFLICT
-        return None
+        with self._lock:
+            if self._state is not _LeaseState.FRESH:
+                return ReasonCode.RECEIPT_IN_PROGRESS
+            self._state = _LeaseState.ENTERED
+            if not _binding_matches_verified(self._binding, verified):
+                self._state = _LeaseState.CLOSED
+                return ReasonCode.IDEMPOTENCY_CONFLICT
+            return None
 
     def _denial(self, reason_code: ReasonCode) -> FinalAuthorityDenial:
         return FinalAuthorityDenial(
@@ -184,8 +186,9 @@ class ReceiptDispatchLease:
         )
 
     def _close_with_denial(self, reason_code: ReasonCode) -> FinalAuthorityDenial:
-        if self._state is _LeaseState.ENTERED:
-            self._state = _LeaseState.CLOSED
+        with self._lock:
+            if self._state is _LeaseState.ENTERED:
+                self._state = _LeaseState.CLOSED
         return self._denial(reason_code)
 
     def _authorize(
@@ -194,17 +197,18 @@ class ReceiptDispatchLease:
         target: TargetBinding,
         service_role: ServiceRole,
     ) -> MutationPermit:
-        if self._state is not _LeaseState.ENTERED:
-            raise RuntimeError("receipt dispatch lease is not active")
-        self._state = _LeaseState.CLOSED
-        return MutationPermit(
-            _PERMIT_KEY,
-            target=target,
-            service_role=service_role,
-            intent=verified.request.intent,
-            receipt_id=self._claimed_receipt.value.receipt_id,
-            binding=self._binding,
-        )
+        with self._lock:
+            if self._state is not _LeaseState.ENTERED:
+                raise RuntimeError("receipt dispatch lease is not active")
+            self._state = _LeaseState.CLOSED
+            return MutationPermit(
+                _PERMIT_KEY,
+                target=target,
+                service_role=service_role,
+                intent=verified.request.intent,
+                receipt_id=self._claimed_receipt.value.receipt_id,
+                binding=self._binding,
+            )
 
 
 class DefinitiveFreshClaimLeaseFactory:
@@ -232,7 +236,15 @@ _PERMIT_KEY = _PermitKey()
 class MutationPermit:
     """Opaque, target-bound permission for one already-fenced mutation intent."""
 
-    __slots__ = ("_binding", "_intent", "_receipt_id", "_service_role", "_target")
+    __slots__ = (
+        "_available",
+        "_binding",
+        "_intent",
+        "_lock",
+        "_receipt_id",
+        "_service_role",
+        "_target",
+    )
 
     def __init__(
         self,
@@ -260,12 +272,22 @@ class MutationPermit:
         self._intent = intent
         self._receipt_id = receipt_id
         self._binding = binding
+        self._available = True
+        self._lock = Lock()
 
     @property
     def intent(self) -> MutationIntent:
-        """Return the immutable command already sealed into this permit."""
+        """Consume and return the immutable command sealed into this permit."""
 
-        return self._intent
+        with self._lock:
+            if not self._available:
+                raise RuntimeError("mutation permit is already consumed or closed")
+            self._available = False
+            return self._intent
+
+    def _close(self) -> None:
+        with self._lock:
+            self._available = False
 
 
 class FinalMutationGate[ResultT]:
@@ -339,9 +361,11 @@ class FinalMutationGate[ResultT]:
         )
         if denial is not None:
             return lease._close_with_denial(denial)
-        return await self._adapter.mutate(
-            lease._authorize(verified, self._target, self._service_role)
-        )
+        permit = lease._authorize(verified, self._target, self._service_role)
+        try:
+            return await self._adapter.mutate(permit)
+        finally:
+            permit._close()
 
 
 def _validate_claimed_record(claimed: object) -> None:

@@ -368,11 +368,13 @@ class _Adapter:
         self.events = events
         self.error = error
         self.calls: list[MutationPermit] = []
+        self.intents: list[MutationIntent] = []
 
     async def mutate(self, permit: MutationPermit) -> str:
         if self.events is not None:
             self.events.append("mutation")
         self.calls.append(permit)
+        self.intents.append(permit.intent)
         if self.error is not None:
             raise self.error
         return "mutated"
@@ -385,6 +387,7 @@ class _BlockingAdapter(_Adapter):
 
     async def mutate(self, permit: MutationPermit) -> str:
         self.calls.append(permit)
+        self.intents.append(permit.intent)
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -415,7 +418,9 @@ def test_exact_executor_and_recovery_actions_dispatch_once(
         assert await gate.execute(_lease(verified), verified) == "mutated"
         assert len(adapter.calls) == 1
         assert type(adapter.calls[0]) is MutationPermit
-        assert adapter.calls[0].intent == verified.request.intent
+        assert adapter.intents == [verified.request.intent]
+        with pytest.raises(RuntimeError, match="consumed or closed"):
+            _ = adapter.calls[0].intent
         assert reader.calls == [verified.root.root_id]
 
     asyncio.run(scenario())
@@ -639,6 +644,45 @@ def test_receipt_dispatch_lease_is_exactly_one_use_concurrently() -> None:
     asyncio.run(scenario())
 
 
+def test_receipt_dispatch_lease_has_one_cross_thread_entry_winner() -> None:
+    async def scenario() -> None:
+        verified = _verified()
+        lease = _lease(verified)
+
+        results = await asyncio.gather(
+            asyncio.to_thread(lease._enter, verified),
+            asyncio.to_thread(lease._enter, verified),
+        )
+
+        assert results.count(None) == 1
+        assert results.count(ReasonCode.RECEIPT_IN_PROGRESS) == 1
+
+    asyncio.run(scenario())
+
+
+def test_mutation_permit_has_one_cross_thread_consumer() -> None:
+    async def scenario() -> None:
+        verified = _verified()
+        lease = _lease(verified)
+        assert lease._enter(verified) is None
+        permit = lease._authorize(
+            verified,
+            verified.root.target,
+            ServiceRole.EXECUTOR,
+        )
+
+        results = await asyncio.gather(
+            asyncio.to_thread(lambda: permit.intent),
+            asyncio.to_thread(lambda: permit.intent),
+            return_exceptions=True,
+        )
+
+        assert sum(type(result) is MutationIntent for result in results) == 1
+        assert sum(isinstance(result, RuntimeError) for result in results) == 1
+
+    asyncio.run(scenario())
+
+
 def test_adapter_exception_leaves_dispatch_lease_irrevocably_closed() -> None:
     async def scenario() -> None:
         verified = _verified()
@@ -850,7 +894,7 @@ def test_authority_epoch_must_equal_persistence_revision_plus_one() -> None:
     async def scenario() -> None:
         verified = _verified(epoch=2)
         snapshot = _snapshot(epoch=2)
-        incoherent_authority = EpochAuthorityRecord(
+        incoherent_authority = EpochAuthorityRecord.model_construct(
             **{
                 **snapshot.authority.value.model_dump(mode="python"),
                 "revision": 2,
