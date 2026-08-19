@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from google.api_core import exceptions as api_exceptions
+from google.cloud import firestore_v1
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStore,
@@ -15,6 +16,7 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreErrorCode,
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
+    CreatedRollout,
     DirectReceiptCreate,
     FencedServiceClaim,
     FinalAuthoritySnapshot,
@@ -468,14 +470,14 @@ class _Transaction:
     def __init__(self, client: "_FakeClient", maximum_attempts: int) -> None:
         self.client = client
         self.maximum_attempts = maximum_attempts
-        self.operations: list[tuple[str, _Reference, dict[str, Any]]] = []
+        self.operations: list[tuple[str, _Reference, dict[str, Any], object | None]] = []
         self.write_results: list[object] = []
 
     def snapshot(self, reference: _Reference) -> _Snapshot:
         return self.client.snapshot(reference)
 
     def create(self, reference: _Reference, document_data: dict[str, Any]) -> None:
-        self.operations.append(("create", reference, deepcopy(document_data)))
+        self.operations.append(("create", reference, deepcopy(document_data), None))
 
     def update(
         self,
@@ -483,8 +485,7 @@ class _Transaction:
         field_updates: dict[str, Any],
         option: object | None = None,
     ) -> None:
-        del option
-        self.operations.append(("update", reference, deepcopy(field_updates)))
+        self.operations.append(("update", reference, deepcopy(field_updates), option))
 
 
 class _FakeClient:
@@ -606,11 +607,22 @@ class _FakeTransactionRunner:
                 raise TimeoutError("synthetic provider detail")
             original = deepcopy(client.documents)
             pending = deepcopy(client.documents)
-            for operation, reference, data in transaction.operations:
+            for operation, reference, data, option in transaction.operations:
                 if operation == "create" and reference.path in pending:
                     raise api_exceptions.AlreadyExists("synthetic contention detail")
                 if operation == "update" and reference.path not in pending:
                     raise api_exceptions.NotFound("synthetic contention detail")
+                if isinstance(option, firestore_v1.LastUpdateOption):
+                    expected_update_time = vars(option).get("_last_update_time")
+                    current = pending.get(reference.path)
+                    if (
+                        type(expected_update_time) is not datetime
+                        or current is None
+                        or current.update_time != expected_update_time
+                    ):
+                        raise api_exceptions.FailedPrecondition(
+                            "synthetic update-time contention detail"
+                        )
                 client.clock += timedelta(microseconds=1)
                 pending[reference.path] = _StoredDocument(data, client.clock)
                 transaction.write_results.append(_WriteResult(client.clock))
@@ -649,6 +661,40 @@ def store_fixture() -> tuple[FirestoreAuthorityStore, _FakeClient, _FakeTransact
         transaction_runner=runner,
     )
     return store, client, runner
+
+
+async def _create_rollout(
+    authority_store: FirestoreAuthorityStore,
+    root: RolloutRoot,
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+) -> CreatedRollout:
+    return await authority_store.create_rollout(
+        root,
+        claim,
+        authority,
+        verified_candidate_revision_configuration_sha256=(
+            claim.candidate_revision_configuration_sha256
+        ),
+    )
+
+
+async def _create_rollout_after_release(
+    authority_store: FirestoreAuthorityStore,
+    expected_released_claim: StoredRecord[ServiceClaimRecord],
+    root: RolloutRoot,
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+) -> CreatedRollout:
+    return await authority_store.create_rollout_after_release(
+        expected_released_claim,
+        root,
+        claim,
+        authority,
+        verified_candidate_revision_configuration_sha256=(
+            claim.candidate_revision_configuration_sha256
+        ),
+    )
 
 
 def test_store_is_sealed_to_one_target_and_named_database(
@@ -772,7 +818,7 @@ def test_rollout_creation_atomically_persists_three_strongly_read_records() -> N
         store, client, runner = store_fixture()
         root, claim, authority = initial_records()
 
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
 
         assert created.root == StoredRecord(root, 0)
         assert created.service_claim == StoredRecord(claim, 0)
@@ -803,7 +849,44 @@ def test_rollout_creation_binds_initial_authority_to_operator_owner() -> None:
         )
 
         with pytest.raises(ValueError, match="one atomic authority state"):
-            await store.create_rollout(root, claim, workload_attributed)
+            await _create_rollout(store, root, claim, workload_attributed)
+
+    asyncio.run(scenario())
+
+
+def test_rollout_creation_rejects_workload_attribution_and_unverified_candidate() -> None:
+    async def scenario() -> None:
+        store, client, runner = store_fixture()
+        root, claim, authority = initial_records()
+        workload_claim = claim.model_copy(
+            update={"operator_owner": claim.workload_creator}
+        )
+        workload_root = root.model_copy(update={"approved_by": claim.workload_creator})
+        workload_authority = authority.model_copy(
+            update={"changed_by": claim.workload_creator}
+        )
+
+        with pytest.raises(ValueError, match="one atomic authority state"):
+            await FirestoreAuthorityStore.create_rollout(
+                store,
+                workload_root,
+                workload_claim,
+                workload_authority,
+                verified_candidate_revision_configuration_sha256=(
+                    workload_claim.candidate_revision_configuration_sha256
+                ),
+            )
+        with pytest.raises(ValueError, match="verified candidate configuration"):
+            await FirestoreAuthorityStore.create_rollout(
+                store,
+                root,
+                claim,
+                authority,
+                verified_candidate_revision_configuration_sha256=FOUR_DIGEST,
+            )
+
+        assert client.documents == {}
+        assert runner.maximum_attempts == []
 
     asyncio.run(scenario())
 
@@ -815,8 +898,8 @@ def test_racing_root_creates_have_one_service_claim_winner() -> None:
         second = initial_records("root-race-second")
 
         results = await asyncio.gather(
-            store.create_rollout(*first),
-            store.create_rollout(*second),
+            _create_rollout(store, *first),
+            _create_rollout(store, *second),
             return_exceptions=True,
         )
 
@@ -851,7 +934,7 @@ def test_legacy_active_claim_path_blocks_v2_creation() -> None:
         )
 
         with pytest.raises(AuthorityStoreConflict):
-            await store.create_rollout(root, claim, authority)
+            await _create_rollout(store, root, claim, authority)
 
         assert set(client.documents) == {claim_path}
 
@@ -862,7 +945,7 @@ def test_authority_compare_and_advance_has_one_monotonic_winner() -> None:
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         expected = await store.read_authority(root.root_id)
         assert expected is not None
 
@@ -891,7 +974,7 @@ def test_authority_advance_rejects_time_regression_without_writing() -> None:
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         expected = await store.read_authority(root.root_id)
         assert expected is not None
         regressed = EpochAuthorityRecord(
@@ -1144,7 +1227,7 @@ def test_ambiguous_cas_with_a_competing_next_revision_is_a_conflict() -> None:
     async def scenario() -> None:
         store, _, runner = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         expected = await store.read_authority(root.root_id)
         assert expected is not None
         winning = advanced_authority(authority, suffix="winner")
@@ -1210,7 +1293,7 @@ def test_transactional_authority_read_rejects_revision_corruption_without_writin
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         expected = await store.read_authority(root.root_id)
         assert expected is not None
         path = (
@@ -1235,7 +1318,7 @@ def test_service_claim_fence_atomically_revokes_then_release_preserves_authority
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         expected_claim = await store.read_service_claim()
         expected_authority = await store.read_authority(root.root_id)
         assert expected_claim is not None
@@ -1281,7 +1364,7 @@ def test_ambiguous_fence_is_adopted_only_when_both_replacements_match() -> None:
     async def scenario() -> None:
         store, _, runner = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, _, revoked = release_transition(claim, authority)
         runner.mode = "commit-then-timeout"
 
@@ -1298,7 +1381,7 @@ def test_ambiguous_fence_is_adopted_only_when_both_replacements_match() -> None:
         )
 
         partial_store, _, partial_runner = store_fixture()
-        partial_created = await partial_store.create_rollout(root, claim, authority)
+        partial_created = await _create_rollout(partial_store, root, claim, authority)
         partial_runner.mode = "commit-first-only-then-timeout"
         with pytest.raises(AuthorityStoreOutcomeUnknown):
             await partial_store.fence_service_claim(
@@ -1327,7 +1410,7 @@ def test_fence_rejects_unmatched_transition_bindings_before_writing(
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         expected_claim = await store.read_service_claim()
         expected_authority = await store.read_authority(root.root_id)
         assert expected_claim is not None
@@ -1358,7 +1441,7 @@ def test_fence_cannot_replace_the_claimed_candidate_revision_digest() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, _, revoked = release_transition(claim, authority)
         altered = fenced.model_copy(
             update={"candidate_revision_configuration_sha256": TWO_DIGEST}
@@ -1382,7 +1465,7 @@ def test_issuance_snapshot_cannot_mix_with_an_interleaved_fence() -> None:
     async def scenario() -> None:
         store, client, runner = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, _, revoked = release_transition(claim, authority)
         client.transaction_read_count = 0
         client.pause_transaction_read_after = 1
@@ -1428,7 +1511,7 @@ def test_release_requires_a_fenced_claim_and_the_exact_fenced_authority() -> Non
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, released, revoked = release_transition(claim, authority)
         before = deepcopy(client.documents)
 
@@ -1462,7 +1545,7 @@ def test_ambiguous_final_release_adopts_only_the_exact_claim_revision() -> None:
     async def scenario() -> None:
         store, _, runner = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, released, revoked = release_transition(claim, authority)
         fenced_state = await store.fence_service_claim(
             created.service_claim,
@@ -1484,7 +1567,7 @@ def test_ambiguous_final_release_adopts_only_the_exact_claim_revision() -> None:
         )
 
         partial_store, _, partial_runner = store_fixture()
-        partial_created = await partial_store.create_rollout(root, claim, authority)
+        partial_created = await _create_rollout(partial_store, root, claim, authority)
         partial_fenced = await partial_store.fence_service_claim(
             partial_created.service_claim,
             fenced,
@@ -1504,9 +1587,9 @@ def test_ambiguous_final_release_adopts_only_the_exact_claim_revision() -> None:
 
 def test_takeover_is_blocked_until_terminal_release_then_is_explicit() -> None:
     async def scenario() -> None:
-        store, _, _ = store_fixture()
+        store, client, runner = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, released, revoked = release_transition(claim, authority)
         replacement = initial_records(
             "root-firestore-002",
@@ -1517,7 +1600,7 @@ def test_takeover_is_blocked_until_terminal_release_then_is_explicit() -> None:
         )
 
         with pytest.raises(ValueError, match="safely released claim"):
-            await store.create_rollout_after_release(created.service_claim, *replacement)
+            await _create_rollout_after_release(store, created.service_claim, *replacement)
 
         fenced_state = await store.fence_service_claim(
             created.service_claim,
@@ -1526,7 +1609,7 @@ def test_takeover_is_blocked_until_terminal_release_then_is_explicit() -> None:
             revoked,
         )
         with pytest.raises(ValueError, match="safely released claim"):
-            await store.create_rollout_after_release(
+            await _create_rollout_after_release(store,
                 fenced_state.service_claim,
                 *replacement,
             )
@@ -1536,7 +1619,20 @@ def test_takeover_is_blocked_until_terminal_release_then_is_explicit() -> None:
             released,
             fenced_state.authority,
         )
-        takeover = await store.create_rollout_after_release(
+        before_mismatch = deepcopy(client.documents)
+        attempts_before_mismatch = len(runner.maximum_attempts)
+        with pytest.raises(ValueError, match="verified candidate configuration"):
+            await FirestoreAuthorityStore.create_rollout_after_release(
+                store,
+                released_state.service_claim,
+                *replacement,
+                verified_candidate_revision_configuration_sha256=FOUR_DIGEST,
+            )
+        assert client.documents == before_mismatch
+        assert len(runner.maximum_attempts) == attempts_before_mismatch
+
+        takeover = await _create_rollout_after_release(
+            store,
             released_state.service_claim,
             *replacement,
         )
@@ -1553,7 +1649,7 @@ def test_racing_released_claim_takeovers_have_one_winner() -> None:
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, released, revoked = release_transition(claim, authority)
         fenced_state = await store.fence_service_claim(
             created.service_claim,
@@ -1582,8 +1678,8 @@ def test_racing_released_claim_takeovers_have_one_winner() -> None:
         )
 
         results = await asyncio.gather(
-            store.create_rollout_after_release(released_state.service_claim, *first),
-            store.create_rollout_after_release(released_state.service_claim, *second),
+            _create_rollout_after_release(store, released_state.service_claim, *first),
+            _create_rollout_after_release(store, released_state.service_claim, *second),
             return_exceptions=True,
         )
 
@@ -1605,7 +1701,7 @@ def test_ambiguous_takeover_adopts_exact_commit_and_rejects_partial_state() -> N
     ]:
         store, _, runner = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, released, revoked = release_transition(claim, authority)
         fenced_state = await store.fence_service_claim(
             created.service_claim,
@@ -1631,7 +1727,7 @@ def test_ambiguous_takeover_adopts_exact_commit_and_rejects_partial_state() -> N
         store, runner, expected = await released_fixture()
         runner.mode = "commit-then-timeout"
 
-        adopted = await store.create_rollout_after_release(expected, *replacement)
+        adopted = await _create_rollout_after_release(store, expected, *replacement)
 
         assert adopted.root == StoredRecord(replacement[0], 0)
         assert adopted.service_claim == StoredRecord(replacement[1], 3)
@@ -1640,7 +1736,7 @@ def test_ambiguous_takeover_adopts_exact_commit_and_rejects_partial_state() -> N
         partial_store, partial_runner, partial_expected = await released_fixture()
         partial_runner.mode = "commit-first-only-then-timeout"
         with pytest.raises(AuthorityStoreOutcomeUnknown):
-            await partial_store.create_rollout_after_release(
+            await _create_rollout_after_release(partial_store,
                 partial_expected,
                 *replacement,
             )
@@ -1652,7 +1748,7 @@ def test_claim_lifecycle_revisions_remain_monotonic_across_multiple_roots() -> N
     async def scenario() -> None:
         store, _, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, released, revoked = release_transition(claim, authority)
         first_fence = await store.fence_service_claim(
             created.service_claim,
@@ -1672,7 +1768,7 @@ def test_claim_lifecycle_revisions_remain_monotonic_across_multiple_roots() -> N
             claimed_at="2026-08-19T12:09:01Z",
             service_generation=15,
         )
-        takeover = await store.create_rollout_after_release(
+        takeover = await _create_rollout_after_release(store,
             first_release.service_claim,
             *second,
         )
@@ -1718,7 +1814,7 @@ def test_final_authority_snapshot_uses_one_order_independent_batch_get() -> None
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         client.document_calls = 0
         client.batch_get_mode = "reversed"
 
@@ -1745,7 +1841,7 @@ def test_final_authority_snapshot_returns_none_for_a_complete_missing_response()
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         claim_path = (
             f"{AuthorityStorageKind.SERVICE_CLAIM.value}/"
             f"{service_claim_document_id(root.target)}"
@@ -1766,7 +1862,7 @@ def test_final_authority_snapshot_rejects_malformed_batch_streams(mode: str) -> 
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         client.batch_get_mode = mode
 
         with pytest.raises(AuthorityStoreCorruptRecord):
@@ -1781,7 +1877,7 @@ def test_final_authority_snapshot_sanitizes_batch_get_failure() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        await store.create_rollout(root, claim, authority)
+        await _create_rollout(store, root, claim, authority)
         client.batch_get_mode = "mid-stream-error"
 
         with pytest.raises(AuthorityStoreUnavailable) as error:
@@ -1798,7 +1894,7 @@ def test_final_authority_snapshot_captures_claim_fence_before_returning() -> Non
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, _, revoked = release_transition(claim, authority)
         client.pause_batch_get_before_capture = True
 
@@ -1828,7 +1924,7 @@ def test_final_authority_batch_get_cannot_mix_with_interleaved_fence() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
         root, claim, authority = initial_records()
-        created = await store.create_rollout(root, claim, authority)
+        created = await _create_rollout(store, root, claim, authority)
         fenced, _, revoked = release_transition(claim, authority)
         client.pause_batch_get_after_first = True
 

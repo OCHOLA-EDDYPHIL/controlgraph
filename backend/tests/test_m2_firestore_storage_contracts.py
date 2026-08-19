@@ -329,6 +329,18 @@ def test_service_claim_lifecycle_is_closed_and_complete() -> None:
         )
 
 
+def test_service_claim_separates_operator_and_workload_identities() -> None:
+    claim = active_claim()
+
+    with pytest.raises(ValidationError, match="operator and workload identities"):
+        ServiceClaimRecord(
+            **{
+                **claim.model_dump(mode="python"),
+                "operator_owner": claim.workload_creator,
+            }
+        )
+
+
 def test_released_claim_rejects_unbound_or_reused_proof_material() -> None:
     claim = active_claim()
     terminal, classification = release_proofs(claim)

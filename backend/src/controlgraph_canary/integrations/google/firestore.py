@@ -72,6 +72,7 @@ FIRESTORE_OPERATION_TIMEOUT_SECONDS: Final = 5.0
 FIRESTORE_MAX_TRANSACTION_ATTEMPTS: Final = 3
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
+_SHA256_DIGEST: Final = re.compile(r"^[0-9a-f]{64}$")
 _DOCUMENT_FIELDS: Final = frozenset(AuthorityStorageDocument.model_fields)
 _KNOWN_CONTENTION = (
     api_exceptions.Aborted,
@@ -391,7 +392,22 @@ def _validate_initial_rollout(
     root: RolloutRoot,
     claim: ServiceClaimRecord,
     authority: EpochAuthorityRecord,
+    *,
+    verified_candidate_revision_configuration_sha256: str,
 ) -> None:
+    if (
+        type(verified_candidate_revision_configuration_sha256) is not str
+        or _SHA256_DIGEST.fullmatch(
+            verified_candidate_revision_configuration_sha256
+        )
+        is None
+    ):
+        raise ValueError("verified candidate configuration is not a SHA-256 digest")
+    if (
+        claim.candidate_revision_configuration_sha256
+        != verified_candidate_revision_configuration_sha256
+    ):
+        raise ValueError("verified candidate configuration does not match the claim")
     if any(value.target != configured_target for value in (root, claim, authority)):
         raise ValueError("rollout records do not match the configured target")
     root_sha256 = canonical_sha256(root)
@@ -414,6 +430,9 @@ def _validate_initial_rollout(
         )
         or authority.changed_by != claim.operator_owner
         or claim.operator_owner != root.approved_by
+        or claim.operator_owner == claim.workload_creator
+        or root.approved_by == claim.workload_creator
+        or authority.changed_by == claim.workload_creator
         or authority.root_id != root.root_id
         or authority.root_sha256 != root_sha256
         or authority.current_epoch != root.initial_epoch
@@ -574,8 +593,18 @@ def _validate_released_takeover(
     root: RolloutRoot,
     claim: ServiceClaimRecord,
     authority: EpochAuthorityRecord,
+    *,
+    verified_candidate_revision_configuration_sha256: str,
 ) -> None:
-    _validate_initial_rollout(configured_target, root, claim, authority)
+    _validate_initial_rollout(
+        configured_target,
+        root,
+        claim,
+        authority,
+        verified_candidate_revision_configuration_sha256=(
+            verified_candidate_revision_configuration_sha256
+        ),
+    )
     previous = expected_released_claim.value
     if type(previous) is not ServiceClaimRecord:
         raise TypeError("released claim takeover requires an exact service claim")
@@ -914,6 +943,22 @@ class FirestoreAuthorityStore:
         document_id: str,
         model_type: type[ModelT],
     ) -> _DecodedDocument[ModelT] | None:
+        decoded, _ = await self._strong_read_with_update_time(
+            kind=kind,
+            logical_id=logical_id,
+            document_id=document_id,
+            model_type=model_type,
+        )
+        return decoded
+
+    async def _strong_read_with_update_time[ModelT: StrictContractModel](
+        self,
+        *,
+        kind: AuthorityStorageKind,
+        logical_id: str,
+        document_id: str,
+        model_type: type[ModelT],
+    ) -> tuple[_DecodedDocument[ModelT] | None, datetime | None]:
         client = await self._client()
         reference = self._reference(client, kind, document_id)
         try:
@@ -925,7 +970,7 @@ class FirestoreAuthorityStore:
             raise
         except Exception:
             raise AuthorityStoreUnavailable from None
-        return self._decode_snapshot(
+        decoded = self._decode_snapshot(
             snapshot,
             reference=reference,
             kind=kind,
@@ -933,6 +978,13 @@ class FirestoreAuthorityStore:
             document_id=document_id,
             model_type=model_type,
         )
+        if decoded is None:
+            return None, None
+        try:
+            update_time = _aware_utc(cast(_ProviderSnapshotPort, snapshot).update_time)
+        except Exception:
+            raise AuthorityStoreCorruptRecord from None
+        return decoded, update_time
 
     async def _transaction_read[ModelT: StrictContractModel](
         self,
@@ -1058,8 +1110,18 @@ class FirestoreAuthorityStore:
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
+        *,
+        verified_candidate_revision_configuration_sha256: str,
     ) -> CreatedRollout:
-        _validate_initial_rollout(self._target, root, service_claim, authority)
+        _validate_initial_rollout(
+            self._target,
+            root,
+            service_claim,
+            authority,
+            verified_candidate_revision_configuration_sha256=(
+                verified_candidate_revision_configuration_sha256
+            ),
+        )
         root_document = _prepared_document(
             kind=AuthorityStorageKind.ROLLOUT_ROOT,
             logical_id=root.root_id,
@@ -1111,6 +1173,8 @@ class FirestoreAuthorityStore:
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
+        *,
+        verified_candidate_revision_configuration_sha256: str,
     ) -> CreatedRollout:
         _validate_released_takeover(
             self._target,
@@ -1118,6 +1182,9 @@ class FirestoreAuthorityStore:
             root,
             service_claim,
             authority,
+            verified_candidate_revision_configuration_sha256=(
+                verified_candidate_revision_configuration_sha256
+            ),
         )
         root_document = _prepared_document(
             kind=AuthorityStorageKind.ROLLOUT_ROOT,
@@ -1437,6 +1504,16 @@ class FirestoreAuthorityStore:
         )
         documents: tuple[_PreparedDocument[StrictContractModel], ...] = (document,)
 
+        current, update_time = await self._strong_read_with_update_time(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=replacement.root_id,
+            document_id=document.document_id,
+            model_type=EpochAuthorityRecord,
+        )
+        if current is None or current.stored != expected or update_time is None:
+            raise AuthorityStoreConflict
+        write_option = firestore_v1.LastUpdateOption(update_time)
+
         async def update(transaction: _TransactionPort) -> None:
             client = await self._client()
             reference = self._reference(
@@ -1444,17 +1521,11 @@ class FirestoreAuthorityStore:
                 AuthorityStorageKind.EPOCH_AUTHORITY,
                 epoch_authority_document_id(replacement.root_id),
             )
-            current = await self._transaction_read(
-                transaction,
-                reference=reference,
-                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
-                logical_id=replacement.root_id,
-                document_id=document.document_id,
-                model_type=EpochAuthorityRecord,
+            transaction.update(
+                reference,
+                _document_data(document.wrapper),
+                option=write_option,
             )
-            if current is None or current.stored != expected:
-                raise _ExpectedStateMismatch
-            transaction.update(reference, _document_data(document.wrapper))
 
         await self._run_transaction(documents, update)
         return _stored(document)

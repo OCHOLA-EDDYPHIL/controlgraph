@@ -11,6 +11,7 @@ import pytest
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
+    CreatedRollout,
     FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
     ReceiptClaimAdopted,
@@ -352,6 +353,40 @@ def _assert_one_conflict(results: Sequence[object]) -> object:
     return winners[0]
 
 
+async def _create_rollout(
+    authority_store: FirestoreAuthorityStore,
+    root: RolloutRoot,
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+) -> CreatedRollout:
+    return await authority_store.create_rollout(
+        root,
+        claim,
+        authority,
+        verified_candidate_revision_configuration_sha256=(
+            claim.candidate_revision_configuration_sha256
+        ),
+    )
+
+
+async def _create_rollout_after_release(
+    authority_store: FirestoreAuthorityStore,
+    expected_released_claim: StoredRecord[ServiceClaimRecord],
+    root: RolloutRoot,
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+) -> CreatedRollout:
+    return await authority_store.create_rollout_after_release(
+        expected_released_claim,
+        root,
+        claim,
+        authority,
+        verified_candidate_revision_configuration_sha256=(
+            claim.candidate_revision_configuration_sha256
+        ),
+    )
+
+
 def test_emulator_root_creation_and_epoch_revocation_have_single_winners() -> None:
     async def scenario() -> None:
         target = _target()
@@ -367,8 +402,8 @@ def test_emulator_root_creation_and_epoch_revocation_have_single_winners() -> No
         )
 
         create_results = await asyncio.gather(
-            first_store.create_rollout(*first),
-            second_store.create_rollout(*second),
+            _create_rollout(first_store, *first),
+            _create_rollout(second_store, *second),
             return_exceptions=True,
         )
         created = _assert_one_conflict(create_results)
@@ -413,7 +448,7 @@ def test_emulator_issuance_snapshot_is_coherent_across_claim_fence() -> None:
             target=target,
             configured_project_id=target.project_id,
         )
-        created = await first_store.create_rollout(root, claim, authority)
+        created = await _create_rollout(first_store, root, claim, authority)
         fenced, _, revoked = _release(claim, authority)
 
         snapshot, fence_result = await asyncio.gather(
@@ -459,7 +494,7 @@ def test_emulator_final_snapshot_is_coherent_across_claim_fence() -> None:
             target=target,
             configured_project_id=target.project_id,
         )
-        created = await first_store.create_rollout(root, claim, authority)
+        created = await _create_rollout(first_store, root, claim, authority)
         fenced, _, revoked = _release(claim, authority)
 
         snapshot, fence_result = await asyncio.gather(
@@ -503,7 +538,7 @@ def test_emulator_released_claim_takeover_has_one_transactional_winner() -> None
             target=target,
             configured_project_id=target.project_id,
         )
-        created = await first_store.create_rollout(root, claim, authority)
+        created = await _create_rollout(first_store, root, claim, authority)
         fenced, released, revoked = _release(claim, authority)
         fenced_state = await first_store.fence_service_claim(
             created.service_claim,
@@ -534,11 +569,11 @@ def test_emulator_released_claim_takeover_has_one_transactional_winner() -> None
         )
 
         results = await asyncio.gather(
-            first_store.create_rollout_after_release(
+            _create_rollout_after_release(first_store,
                 released_state.service_claim,
                 *first,
             ),
-            second_store.create_rollout_after_release(
+            _create_rollout_after_release(second_store,
                 released_state.service_claim,
                 *second,
             ),
@@ -571,7 +606,7 @@ def test_emulator_release_race_never_ignores_a_newer_authority_epoch() -> None:
             target=target,
             configured_project_id=target.project_id,
         )
-        created = await first_store.create_rollout(root, claim, authority)
+        created = await _create_rollout(first_store, root, claim, authority)
         fenced, released, revoked = _release(claim, authority)
         fenced_state = await first_store.fence_service_claim(
             created.service_claim,

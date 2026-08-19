@@ -278,6 +278,8 @@ class AuthorityStore(Protocol):
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
+        *,
+        verified_candidate_revision_configuration_sha256: str,
     ) -> CreatedRollout: ...
 
     async def create_rollout_after_release(
@@ -286,6 +288,8 @@ class AuthorityStore(Protocol):
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
+        *,
+        verified_candidate_revision_configuration_sha256: str,
     ) -> CreatedRollout: ...
 
     async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None: ...

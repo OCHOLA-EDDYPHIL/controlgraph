@@ -179,6 +179,8 @@ class ServiceClaimRecord(StrictContractModel):
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
         _require_service_claim_target(self.target)
+        if self.operator_owner == self.workload_creator:
+            raise ValueError("service claim operator and workload identities must differ")
         if self.stable_revision == self.candidate_revision:
             raise ValueError("service claim revisions must differ")
         prefix = f"{self.target.service_name}-"
