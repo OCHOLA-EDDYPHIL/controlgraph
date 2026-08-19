@@ -197,10 +197,12 @@ def all_contracts() -> tuple[object, ...]:
             epoch=7,
             action=CapabilityAction.APPLY_CANARY,
             provider_etag="etag-stable-7",
+            dispatch_not_after="2026-08-19T12:10:00Z",
             outcome=ReceiptOutcome.DENIED,
             reason_code=ReasonCode.EPOCH_MISMATCH,
             provider_operation=None,
             observed_etag=None,
+            observed_authority_epoch=8,
             created_at="2026-08-19T12:03:00Z",
             updated_at="2026-08-19T12:03:00Z",
             evidence_ids=("evidence-denial-001",),
@@ -384,6 +386,41 @@ def test_cross_field_inconsistencies_are_rejected() -> None:
     task_data["intent"]["root_sha256"] = ZERO_DIGEST  # type: ignore[index]
     with pytest.raises(ValidationError):
         TaskRequest.model_validate(task_data)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ReasonCode.PROVIDER_PRECONDITION_FAILED,
+        ReasonCode.TARGET_BINDING_MISMATCH,
+        ReasonCode.PROVIDER_REQUEST_REJECTED,
+    ],
+)
+def test_failed_safe_receipt_accepts_only_stable_sanitized_reasons(
+    reason: ReasonCode,
+) -> None:
+    receipt_data = all_contracts()[8].model_dump(mode="python")  # type: ignore[union-attr]
+    receipt_data.update(
+        outcome=ReceiptOutcome.FAILED_SAFE,
+        reason_code=reason,
+        observed_authority_epoch=None,
+    )
+
+    receipt = ExecutionReceipt.model_validate(receipt_data)
+
+    assert receipt.reason_code is reason
+
+
+def test_failed_safe_receipt_rejects_unrelated_reason() -> None:
+    receipt_data = all_contracts()[8].model_dump(mode="python")  # type: ignore[union-attr]
+    receipt_data.update(
+        outcome=ReceiptOutcome.FAILED_SAFE,
+        reason_code=ReasonCode.AUTHORITY_UNAVAILABLE,
+        observed_authority_epoch=None,
+    )
+
+    with pytest.raises(ValidationError, match="failed-safe receipt reason"):
+        ExecutionReceipt.model_validate(receipt_data)
 
 
 def test_oversized_input_is_rejected_before_schema_validation() -> None:

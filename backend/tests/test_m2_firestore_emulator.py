@@ -13,7 +13,16 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
     FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
+    ReceiptClaimAdopted,
+    ReceiptClaimConflict,
+    ReceiptClaimCreated,
     StoredRecord,
+)
+from controlgraph_canary.authority.replay import (
+    MutationAction,
+    MutationBinding,
+    MutationTargetKey,
+    mutation_identity,
 )
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import (
@@ -43,6 +52,7 @@ ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
 TWO_DIGEST = "2" * 64
 THREE_DIGEST = "3" * 64
+FOUR_DIGEST = "4" * 64
 
 
 def _initial_records(
@@ -155,7 +165,7 @@ def _receipt(
 ) -> ExecutionReceipt:
     claim_key = idempotency_key or f"intent-{seed}"
     receipt_id = execution_receipt_logical_id(root.target, claim_key)
-    return ExecutionReceipt(
+    initial = ExecutionReceipt(
         schema_version="controlgraph.execution-receipt/v1",
         receipt_id=receipt_id,
         request_id=f"request-{seed}",
@@ -170,14 +180,51 @@ def _receipt(
         epoch=1,
         action=action,
         provider_etag="etag-stable-12",
+        dispatch_not_after="2026-08-19T12:10:00Z",
         outcome=ReceiptOutcome.CLAIMED,
         reason_code=None,
         provider_operation=None,
         observed_etag=None,
+        observed_authority_epoch=None,
         created_at="2026-08-19T12:02:00Z",
         updated_at="2026-08-19T12:02:00Z",
         evidence_ids=(f"evidence-{seed}",),
     )
+    return ExecutionReceipt(
+        **{
+            **initial.model_dump(mode="python"),
+            "mutation_sha256": mutation_identity(_receipt_binding(initial)),
+        }
+    )
+
+
+def _receipt_binding(receipt: ExecutionReceipt) -> MutationBinding:
+    return MutationBinding(
+        idempotency_key=receipt.idempotency_key,
+        request_id=receipt.request_id,
+        root_id=receipt.root_id,
+        root_sha256=receipt.root_sha256,
+        epoch=receipt.epoch,
+        action=MutationAction(receipt.action.value),
+        target=MutationTargetKey(
+            project_id=receipt.target.project_id,
+            region=receipt.target.region,
+            environment=receipt.target.environment,
+            service_name=receipt.target.service_name,
+        ),
+        provider_precondition=receipt.provider_etag,
+        plan_sha256=receipt.plan_sha256,
+        capability_sha256=receipt.capability_sha256,
+        payload_sha256=FOUR_DIGEST,
+        expected_poststate_sha256=receipt.expected_poststate_sha256,
+    )
+
+
+async def _claim_or_adopt(
+    store: FirestoreAuthorityStore,
+    receipt: ExecutionReceipt,
+) -> ReceiptClaimCreated | ReceiptClaimAdopted | ReceiptClaimConflict:
+    return await store.claim_or_adopt_receipt(receipt, _receipt_binding(receipt))
 
 
 def _target() -> TargetBinding:
@@ -356,13 +403,15 @@ def test_emulator_execute_and_recover_receipt_claims_have_single_winners(
         )
 
         results = await asyncio.gather(
-            first_store.claim_receipt(receipt),
-            second_store.claim_receipt(receipt),
-            return_exceptions=True,
+            _claim_or_adopt(first_store, receipt),
+            _claim_or_adopt(second_store, receipt),
         )
-        claimed = _assert_one_conflict(results)
-        assert claimed == StoredRecord(receipt, 0)
-        assert await first_store.read_receipt(receipt.idempotency_key) == claimed
+        assert sum(type(result) is ReceiptClaimCreated for result in results) == 1
+        assert sum(type(result) is ReceiptClaimAdopted for result in results) == 1
+        created = next(result for result in results if type(result) is ReceiptClaimCreated)
+        adopted = next(result for result in results if type(result) is ReceiptClaimAdopted)
+        assert created.receipt == adopted.receipt == StoredRecord(receipt, 0)
+        assert await first_store.read_receipt(receipt.idempotency_key) == created.receipt
 
     asyncio.run(scenario())
 
@@ -397,19 +446,18 @@ def test_emulator_same_receipt_key_with_changed_binding_has_one_winner() -> None
             configured_project_id=target.project_id,
         )
         results = await asyncio.gather(
-            first_store.claim_receipt(first),
-            second_store.claim_receipt(second),
-            return_exceptions=True,
+            _claim_or_adopt(first_store, first),
+            _claim_or_adopt(second_store, second),
         )
-        claimed = _assert_one_conflict(results)
-        assert isinstance(claimed, StoredRecord)
+        assert sum(type(result) is ReceiptClaimCreated for result in results) == 1
+        assert sum(type(result) is ReceiptClaimConflict for result in results) == 1
+        claimed = next(result for result in results if type(result) is ReceiptClaimCreated)
         stored = await first_store.read_receipt(claim_key)
-        assert stored == claimed
+        assert stored == claimed.receipt
         assert stored.value in (first, second)
 
         loser = second if stored.value == first else first
-        with pytest.raises(AuthorityStoreConflict):
-            await first_store.claim_receipt(loser)
+        assert type(await _claim_or_adopt(first_store, loser)) is ReceiptClaimConflict
         assert await second_store.read_receipt(claim_key) == stored
 
     asyncio.run(scenario())

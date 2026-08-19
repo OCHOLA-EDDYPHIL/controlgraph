@@ -45,9 +45,7 @@ from controlgraph_canary.authority import (
     compare_and_advance,
     decide_replay,
     decide_transport_failure,
-    mark_provider_attempted,
     mutation_identity,
-    record_pre_dispatch_failure,
     record_provider_result,
     record_readback,
     reduce_rollout,
@@ -420,28 +418,6 @@ def _commit_initial_claim(
         _ReceiptClaimStore(
             revision=store.revision + 1,
             receipt=decision.receipt,
-            owner=owner,
-        ),
-        True,
-    )
-
-
-def _commit_provider_attempt(
-    store: _ReceiptClaimStore,
-    *,
-    snapshot_revision: int,
-    owner: str,
-    binding: MutationBinding,
-) -> tuple[_ReceiptClaimStore, bool]:
-    if store.revision != snapshot_revision:
-        return store, False
-    decision = decide_replay(binding, store.receipt)
-    if decision.action is not ReplayAction.RESUME_PRE_DISPATCH or decision.receipt is None:
-        return store, False
-    return (
-        _ReceiptClaimStore(
-            revision=store.revision + 1,
-            receipt=mark_provider_attempted(decision.receipt),
             owner=owner,
         ),
         True,
@@ -916,7 +892,7 @@ def test_mutation_identity_binds_every_exact_field(
     binding=_mutation_bindings(),
     field=st.sampled_from(_MUTATION_FIELDS[1:]),
 )
-def test_exact_duplicate_resumes_but_altered_replay_conflicts(
+def test_exact_duplicate_stays_in_progress_but_altered_replay_conflicts(
     binding: MutationBinding,
     field: str,
 ) -> None:
@@ -925,11 +901,10 @@ def test_exact_duplicate_resumes_but_altered_replay_conflicts(
     exact = decide_replay(binding, stored)
     conflict = decide_replay(_alter_binding(binding, field), stored)
 
-    assert exact.action is ReplayAction.RESUME_PRE_DISPATCH
-    assert exact.may_enter_dispatch is True
+    assert exact.action is ReplayAction.RETURN_IN_PROGRESS
+    assert exact.reason is DenialReason.RECEIPT_IN_PROGRESS
     assert conflict.action is ReplayAction.DENY_CONFLICT
     assert conflict.reason is DenialReason.IDEMPOTENCY_CONFLICT
-    assert conflict.may_enter_dispatch is False
 
 
 @PROPERTY_SETTINGS
@@ -974,38 +949,18 @@ def test_transactional_claim_race_has_one_initial_winner(
         max_size=16,
         unique=True,
     ),
-    claimed_revision=st.integers(min_value=0, max_value=1_000_000),
 )
-def test_transactional_provider_attempt_yields_one_dispatch_permit(
+def test_durable_claim_never_yields_a_later_dispatch_permit(
     binding: MutationBinding,
     contender_order: list[str],
-    claimed_revision: int,
 ) -> None:
-    store = _ReceiptClaimStore(
-        revision=claimed_revision,
-        receipt=claim_receipt(binding),
-        owner=None,
-    )
-    dispatch_permits: list[str] = []
+    stored = claim_receipt(binding)
+    decisions: list[ReplayAction] = []
 
-    for contender in contender_order:
-        store, committed = _commit_provider_attempt(
-            store,
-            snapshot_revision=claimed_revision,
-            owner=contender,
-            binding=binding,
-        )
-        if committed:
-            dispatch_permits.append(contender)
+    for _contender in contender_order:
+        decisions.append(decide_replay(binding, stored).action)
 
-    assert dispatch_permits == contender_order[:1]
-    assert store.revision == claimed_revision + 1
-    assert store.owner == contender_order[0]
-    assert store.receipt is not None
-    assert store.receipt.outcome is ReplayReceiptOutcome.AMBIGUOUS
-    after_commit = decide_replay(binding, store.receipt)
-    assert after_commit.action is ReplayAction.REQUIRE_READBACK
-    assert after_commit.may_enter_dispatch is False
+    assert decisions == [ReplayAction.RETURN_IN_PROGRESS] * len(contender_order)
 
 
 @PROPERTY_SETTINGS
@@ -1013,8 +968,10 @@ def test_transactional_provider_attempt_yields_one_dispatch_permit(
 def test_readback_success_uses_only_the_bound_expectation(
     binding: MutationBinding,
 ) -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding))
-    uncertain = record_provider_result(attempted, ProviderAttemptResult.TIMEOUT)
+    uncertain = record_provider_result(
+        claim_receipt(binding),
+        ProviderAttemptResult.TIMEOUT,
+    )
     caller_selected = _different_digest(binding.expected_poststate_sha256)
 
     rejected = record_readback(
@@ -1049,19 +1006,21 @@ def test_provider_attempts_and_uncertain_outcomes_never_redispatch(
     result: ProviderAttemptResult,
     observed: str | None,
 ) -> None:
-    attempted = mark_provider_attempted(claim_receipt(binding))
+    claimed = claim_receipt(binding)
+    duplicate = decide_replay(binding, claimed)
+    assert duplicate.action is ReplayAction.RETURN_IN_PROGRESS
 
-    duplicate = decide_replay(binding, attempted)
-    assert duplicate.action is ReplayAction.REQUIRE_READBACK
-    assert duplicate.may_enter_dispatch is False
-
-    classified = record_provider_result(attempted, result)
+    classified = record_provider_result(claimed, result)
     after_result = decide_replay(binding, classified)
-    assert after_result.may_enter_dispatch is False
+    assert after_result.action in {
+        ReplayAction.RETURN_STORED,
+        ReplayAction.REQUIRE_READBACK,
+    }
 
     if result not in {
         ProviderAttemptResult.ACCEPTED,
         ProviderAttemptResult.PRECONDITION_REJECTED,
+        ProviderAttemptResult.REQUEST_REJECTED,
     }:
         assert classified.outcome is ReplayReceiptOutcome.AMBIGUOUS
         assert classified.reason is DenialReason.PROVIDER_OUTCOME_AMBIGUOUS
@@ -1072,7 +1031,10 @@ def test_provider_attempts_and_uncertain_outcomes_never_redispatch(
             observed_poststate_sha256=observed,
         )
         after_readback = decide_replay(binding, readback)
-        assert after_readback.may_enter_dispatch is False
+        assert after_readback.action in {
+            ReplayAction.RETURN_STORED,
+            ReplayAction.REQUIRE_READBACK,
+        }
         if observed != binding.expected_poststate_sha256:
             assert readback.outcome is ReplayReceiptOutcome.AMBIGUOUS
             assert readback.reason is DenialReason.PROVIDER_OUTCOME_AMBIGUOUS
@@ -1118,25 +1080,17 @@ def test_transport_retry_is_bounded_to_known_pre_dispatch_failures(
     binding=_mutation_bindings(),
     maximum_attempts=st.integers(min_value=1, max_value=3),
 )
-def test_pre_dispatch_retry_exhaustion_is_durable(
+def test_repeated_duplicate_delivery_never_changes_claimed_state(
     binding: MutationBinding,
     maximum_attempts: int,
 ) -> None:
     receipt = claim_receipt(binding)
 
-    for expected_attempt in range(1, maximum_attempts + 1):
-        receipt = record_pre_dispatch_failure(
-            receipt,
-            maximum_attempts=maximum_attempts,
-        )
-        assert receipt.pre_dispatch_attempts == expected_attempt
-
-    assert receipt.terminal is True
-    assert receipt.outcome is ReplayReceiptOutcome.FAILED_SAFE
-    assert receipt.reason is DenialReason.TRANSPORT_UNAVAILABLE
-    duplicate = decide_replay(binding, receipt)
-    assert duplicate.action is ReplayAction.RETURN_STORED
-    assert duplicate.may_enter_dispatch is False
+    for _ in range(maximum_attempts):
+        duplicate = decide_replay(binding, receipt)
+        assert duplicate.action is ReplayAction.RETURN_IN_PROGRESS
+        assert duplicate.reason is DenialReason.RECEIPT_IN_PROGRESS
+        assert duplicate.receipt is receipt
 
 
 @PROPERTY_SETTINGS

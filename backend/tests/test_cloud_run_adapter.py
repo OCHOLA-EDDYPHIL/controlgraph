@@ -12,6 +12,7 @@ from google.api_core import exceptions as api_exceptions
 from google.cloud import run_v2
 
 from controlgraph_canary.application.authority_store import (
+    DirectReceiptCreate,
     FinalAuthoritySnapshot,
     StoredRecord,
 )
@@ -32,8 +33,8 @@ from controlgraph_canary.application.cloud_run import (
 )
 from controlgraph_canary.application.execution import (
     DefinitiveFreshClaimLeaseFactory,
-    DefinitiveReceiptCreate,
     FinalMutationGate,
+    FinalMutationResult,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
@@ -317,13 +318,15 @@ def _claimed(verified: VerifiedMutation) -> StoredRecord[ExecutionReceipt]:
         epoch=intent.epoch,
         action=intent.action,
         provider_etag=intent.provider_etag,
+        dispatch_not_after=verified.request.expires_at,
         outcome=ReceiptOutcome.CLAIMED,
         reason_code=None,
         provider_operation=None,
         observed_etag=None,
+        observed_authority_epoch=None,
         created_at="2026-08-19T12:02:01Z",
         updated_at="2026-08-19T12:02:01Z",
-        evidence_ids=("evidence-receipt-claimed",),
+        evidence_ids=(),
     )
     return StoredRecord(receipt, 0)
 
@@ -559,7 +562,7 @@ async def _execute(
         root_concurrency=root_concurrency,
         candidate_revision=candidate_revision,
     )
-    proof = DefinitiveReceiptCreate._from_confirmed_create(
+    proof = DirectReceiptCreate._from_direct_store_create(
         _claimed(verified),
         _binding(verified),
     )
@@ -569,8 +572,9 @@ async def _execute(
         adapter=adapter,
         clock=lambda: NOW,
     ).execute(lease, verified)
-    assert type(result) is CloudRunMutationResult
-    return result
+    assert type(result) is FinalMutationResult
+    assert type(result.result) is CloudRunMutationResult
+    return result.result
 
 
 @pytest.mark.parametrize(

@@ -4,15 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from threading import Lock
 from typing import Protocol, runtime_checkable
 
+from controlgraph_canary.authority.replay import (
+    MutationAction,
+    MutationBinding,
+    MutationTargetKey,
+    mutation_identity,
+)
 from controlgraph_canary.contracts.models import (
     EpochAuthorityRecord,
     ExecutionReceipt,
+    ReasonCode,
+    ReceiptOutcome,
     RolloutRoot,
     TargetBinding,
 )
-from controlgraph_canary.contracts.storage import ServiceClaimRecord
+from controlgraph_canary.contracts.storage import (
+    ServiceClaimRecord,
+    execution_receipt_logical_id,
+)
 
 
 class AuthorityStoreErrorCode(StrEnum):
@@ -64,6 +76,151 @@ class StoredRecord[RecordT]:
     def __post_init__(self) -> None:
         if type(self.revision) is not int or not 0 <= self.revision <= 2**53 - 1:
             raise ValueError("stored record revision is invalid")
+
+
+class _DirectReceiptCreateKey:
+    pass
+
+
+_DIRECT_RECEIPT_CREATE_KEY = _DirectReceiptCreateKey()
+
+
+class DirectReceiptCreate:
+    """One-use proof of an uninterrupted, directly confirmed receipt create."""
+
+    __slots__ = ("_available", "_binding", "_claimed_receipt", "_lock")
+
+    def __init__(
+        self,
+        key: _DirectReceiptCreateKey,
+        claimed_receipt: StoredRecord[ExecutionReceipt],
+        binding: MutationBinding,
+    ) -> None:
+        if key is not _DIRECT_RECEIPT_CREATE_KEY:
+            raise TypeError("direct receipt-create proof is store-issued")
+        _validate_initial_receipt_claim(claimed_receipt)
+        if type(binding) is not MutationBinding or not _receipt_matches_binding(
+            claimed_receipt.value,
+            binding,
+        ):
+            raise ValueError("direct receipt create does not match its mutation binding")
+        self._claimed_receipt = claimed_receipt
+        self._binding = binding
+        self._available = True
+        self._lock = Lock()
+
+    @classmethod
+    def _from_direct_store_create(
+        cls,
+        claimed_receipt: StoredRecord[ExecutionReceipt],
+        binding: MutationBinding,
+    ) -> DirectReceiptCreate:
+        """Issue only after a store directly confirms its initial create."""
+
+        return cls(_DIRECT_RECEIPT_CREATE_KEY, claimed_receipt, binding)
+
+    def _take_claim(
+        self,
+    ) -> tuple[StoredRecord[ExecutionReceipt], MutationBinding]:
+        with self._lock:
+            if not self._available:
+                raise ValueError("direct receipt-create proof is already consumed")
+            self._available = False
+            return self._claimed_receipt, self._binding
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptClaimCreated:
+    """A fresh claim with the only proof permitted to mint dispatch ownership."""
+
+    receipt: StoredRecord[ExecutionReceipt]
+    direct_create: DirectReceiptCreate
+
+    def __post_init__(self) -> None:
+        _validate_initial_receipt_claim(self.receipt)
+        if type(self.direct_create) is not DirectReceiptCreate:
+            raise TypeError("a direct receipt-create proof is required")
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptClaimAdopted:
+    """An exact existing receipt that never carries dispatch authority."""
+
+    receipt: StoredRecord[ExecutionReceipt]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.receipt) is not StoredRecord
+            or type(self.receipt.value) is not ExecutionReceipt
+        ):
+            raise TypeError("an exact stored receipt is required")
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptClaimConflict:
+    """Stable denial for target-bound idempotency reuse with different work."""
+
+    reason_code: ReasonCode = ReasonCode.IDEMPOTENCY_CONFLICT
+
+    def __post_init__(self) -> None:
+        if self.reason_code is not ReasonCode.IDEMPOTENCY_CONFLICT:
+            raise ValueError("receipt claim conflict reason is fixed")
+
+
+type ReceiptClaimResult = ReceiptClaimCreated | ReceiptClaimAdopted | ReceiptClaimConflict
+
+
+def _validate_initial_receipt_claim(claimed: object) -> None:
+    if type(claimed) is not StoredRecord:
+        raise TypeError("an exact stored receipt is required")
+    receipt = claimed.value
+    if type(receipt) is not ExecutionReceipt:
+        raise TypeError("an exact claimed receipt is required")
+    if (
+        claimed.revision != 0
+        or receipt.outcome is not ReceiptOutcome.CLAIMED
+        or receipt.receipt_id
+        != execution_receipt_logical_id(receipt.target, receipt.idempotency_key)
+    ):
+        raise ValueError("receipt is not one initial claim")
+
+
+def _receipt_matches_binding(
+    receipt: ExecutionReceipt,
+    binding: MutationBinding,
+) -> bool:
+    target = binding.target
+    return (
+        type(binding.action) is MutationAction
+        and type(target) is MutationTargetKey
+        and receipt.idempotency_key == binding.idempotency_key
+        and receipt.request_id == binding.request_id
+        and receipt.root_id == binding.root_id
+        and receipt.root_sha256 == binding.root_sha256
+        and receipt.epoch == binding.epoch
+        and receipt.action.value == binding.action.value
+        and receipt.target.project_id == target.project_id
+        and receipt.target.region == target.region
+        and receipt.target.environment == target.environment
+        and receipt.target.service_name == target.service_name
+        and receipt.provider_etag == binding.provider_precondition
+        and receipt.plan_sha256 == binding.plan_sha256
+        and receipt.capability_sha256 == binding.capability_sha256
+        and receipt.mutation_sha256 == mutation_identity(binding)
+        and receipt.expected_poststate_sha256 == binding.expected_poststate_sha256
+    )
+
+
+def validate_receipt_claim_binding(
+    receipt: ExecutionReceipt,
+    binding: MutationBinding,
+) -> None:
+    """Reject a claimed receipt that is not the exact canonical mutation binding."""
+
+    claimed = StoredRecord(receipt, 0)
+    _validate_initial_receipt_claim(claimed)
+    if type(binding) is not MutationBinding or not _receipt_matches_binding(receipt, binding):
+        raise ValueError("receipt claim does not match its mutation binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,10 +310,11 @@ class AuthorityStore(Protocol):
         idempotency_key: str,
     ) -> StoredRecord[ExecutionReceipt] | None: ...
 
-    async def claim_receipt(
+    async def claim_or_adopt_receipt(
         self,
         receipt: ExecutionReceipt,
-    ) -> StoredRecord[ExecutionReceipt]: ...
+        binding: MutationBinding,
+    ) -> ReceiptClaimResult: ...
 
     async def compare_and_set_receipt(
         self,
@@ -174,8 +332,14 @@ __all__ = [
     "AuthorityStoreOutcomeUnknown",
     "AuthorityStoreUnavailable",
     "CreatedRollout",
+    "DirectReceiptCreate",
     "FinalAuthoritySnapshot",
     "IssuanceStateSnapshot",
+    "ReceiptClaimAdopted",
+    "ReceiptClaimConflict",
+    "ReceiptClaimCreated",
+    "ReceiptClaimResult",
     "ReleasedServiceClaim",
     "StoredRecord",
+    "validate_receipt_claim_binding",
 ]

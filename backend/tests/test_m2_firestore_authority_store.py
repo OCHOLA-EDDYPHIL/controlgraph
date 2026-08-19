@@ -15,10 +15,20 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreErrorCode,
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
+    DirectReceiptCreate,
     FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
+    ReceiptClaimAdopted,
+    ReceiptClaimConflict,
+    ReceiptClaimCreated,
     ReleasedServiceClaim,
     StoredRecord,
+)
+from controlgraph_canary.authority.replay import (
+    MutationAction,
+    MutationBinding,
+    MutationTargetKey,
+    mutation_identity,
 )
 from controlgraph_canary.contracts.codec import canonical_json_bytes, canonical_sha256
 from controlgraph_canary.contracts.models import (
@@ -53,6 +63,7 @@ ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
 TWO_DIGEST = "2" * 64
 THREE_DIGEST = "3" * 64
+FOUR_DIGEST = "4" * 64
 
 
 def target() -> TargetBinding:
@@ -177,7 +188,7 @@ def release_transition(
 def claimed_receipt(seed: str = "firestore-001") -> ExecutionReceipt:
     root = rollout_root()
     idempotency_key = f"intent-{seed}"
-    return ExecutionReceipt(
+    initial = ExecutionReceipt(
         schema_version="controlgraph.execution-receipt/v1",
         receipt_id=execution_receipt_logical_id(root.target, idempotency_key),
         request_id=f"request-{seed}",
@@ -192,14 +203,66 @@ def claimed_receipt(seed: str = "firestore-001") -> ExecutionReceipt:
         epoch=1,
         action=CapabilityAction.APPLY_CANARY,
         provider_etag="etag-stable-12",
+        dispatch_not_after="2026-08-19T12:10:00Z",
         outcome=ReceiptOutcome.CLAIMED,
         reason_code=None,
         provider_operation=None,
         observed_etag=None,
+        observed_authority_epoch=None,
         created_at="2026-08-19T12:02:00Z",
         updated_at="2026-08-19T12:02:00Z",
         evidence_ids=("evidence-receipt-claimed",),
     )
+    return ExecutionReceipt(
+        **{
+            **initial.model_dump(mode="python"),
+            "mutation_sha256": mutation_identity(receipt_binding(initial)),
+        }
+    )
+
+
+def receipt_binding(receipt: ExecutionReceipt) -> MutationBinding:
+    return MutationBinding(
+        idempotency_key=receipt.idempotency_key,
+        request_id=receipt.request_id,
+        root_id=receipt.root_id,
+        root_sha256=receipt.root_sha256,
+        epoch=receipt.epoch,
+        action=MutationAction(receipt.action.value),
+        target=MutationTargetKey(
+            project_id=receipt.target.project_id,
+            region=receipt.target.region,
+            environment=receipt.target.environment,
+            service_name=receipt.target.service_name,
+        ),
+        provider_precondition=receipt.provider_etag,
+        plan_sha256=receipt.plan_sha256,
+        capability_sha256=receipt.capability_sha256,
+        payload_sha256=FOUR_DIGEST,
+        expected_poststate_sha256=receipt.expected_poststate_sha256,
+    )
+
+
+def rebound_receipt(receipt: ExecutionReceipt, **changes: object) -> ExecutionReceipt:
+    changed = ExecutionReceipt(
+        **{
+            **receipt.model_dump(mode="python"),
+            **changes,
+        }
+    )
+    return ExecutionReceipt(
+        **{
+            **changed.model_dump(mode="python"),
+            "mutation_sha256": mutation_identity(receipt_binding(changed)),
+        }
+    )
+
+
+async def claim_or_adopt(
+    store: FirestoreAuthorityStore,
+    receipt: ExecutionReceipt,
+) -> ReceiptClaimCreated | ReceiptClaimAdopted | ReceiptClaimConflict:
+    return await store.claim_or_adopt_receipt(receipt, receipt_binding(receipt))
 
 
 def ambiguous_receipt(current: ExecutionReceipt, *, suffix: str) -> ExecutionReceipt:
@@ -685,12 +748,15 @@ def test_receipt_claim_and_compare_and_set_each_have_one_winner() -> None:
         receipt = claimed_receipt()
 
         claims = await asyncio.gather(
-            store.claim_receipt(receipt),
-            store.claim_receipt(receipt),
-            return_exceptions=True,
+            claim_or_adopt(store, receipt),
+            claim_or_adopt(store, receipt),
         )
-        assert sum(not isinstance(result, Exception) for result in claims) == 1
-        assert sum(isinstance(result, AuthorityStoreConflict) for result in claims) == 1
+        assert sum(type(result) is ReceiptClaimCreated for result in claims) == 1
+        assert sum(type(result) is ReceiptClaimAdopted for result in claims) == 1
+        created = next(result for result in claims if type(result) is ReceiptClaimCreated)
+        adopted = next(result for result in claims if type(result) is ReceiptClaimAdopted)
+        assert type(created.direct_create) is DirectReceiptCreate
+        assert created.receipt == adopted.receipt == StoredRecord(receipt, 0)
         expected = await store.read_receipt(receipt.idempotency_key)
         assert expected == StoredRecord(receipt, 0)
         assert expected is not None
@@ -716,6 +782,27 @@ def test_receipt_claim_and_compare_and_set_each_have_one_winner() -> None:
     asyncio.run(scenario())
 
 
+def test_exact_duplicate_adopts_the_original_claim_timestamp() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        original = claimed_receipt("receipt-created-at-adoption")
+        created = await claim_or_adopt(store, original)
+        assert type(created) is ReceiptClaimCreated
+        duplicate = ExecutionReceipt(
+            **{
+                **original.model_dump(mode="python"),
+                "created_at": "2026-08-19T12:02:01Z",
+                "updated_at": "2026-08-19T12:02:01Z",
+            }
+        )
+
+        adopted = await claim_or_adopt(store, duplicate)
+
+        assert adopted == ReceiptClaimAdopted(StoredRecord(original, 0))
+
+    asyncio.run(scenario())
+
+
 def test_receipt_claim_rejects_a_caller_selected_identifier_before_io() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
@@ -727,8 +814,11 @@ def test_receipt_claim_rejects_a_caller_selected_identifier_before_io() -> None:
             }
         )
 
-        with pytest.raises(ValueError, match="idempotency claim"):
-            await store.claim_receipt(substituted)
+        with pytest.raises(ValueError, match="initial claim"):
+            await store.claim_or_adopt_receipt(
+                substituted,
+                receipt_binding(substituted),
+            )
 
         assert client.document_calls == 0
         assert client.documents == {}
@@ -740,30 +830,26 @@ def test_same_idempotency_key_with_a_changed_binding_has_one_claim_winner() -> N
     async def scenario() -> None:
         store, client, _ = store_fixture()
         first = claimed_receipt("shared-idempotency")
-        second = ExecutionReceipt(
-            **{
-                **first.model_dump(mode="python"),
-                "request_id": "request-changed-binding",
-                "capability_sha256": THREE_DIGEST,
-            }
+        second = rebound_receipt(
+            first,
+            request_id="request-changed-binding",
+            capability_sha256=THREE_DIGEST,
         )
 
         results = await asyncio.gather(
-            store.claim_receipt(first),
-            store.claim_receipt(second),
-            return_exceptions=True,
+            claim_or_adopt(store, first),
+            claim_or_adopt(store, second),
         )
 
-        assert sum(not isinstance(result, BaseException) for result in results) == 1
-        assert sum(isinstance(result, AuthorityStoreConflict) for result in results) == 1
+        assert sum(type(result) is ReceiptClaimCreated for result in results) == 1
+        assert sum(type(result) is ReceiptClaimConflict for result in results) == 1
         assert len(client.documents) == 1
         stored = await store.read_receipt(first.idempotency_key)
         assert stored is not None
         assert stored.value in (first, second)
 
         losing = second if stored.value == first else first
-        with pytest.raises(AuthorityStoreConflict):
-            await store.claim_receipt(losing)
+        assert type(await claim_or_adopt(store, losing)) is ReceiptClaimConflict
         assert len(client.documents) == 1
 
     asyncio.run(scenario())
@@ -773,7 +859,9 @@ def test_receipt_cas_rejects_binding_changes_and_terminal_regression() -> None:
     async def scenario() -> None:
         store, _, _ = store_fixture()
         receipt = claimed_receipt()
-        expected = await store.claim_receipt(receipt)
+        claimed = await claim_or_adopt(store, receipt)
+        assert type(claimed) is ReceiptClaimCreated
+        expected = claimed.receipt
         changed_binding = ExecutionReceipt(
             **{
                 **ambiguous_receipt(receipt, suffix="binding").model_dump(mode="python"),
@@ -788,6 +876,7 @@ def test_receipt_cas_rejects_binding_changes_and_terminal_regression() -> None:
                 **receipt.model_dump(mode="python"),
                 "outcome": ReceiptOutcome.DENIED,
                 "reason_code": ReasonCode.EPOCH_MISMATCH,
+                "observed_authority_epoch": 2,
                 "updated_at": "2026-08-19T12:02:01Z",
             }
         )
@@ -807,32 +896,32 @@ def test_ambiguous_commit_is_adopted_only_after_exact_readback() -> None:
         committed = claimed_receipt("receipt-ambiguous-committed")
         runner.mode = "commit-then-timeout"
 
-        result = await store.claim_receipt(committed)
+        result = await claim_or_adopt(store, committed)
 
-        assert result == StoredRecord(committed, 0)
-        assert await store.read_receipt(committed.idempotency_key) == result
+        assert result == ReceiptClaimAdopted(StoredRecord(committed, 0))
+        assert await store.read_receipt(committed.idempotency_key) == result.receipt
         attempted = ambiguous_receipt(committed, suffix="commit-readback")
         runner.mode = "commit-then-timeout"
-        updated = await store.compare_and_set_receipt(result, attempted)
+        updated = await store.compare_and_set_receipt(result.receipt, attempted)
         assert updated == StoredRecord(attempted, 1)
         assert await store.read_receipt(committed.idempotency_key) == updated
 
         absent = claimed_receipt("receipt-ambiguous-absent")
         runner.mode = "timeout-before-commit"
         with pytest.raises(AuthorityStoreOutcomeUnknown) as error:
-            await store.claim_receipt(absent)
+            await claim_or_adopt(store, absent)
         assert str(error.value) == AuthorityStoreErrorCode.OUTCOME_UNKNOWN.value
         assert await store.read_receipt(absent.idempotency_key) is None
 
         corrupt = claimed_receipt("receipt-ambiguous-corrupt")
         runner.mode = "commit-corrupt-then-timeout"
         with pytest.raises(AuthorityStoreOutcomeUnknown):
-            await store.claim_receipt(corrupt)
+            await claim_or_adopt(store, corrupt)
 
     asyncio.run(scenario())
 
 
-def test_caller_cancellation_after_commit_returns_the_exact_durable_result() -> None:
+def test_caller_cancellation_after_commit_repropagates_without_create_proof() -> None:
     async def scenario() -> None:
         store, _, runner = store_fixture()
         receipt = claimed_receipt("receipt-cancelled-after-commit")
@@ -841,10 +930,10 @@ def test_caller_cancellation_after_commit_returns_the_exact_durable_result() -> 
         runner.task_to_cancel = current_task
         runner.mode = "commit-then-cancel-caller"
 
-        result = await store.claim_receipt(receipt)
+        with pytest.raises(asyncio.CancelledError):
+            await claim_or_adopt(store, receipt)
 
-        assert result == StoredRecord(receipt, 0)
-        assert await store.read_receipt(receipt.idempotency_key) == result
+        assert await store.read_receipt(receipt.idempotency_key) == StoredRecord(receipt, 0)
         assert current_task.cancelling() == 0
 
     asyncio.run(scenario())
@@ -874,7 +963,7 @@ def test_corrupt_and_unavailable_reads_fail_closed_with_sanitized_errors() -> No
     async def scenario() -> None:
         store, client, _ = store_fixture()
         receipt = claimed_receipt()
-        await store.claim_receipt(receipt)
+        await claim_or_adopt(store, receipt)
         path = (
             f"{AuthorityStorageKind.EXECUTION_RECEIPT.value}/"
             f"{execution_receipt_document_id(receipt.target, receipt.idempotency_key)}"
@@ -899,7 +988,7 @@ def test_read_receipt_rejects_a_caller_selected_identity_as_corrupt() -> None:
     async def scenario() -> None:
         store, client, _ = store_fixture()
         receipt = claimed_receipt()
-        await store.claim_receipt(receipt)
+        await claim_or_adopt(store, receipt)
         path = (
             f"{AuthorityStorageKind.EXECUTION_RECEIPT.value}/"
             f"{execution_receipt_document_id(receipt.target, receipt.idempotency_key)}"
