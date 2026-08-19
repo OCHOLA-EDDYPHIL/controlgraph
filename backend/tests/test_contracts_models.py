@@ -65,6 +65,45 @@ def snapshot() -> StableSnapshot:
     )
 
 
+def test_stable_snapshot_accepts_one_explicit_unserved_revision() -> None:
+    value = StableSnapshot(
+        **{
+            **snapshot().model_dump(mode="python"),
+            "traffic": (
+                TrafficAllocation(revision="canary-target-stable", percent=100),
+                TrafficAllocation(revision="canary-target-candidate", percent=0),
+            ),
+        }
+    )
+
+    assert value.traffic[1].percent == 0
+
+
+@pytest.mark.parametrize(
+    "traffic",
+    [
+        (
+            TrafficAllocation(revision="canary-target-stable", percent=100),
+            TrafficAllocation(revision="canary-target-candidate", percent=1),
+        ),
+        (
+            TrafficAllocation(revision="canary-target-stable", percent=100),
+            TrafficAllocation(revision="canary-target-stable", percent=0),
+        ),
+    ],
+)
+def test_stable_snapshot_rejects_nonzero_or_duplicate_unserved_revision(
+    traffic: tuple[TrafficAllocation, ...],
+) -> None:
+    with pytest.raises(ValidationError, match="distinct zero-percent"):
+        StableSnapshot(
+            **{
+                **snapshot().model_dump(mode="python"),
+                "traffic": traffic,
+            }
+        )
+
+
 def root() -> RolloutRoot:
     return RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
