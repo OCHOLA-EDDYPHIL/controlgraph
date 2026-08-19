@@ -6,12 +6,12 @@ rejects project identifiers containing `reconcile`.
 
 ```text
 bootstrap/   Dedicated project and retained Terraform state bucket
-foundation/  APIs, budget, audit policy, network, registry, identities, and IAM
-runtime/     Private services, fixed task queues, and the disposable reference target
+foundation/  APIs, budget, audit policy, network, registry, authority data, keys, identities, IAM
+runtime/     Private controller services and fixed authenticated task queues
 ```
 
-The runtime stack is added by the service deployment roadmap issues. No stack may use a shared
-project, a sibling repository state bucket, or credentials stored in this repository.
+The disposable reference target is added by its numbered roadmap issue. No stack may use a
+shared project, a sibling repository state bucket, or credentials stored in this repository.
 
 ## Bootstrap and state migration
 
@@ -45,6 +45,9 @@ Initialize later stacks with separate prefixes in the same retained bucket:
 terraform -chdir=../foundation init \
   -backend-config="bucket=CONTROLGRAPH_STATE_BUCKET" \
   -backend-config="prefix=foundation"
+terraform -chdir=../runtime init \
+  -backend-config="bucket=CONTROLGRAPH_STATE_BUCKET" \
+  -backend-config="prefix=runtime"
 ```
 
 Always review the saved plan before applying. Confirm the exact project ID, organization,
@@ -56,18 +59,57 @@ provider-managed global services. They carry no rollout authority data path. The
 `_Default` sink is explicitly routed to the dedicated `us-central1` log bucket; Firestore, KMS,
 Tasks, Artifact Registry, networking, Cloud Run, and workload log storage remain regional.
 
-## Cost and retention
+## Defined cost and retention
 
-The foundation configures a project-filtered USD 10 monthly budget with current-spend alerts at
-50, 90, and 100 percent and a forecast alert at 100 percent. A budget is visibility, not a hard
-spending cap. Cloud Run services use bounded scaling in the runtime stack, logs retain 30 days,
-and Artifact Registry cleanup is limited to old untagged artifacts.
+The foundation configuration defines a project-filtered USD 10 monthly budget with current-spend
+alerts at 50, 90, and 100 percent and a forecast alert at 100 percent. A budget is visibility, not
+a hard spending cap. The runtime definitions bound Cloud Run scaling, retain workload logs for 30
+days, and limit Artifact Registry cleanup to old untagged artifacts when the stacks are applied.
 
-The project, state bucket, authority database, signing keys, network, registry, log bucket,
-runtime services, and acceptance evidence remain retained after M4. Deletion protection and
-`prevent_destroy` are deliberate. Bootstrap and foundation applies use an authenticated human;
-the keyless CI Terraform identity is currently limited to its exact state bucket. Resource
-provisioning permissions are added only with the resource-specific deployment workflow.
+The definitions retain the project, state bucket, authority database, signing keys, network,
+registry, log bucket, runtime services, and acceptance evidence after M4. Deletion protection and
+`prevent_destroy` are deliberate. A future authorized bootstrap or foundation apply uses an
+authenticated human; the defined keyless CI Terraform identity is limited to its exact state
+bucket and dedicated signing key ring. Resource provisioning permissions are added only with a
+resource-specific deployment workflow.
+
+The foundation declares one Firestore Native database named `controlgraph-authority` and one
+regional KMS key ring containing exactly two asymmetric signing keys: capability and evidence.
+The runtime stack declares six Python service shells from one dedicated-registry image digest.
+Each definition has its own runtime identity, zero minimum and two maximum instances, concurrency
+eight, a 30-second request timeout, one CPU, 512 MiB memory, Direct VPC egress, authenticated
+invocation, and no enabled target mutation. The API binding admits only the explicit operator
+principal; all other service definitions use internal ingress. Execution and recovery queue
+definitions are separate, region-pinned, limited to one dispatch per second and one concurrent
+dispatch, and force their exact HTTPS path, OIDC caller, and audience.
+
+The IAM graph keeps the capability issuer and evidence writer as distinct identities with signer
+access to only their respective keys. It grants the evidence writer no Firestore authority write,
+keeps the verifier read-only, and permits the API identity to read the two public keys and version
+metadata for trust-bundle publication without signing or key administration.
+
+Firestore server-client IAM is database-granular. The coordinator authority facade is the only
+defined database writer; executor and recovery identities receive read access and must use narrow
+authenticated coordinator operations for receipt claim and compare-and-set writes. Collection
+names are application contract boundaries, not claimed IAM boundaries.
+
+The keyless CI Terraform identity can administer objects in its exact state bucket and signing
+keys in the dedicated key ring; it does not yet have general runtime provisioning authority.
+Bootstrap, foundation, and runtime applies therefore remain authenticated human operations until
+a reviewed resource-specific deployment workflow grants narrower provisioning permissions.
+
+## Retained authority data and keys
+
+The authority database uses delete protection, an `ABANDON` deletion policy, and
+`prevent_destroy`. A separately authorized teardown must first decide whether the synthetic M4
+authority and receipt records require a Firestore managed export, record the export location and
+retention boundary, then review a change that disables database deletion protection. Removing the
+Terraform resource alone must not be represented as deleting the retained database.
+
+KMS private key material is never exportable. Separately authorized retirement disables a key
+version before scheduling destruction, preserves public verification material for retained
+evidence, and observes the configured 30-day destruction delay. Acceptance must not disable or
+schedule destruction of either initial signing version.
 
 ## Separately authorized teardown
 

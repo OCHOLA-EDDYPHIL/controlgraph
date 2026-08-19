@@ -31,10 +31,13 @@ uv run controlgraph-canary doctor
 uv run controlgraph-canary serve
 ```
 
-During the foundation milestone, the HTTP process exposes only read-only endpoints:
+Each M2 service shell exposes only identity-safe read endpoints:
 
 - `GET /healthz`
-- `GET /v1/capabilities`
+- `GET /v1/metadata`
+
+Role-specific protected POST routes exist for authenticated integration checks but return
+`MUTATION_DISABLED` until the M3 enforcement path is composed.
 
 ### Web console
 
@@ -53,6 +56,8 @@ terraform -chdir=infra/bootstrap init -backend=false
 terraform -chdir=infra/bootstrap validate
 terraform -chdir=infra/foundation init -backend=false
 terraform -chdir=infra/foundation validate
+terraform -chdir=infra/runtime init -backend=false
+terraform -chdir=infra/runtime validate
 ```
 
 Terraform must receive immutable container references in the form `...@sha256:...`. Plans
@@ -80,6 +85,7 @@ cd web && npm run typecheck && npm test -- --run && npm run build
 terraform -chdir=infra fmt -check -recursive
 terraform -chdir=infra/bootstrap init -backend=false && terraform -chdir=infra/bootstrap validate
 terraform -chdir=infra/foundation init -backend=false && terraform -chdir=infra/foundation validate
+terraform -chdir=infra/runtime init -backend=false && terraform -chdir=infra/runtime validate
 python scripts/check_clean_room.py
 ```
 

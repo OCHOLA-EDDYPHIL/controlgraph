@@ -30,6 +30,11 @@ locals {
       display_name = "ControlGraph verifier"
       description  = "Health and evidence verification workload identity."
     }
+    evidence_writer = {
+      account_id   = "cg-evidence-writer"
+      display_name = "ControlGraph evidence writer"
+      description  = "Append-only evidence signing workload identity with no authority-write permission."
+    }
     reference = {
       account_id   = "controlgraph-reference"
       display_name = "ControlGraph reference target"

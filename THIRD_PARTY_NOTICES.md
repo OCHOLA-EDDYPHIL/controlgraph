@@ -7,6 +7,10 @@ ControlGraph Canary is licensed under Apache-2.0. The project depends on or uses
 | FastAPI | Python HTTP API | MIT |
 | Pydantic | API response models | MIT |
 | Uvicorn | ASGI server | BSD-3-Clause |
+| Google Cloud Firestore, KMS, and Tasks Python clients | Hosted authority storage, asymmetric signing, and addressed delivery adapters | Apache-2.0 |
+| Google Auth | Application Default Credentials and Google workload authentication | Apache-2.0 |
+| google-crc32c | Cloud KMS request and response integrity checks | Apache-2.0 |
+| cryptography | Local P-256 public-key and signature verification | Apache-2.0 OR BSD-3-Clause |
 | pytest | Python tests | MIT |
 | mypy | Python type checking | MIT |
 | Ruff | Python linting | MIT |
@@ -18,7 +22,7 @@ ControlGraph Canary is licensed under Apache-2.0. The project depends on or uses
 | jsdom | Test DOM implementation | MIT |
 | Hypothesis | Property-based Python tests | MPL-2.0 |
 | Terraform | Infrastructure tooling | BUSL-1.1 for current upstream releases; verify the installed version |
-| Google Terraform provider | Future Cloud Run resource provider | MPL-2.0 |
+| Google and Google Beta Terraform providers | Google Cloud resource providers | MPL-2.0 |
 | GitHub checkout/setup actions | CI bootstrap | MIT |
 | HashiCorp setup-terraform action | CI bootstrap | MPL-2.0 |
 

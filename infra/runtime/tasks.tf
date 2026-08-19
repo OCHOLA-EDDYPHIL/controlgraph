@@ -1,0 +1,123 @@
+resource "google_cloud_tasks_queue" "execution" {
+  project  = var.project_id
+  location = var.region
+  name     = local.execution_queue.name
+
+  rate_limits {
+    max_dispatches_per_second = 1
+    max_concurrent_dispatches = 1
+  }
+
+  retry_config {
+    max_attempts       = 3
+    max_retry_duration = "900s"
+    min_backoff        = "5s"
+    max_backoff        = "30s"
+    max_doublings      = 3
+  }
+
+  http_target {
+    http_method = "POST"
+
+    header_overrides {
+      header {
+        key   = "Content-Type"
+        value = "application/json"
+      }
+    }
+
+    uri_override {
+      scheme                    = "HTTPS"
+      host                      = trimprefix(module.executor.service.uri, "https://")
+      uri_override_enforce_mode = "ALWAYS"
+
+      path_override {
+        path = local.execution_queue.handler_path
+      }
+
+      query_override {
+        query_params = local.execution_queue.fixed_query
+      }
+    }
+
+    oidc_token {
+      service_account_email = local.service_accounts.execution_task_caller
+      audience              = module.executor.service.uri
+    }
+  }
+
+  stackdriver_logging_config {
+    sampling_ratio = 1
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [
+    google_service_account_iam_member.cloud_tasks_token_creator,
+    google_service_account_iam_member.coordinator_task_caller_actor,
+  ]
+}
+
+resource "google_cloud_tasks_queue" "recovery" {
+  project  = var.project_id
+  location = var.region
+  name     = local.recovery_queue.name
+
+  rate_limits {
+    max_dispatches_per_second = 1
+    max_concurrent_dispatches = 1
+  }
+
+  retry_config {
+    max_attempts       = 3
+    max_retry_duration = "900s"
+    min_backoff        = "5s"
+    max_backoff        = "30s"
+    max_doublings      = 3
+  }
+
+  http_target {
+    http_method = "POST"
+
+    header_overrides {
+      header {
+        key   = "Content-Type"
+        value = "application/json"
+      }
+    }
+
+    uri_override {
+      scheme                    = "HTTPS"
+      host                      = trimprefix(module.recovery.service.uri, "https://")
+      uri_override_enforce_mode = "ALWAYS"
+
+      path_override {
+        path = local.recovery_queue.handler_path
+      }
+
+      query_override {
+        query_params = local.recovery_queue.fixed_query
+      }
+    }
+
+    oidc_token {
+      service_account_email = local.service_accounts.recovery_task_caller
+      audience              = module.recovery.service.uri
+    }
+  }
+
+  stackdriver_logging_config {
+    sampling_ratio = 1
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [
+    google_service_account_iam_member.cloud_tasks_token_creator,
+    google_service_account_iam_member.coordinator_task_caller_actor,
+  ]
+}

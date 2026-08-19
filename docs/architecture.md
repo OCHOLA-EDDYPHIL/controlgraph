@@ -7,10 +7,13 @@ authenticated, correctly signed, and intact yet no longer be authorized because 
 before an operator revoked its rollout epoch.
 
 The current repository implements strict versioned contracts, cross-language canonical fixtures,
-a pure rollout reducer, root-scoped exact-match epochs, read-only HTTP routes, a CLI diagnostic,
-a static React shell, Terraform input contracts, and local tests. It does not currently persist
-authoritative epochs, sign capabilities, deliver authenticated tasks, mutate Cloud Run, evaluate
-hosted health, recover a service, or render a hosted evidence timeline.
+a pure rollout reducer, root-scoped exact-match epochs, transactional Firestore authority and
+receipt adapters, purpose-separated KMS signing and verification, sealed Cloud Tasks delivery,
+mutation-disabled service shells, a static React console, and Terraform for their isolated cloud
+substrate. These boundaries have local and Firestore-emulator coverage. They have not yet been
+composed into the M3 enforcement path or accepted in the hosted environment, and the repository
+does not yet mutate Cloud Run, evaluate hosted health, recover a service, or render a hosted
+evidence timeline.
 
 The architecture below fixes the boundary that later numbered implementation work must satisfy.
 It must not be read as evidence that the hosted path has already been deployed or accepted.
@@ -144,15 +147,22 @@ against the exact approved root digest and maximum scope.
 
 ## Identity and signing
 
-Operator, API, coordinator, issuer, executor, recovery, verifier, and task-caller identities are
-separate. Service invocation uses Cloud Run IAM, and protected application routes independently
-verify Google-issued identity claims against an exact audience and caller policy. A valid identity
-does not authorize mutation without the capability.
+Operator, API, coordinator, issuer, executor, recovery, verifier, evidence-writer, and task-caller
+identities are separate. Service invocation uses Cloud Run IAM, and protected application routes
+independently verify Google-issued identity claims against an exact audience and caller policy. A
+valid identity does not authorize mutation without the capability.
 
 Cloud KMS holds asymmetric private keys. Capabilities bind the configured signing algorithm and
 exact key version into their canonical claims. Callers cannot select a key, algorithm, trust
 bundle, or public-key URL. Capability and evidence signing use separate permissions. The issuer
-can sign approved canonical claims but cannot mutate Cloud Run.
+can sign approved canonical claims but cannot mutate Cloud Run. The evidence writer can sign only
+evidence and has no Firestore authority-write permission; the verifier remains read-only.
+
+Firestore server-client IAM is database-granular. The coordinator authority facade is the only
+runtime identity with database write permission. Executor and recovery identities retain strong
+read access but submit exact receipt claim and compare-and-set requests through narrow,
+authenticated coordinator operations. Canonical document families and transition checks remain
+enforced by the persistence adapter; they are not represented as collection-level IAM controls.
 
 ## Delivery and execution
 
