@@ -9,11 +9,15 @@ from collections.abc import Sequence
 from typing import Any
 
 from controlgraph_canary.authority import EpochFence, EpochMismatchError
-from controlgraph_canary.settings import REQUIRED_ENVIRONMENT_KEYS, ControllerSettings
+from controlgraph_canary.settings import ControllerSettings, required_environment_keys
 
 
 def _doctor_report(environment: dict[str, str]) -> dict[str, Any]:
-    missing = [key for key in REQUIRED_ENVIRONMENT_KEYS if not environment.get(key, "").strip()]
+    missing = [
+        key
+        for key in required_environment_keys(environment)
+        if not environment.get(key, "").strip()
+    ]
     return {
         "configured": not missing,
         "missing": missing,

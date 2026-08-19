@@ -33,6 +33,12 @@ from controlgraph_canary.contracts.models import (
     RolloutRoot,
     TargetBinding,
 )
+from controlgraph_canary.contracts.root_creation import (
+    CapabilityLineageAnchorV1,
+    RolloutRootV2,
+    RootCreationResultV1,
+    SignedEvidenceEventV1,
+)
 
 SERVICE_CLAIM_V2: Final = "controlgraph.service-claim/v2"
 AUTHORITY_STORAGE_DOCUMENT_V1: Final = "controlgraph.authority-storage-document/v1"
@@ -375,13 +381,86 @@ def active_service_claim_matches_root(
     )
 
 
+def service_claim_matches_root_v2(
+    claim: ServiceClaimRecord,
+    root: RolloutRootV2,
+    *,
+    stable_target_configuration_sha256: str,
+    candidate_target_configuration_sha256: str,
+) -> bool:
+    """Return whether one claim exactly binds a content-addressed rollout root."""
+
+    if type(claim) is not ServiceClaimRecord or type(root) is not RolloutRootV2:
+        return False
+    if any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (
+            stable_target_configuration_sha256,
+            candidate_target_configuration_sha256,
+        )
+    ):
+        return False
+    content = root.content
+    snapshot = content.stable_snapshot
+    plan = content.rollout_plan
+    expected_reader = (
+        f"controlgraph-verifier@{content.target.project_id}.iam.gserviceaccount.com"
+    )
+    return (
+        claim.target == content.target
+        and claim.root_id == root.root_id
+        and claim.root_sha256 == root.root_sha256
+        and claim.stable_revision == plan.stable_revision
+        and claim.candidate_revision == plan.candidate_revision
+        and claim.initial_epoch == plan.initial_epoch
+        and claim.baseline_service_generation == snapshot.service_generation
+        and claim.baseline_configuration_sha256 == snapshot.configuration_sha256
+        and (
+            claim.baseline_revision_configuration_sha256
+            == plan.stable_revision_configuration_sha256
+        )
+        and (
+            claim.candidate_revision_configuration_sha256
+            == plan.candidate_revision_configuration_sha256
+        )
+        and claim.stable_target_configuration_sha256 == stable_target_configuration_sha256
+        and claim.candidate_target_configuration_sha256 == candidate_target_configuration_sha256
+        and claim.operator_owner == content.approved_by
+        and claim.workload_creator == "controlgraph.api/v1"
+        and claim.terminal_release_condition == SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+        and snapshot.captured_by == expected_reader
+        and snapshot.captured_at <= content.approved_at <= claim.claimed_at
+    )
+
+
+def active_service_claim_matches_root_v2(
+    claim: ServiceClaimRecord,
+    root: RolloutRootV2,
+    *,
+    stable_target_configuration_sha256: str,
+    candidate_target_configuration_sha256: str,
+) -> bool:
+    """Return whether one active claim exactly binds a content-addressed root."""
+
+    return claim.status is ServiceClaimStatus.ACTIVE and service_claim_matches_root_v2(
+        claim,
+        root,
+        stable_target_configuration_sha256=stable_target_configuration_sha256,
+        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+    )
+
+
 class AuthorityStorageKind(StrEnum):
     """Closed Firestore record families used by the authority database."""
 
     ROLLOUT_ROOT = "controlgraph-rollout-roots-v1"
+    ROLLOUT_ROOT_V2 = "controlgraph-rollout-roots-v2"
     SERVICE_CLAIM = "controlgraph-service-claims-v1"
     EPOCH_AUTHORITY = "controlgraph-epoch-authorities-v1"
     EXECUTION_RECEIPT = "controlgraph-execution-receipts-v1"
+    CAPABILITY_LINEAGE_ANCHOR = "controlgraph-capability-lineage-anchors-v1"
+    SIGNED_EVIDENCE_EVENT = "controlgraph-signed-evidence-events-v1"
+    ROOT_CREATION_RESULT = "controlgraph-root-creation-results-v1"
 
 
 class AuthorityStorageDocument(StrictContractModel):
@@ -397,23 +476,47 @@ class AuthorityStorageDocument(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_payload(self) -> Self:
-        model_type: type[RolloutRoot | ServiceClaimRecord | EpochAuthorityRecord | ExecutionReceipt]
+        model_type: type[
+            RolloutRoot
+            | RolloutRootV2
+            | ServiceClaimRecord
+            | EpochAuthorityRecord
+            | ExecutionReceipt
+            | CapabilityLineageAnchorV1
+            | SignedEvidenceEventV1
+            | RootCreationResultV1
+        ]
         if self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT:
             model_type = RolloutRoot
+        elif self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT_V2:
+            model_type = RolloutRootV2
         elif self.record_kind is AuthorityStorageKind.SERVICE_CLAIM:
             model_type = ServiceClaimRecord
         elif self.record_kind is AuthorityStorageKind.EPOCH_AUTHORITY:
             model_type = EpochAuthorityRecord
-        else:
+        elif self.record_kind is AuthorityStorageKind.EXECUTION_RECEIPT:
             model_type = ExecutionReceipt
+        elif self.record_kind is AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR:
+            model_type = CapabilityLineageAnchorV1
+        elif self.record_kind is AuthorityStorageKind.SIGNED_EVIDENCE_EVENT:
+            model_type = SignedEvidenceEventV1
+        else:
+            model_type = RootCreationResultV1
         try:
             payload = decode_contract(self.canonical_payload, model_type)
         except ContractError as error:
             raise ValueError("authority storage payload is invalid") from error
         if canonical_sha256(payload) != self.payload_sha256:
             raise ValueError("authority storage payload digest does not match")
-        if self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT and self.revision != 0:
-            raise ValueError("immutable rollout root must remain at revision zero")
+        immutable_kinds = {
+            AuthorityStorageKind.ROLLOUT_ROOT,
+            AuthorityStorageKind.ROLLOUT_ROOT_V2,
+            AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+            AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+            AuthorityStorageKind.ROOT_CREATION_RESULT,
+        }
+        if self.record_kind in immutable_kinds and self.revision != 0:
+            raise ValueError("immutable authority record must remain at revision zero")
         if (
             self.record_kind is AuthorityStorageKind.EPOCH_AUTHORITY
             and self.revision != cast(EpochAuthorityRecord, payload).revision
@@ -437,8 +540,22 @@ class AuthorityStorageDocument(StrictContractModel):
             )
             if receipt.receipt_id != expected_logical_id:
                 raise ValueError("execution receipt identity does not match its claim key")
+        elif self.record_kind is AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR:
+            expected_logical_id = capability_lineage_anchor_logical_id(
+                cast(CapabilityLineageAnchorV1, payload)
+            )
+        elif self.record_kind is AuthorityStorageKind.SIGNED_EVIDENCE_EVENT:
+            expected_logical_id = cast(SignedEvidenceEventV1, payload).event.evidence_id
+        elif self.record_kind is AuthorityStorageKind.ROOT_CREATION_RESULT:
+            result = cast(RootCreationResultV1, payload)
+            if result.outcome != "CREATED":
+                raise ValueError("persisted root creation result must identify the winner")
+            expected_logical_id = result.root.root_id
         else:
-            expected_logical_id = payload.root_id
+            expected_logical_id = cast(
+                RolloutRoot | RolloutRootV2 | EpochAuthorityRecord,
+                payload,
+            ).root_id
         if self.logical_id != expected_logical_id:
             raise ValueError("authority storage payload identity does not match")
         return self
@@ -466,6 +583,12 @@ def rollout_root_document_id(root_id: str) -> str:
     return _document_id(AuthorityStorageKind.ROLLOUT_ROOT, root_id)
 
 
+def rollout_root_v2_document_id(root_id: str) -> str:
+    """Return the domain-separated document ID for one v2 rollout root."""
+
+    return _document_id(AuthorityStorageKind.ROLLOUT_ROOT_V2, root_id)
+
+
 def service_claim_logical_id(target: TargetBinding) -> str:
     """Return the canonical service identity without exposing a Firestore path."""
 
@@ -483,6 +606,35 @@ def epoch_authority_document_id(root_id: str) -> str:
     """Return the domain-separated document ID for one root's authority."""
 
     return _document_id(AuthorityStorageKind.EPOCH_AUTHORITY, root_id)
+
+
+def capability_lineage_anchor_logical_id(anchor: CapabilityLineageAnchorV1) -> str:
+    """Return the content-addressed identity for one lineage anchor."""
+
+    if type(anchor) is not CapabilityLineageAnchorV1:
+        raise TypeError("lineage anchor identity requires an exact anchor")
+    return f"cganchor:{canonical_sha256(anchor)}"
+
+
+def capability_lineage_anchor_document_id(anchor: CapabilityLineageAnchorV1) -> str:
+    """Return the domain-separated document ID for one lineage anchor."""
+
+    return _document_id(
+        AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+        capability_lineage_anchor_logical_id(anchor),
+    )
+
+
+def signed_evidence_event_document_id(evidence_id: str) -> str:
+    """Return the domain-separated document ID for one signed evidence event."""
+
+    return _document_id(AuthorityStorageKind.SIGNED_EVIDENCE_EVENT, evidence_id)
+
+
+def root_creation_result_document_id(root_id: str) -> str:
+    """Return the domain-separated document ID for one root creation winner."""
+
+    return _document_id(AuthorityStorageKind.ROOT_CREATION_RESULT, root_id)
 
 
 def execution_receipt_logical_id(target: TargetBinding, idempotency_key: str) -> str:
@@ -526,11 +678,18 @@ __all__ = [
     "ServiceClaimTerminalRootProof",
     "ServiceClaimTerminalRootState",
     "active_service_claim_matches_root",
+    "active_service_claim_matches_root_v2",
+    "capability_lineage_anchor_document_id",
+    "capability_lineage_anchor_logical_id",
     "epoch_authority_document_id",
     "execution_receipt_document_id",
     "execution_receipt_logical_id",
     "rollout_root_document_id",
+    "rollout_root_v2_document_id",
+    "root_creation_result_document_id",
     "service_claim_document_id",
     "service_claim_logical_id",
     "service_claim_matches_root",
+    "service_claim_matches_root_v2",
+    "signed_evidence_event_document_id",
 ]

@@ -1,12 +1,13 @@
 output "controller_services" {
   description = "Private controller service coordinates keyed by role."
   value = {
-    api         = module.api.service
-    coordinator = module.coordinator.service
-    issuer      = module.issuer.service
-    executor    = module.executor.service
-    recovery    = module.recovery.service
-    verifier    = module.verifier.service
+    api             = module.api.service
+    coordinator     = module.coordinator.service
+    issuer          = module.issuer.service
+    executor        = module.executor.service
+    recovery        = module.recovery.service
+    verifier        = module.verifier.service
+    evidence_writer = module.evidence_writer.service
   }
 }
 

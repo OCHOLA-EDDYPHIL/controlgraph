@@ -255,6 +255,15 @@ class DigestSigningBackend(Protocol):
     def sign_digest(self, digest: bytes) -> bytes: ...
 
 
+class AsyncDigestSigningBackend(Protocol):
+    """An asynchronous backend sealed to one exact signing profile."""
+
+    @property
+    def profile(self) -> SigningProfile: ...
+
+    async def sign_digest(self, digest: bytes) -> bytes: ...
+
+
 def _validate_payload(profile: SigningProfile | VerificationProfile, payload: object) -> None:
     if not isinstance(payload, StrictContractModel):
         raise _fail(SigningErrorCode.PURPOSE_MISMATCH, "signing payload type is invalid")
@@ -371,6 +380,36 @@ class PurposeSealedSigner:
     def sign(self, payload: StrictContractModel) -> DetachedSignature:
         signing_input = build_signing_input(self._profile, payload)
         signature = self._backend.sign_digest(signing_input.digest)
+        if type(signature) is not bytes or not signature or len(signature) > 256:
+            raise _fail(SigningErrorCode.SIGNATURE_INVALID, "signer returned an invalid signature")
+        return DetachedSignature(
+            schema_version=DETACHED_SIGNATURE_V1,
+            purpose=self._profile.purpose,
+            key_version=self._profile.key_version,
+            algorithm=self._profile.algorithm,
+            payload_version=self._profile.payload_version,
+            payload_sha256=signing_input.payload_sha256,
+            digest_sha256=signing_input.digest_sha256,
+            signature=encode_base64url(signature),
+        )
+
+
+class AsyncPurposeSealedSigner:
+    """Sign canonical contracts through one fixed asynchronous backend profile."""
+
+    def __init__(self, backend: AsyncDigestSigningBackend) -> None:
+        self._backend = backend
+        self._profile = backend.profile
+        if not isinstance(self._profile, SigningProfile):
+            raise _fail(SigningErrorCode.PROFILE_INVALID, "signing backend profile is invalid")
+
+    @property
+    def profile(self) -> SigningProfile:
+        return self._profile
+
+    async def sign(self, payload: StrictContractModel) -> DetachedSignature:
+        signing_input = build_signing_input(self._profile, payload)
+        signature = await self._backend.sign_digest(signing_input.digest)
         if type(signature) is not bytes or not signature or len(signature) > 256:
             raise _fail(SigningErrorCode.SIGNATURE_INVALID, "signer returned an invalid signature")
         return DetachedSignature(
@@ -730,6 +769,8 @@ __all__ = [
     "SIGNATURE_INPUT_V1",
     "SIGNING_ALGORITHM",
     "TRUST_BUNDLE_V1",
+    "AsyncDigestSigningBackend",
+    "AsyncPurposeSealedSigner",
     "CanonicalSigningInput",
     "DetachedSignature",
     "DigestSigningBackend",

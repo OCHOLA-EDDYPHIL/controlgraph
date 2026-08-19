@@ -30,11 +30,15 @@ from controlgraph_canary.application.authority_store import (
     ReceiptClaimCreated,
     ReceiptClaimResult,
     ReleasedServiceClaim,
+    RootCreationBundle,
+    RootCreationWriteResult,
     StoredRecord,
     validate_receipt_claim_binding,
 )
 from controlgraph_canary.application.cloud_run import (
+    TargetConfigurationProjection,
     rollout_root_target_configuration_sha256,
+    target_configuration_projection_sha256,
 )
 from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts.base import StrictContractModel
@@ -51,6 +55,13 @@ from controlgraph_canary.contracts.models import (
     RolloutRoot,
     TargetBinding,
 )
+from controlgraph_canary.contracts.root_creation import (
+    CapabilityLineageAnchorV1,
+    RolloutRootV2,
+    RootCreationResultV1,
+    SignedEvidenceEventV1,
+    capability_lineage_anchor,
+)
 from controlgraph_canary.contracts.storage import (
     AUTHORITY_STORAGE_DOCUMENT_V1,
     AuthorityStorageDocument,
@@ -58,12 +69,19 @@ from controlgraph_canary.contracts.storage import (
     ServiceClaimRecord,
     ServiceClaimStatus,
     active_service_claim_matches_root,
+    active_service_claim_matches_root_v2,
+    capability_lineage_anchor_document_id,
+    capability_lineage_anchor_logical_id,
     epoch_authority_document_id,
     execution_receipt_document_id,
     execution_receipt_logical_id,
     rollout_root_document_id,
+    rollout_root_v2_document_id,
+    root_creation_result_document_id,
     service_claim_document_id,
     service_claim_logical_id,
+    service_claim_matches_root_v2,
+    signed_evidence_event_document_id,
 )
 
 FIRESTORE_AUTHORITY_DATABASE: Final = "controlgraph-authority"
@@ -617,6 +635,210 @@ def _validate_released_takeover(
         or claim.claimed_at < root.approved_at
     ):
         raise ValueError("new rollout does not follow one safely released claim")
+
+
+def _rollout_root_v2_target_configuration_sha256(
+    root: RolloutRootV2,
+    *,
+    stable_percent: int,
+    candidate_percent: int,
+) -> str:
+    plan = root.content.rollout_plan
+    return target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.content.target,
+            stable_revision=plan.stable_revision,
+            candidate_revision=plan.candidate_revision,
+            stable_percent=stable_percent,
+            candidate_percent=candidate_percent,
+            concurrency=plan.concurrency,
+        )
+    )
+
+
+def _validate_released_takeover_v2(
+    configured_target: TargetBinding,
+    expected_released_claim: StoredRecord[ServiceClaimRecord],
+    root: RolloutRootV2,
+    claim: ServiceClaimRecord,
+) -> None:
+    previous = expected_released_claim.value
+    if type(previous) is not ServiceClaimRecord:
+        raise TypeError("released claim takeover requires an exact service claim")
+    if (
+        previous.target != configured_target
+        or previous.status is not ServiceClaimStatus.RELEASED
+        or expected_released_claim.revision % 3 != 2
+        or previous.root_id == root.root_id
+        or previous.released_at is None
+        or root.content.stable_snapshot.captured_at <= previous.released_at
+        or claim.claimed_at < root.content.approved_at
+    ):
+        raise ValueError("new rollout does not follow one safely released claim")
+
+
+def _validate_initial_root_creation_bundle(
+    configured_target: TargetBinding,
+    root: RolloutRootV2,
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+    lineage_anchor: CapabilityLineageAnchorV1,
+    signed_evidence: SignedEvidenceEventV1,
+    creation_result: RootCreationResultV1,
+    expected_released_claim: StoredRecord[ServiceClaimRecord] | None,
+) -> None:
+    exact_records = (
+        (root, RolloutRootV2),
+        (claim, ServiceClaimRecord),
+        (authority, EpochAuthorityRecord),
+        (lineage_anchor, CapabilityLineageAnchorV1),
+        (signed_evidence, SignedEvidenceEventV1),
+        (creation_result, RootCreationResultV1),
+    )
+    if any(type(record) is not model_type for record, model_type in exact_records):
+        raise TypeError("root creation requires exact bundle records")
+    stable_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+        root,
+        stable_percent=100,
+        candidate_percent=0,
+    )
+    candidate_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+        root,
+        stable_percent=0,
+        candidate_percent=100,
+    )
+    if any(
+        record_target != configured_target
+        for record_target in (
+            root.content.target,
+            claim.target,
+            authority.target,
+            lineage_anchor.target,
+            signed_evidence.event.target,
+        )
+    ):
+        raise ValueError("root creation records do not match the configured target")
+    if (
+        creation_result.outcome != "CREATED"
+        or creation_result.root != root
+        or creation_result.initial_authority != authority
+        or creation_result.lineage_anchor != lineage_anchor
+        or creation_result.signed_evidence != signed_evidence
+        or lineage_anchor != capability_lineage_anchor(root)
+        or not active_service_claim_matches_root_v2(
+            claim,
+            root,
+            stable_target_configuration_sha256=stable_configuration_sha256,
+            candidate_target_configuration_sha256=candidate_configuration_sha256,
+        )
+        or creation_result.winner_service_claim_id
+        != service_claim_logical_id(configured_target)
+        or creation_result.winner_service_claim_sha256 != canonical_sha256(claim)
+        or claim.claim_request_id != creation_result.winner_request_id
+        or claim.claim_evidence_id != signed_evidence.event.evidence_id
+        or claim.claimed_at != creation_result.created_at
+        or authority.request_id != claim.claim_request_id
+        or authority.evidence_id != claim.claim_evidence_id
+        or authority.changed_at != claim.claimed_at
+    ):
+        raise ValueError("root creation records are not one atomic authority bundle")
+    if expected_released_claim is not None:
+        if type(expected_released_claim) is not StoredRecord:
+            raise TypeError("released claim takeover requires an exact stored claim")
+        _validate_released_takeover_v2(
+            configured_target,
+            expected_released_claim,
+            root,
+            claim,
+        )
+
+
+def _validate_read_root_creation_bundle(
+    configured_target: TargetBinding,
+    bundle: RootCreationBundle,
+) -> None:
+    root = bundle.root.value
+    claim = bundle.service_claim.value
+    authority = bundle.authority.value
+    anchor = bundle.lineage_anchor.value
+    evidence = bundle.signed_evidence.value
+    result = bundle.creation_result.value
+    if any(
+        record_target != configured_target
+        for record_target in (
+            root.content.target,
+            claim.target,
+            authority.target,
+            anchor.target,
+            evidence.event.target,
+        )
+    ):
+        raise ValueError("root creation bundle target does not match configuration")
+    if (
+        bundle.root.revision != 0
+        or bundle.lineage_anchor.revision != 0
+        or bundle.signed_evidence.revision != 0
+        or bundle.creation_result.revision != 0
+        or result.outcome != "CREATED"
+        or result.root != root
+        or result.lineage_anchor != anchor
+        or result.signed_evidence != evidence
+        or anchor != capability_lineage_anchor(root)
+        or authority.root_id != root.root_id
+        or authority.root_sha256 != root.root_sha256
+        or authority.revision != bundle.authority.revision
+        or result.winner_service_claim_id != service_claim_logical_id(configured_target)
+    ):
+        raise ValueError("root creation bundle is incoherent")
+    if claim.root_id == root.root_id:
+        stable_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+            root,
+            stable_percent=100,
+            candidate_percent=0,
+        )
+        candidate_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+            root,
+            stable_percent=0,
+            candidate_percent=100,
+        )
+        if not service_claim_matches_root_v2(
+            claim,
+            root,
+            stable_target_configuration_sha256=stable_configuration_sha256,
+            candidate_target_configuration_sha256=candidate_configuration_sha256,
+        ):
+            raise ValueError("root creation bundle claim is incoherent")
+        if bundle.service_claim.revision == 0 and (
+            result.winner_service_claim_sha256 != canonical_sha256(claim)
+        ):
+            raise ValueError("root creation bundle initial claim digest does not match")
+
+
+def _adopted_root_creation_result(result: RootCreationResultV1) -> RootCreationResultV1:
+    return RootCreationResultV1.model_validate(
+        {**result.model_dump(mode="python"), "outcome": "ADOPTED"}
+    )
+
+
+def _root_creation_bundle_matches_request(
+    bundle: RootCreationBundle,
+    *,
+    root: RolloutRootV2,
+    service_claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+    lineage_anchor: CapabilityLineageAnchorV1,
+    signed_evidence: SignedEvidenceEventV1,
+    creation_result: RootCreationResultV1,
+) -> bool:
+    return (
+        bundle.root == StoredRecord(root, 0)
+        and bundle.service_claim.value == service_claim
+        and bundle.service_claim.revision % 3 == 0
+        and bundle.authority == StoredRecord(authority, 0)
+        and bundle.lineage_anchor == StoredRecord(lineage_anchor, 0)
+        and bundle.signed_evidence == StoredRecord(signed_evidence, 0)
+        and bundle.creation_result == StoredRecord(creation_result, 0)
+    )
 
 
 _RECEIPT_TRANSITIONS: Final = {
@@ -1254,6 +1476,283 @@ class FirestoreAuthorityStore:
             service_claim=_stored(claim_document),
             authority=_stored(authority_document),
         )
+
+    async def create_or_adopt_root_creation_bundle(
+        self,
+        root: RolloutRootV2,
+        service_claim: ServiceClaimRecord,
+        authority: EpochAuthorityRecord,
+        lineage_anchor: CapabilityLineageAnchorV1,
+        signed_evidence: SignedEvidenceEventV1,
+        creation_result: RootCreationResultV1,
+        *,
+        expected_released_claim: StoredRecord[ServiceClaimRecord] | None = None,
+    ) -> RootCreationWriteResult:
+        _validate_initial_root_creation_bundle(
+            self._target,
+            root,
+            service_claim,
+            authority,
+            lineage_anchor,
+            signed_evidence,
+            creation_result,
+            expected_released_claim,
+        )
+        root_document = _prepared_document(
+            kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+            logical_id=root.root_id,
+            document_id=rollout_root_v2_document_id(root.root_id),
+            revision=0,
+            value=root,
+        )
+        claim_logical_id = service_claim_logical_id(self._target)
+        claim_revision = (
+            0 if expected_released_claim is None else expected_released_claim.revision + 1
+        )
+        claim_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM,
+            logical_id=claim_logical_id,
+            document_id=service_claim_document_id(self._target),
+            revision=claim_revision,
+            value=service_claim,
+        )
+        authority_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=authority.root_id,
+            document_id=epoch_authority_document_id(authority.root_id),
+            revision=0,
+            value=authority,
+        )
+        anchor_logical_id = capability_lineage_anchor_logical_id(lineage_anchor)
+        anchor_document = _prepared_document(
+            kind=AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+            logical_id=anchor_logical_id,
+            document_id=capability_lineage_anchor_document_id(lineage_anchor),
+            revision=0,
+            value=lineage_anchor,
+        )
+        evidence_logical_id = signed_evidence.event.evidence_id
+        evidence_document = _prepared_document(
+            kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+            logical_id=evidence_logical_id,
+            document_id=signed_evidence_event_document_id(evidence_logical_id),
+            revision=0,
+            value=signed_evidence,
+        )
+        result_document = _prepared_document(
+            kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
+            logical_id=root.root_id,
+            document_id=root_creation_result_document_id(root.root_id),
+            revision=0,
+            value=creation_result,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            root_document,
+            claim_document,
+            authority_document,
+            anchor_document,
+            evidence_document,
+            result_document,
+        )
+
+        async def create(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            if expected_released_claim is None:
+                for document in documents:
+                    reference = self._reference(
+                        client,
+                        document.wrapper.record_kind,
+                        document.document_id,
+                    )
+                    transaction.create(reference, _document_data(document.wrapper))
+                return
+            claim_reference = self._reference(
+                client,
+                AuthorityStorageKind.SERVICE_CLAIM,
+                claim_document.document_id,
+            )
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=claim_reference,
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document.document_id,
+                model_type=ServiceClaimRecord,
+            )
+            if current_claim is None or current_claim.stored != expected_released_claim:
+                raise _ExpectedStateMismatch
+            for document in documents:
+                if document is claim_document:
+                    continue
+                reference = self._reference(
+                    client,
+                    document.wrapper.record_kind,
+                    document.document_id,
+                )
+                transaction.create(reference, _document_data(document.wrapper))
+            transaction.update(claim_reference, _document_data(claim_document.wrapper))
+
+        bundle = RootCreationBundle(
+            root=_stored(root_document),
+            service_claim=_stored(claim_document),
+            authority=_stored(authority_document),
+            lineage_anchor=_stored(anchor_document),
+            signed_evidence=_stored(evidence_document),
+            creation_result=_stored(result_document),
+        )
+        try:
+            disposition = await self._run_transaction(documents, create)
+        except AuthorityStoreConflict:
+            existing = await self.read_root_creation_bundle(root.root_id)
+            if existing is None or not _root_creation_bundle_matches_request(
+                existing,
+                root=root,
+                service_claim=service_claim,
+                authority=authority,
+                lineage_anchor=lineage_anchor,
+                signed_evidence=signed_evidence,
+                creation_result=creation_result,
+            ):
+                raise
+            return RootCreationWriteResult(
+                result=_adopted_root_creation_result(existing.creation_result.value),
+                bundle=existing,
+            )
+        result = (
+            creation_result
+            if disposition is _TransactionCommitDisposition.DIRECT_CONFIRMED
+            else _adopted_root_creation_result(creation_result)
+        )
+        return RootCreationWriteResult(result=result, bundle=bundle)
+
+    async def read_root_creation_bundle(
+        self,
+        root_id: str,
+    ) -> RootCreationBundle | None:
+        decoded_bundle: RootCreationBundle | None = None
+        completed = False
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal completed, decoded_bundle
+            client = await self._client()
+            root_document_id = rollout_root_v2_document_id(root_id)
+            authority_document_id = epoch_authority_document_id(root_id)
+            result_document_id = root_creation_result_document_id(root_id)
+            root = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRootV2,
+            )
+            authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            creation_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROOT_CREATION_RESULT,
+                    result_document_id,
+                ),
+                kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
+                logical_id=root_id,
+                document_id=result_document_id,
+                model_type=RootCreationResultV1,
+            )
+            root_specific = (root, authority, creation_result)
+            if all(record is None for record in root_specific):
+                completed = True
+                return
+            if any(record is None for record in root_specific):
+                raise AuthorityStoreCorruptRecord
+            decoded_root = cast(_DecodedDocument[RolloutRootV2], root)
+            decoded_authority = cast(_DecodedDocument[EpochAuthorityRecord], authority)
+            decoded_result = cast(
+                _DecodedDocument[RootCreationResultV1],
+                creation_result,
+            )
+            result = decoded_result.value
+            claim_logical_id = service_claim_logical_id(self._target)
+            claim_document_id = service_claim_document_id(self._target)
+            anchor_logical_id = result.winner_lineage_anchor_id
+            anchor_document_id = capability_lineage_anchor_document_id(
+                result.lineage_anchor
+            )
+            evidence_logical_id = result.winner_evidence_id
+            evidence_document_id = signed_evidence_event_document_id(evidence_logical_id)
+            claim = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document_id,
+                model_type=ServiceClaimRecord,
+            )
+            anchor = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+                    anchor_document_id,
+                ),
+                kind=AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+                logical_id=anchor_logical_id,
+                document_id=anchor_document_id,
+                model_type=CapabilityLineageAnchorV1,
+            )
+            evidence = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    evidence_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=evidence_logical_id,
+                document_id=evidence_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+            if claim is None or anchor is None or evidence is None:
+                raise AuthorityStoreCorruptRecord
+            decoded_bundle = RootCreationBundle(
+                root=decoded_root.stored,
+                service_claim=claim.stored,
+                authority=decoded_authority.stored,
+                lineage_anchor=anchor.stored,
+                signed_evidence=evidence.stored,
+                creation_result=decoded_result.stored,
+            )
+            completed = True
+
+        await self._run_consistent_read(read)
+        if not completed:
+            raise AuthorityStoreUnavailable
+        if decoded_bundle is None:
+            return None
+        try:
+            _validate_read_root_creation_bundle(self._target, decoded_bundle)
+        except (TypeError, ValueError):
+            raise AuthorityStoreCorruptRecord from None
+        return decoded_bundle
 
     async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None:
         decoded = await self._strong_read(

@@ -5,7 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from controlgraph_canary.cli import _doctor_report, main
-from controlgraph_canary.settings import REQUIRED_ENVIRONMENT_KEYS, ControllerSettings
+from controlgraph_canary.settings import (
+    EVIDENCE_WRITER_ENVIRONMENT_KEYS,
+    REQUIRED_ENVIRONMENT_KEYS,
+    ControllerSettings,
+)
 
 
 def test_doctor_reports_missing_configuration() -> None:
@@ -15,6 +19,24 @@ def test_doctor_reports_missing_configuration() -> None:
         "configured": False,
         "missing": list(REQUIRED_ENVIRONMENT_KEYS),
         "cloud_calls_performed": False,
+    }
+
+
+def test_doctor_requires_the_role_specific_evidence_signing_configuration() -> None:
+    environment = {key: "configured" for key in REQUIRED_ENVIRONMENT_KEYS}
+    environment["CONTROLGRAPH_ROLE"] = "evidence_writer"
+    environment["CONTROLGRAPH_EVIDENCE_KEY_VERSION"] = "configured"
+
+    report = _doctor_report(environment)
+
+    assert report == {
+        "configured": False,
+        "missing": ["CONTROLGRAPH_SIGNING_ALGORITHM"],
+        "cloud_calls_performed": False,
+    }
+    assert set(EVIDENCE_WRITER_ENVIRONMENT_KEYS) == {
+        "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+        "CONTROLGRAPH_SIGNING_ALGORITHM",
     }
 
 

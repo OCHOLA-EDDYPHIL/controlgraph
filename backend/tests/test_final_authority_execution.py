@@ -8,12 +8,12 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from root_v2_support import RootBundle, root_bundle, root_records
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreCorruptRecord,
     AuthorityStoreUnavailable,
     DirectReceiptCreate,
-    FinalAuthoritySnapshot,
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
@@ -49,18 +49,15 @@ from controlgraph_canary.contracts import (
     MutationIntent,
     ReasonCode,
     ReceiptOutcome,
-    RolloutRoot,
+    RolloutRootV2,
     SignedCapability,
-    StableSnapshot,
     TargetBinding,
     TaskRequest,
-    TrafficAllocation,
     canonical_sha256,
     encode_base64url,
 )
 from controlgraph_canary.contracts.storage import (
     SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
-    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
     SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
     ServiceClaimRecord,
     ServiceClaimStatus,
@@ -93,41 +90,12 @@ def _target() -> TargetBinding:
     )
 
 
-def _root() -> RolloutRoot:
-    target = _target()
-    stable = StableSnapshot(
-        schema_version="controlgraph.stable-snapshot/v1",
-        target=target,
-        stable_revision="controlgraph-reference-target-stable-v1",
-        traffic=(
-            TrafficAllocation(
-                revision="controlgraph-reference-target-stable-v1",
-                percent=100,
-            ),
-        ),
-        concurrency=40,
-        service_generation=7,
-        provider_etag="etag-stable-7",
-        configuration_sha256=ZERO_DIGEST,
-        stable_revision_configuration_sha256=ONE_DIGEST,
-        captured_at="2026-08-19T12:00:00Z",
-        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
+def _root() -> RolloutRootV2:
+    root, _, _, _ = root_records(
+        target=_target(),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
     )
-    return RolloutRoot(
-        schema_version="controlgraph.rollout-root/v1",
-        root_id="root-final-gate",
-        target=target,
-        stable_snapshot=stable,
-        candidate_revision="controlgraph-reference-target-candidate-v1",
-        stable_percent=90,
-        candidate_percent=10,
-        health_policy_sha256=ONE_DIGEST,
-        maximum_recovery_attempts=1,
-        initial_epoch=1,
-        plan_sha256=TWO_DIGEST,
-        approved_by="controlgraph.operator/v1",
-        approved_at="2026-08-19T12:01:00Z",
-    )
+    return root
 
 
 def _action_shape(action: CapabilityAction) -> tuple[int, int, int | None]:
@@ -157,18 +125,18 @@ def _verified(
         issuer=f"controlgraph-issuer@{PROJECT_ID}.iam.gserviceaccount.com",
         subject=f"controlgraph-{role.value}@{PROJECT_ID}.iam.gserviceaccount.com",
         audience=audience,
-        target=root.target,
+        target=root.content.target,
         root_id=root.root_id,
-        root_sha256=canonical_sha256(root),
+        root_sha256=root.root_sha256,
         epoch=epoch,
         action=action,
-        stable_revision=root.stable_snapshot.stable_revision,
-        candidate_revision=root.candidate_revision,
+        stable_revision=root.content.rollout_plan.stable_revision,
+        candidate_revision=root.content.rollout_plan.candidate_revision,
         stable_percent=stable_percent,
         candidate_percent=candidate_percent,
         concurrency=concurrency,
-        plan_sha256=root.plan_sha256,
-        provider_etag=root.stable_snapshot.provider_etag,
+        plan_sha256=canonical_sha256(root.content.rollout_plan),
+        provider_etag=root.content.stable_snapshot.provider_etag,
         request_id=f"request-{action.value.lower()}-{epoch}",
         idempotency_key=f"intent-{action.value.lower()}-{epoch}",
         parent_capability_sha256=None,
@@ -204,7 +172,7 @@ def _verified(
     request = TaskRequest(
         schema_version="controlgraph.task-request/v1",
         task_id=f"task-{action.value.lower()}-{epoch}",
-        queue_region=root.target.region,
+        queue_region=root.content.target.region,
         handler_audience=audience,
         scheduled_at=claims.not_before,
         expires_at=claims.expires_at,
@@ -228,6 +196,10 @@ def _verified(
     return VerifiedMutation(
         request=request,
         root=root,
+        lineage_anchor=root_records(
+            target=_target(),
+            candidate_revision_configuration_sha256=THREE_DIGEST,
+        )[1],
         caller=caller,
         capability_sha256=canonical_sha256(capability),
         claims_sha256=capability.claims_sha256,
@@ -291,14 +263,16 @@ def _claimed(verified: VerifiedMutation) -> StoredRecord[ExecutionReceipt]:
     return StoredRecord(receipt, 0)
 
 
-def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapshot:
-    root = _root()
-    root_sha256 = canonical_sha256(root)
+def _snapshot(*, epoch: int = 1, released: bool = False) -> RootBundle:
+    root, anchor, base_claim, initial_authority = root_records(
+        target=_target(),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
+    )
     authority = EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
         root_id=root.root_id,
-        root_sha256=root_sha256,
-        target=root.target,
+        root_sha256=root.root_sha256,
+        target=root.content.target,
         current_epoch=epoch,
         previous_epoch=None if epoch == 1 else epoch - 1,
         revision=epoch - 1,
@@ -307,54 +281,41 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
             if epoch == 1
             else EpochChangeCause.OPERATOR_REVOCATION
         ),
-        changed_by="controlgraph.operator/v1",
+        changed_by=(
+            initial_authority.changed_by if epoch == 1 else "controlgraph.operator/v1"
+        ),
         request_id=f"request-authority-{epoch}",
         evidence_id=f"evidence-authority-{epoch}",
         changed_at=f"2026-08-19T12:0{epoch}:00Z",
     )
     stable_target_configuration_sha256 = target_configuration_projection_sha256(
         TargetConfigurationProjection(
-            target=root.target,
-            stable_revision=root.stable_snapshot.stable_revision,
-            candidate_revision=root.candidate_revision,
+            target=root.content.target,
+            stable_revision=root.content.rollout_plan.stable_revision,
+            candidate_revision=root.content.rollout_plan.candidate_revision,
             stable_percent=100,
             candidate_percent=0,
-            concurrency=root.stable_snapshot.concurrency,
+            concurrency=root.content.rollout_plan.concurrency,
         )
     )
     candidate_target_configuration_sha256 = target_configuration_projection_sha256(
         TargetConfigurationProjection(
-            target=root.target,
-            stable_revision=root.stable_snapshot.stable_revision,
-            candidate_revision=root.candidate_revision,
+            target=root.content.target,
+            stable_revision=root.content.rollout_plan.stable_revision,
+            candidate_revision=root.content.rollout_plan.candidate_revision,
             stable_percent=0,
             candidate_percent=100,
-            concurrency=root.stable_snapshot.concurrency,
+            concurrency=root.content.rollout_plan.concurrency,
         )
     )
     claim_values: dict[str, object] = {
         "schema_version": "controlgraph.service-claim/v2",
-        "target": root.target,
+        **base_claim.model_dump(mode="python"),
         "root_id": root.root_id,
-        "root_sha256": root_sha256,
-        "stable_revision": root.stable_snapshot.stable_revision,
-        "candidate_revision": root.candidate_revision,
-        "initial_epoch": root.initial_epoch,
-        "baseline_service_generation": root.stable_snapshot.service_generation,
-        "baseline_configuration_sha256": root.stable_snapshot.configuration_sha256,
-        "baseline_revision_configuration_sha256": (
-            root.stable_snapshot.stable_revision_configuration_sha256
-        ),
-        "candidate_revision_configuration_sha256": THREE_DIGEST,
+        "root_sha256": root.root_sha256,
         "stable_target_configuration_sha256": stable_target_configuration_sha256,
         "candidate_target_configuration_sha256": candidate_target_configuration_sha256,
-        "operator_owner": root.approved_by,
-        "workload_creator": "controlgraph.api/v1",
-        "terminal_release_condition": SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         "status": ServiceClaimStatus.RELEASED if released else ServiceClaimStatus.ACTIVE,
-        "claim_request_id": "request-claim",
-        "claim_evidence_id": "evidence-claim",
-        "claimed_at": "2026-08-19T12:01:01Z",
         "release_fence_epoch": authority.current_epoch if released else None,
         "release_fence_authority_revision": authority.revision if released else None,
         "release_fenced_by": authority.changed_by if released else None,
@@ -368,9 +329,9 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
         "terminal_root_proof": (
             ServiceClaimTerminalRootProof(
                 schema_version=SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
-                target=root.target,
+                target=root.content.target,
                 root_id=root.root_id,
-                root_sha256=root_sha256,
+                root_sha256=root.root_sha256,
                 state=ServiceClaimTerminalRootState.RECOVERED,
                 target_configuration_sha256=stable_target_configuration_sha256,
                 evidence_id="evidence-terminal",
@@ -384,9 +345,9 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
         "target_classification_proof": (
             ServiceClaimTargetClassificationProof(
                 schema_version=SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
-                target=root.target,
+                target=root.content.target,
                 root_id=root.root_id,
-                root_sha256=root_sha256,
+                root_sha256=root.root_sha256,
                 classification=ServiceClaimTargetClassification.STABLE_RESTORED,
                 fenced_epoch=authority.current_epoch,
                 fenced_authority_revision=authority.revision,
@@ -405,10 +366,12 @@ def _snapshot(*, epoch: int = 1, released: bool = False) -> FinalAuthoritySnapsh
         ),
     }
     claim = ServiceClaimRecord(**claim_values)  # type: ignore[arg-type]
-    return FinalAuthoritySnapshot(
-        root=StoredRecord(root, 0),
-        service_claim=StoredRecord(claim, 2 if released else 0),
-        authority=StoredRecord(authority, authority.revision),
+    return root_bundle(
+        root=root,
+        anchor=anchor,
+        claim=claim,
+        authority=authority,
+        claim_revision=2 if released else 0,
     )
 
 
@@ -423,7 +386,7 @@ def _lease(verified: VerifiedMutation) -> ReceiptDispatchLease:
 class _Reader:
     def __init__(
         self,
-        snapshot: FinalAuthoritySnapshot | None,
+        snapshot: RootBundle | None,
         *,
         error: Exception | None = None,
         events: list[str] | None = None,
@@ -437,10 +400,10 @@ class _Reader:
         self.continue_read = asyncio.Event()
         self.pause = False
 
-    async def read_final_authority_snapshot(
+    async def read_root_creation_bundle(
         self,
         root_id: str,
-    ) -> FinalAuthoritySnapshot | None:
+    ) -> RootBundle | None:
         self.calls.append(root_id)
         if self.events is not None:
             self.events.append("authority")
@@ -734,6 +697,41 @@ def test_canonically_wrapped_tampered_claim_projection_is_denied() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("tamper_verified", [False, True])
+def test_final_gate_requires_the_exact_persisted_lineage_anchor(
+    tamper_verified: bool,
+) -> None:
+    async def scenario() -> None:
+        verified = _verified()
+        snapshot = _snapshot()
+        altered_anchor = snapshot.lineage_anchor.value.model_copy(
+            update={"candidate_revision_configuration_sha256": ZERO_DIGEST}
+        )
+        if tamper_verified:
+            verified_input = replace(verified, lineage_anchor=altered_anchor)
+            final_snapshot = snapshot
+        else:
+            verified_input = verified
+            final_snapshot = replace(
+                snapshot,
+                lineage_anchor=StoredRecord(altered_anchor, 0),
+            )
+        adapter = _Adapter(ServiceRole.EXECUTOR)
+
+        result = await FinalMutationGate(
+            authority_reader=_Reader(final_snapshot),
+            adapter=adapter,
+            clock=lambda: NOW,
+        ).execute(_lease(verified_input), verified_input)
+
+        assert isinstance(result, FinalAuthorityDenial)
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.observed_authority_epoch is None
+        assert adapter.calls == []
+
+    asyncio.run(scenario())
+
+
 def test_revocation_while_final_read_is_paused_prevents_dispatch() -> None:
     async def scenario() -> None:
         verified = _verified()
@@ -832,7 +830,7 @@ def test_mutation_permit_has_one_cross_thread_consumer() -> None:
         assert lease._enter(verified) is None
         permit = lease._authorize(
             verified,
-            verified.root.target,
+            verified.root.content.target,
             ServiceRole.EXECUTOR,
         )
 
@@ -944,7 +942,7 @@ def test_final_snapshot_is_followed_by_adapter_mutation_as_the_next_await() -> N
     )
     assert len(awaits) == 2
     assert [awaited.value.func.attr for awaited in awaits] == [  # type: ignore[union-attr]
-        "read_final_authority_snapshot",
+        "read_root_creation_bundle",
         "mutate",
     ]
 
@@ -1098,7 +1096,7 @@ def test_lease_and_permit_construction_require_internal_proof() -> None:
     with pytest.raises(TypeError):
         MutationPermit(  # type: ignore[call-arg,arg-type]
             object(),
-            target=verified.root.target,
+            target=verified.root.content.target,
             service_role=ServiceRole.EXECUTOR,
             intent=verified.request.intent,
             receipt_id=claimed.value.receipt_id,

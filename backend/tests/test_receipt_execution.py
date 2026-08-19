@@ -5,13 +5,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from root_v2_support import RootBundle, root_bundle, root_records
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
     AuthorityStoreOutcomeUnknown,
     AuthorityStoreUnavailable,
     DirectReceiptCreate,
-    FinalAuthoritySnapshot,
     ReceiptClaimAdopted,
     ReceiptClaimConflict,
     ReceiptClaimCreated,
@@ -26,7 +26,6 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunMutationResult,
     CloudRunTrafficAllocation,
     TargetConfigurationProjection,
-    rollout_root_target_configuration_sha256,
     target_configuration_projection,
 )
 from controlgraph_canary.application.execution import (
@@ -60,18 +59,11 @@ from controlgraph_canary.contracts.models import (
     MutationIntent,
     ReasonCode,
     ReceiptOutcome,
-    RolloutRoot,
     SignedCapability,
-    StableSnapshot,
     TargetBinding,
     TaskRequest,
-    TrafficAllocation,
 )
-from controlgraph_canary.contracts.storage import (
-    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
-    ServiceClaimRecord,
-    ServiceClaimStatus,
-)
+from controlgraph_canary.contracts.root_creation import RolloutRootV2
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 ZERO_DIGEST = "0" * 64
@@ -95,46 +87,17 @@ def _target() -> TargetBinding:
     )
 
 
-def _root() -> RolloutRoot:
-    target = _target()
-    snapshot = StableSnapshot(
-        schema_version="controlgraph.stable-snapshot/v1",
-        target=target,
-        stable_revision="controlgraph-reference-target-stable-v1",
-        traffic=(
-            TrafficAllocation(
-                revision="controlgraph-reference-target-stable-v1",
-                percent=100,
-            ),
-        ),
-        concurrency=40,
-        service_generation=7,
-        provider_etag="etag-stable-7",
-        configuration_sha256=ZERO_DIGEST,
-        stable_revision_configuration_sha256=ONE_DIGEST,
-        captured_at="2026-08-19T12:00:00Z",
-        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
+def _root() -> RolloutRootV2:
+    root, _, _, _ = root_records(
+        target=_target(),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
     )
-    return RolloutRoot(
-        schema_version="controlgraph.rollout-root/v1",
-        root_id="root-receipt-execution",
-        target=target,
-        stable_snapshot=snapshot,
-        candidate_revision="controlgraph-reference-target-candidate-v1",
-        stable_percent=90,
-        candidate_percent=10,
-        health_policy_sha256=ONE_DIGEST,
-        maximum_recovery_attempts=1,
-        initial_epoch=1,
-        plan_sha256=TWO_DIGEST,
-        approved_by="controlgraph.operator/v1",
-        approved_at="2026-08-19T12:01:00Z",
-    )
+    return root
 
 
 def _verified() -> VerifiedMutation:
     root = _root()
-    root_sha256 = canonical_sha256(root)
+    root_sha256 = root.root_sha256
     audience = "https://controlgraph-executor-123456789012.us-central1.run.app"
     claims = CapabilityClaims(
         schema_version="controlgraph.capability-claims/v1",
@@ -142,18 +105,18 @@ def _verified() -> VerifiedMutation:
         issuer=f"controlgraph-issuer@{PROJECT_ID}.iam.gserviceaccount.com",
         subject=f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com",
         audience=audience,
-        target=root.target,
+        target=root.content.target,
         root_id=root.root_id,
         root_sha256=root_sha256,
         epoch=1,
         action=CapabilityAction.APPLY_CANARY,
-        stable_revision=root.stable_snapshot.stable_revision,
-        candidate_revision=root.candidate_revision,
+        stable_revision=root.content.rollout_plan.stable_revision,
+        candidate_revision=root.content.rollout_plan.candidate_revision,
         stable_percent=90,
         candidate_percent=10,
         concurrency=None,
-        plan_sha256=root.plan_sha256,
-        provider_etag=root.stable_snapshot.provider_etag,
+        plan_sha256=canonical_sha256(root.content.rollout_plan),
+        provider_etag=root.content.stable_snapshot.provider_etag,
         request_id="request-receipt-execution",
         idempotency_key="intent-receipt-execution",
         parent_capability_sha256=None,
@@ -173,7 +136,7 @@ def _verified() -> VerifiedMutation:
         schema_version="controlgraph.mutation-intent/v1",
         request_id=claims.request_id,
         idempotency_key=claims.idempotency_key,
-        target=root.target,
+        target=root.content.target,
         root_id=root.root_id,
         root_sha256=root_sha256,
         epoch=claims.epoch,
@@ -208,6 +171,10 @@ def _verified() -> VerifiedMutation:
     return VerifiedMutation(
         request=request,
         root=root,
+        lineage_anchor=root_records(
+            target=_target(),
+            candidate_revision_configuration_sha256=THREE_DIGEST,
+        )[1],
         caller=caller,
         capability_sha256=canonical_sha256(capability),
         claims_sha256=capability.claims_sha256,
@@ -217,62 +184,16 @@ def _verified() -> VerifiedMutation:
     )
 
 
-def _snapshot(*, epoch: int = 1) -> FinalAuthoritySnapshot:
-    root = _root()
-    root_sha256 = canonical_sha256(root)
-    claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v2",
-        target=root.target,
-        root_id=root.root_id,
-        root_sha256=root_sha256,
-        stable_revision=root.stable_snapshot.stable_revision,
-        candidate_revision=root.candidate_revision,
-        initial_epoch=root.initial_epoch,
-        baseline_service_generation=root.stable_snapshot.service_generation,
-        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
-        baseline_revision_configuration_sha256=(
-            root.stable_snapshot.stable_revision_configuration_sha256
-        ),
+def _snapshot(*, epoch: int = 1) -> RootBundle:
+    root, anchor, claim, initial_authority = root_records(
+        target=_target(),
         candidate_revision_configuration_sha256=THREE_DIGEST,
-        stable_target_configuration_sha256=(
-            rollout_root_target_configuration_sha256(
-                root,
-                stable_percent=100,
-                candidate_percent=0,
-            )
-        ),
-        candidate_target_configuration_sha256=(
-            rollout_root_target_configuration_sha256(
-                root,
-                stable_percent=0,
-                candidate_percent=100,
-            )
-        ),
-        operator_owner=root.approved_by,
-        workload_creator="controlgraph.api/v1",
-        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
-        status=ServiceClaimStatus.ACTIVE,
-        claim_request_id="request-claim",
-        claim_evidence_id="evidence-claim",
-        claimed_at="2026-08-19T12:01:01Z",
-        release_fence_epoch=None,
-        release_fence_authority_revision=None,
-        release_fenced_by=None,
-        release_fence_request_id=None,
-        release_fence_evidence_id=None,
-        release_fenced_at=None,
-        released_by=None,
-        release_request_id=None,
-        release_evidence_id=None,
-        released_at=None,
-        terminal_root_proof=None,
-        target_classification_proof=None,
     )
     authority = EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
         root_id=root.root_id,
-        root_sha256=root_sha256,
-        target=root.target,
+        root_sha256=root.root_sha256,
+        target=root.content.target,
         current_epoch=epoch,
         previous_epoch=None if epoch == 1 else epoch - 1,
         revision=epoch - 1,
@@ -281,15 +202,18 @@ def _snapshot(*, epoch: int = 1) -> FinalAuthoritySnapshot:
             if epoch == 1
             else EpochChangeCause.OPERATOR_REVOCATION
         ),
-        changed_by="controlgraph.operator/v1",
+        changed_by=(
+            initial_authority.changed_by if epoch == 1 else "controlgraph.operator/v1"
+        ),
         request_id=f"request-authority-{epoch}",
         evidence_id=f"evidence-authority-{epoch}",
         changed_at=f"2026-08-19T12:0{epoch}:00Z",
     )
-    return FinalAuthoritySnapshot(
-        root=StoredRecord(root, 0),
-        service_claim=StoredRecord(claim, 0),
-        authority=StoredRecord(authority, authority.revision),
+    return root_bundle(
+        root=root,
+        anchor=anchor,
+        claim=claim,
+        authority=authority,
     )
 
 
@@ -297,7 +221,7 @@ def _expected_state() -> TargetConfigurationProjection:
     root = _root()
     return target_configuration_projection(
         _verified().request.intent,
-        expected_concurrency=root.stable_snapshot.concurrency,
+        expected_concurrency=root.content.rollout_plan.concurrency,
     )
 
 
@@ -440,7 +364,7 @@ class _OperationSubstitutionStore(_Store):
 class _Reader:
     def __init__(
         self,
-        snapshot: FinalAuthoritySnapshot,
+        snapshot: RootBundle,
         events: list[str],
     ) -> None:
         self.target = _target()
@@ -450,10 +374,10 @@ class _Reader:
         self.started = asyncio.Event()
         self.resume = asyncio.Event()
 
-    async def read_final_authority_snapshot(
+    async def read_root_creation_bundle(
         self,
         root_id: str,
-    ) -> FinalAuthoritySnapshot:
+    ) -> RootBundle:
         assert root_id == _root().root_id
         self.events.append("authority")
         self.started.set()

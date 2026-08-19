@@ -13,14 +13,14 @@ from typing import Protocol, runtime_checkable
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreError,
     DirectReceiptCreate,
-    FinalAuthoritySnapshot,
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
-from controlgraph_canary.application.cloud_run import (
-    rollout_root_target_configuration_sha256,
-)
 from controlgraph_canary.application.identity import AuthenticationContext, ServiceRole
+from controlgraph_canary.application.root_authority import (
+    RootAuthorityBundle,
+    inspect_root_authority_bundle,
+)
 from controlgraph_canary.authority.replay import (
     MutationAction,
     MutationBinding,
@@ -30,21 +30,18 @@ from controlgraph_canary.authority.replay import (
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
-    EpochAuthorityRecord,
     EpochChangeCause,
     ExecutionReceipt,
     MutationIntent,
     ReasonCode,
     ReceiptOutcome,
-    RolloutRoot,
     TargetBinding,
     TaskRequest,
 )
+from controlgraph_canary.contracts.root_creation import RolloutRootV2
 from controlgraph_canary.contracts.storage import (
-    ServiceClaimRecord,
     ServiceClaimStatus,
     execution_receipt_logical_id,
-    service_claim_matches_root,
 )
 
 
@@ -55,10 +52,10 @@ class FinalAuthorityReader(Protocol):
     @property
     def target(self) -> TargetBinding: ...
 
-    async def read_final_authority_snapshot(
+    async def read_root_creation_bundle(
         self,
         root_id: str,
-    ) -> FinalAuthoritySnapshot | None: ...
+    ) -> RootAuthorityBundle | None: ...
 
 
 @runtime_checkable
@@ -327,7 +324,7 @@ class FinalMutationGate[ResultT]:
         if entry_denial is not None:
             return lease._denial(entry_denial)
         try:
-            snapshot = await self._authority_reader.read_final_authority_snapshot(
+            snapshot = await self._authority_reader.read_root_creation_bundle(
                 verified.request.intent.root_id
             )
         except asyncio.CancelledError:
@@ -416,7 +413,7 @@ def _binding_matches_verified(
 ) -> bool:
     if (
         type(verified.request) is not TaskRequest
-        or type(verified.root) is not RolloutRoot
+        or type(verified.root) is not RolloutRootV2
         or type(verified.caller) is not AuthenticationContext
     ):
         return False
@@ -443,29 +440,20 @@ def _binding_matches_verified(
 
 
 def _final_authority_denial(
-    snapshot: FinalAuthoritySnapshot | None,
+    snapshot: RootAuthorityBundle | None,
     *,
     verified: VerifiedMutation,
     target: TargetBinding,
     service_role: ServiceRole,
     now_second: int,
 ) -> ReasonCode | None:
-    if snapshot is None or type(snapshot) is not FinalAuthoritySnapshot:
+    if snapshot is None:
         return ReasonCode.AUTHORITY_UNAVAILABLE
-    if any(
-        type(record) is not StoredRecord
-        for record in (snapshot.root, snapshot.service_claim, snapshot.authority)
-    ):
+    state = inspect_root_authority_bundle(snapshot, target=target)
+    if state is None:
         return ReasonCode.AUTHORITY_UNAVAILABLE
-    root = snapshot.root.value
-    claim = snapshot.service_claim.value
-    authority = snapshot.authority.value
-    if (
-        type(root) is not RolloutRoot
-        or type(claim) is not ServiceClaimRecord
-        or type(authority) is not EpochAuthorityRecord
-    ):
-        return ReasonCode.AUTHORITY_UNAVAILABLE
+    claim = state.service_claim
+    authority = state.authority
     intent = verified.request.intent
     if type(verified.earliest_lineage_issued_at) is not int:
         return ReasonCode.AUTHORITY_UNAVAILABLE
@@ -479,7 +467,7 @@ def _final_authority_denial(
     if observed_authority_epoch != intent.epoch:
         return ReasonCode.EPOCH_MISMATCH
     if (
-        snapshot.service_claim.revision % 3 != 0
+        state.service_claim_revision % 3 != 0
         or claim.status is not ServiceClaimStatus.ACTIVE
         or verified.earliest_lineage_issued_at
         < _parse_utc_second(authority.changed_at)
@@ -500,7 +488,7 @@ def _final_authority_denial(
 
 
 def _observed_authority_epoch(
-    snapshot: FinalAuthoritySnapshot | None,
+    snapshot: RootAuthorityBundle | None,
     *,
     verified: VerifiedMutation,
     target: TargetBinding,
@@ -509,55 +497,30 @@ def _observed_authority_epoch(
 
 
 def _coherent_authority_epoch(
-    snapshot: FinalAuthoritySnapshot | None,
+    snapshot: RootAuthorityBundle | None,
     *,
     verified: VerifiedMutation,
     target: TargetBinding,
 ) -> int | None:
-    if snapshot is None or type(snapshot) is not FinalAuthoritySnapshot:
+    if snapshot is None:
         return None
-    if any(
-        type(record) is not StoredRecord
-        for record in (snapshot.root, snapshot.service_claim, snapshot.authority)
-    ):
+    state = inspect_root_authority_bundle(snapshot, target=target)
+    if state is None:
         return None
-    root = snapshot.root.value
-    claim = snapshot.service_claim.value
-    authority_record = snapshot.authority
-    authority = authority_record.value
-    if (
-        type(root) is not RolloutRoot
-        or type(claim) is not ServiceClaimRecord
-        or type(authority) is not EpochAuthorityRecord
-    ):
-        return None
+    root = state.root
+    anchor = state.lineage_anchor
+    claim = state.service_claim
+    authority = state.authority
     intent = verified.request.intent
-    try:
-        stable_target_configuration_sha256 = (
-            rollout_root_target_configuration_sha256(
-                root,
-                stable_percent=100,
-                candidate_percent=0,
-            )
-        )
-        candidate_target_configuration_sha256 = (
-            rollout_root_target_configuration_sha256(
-                root,
-                stable_percent=0,
-                candidate_percent=100,
-            )
-        )
-    except (TypeError, ValueError):
-        return None
     claim_lifecycle_matches = (
         claim.status is ServiceClaimStatus.ACTIVE
-        and snapshot.service_claim.revision % 3 == 0
+        and state.service_claim_revision % 3 == 0
     ) or (
         claim.status is ServiceClaimStatus.RELEASING
-        and snapshot.service_claim.revision % 3 == 1
+        and state.service_claim_revision % 3 == 1
     ) or (
         claim.status is ServiceClaimStatus.RELEASED
-        and snapshot.service_claim.revision % 3 == 2
+        and state.service_claim_revision % 3 == 2
     )
     claim_fence_matches = claim.status is ServiceClaimStatus.ACTIVE or (
         authority.revision >= 1
@@ -570,25 +533,15 @@ def _coherent_authority_epoch(
         and claim.release_fenced_at == authority.changed_at
     )
     if (
-        snapshot.root.revision != 0
-        or root != verified.root
-        or root.target != target
+        root != verified.root
+        or anchor != verified.lineage_anchor
+        or root.content.target != target
         or intent.target != target
         or root.root_id != intent.root_id
-        or canonical_sha256(root) != intent.root_sha256
+        or root.root_sha256 != intent.root_sha256
         or claim.target != target
         or claim.root_id != intent.root_id
         or claim.root_sha256 != intent.root_sha256
-        or not service_claim_matches_root(
-            claim,
-            root,
-            stable_target_configuration_sha256=(
-                stable_target_configuration_sha256
-            ),
-            candidate_target_configuration_sha256=(
-                candidate_target_configuration_sha256
-            ),
-        )
         or not claim_lifecycle_matches
         or not claim_fence_matches
         or authority.target != target
@@ -596,7 +549,7 @@ def _coherent_authority_epoch(
         or authority.root_sha256 != intent.root_sha256
         or type(authority.current_epoch) is not int
         or authority.current_epoch < 1
-        or authority_record.revision != authority.revision
+        or state.authority_revision != authority.revision
         or authority.current_epoch != authority.revision + 1
     ):
         return None

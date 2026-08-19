@@ -36,6 +36,7 @@ class ServiceRole(StrEnum):
     EXECUTOR = "executor"
     RECOVERY = "recovery"
     VERIFIER = "verifier"
+    EVIDENCE_WRITER = "evidence_writer"
 
 
 class CallerRole(StrEnum):
@@ -48,6 +49,7 @@ class CallerRole(StrEnum):
     EXECUTOR = "executor"
     RECOVERY = "recovery"
     VERIFIER = "verifier"
+    EVIDENCE_WRITER = "evidence_writer"
     EXECUTION_TASK_CALLER = "execution_task_caller"
     RECOVERY_TASK_CALLER = "recovery_task_caller"
 
@@ -111,7 +113,7 @@ class RouteAuthenticationPolicy:
             raise ValueError("protected path does not match the service role")
         _validate_audience(self.audience, self.service_role)
         expected_audience = (
-            f"https://controlgraph-{self.service_role.value}-{self.project_number}"
+            f"https://{runtime_service_name(self.service_role)}-{self.project_number}"
             ".us-central1.run.app"
         )
         if self.audience != expected_audience:
@@ -155,8 +157,19 @@ _SERVICE_ACCOUNT_IDS: dict[CallerRole, str] = {
     CallerRole.EXECUTOR: "controlgraph-executor",
     CallerRole.RECOVERY: "controlgraph-recovery",
     CallerRole.VERIFIER: "controlgraph-verifier",
+    CallerRole.EVIDENCE_WRITER: "cg-evidence-writer",
     CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
     CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
+}
+
+_SERVICE_NAMES: dict[ServiceRole, str] = {
+    ServiceRole.API: "controlgraph-api",
+    ServiceRole.COORDINATOR: "controlgraph-coordinator",
+    ServiceRole.ISSUER: "controlgraph-issuer",
+    ServiceRole.EXECUTOR: "controlgraph-executor",
+    ServiceRole.RECOVERY: "controlgraph-recovery",
+    ServiceRole.VERIFIER: "controlgraph-verifier",
+    ServiceRole.EVIDENCE_WRITER: "controlgraph-evidence-writer",
 }
 
 _PROTECTED_PATHS: dict[ServiceRole, str] = {
@@ -166,6 +179,7 @@ _PROTECTED_PATHS: dict[ServiceRole, str] = {
     ServiceRole.EXECUTOR: EXECUTION_HANDLER_PATH,
     ServiceRole.RECOVERY: RECOVERY_HANDLER_PATH,
     ServiceRole.VERIFIER: "/v1/internal/verify",
+    ServiceRole.EVIDENCE_WRITER: "/v1/internal/evidence/sign",
 }
 
 _ROUTE_CALLER_ROLES: dict[ServiceRole, CallerRole] = {
@@ -175,7 +189,16 @@ _ROUTE_CALLER_ROLES: dict[ServiceRole, CallerRole] = {
     ServiceRole.EXECUTOR: CallerRole.EXECUTION_TASK_CALLER,
     ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
     ServiceRole.VERIFIER: CallerRole.COORDINATOR,
+    ServiceRole.EVIDENCE_WRITER: CallerRole.COORDINATOR,
 }
+
+
+def runtime_service_name(role: ServiceRole) -> str:
+    """Return the exact Cloud Run service name bound to a runtime role."""
+
+    if type(role) is not ServiceRole:
+        raise ValueError("service role is invalid")
+    return _SERVICE_NAMES[role]
 
 
 def protected_path(role: ServiceRole) -> str:
@@ -260,7 +283,7 @@ def runtime_route_policy(
         raise ValueError("identity caller email does not match the protected route")
 
     expected_audience = (
-        f"https://controlgraph-{service_role.value}-{project_number}.{region}.run.app"
+        f"https://{runtime_service_name(service_role)}-{project_number}.{region}.run.app"
     )
     if audience != expected_audience:
         raise ValueError("identity audience does not match the service coordinates")
@@ -335,7 +358,7 @@ def _validate_audience(value: str, service_role: ServiceRole) -> None:
         raise ValueError("route audience is invalid") from None
     hostname = parsed.hostname
     expected_hostname = re.compile(
-        rf"^controlgraph-{re.escape(service_role.value)}-[1-9][0-9]{{5,31}}"
+        rf"^{re.escape(runtime_service_name(service_role))}-[1-9][0-9]{{5,31}}"
         r"\.us-central1\.run\.app$"
     )
     if (
@@ -367,4 +390,5 @@ __all__ = [
     "protected_path",
     "runtime_caller_emails",
     "runtime_route_policy",
+    "runtime_service_name",
 ]

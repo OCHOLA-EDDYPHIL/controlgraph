@@ -15,6 +15,7 @@ from controlgraph_canary.application.identity import (
     protected_path,
     runtime_caller_emails,
     runtime_route_policy,
+    runtime_service_name,
 )
 
 PROJECT_ID = "controlgraph-canary-abc123"
@@ -30,6 +31,7 @@ EXPECTED_CALLERS = {
     CallerRole.EXECUTOR: f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.RECOVERY: f"controlgraph-recovery@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.VERIFIER: f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
+    CallerRole.EVIDENCE_WRITER: f"cg-evidence-writer@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.EXECUTION_TASK_CALLER: (
         f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
     ),
@@ -45,6 +47,7 @@ ROUTE_CALLERS = {
     ServiceRole.EXECUTOR: CallerRole.EXECUTION_TASK_CALLER,
     ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
     ServiceRole.VERIFIER: CallerRole.COORDINATOR,
+    ServiceRole.EVIDENCE_WRITER: CallerRole.COORDINATOR,
 }
 
 
@@ -56,7 +59,7 @@ def identity_environment(role: ServiceRole) -> dict[str, str]:
         "CONTROLGRAPH_REGION": "us-central1",
         "CONTROLGRAPH_ROLE": role.value,
         "CONTROLGRAPH_AUTH_AUDIENCE": (
-            f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+            f"https://{runtime_service_name(role)}-{PROJECT_NUMBER}.us-central1.run.app"
         ),
         "CONTROLGRAPH_AUTH_CALLER_ROLE": caller_role.value,
         "CONTROLGRAPH_AUTH_CALLER_EMAIL": EXPECTED_CALLERS[caller_role],
@@ -78,12 +81,21 @@ def test_each_protected_route_has_one_exact_caller_and_audience(
     assert policy.service_role is service_role
     assert policy.path == protected_path(service_role)
     assert policy.audience == (
-        f"https://controlgraph-{service_role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+        f"https://{runtime_service_name(service_role)}-{PROJECT_NUMBER}.us-central1.run.app"
     )
     assert policy.caller.role is ROUTE_CALLERS[service_role]
     assert policy.caller.email == EXPECTED_CALLERS[ROUTE_CALLERS[service_role]]
     assert policy.caller.subject == SUBJECT
     assert expected_route_caller_role(service_role) is ROUTE_CALLERS[service_role]
+
+
+def test_evidence_writer_identity_and_route_are_exact() -> None:
+    assert runtime_service_name(ServiceRole.EVIDENCE_WRITER) == "controlgraph-evidence-writer"
+    assert protected_path(ServiceRole.EVIDENCE_WRITER) == "/v1/internal/evidence/sign"
+    assert (
+        EXPECTED_CALLERS[CallerRole.EVIDENCE_WRITER]
+        == f"cg-evidence-writer@{PROJECT_ID}.iam.gserviceaccount.com"
+    )
 
 
 @pytest.mark.parametrize(

@@ -3,12 +3,13 @@ locals {
   service_subjects = data.terraform_remote_state.foundation.outputs.service_account_subjects
   project_number   = tostring(data.terraform_remote_state.foundation.outputs.project_number)
   service_names = {
-    api         = "controlgraph-api"
-    coordinator = "controlgraph-coordinator"
-    issuer      = "controlgraph-issuer"
-    executor    = "controlgraph-executor"
-    recovery    = "controlgraph-recovery"
-    verifier    = "controlgraph-verifier"
+    api             = "controlgraph-api"
+    coordinator     = "controlgraph-coordinator"
+    issuer          = "controlgraph-issuer"
+    executor        = "controlgraph-executor"
+    recovery        = "controlgraph-recovery"
+    verifier        = "controlgraph-verifier"
+    evidence_writer = "controlgraph-evidence-writer"
   }
 
   controller_digest = regex("sha256:([0-9a-f]{64})$", var.controller_image)[0]
@@ -44,6 +45,7 @@ locals {
     executor              = local.service_accounts.executor
     recovery              = local.service_accounts.recovery
     verifier              = local.service_accounts.verifier
+    evidence_writer       = local.service_accounts.evidence_writer
     execution_task_caller = local.service_accounts.execution_task_caller
     recovery_task_caller  = local.service_accounts.recovery_task_caller
   }
@@ -56,17 +58,19 @@ locals {
     executor              = tostring(local.service_subjects.executor)
     recovery              = tostring(local.service_subjects.recovery)
     verifier              = tostring(local.service_subjects.verifier)
+    evidence_writer       = tostring(local.service_subjects.evidence_writer)
     execution_task_caller = tostring(local.service_subjects.execution_task_caller)
     recovery_task_caller  = tostring(local.service_subjects.recovery_task_caller)
   }
 
   route_caller_roles = {
-    api         = "operator"
-    coordinator = "api"
-    issuer      = "coordinator"
-    executor    = "execution_task_caller"
-    recovery    = "recovery_task_caller"
-    verifier    = "coordinator"
+    api             = "operator"
+    coordinator     = "api"
+    issuer          = "coordinator"
+    executor        = "execution_task_caller"
+    recovery        = "recovery_task_caller"
+    verifier        = "coordinator"
+    evidence_writer = "coordinator"
   }
 
   identity_environment = {
@@ -106,6 +110,7 @@ check "runtime_identity_map_is_closed" {
         "executor",
         "recovery",
         "verifier",
+        "evidence_writer",
         "execution_task_caller",
         "recovery_task_caller",
       ]) &&
@@ -113,6 +118,19 @@ check "runtime_identity_map_is_closed" {
       toset(keys(local.route_caller_roles)) == toset(keys(local.service_names))
     )
     error_message = "Runtime identity and protected-route caller maps must remain complete and closed."
+  }
+}
+
+check "evidence_writer_route_is_fixed" {
+  assert {
+    condition = (
+      local.service_names.evidence_writer == "controlgraph-evidence-writer" &&
+      local.route_caller_roles.evidence_writer == "coordinator" &&
+      local.identity_environment.evidence_writer.CONTROLGRAPH_AUTH_AUDIENCE == local.service_audiences.evidence_writer &&
+      local.identity_environment.evidence_writer.CONTROLGRAPH_AUTH_CALLER_EMAIL == local.service_accounts.coordinator &&
+      local.identity_environment.evidence_writer.CONTROLGRAPH_AUTH_CALLER_SUBJECT == tostring(local.service_subjects.coordinator)
+    )
+    error_message = "The evidence-writer route must remain bound to its fixed audience and coordinator identity."
   }
 }
 
