@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self, cast
 
@@ -12,7 +13,11 @@ from controlgraph_canary.authority.replay import MutationTargetKey, receipt_clai
 from controlgraph_canary.contracts.base import (
     MAX_CONTRACT_BYTES,
     BoundedText,
+    CloudRunName,
     Identifier,
+    NonNegativeSafeInteger,
+    OpaqueToken,
+    PositiveSafeInteger,
     Sha256Digest,
     StrictContractModel,
     UtcSecond,
@@ -29,51 +34,345 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
 )
 
-SERVICE_CLAIM_V1: Final = "controlgraph.service-claim/v1"
+SERVICE_CLAIM_V2: Final = "controlgraph.service-claim/v2"
 AUTHORITY_STORAGE_DOCUMENT_V1: Final = "controlgraph.authority-storage-document/v1"
 FIRESTORE_DOCUMENT_ID_DOMAIN: Final = b"controlgraph.firestore-document-id/v1\0"
+SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1: Final = (
+    "controlgraph.service-claim-terminal-root-proof/v1"
+)
+SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1: Final = (
+    "controlgraph.service-claim-target-classification-proof/v1"
+)
+SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION: Final = (
+    "FENCED_EPOCH_AND_INDEPENDENT_TARGET_CLASSIFICATION_V2"
+)
+
+_CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
+_CONTROLGRAPH_ENVIRONMENT: Final = "nonprod"
+_CONTROLGRAPH_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
 
 
 class ServiceClaimStatus(StrEnum):
     """Closed lifecycle for the single active-root claim on one service."""
 
     ACTIVE = "ACTIVE"
+    RELEASING = "RELEASING"
     RELEASED = "RELEASED"
+
+
+class ServiceClaimTerminalRootState(StrEnum):
+    """Closed terminal root states that can participate in claim release."""
+
+    PROMOTED = "PROMOTED"
+    RECOVERED = "RECOVERED"
+
+
+class ServiceClaimTargetClassification(StrEnum):
+    """Independent target classifications admitted for terminal release."""
+
+    CANDIDATE_PROMOTED = "CANDIDATE_PROMOTED"
+    STABLE_RESTORED = "STABLE_RESTORED"
+
+
+def _require_service_claim_target(target: TargetBinding) -> None:
+    if type(target) is not TargetBinding:
+        raise TypeError("service claim target must be exact")
+    if (
+        _CONTROLGRAPH_PROJECT_ID.fullmatch(target.project_id) is None
+        or "reconcile" in target.project_id
+        or target.region != "us-central1"
+        or target.environment != _CONTROLGRAPH_ENVIRONMENT
+        or target.service_name != _CONTROLGRAPH_REFERENCE_SERVICE
+    ):
+        raise ValueError("service claim target is outside the ControlGraph boundary")
+
+
+class ServiceClaimTerminalRootProof(StrictContractModel):
+    """Canonical reference to terminal-root evidence presented for release."""
+
+    schema_version: Literal["controlgraph.service-claim-terminal-root-proof/v1"]
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    state: ServiceClaimTerminalRootState
+    target_configuration_sha256: Sha256Digest
+    evidence_id: Identifier
+    evidence_sha256: Sha256Digest
+    confirmed_by: Literal["controlgraph.coordinator/v1"]
+    confirmed_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_target(self) -> Self:
+        _require_service_claim_target(self.target)
+        return self
+
+
+class ServiceClaimTargetClassificationProof(StrictContractModel):
+    """Canonical reference to verifier classification evidence presented for release."""
+
+    schema_version: Literal[
+        "controlgraph.service-claim-target-classification-proof/v1"
+    ]
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    classification: ServiceClaimTargetClassification
+    fenced_epoch: PositiveSafeInteger
+    fenced_authority_revision: NonNegativeSafeInteger
+    service_generation: PositiveSafeInteger
+    provider_etag: OpaqueToken
+    target_configuration_sha256: Sha256Digest
+    evidence_id: Identifier
+    evidence_sha256: Sha256Digest
+    classified_by: BoundedText
+    classified_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_independent_reader(self) -> Self:
+        _require_service_claim_target(self.target)
+        expected_reader = (
+            f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
+        )
+        if self.classified_by != expected_reader:
+            raise ValueError("target classification is not bound to the verifier identity")
+        return self
 
 
 class ServiceClaimRecord(StrictContractModel):
     """One service's ownership by an immutable rollout root."""
 
-    schema_version: Literal["controlgraph.service-claim/v1"]
+    schema_version: Literal["controlgraph.service-claim/v2"]
     target: TargetBinding
     root_id: Identifier
     root_sha256: Sha256Digest
+    stable_revision: CloudRunName
+    candidate_revision: CloudRunName
+    initial_epoch: Literal[1]
+    baseline_service_generation: NonNegativeSafeInteger
+    baseline_configuration_sha256: Sha256Digest
+    baseline_revision_configuration_sha256: Sha256Digest
+    candidate_revision_configuration_sha256: Sha256Digest
+    stable_target_configuration_sha256: Sha256Digest
+    candidate_target_configuration_sha256: Sha256Digest
+    operator_owner: BoundedText
+    workload_creator: Literal["controlgraph.api/v1"]
+    terminal_release_condition: Literal[
+        "FENCED_EPOCH_AND_INDEPENDENT_TARGET_CLASSIFICATION_V2"
+    ]
     status: ServiceClaimStatus
-    claimed_by: BoundedText
     claim_request_id: Identifier
     claim_evidence_id: Identifier
     claimed_at: UtcSecond
-    released_by: BoundedText | None
+    release_fence_epoch: PositiveSafeInteger | None
+    release_fence_authority_revision: NonNegativeSafeInteger | None
+    release_fenced_by: Literal["controlgraph.operator/v1"] | None
+    release_fence_request_id: Identifier | None
+    release_fence_evidence_id: Identifier | None
+    release_fenced_at: UtcSecond | None
+    released_by: Literal["controlgraph.coordinator/v1"] | None
     release_request_id: Identifier | None
     release_evidence_id: Identifier | None
     released_at: UtcSecond | None
+    terminal_root_proof: ServiceClaimTerminalRootProof | None
+    target_classification_proof: ServiceClaimTargetClassificationProof | None
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
-        release_values = (
+        _require_service_claim_target(self.target)
+        if self.operator_owner == self.workload_creator:
+            raise ValueError("service claim operator and workload identities must differ")
+        if self.stable_revision == self.candidate_revision:
+            raise ValueError("service claim revisions must differ")
+        prefix = f"{self.target.service_name}-"
+        if not self.stable_revision.startswith(prefix) or not self.candidate_revision.startswith(
+            prefix
+        ):
+            raise ValueError("service claim revisions are outside the target service")
+        fence_values = (
+            self.release_fence_epoch,
+            self.release_fence_authority_revision,
+            self.release_fenced_by,
+            self.release_fence_request_id,
+            self.release_fence_evidence_id,
+            self.release_fenced_at,
+            self.terminal_root_proof,
+        )
+        final_release_values = (
             self.released_by,
             self.release_request_id,
             self.release_evidence_id,
             self.released_at,
+            self.target_classification_proof,
         )
         if self.status is ServiceClaimStatus.ACTIVE:
-            if any(value is not None for value in release_values):
+            if any(value is not None for value in (*fence_values, *final_release_values)):
                 raise ValueError("active service claim cannot contain release metadata")
-        elif any(value is None for value in release_values):
+            return self
+        if any(value is None for value in fence_values):
+            raise ValueError("non-active service claim requires a complete epoch fence")
+        if self.status is ServiceClaimStatus.RELEASING:
+            if any(value is not None for value in final_release_values):
+                raise ValueError("releasing service claim cannot contain final release metadata")
+        elif any(value is None for value in final_release_values):
             raise ValueError("released service claim requires complete release metadata")
-        elif self.released_at is not None and self.released_at < self.claimed_at:
-            raise ValueError("service claim release predates its creation")
+        terminal = cast(ServiceClaimTerminalRootProof, self.terminal_root_proof)
+        if (
+            terminal.target != self.target
+            or terminal.root_id != self.root_id
+            or terminal.root_sha256 != self.root_sha256
+        ):
+            raise ValueError("service claim terminal proof does not match its root and target")
+        expected_configuration = {
+            ServiceClaimTerminalRootState.PROMOTED: (
+                self.candidate_target_configuration_sha256
+            ),
+            ServiceClaimTerminalRootState.RECOVERED: (
+                self.stable_target_configuration_sha256
+            ),
+        }[terminal.state]
+        if terminal.target_configuration_sha256 != expected_configuration:
+            raise ValueError("terminal root proof does not match the expected target state")
+        release_fence_epoch = cast(int, self.release_fence_epoch)
+        release_fence_revision = cast(int, self.release_fence_authority_revision)
+        release_fence_evidence_id = cast(str, self.release_fence_evidence_id)
+        release_fenced_at = cast(str, self.release_fenced_at)
+        if (
+            release_fence_epoch <= self.initial_epoch
+            or release_fence_revision != release_fence_epoch - self.initial_epoch
+            or not self.claimed_at <= terminal.confirmed_at <= release_fenced_at
+            or terminal.evidence_id == release_fence_evidence_id
+        ):
+            raise ValueError("service claim epoch fence is not a later terminal transition")
+        if self.status is ServiceClaimStatus.RELEASING:
+            return self
+        classification = cast(
+            ServiceClaimTargetClassificationProof,
+            self.target_classification_proof,
+        )
+        if (
+            classification.target != self.target
+            or classification.root_id != self.root_id
+            or classification.root_sha256 != self.root_sha256
+        ):
+            raise ValueError("target classification does not match the claimed root")
+        expected_classification = {
+            ServiceClaimTerminalRootState.PROMOTED: (
+                ServiceClaimTargetClassification.CANDIDATE_PROMOTED
+            ),
+            ServiceClaimTerminalRootState.RECOVERED: (
+                ServiceClaimTargetClassification.STABLE_RESTORED
+            ),
+        }[terminal.state]
+        if (
+            classification.classification is not expected_classification
+            or classification.target_configuration_sha256 != expected_configuration
+            or classification.fenced_epoch != release_fence_epoch
+            or classification.fenced_authority_revision != release_fence_revision
+        ):
+            raise ValueError("terminal root and target classification are incoherent")
+        if classification.service_generation <= self.baseline_service_generation:
+            raise ValueError("target classification predates the claimed baseline")
+        release_evidence_id = cast(str, self.release_evidence_id)
+        if (
+            len(
+                {
+                    self.claim_evidence_id,
+                    terminal.evidence_id,
+                    release_fence_evidence_id,
+                    classification.evidence_id,
+                    release_evidence_id,
+                }
+            )
+            != 5
+            or len(
+                {
+                    terminal.evidence_sha256,
+                    classification.evidence_sha256,
+                }
+            )
+            != 2
+        ):
+            raise ValueError("claim transition evidence must be independent")
+        released_at = cast(str, self.released_at)
+        if not (
+            release_fenced_at <= classification.classified_at <= released_at
+        ):
+            raise ValueError("service claim release proof times are not ordered")
         return self
+
+
+def service_claim_matches_root(
+    claim: ServiceClaimRecord,
+    root: RolloutRoot,
+    *,
+    stable_target_configuration_sha256: str,
+    candidate_target_configuration_sha256: str,
+) -> bool:
+    """Return whether one claim exactly binds an immutable rollout root."""
+
+    if type(claim) is not ServiceClaimRecord or type(root) is not RolloutRoot:
+        return False
+    if any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (
+            stable_target_configuration_sha256,
+            candidate_target_configuration_sha256,
+        )
+    ):
+        return False
+    expected_reader = (
+        f"controlgraph-verifier@{root.target.project_id}.iam.gserviceaccount.com"
+    )
+    return (
+        claim.target == root.target
+        and claim.root_id == root.root_id
+        and claim.root_sha256 == canonical_sha256(root)
+        and claim.stable_revision == root.stable_snapshot.stable_revision
+        and claim.candidate_revision == root.candidate_revision
+        and claim.initial_epoch == root.initial_epoch
+        and (
+            claim.baseline_service_generation
+            == root.stable_snapshot.service_generation
+        )
+        and (
+            claim.baseline_configuration_sha256
+            == root.stable_snapshot.configuration_sha256
+        )
+        and (
+            claim.baseline_revision_configuration_sha256
+            == root.stable_snapshot.stable_revision_configuration_sha256
+        )
+        and (
+            claim.stable_target_configuration_sha256
+            == stable_target_configuration_sha256
+        )
+        and (
+            claim.candidate_target_configuration_sha256
+            == candidate_target_configuration_sha256
+        )
+        and claim.operator_owner == root.approved_by
+        and claim.workload_creator == "controlgraph.api/v1"
+        and claim.terminal_release_condition == SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+        and root.stable_snapshot.captured_by == expected_reader
+        and root.stable_snapshot.captured_at <= root.approved_at <= claim.claimed_at
+    )
+
+
+def active_service_claim_matches_root(
+    claim: ServiceClaimRecord,
+    root: RolloutRoot,
+    *,
+    stable_target_configuration_sha256: str,
+    candidate_target_configuration_sha256: str,
+) -> bool:
+    """Return whether one active claim exactly binds an immutable rollout root."""
+
+    return claim.status is ServiceClaimStatus.ACTIVE and service_claim_matches_root(
+        claim,
+        root,
+        stable_target_configuration_sha256=stable_target_configuration_sha256,
+        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+    )
 
 
 class AuthorityStorageKind(StrEnum):
@@ -121,7 +420,15 @@ class AuthorityStorageDocument(StrictContractModel):
         ):
             raise ValueError("authority storage and payload revisions do not match")
         if self.record_kind is AuthorityStorageKind.SERVICE_CLAIM:
-            expected_logical_id = canonical_sha256(payload.target)
+            claim = cast(ServiceClaimRecord, payload)
+            expected_revision_remainder = {
+                ServiceClaimStatus.ACTIVE: 0,
+                ServiceClaimStatus.RELEASING: 1,
+                ServiceClaimStatus.RELEASED: 2,
+            }[claim.status]
+            if self.revision % 3 != expected_revision_remainder:
+                raise ValueError("service claim lifecycle and storage revision do not match")
+            expected_logical_id = service_claim_logical_id(claim.target)
         elif self.record_kind is AuthorityStorageKind.EXECUTION_RECEIPT:
             receipt = cast(ExecutionReceipt, payload)
             expected_logical_id = execution_receipt_logical_id(
@@ -162,13 +469,12 @@ def rollout_root_document_id(root_id: str) -> str:
 def service_claim_logical_id(target: TargetBinding) -> str:
     """Return the canonical service identity without exposing a Firestore path."""
 
-    if type(target) is not TargetBinding:
-        raise TypeError("service claim target must be exact")
+    _require_service_claim_target(target)
     return canonical_sha256(target)
 
 
 def service_claim_document_id(target: TargetBinding) -> str:
-    """Return the domain-separated document ID for one configured service."""
+    """Return the schema-stable document ID for one configured service."""
 
     return _document_id(AuthorityStorageKind.SERVICE_CLAIM, service_claim_logical_id(target))
 
@@ -207,15 +513,24 @@ def execution_receipt_document_id(target: TargetBinding, idempotency_key: str) -
 __all__ = [
     "AUTHORITY_STORAGE_DOCUMENT_V1",
     "FIRESTORE_DOCUMENT_ID_DOMAIN",
-    "SERVICE_CLAIM_V1",
+    "SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1",
+    "SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION",
+    "SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1",
+    "SERVICE_CLAIM_V2",
     "AuthorityStorageDocument",
     "AuthorityStorageKind",
     "ServiceClaimRecord",
     "ServiceClaimStatus",
+    "ServiceClaimTargetClassification",
+    "ServiceClaimTargetClassificationProof",
+    "ServiceClaimTerminalRootProof",
+    "ServiceClaimTerminalRootState",
+    "active_service_claim_matches_root",
     "epoch_authority_document_id",
     "execution_receipt_document_id",
     "execution_receipt_logical_id",
     "rollout_root_document_id",
     "service_claim_document_id",
     "service_claim_logical_id",
+    "service_claim_matches_root",
 ]

@@ -41,6 +41,7 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunMutationResult,
     CloudRunTrafficAllocation,
     TargetConfigurationProjection,
+    rollout_root_target_configuration_sha256,
     target_configuration_projection,
 )
 from controlgraph_canary.application.execution import FinalMutationGate, MutationPermit
@@ -88,6 +89,7 @@ from controlgraph_canary.contracts import (
     encode_base64url,
 )
 from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
     ServiceClaimRecord,
     ServiceClaimStatus,
 )
@@ -118,8 +120,8 @@ def _target(**overrides: object) -> TargetBinding:
         "schema_version": "controlgraph.target-binding/v1",
         "project_id": PROJECT_ID,
         "region": "us-central1",
-        "environment": "acceptance",
-        "service_name": "reference-target",
+        "environment": "nonprod",
+        "service_name": "controlgraph-reference-target",
     }
     values.update(overrides)
     return TargetBinding(**values)  # type: ignore[arg-type]
@@ -130,22 +132,27 @@ def _root() -> RolloutRoot:
     snapshot = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=target,
-        stable_revision="reference-target-stable",
-        traffic=(TrafficAllocation(revision="reference-target-stable", percent=100),),
+        stable_revision="controlgraph-reference-target-stable-v1",
+        traffic=(
+            TrafficAllocation(
+                revision="controlgraph-reference-target-stable-v1",
+                percent=100,
+            ),
+        ),
         concurrency=40,
         service_generation=7,
         provider_etag="etag-stable-7",
         configuration_sha256=ZERO_DIGEST,
         stable_revision_configuration_sha256=ONE_DIGEST,
         captured_at="2026-08-19T12:00:00Z",
-        captured_by="controlgraph.operator/v1",
+        captured_by=f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
     )
     return RolloutRoot(
         schema_version="controlgraph.rollout-root/v1",
         root_id="root-001",
         target=target,
         stable_snapshot=snapshot,
-        candidate_revision="reference-target-candidate",
+        candidate_revision="controlgraph-reference-target-candidate-v1",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
@@ -695,19 +702,52 @@ def _joined_final_snapshot(*, epoch: int = 1) -> FinalAuthoritySnapshot:
     root = _root()
     root_sha256 = canonical_sha256(root)
     claim = ServiceClaimRecord(
-        schema_version="controlgraph.service-claim/v1",
+        schema_version="controlgraph.service-claim/v2",
         target=root.target,
         root_id=root.root_id,
         root_sha256=root_sha256,
+        stable_revision=root.stable_snapshot.stable_revision,
+        candidate_revision=root.candidate_revision,
+        initial_epoch=root.initial_epoch,
+        baseline_service_generation=root.stable_snapshot.service_generation,
+        baseline_configuration_sha256=root.stable_snapshot.configuration_sha256,
+        baseline_revision_configuration_sha256=(
+            root.stable_snapshot.stable_revision_configuration_sha256
+        ),
+        candidate_revision_configuration_sha256=THREE_DIGEST,
+        stable_target_configuration_sha256=(
+            rollout_root_target_configuration_sha256(
+                root,
+                stable_percent=100,
+                candidate_percent=0,
+            )
+        ),
+        candidate_target_configuration_sha256=(
+            rollout_root_target_configuration_sha256(
+                root,
+                stable_percent=0,
+                candidate_percent=100,
+            )
+        ),
+        operator_owner=root.approved_by,
+        workload_creator="controlgraph.api/v1",
+        terminal_release_condition=SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
         status=ServiceClaimStatus.ACTIVE,
-        claimed_by="controlgraph.api/v1",
         claim_request_id="request-claim-001",
         claim_evidence_id="evidence-claim-001",
         claimed_at="2026-08-19T12:01:01Z",
+        release_fence_epoch=None,
+        release_fence_authority_revision=None,
+        release_fenced_by=None,
+        release_fence_request_id=None,
+        release_fence_evidence_id=None,
+        release_fenced_at=None,
         released_by=None,
         release_request_id=None,
         release_evidence_id=None,
         released_at=None,
+        terminal_root_proof=None,
+        target_classification_proof=None,
     )
     authority = EpochAuthorityRecord(
         schema_version="controlgraph.epoch-authority/v1",
@@ -1093,7 +1133,10 @@ def _denial_scenario(
         expected = ReasonCode.TARGET_BINDING_MISMATCH
     elif name == "revision":
         altered = _signed(
-            _claims(role, stable_revision="reference-target-other-stable"),
+            _claims(
+                role,
+                stable_revision="controlgraph-reference-target-other-stable",
+            ),
             private_key,
         )
         payload = canonical_json_bytes(_task(altered))

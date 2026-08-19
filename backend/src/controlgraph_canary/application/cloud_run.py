@@ -10,7 +10,7 @@ from typing import Final
 
 from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 from controlgraph_canary.contracts.codec import RestrictedJson, canonical_json_value_bytes
-from controlgraph_canary.contracts.models import MutationIntent, TargetBinding
+from controlgraph_canary.contracts.models import MutationIntent, RolloutRoot, TargetBinding
 
 TARGET_CONFIGURATION_DOMAIN: Final = b"controlgraph.target-configuration-sha256/v1\0"
 TARGET_CONFIGURATION_V1: Final = "controlgraph.target-configuration/v1"
@@ -409,6 +409,16 @@ def target_configuration_sha256(
         intent,
         expected_concurrency=expected_concurrency,
     )
+    return target_configuration_projection_sha256(projected)
+
+
+def target_configuration_projection_sha256(
+    projected: TargetConfigurationProjection,
+) -> str:
+    """Hash one exact provider-neutral traffic projection."""
+
+    if type(projected) is not TargetConfigurationProjection:
+        raise TypeError("an exact target configuration projection is required")
     value: RestrictedJson = {
         "candidate_percent": projected.candidate_percent,
         "candidate_revision": projected.candidate_revision,
@@ -421,6 +431,28 @@ def target_configuration_sha256(
     return hashlib.sha256(
         TARGET_CONFIGURATION_DOMAIN + canonical_json_value_bytes(value)
     ).hexdigest()
+
+
+def rollout_root_target_configuration_sha256(
+    root: RolloutRoot,
+    *,
+    stable_percent: int,
+    candidate_percent: int,
+) -> str:
+    """Hash one root-bound target traffic state without provider types."""
+
+    if type(root) is not RolloutRoot:
+        raise TypeError("an exact rollout root is required")
+    return target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.target,
+            stable_revision=root.stable_snapshot.stable_revision,
+            candidate_revision=root.candidate_revision,
+            stable_percent=stable_percent,
+            candidate_percent=candidate_percent,
+            concurrency=root.stable_snapshot.concurrency,
+        )
+    )
 
 
 def cloud_run_revision_configuration_sha256(
@@ -749,6 +781,8 @@ __all__ = [
     "DeclaredRevision",
     "TargetConfigurationProjection",
     "cloud_run_revision_configuration_sha256",
+    "rollout_root_target_configuration_sha256",
     "target_configuration_projection",
+    "target_configuration_projection_sha256",
     "target_configuration_sha256",
 ]

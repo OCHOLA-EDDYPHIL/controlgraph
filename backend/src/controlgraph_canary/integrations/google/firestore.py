@@ -22,6 +22,7 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreUnavailable,
     CreatedRollout,
     DirectReceiptCreate,
+    FencedServiceClaim,
     FinalAuthoritySnapshot,
     IssuanceStateSnapshot,
     ReceiptClaimAdopted,
@@ -31,6 +32,9 @@ from controlgraph_canary.application.authority_store import (
     ReleasedServiceClaim,
     StoredRecord,
     validate_receipt_claim_binding,
+)
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_target_configuration_sha256,
 )
 from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts.base import StrictContractModel
@@ -53,6 +57,7 @@ from controlgraph_canary.contracts.storage import (
     AuthorityStorageKind,
     ServiceClaimRecord,
     ServiceClaimStatus,
+    active_service_claim_matches_root,
     epoch_authority_document_id,
     execution_receipt_document_id,
     execution_receipt_logical_id,
@@ -67,6 +72,7 @@ FIRESTORE_OPERATION_TIMEOUT_SECONDS: Final = 5.0
 FIRESTORE_MAX_TRANSACTION_ATTEMPTS: Final = 3
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
+_SHA256_DIGEST: Final = re.compile(r"^[0-9a-f]{64}$")
 _DOCUMENT_FIELDS: Final = frozenset(AuthorityStorageDocument.model_fields)
 _KNOWN_CONTENTION = (
     api_exceptions.Aborted,
@@ -232,6 +238,7 @@ def _validate_project_binding(target: TargetBinding, configured_project_id: str)
         raise ValueError("Firestore authority target project does not match configuration")
     if target.region != FIRESTORE_AUTHORITY_REGION:
         raise ValueError("Firestore authority target must use us-central1")
+    service_claim_logical_id(target)
 
 
 def _reject_emulator_host() -> None:
@@ -385,14 +392,47 @@ def _validate_initial_rollout(
     root: RolloutRoot,
     claim: ServiceClaimRecord,
     authority: EpochAuthorityRecord,
+    *,
+    verified_candidate_revision_configuration_sha256: str,
 ) -> None:
+    if (
+        type(verified_candidate_revision_configuration_sha256) is not str
+        or _SHA256_DIGEST.fullmatch(
+            verified_candidate_revision_configuration_sha256
+        )
+        is None
+    ):
+        raise ValueError("verified candidate configuration is not a SHA-256 digest")
+    if (
+        claim.candidate_revision_configuration_sha256
+        != verified_candidate_revision_configuration_sha256
+    ):
+        raise ValueError("verified candidate configuration does not match the claim")
     if any(value.target != configured_target for value in (root, claim, authority)):
         raise ValueError("rollout records do not match the configured target")
     root_sha256 = canonical_sha256(root)
+    stable_configuration_sha256 = rollout_root_target_configuration_sha256(
+        root,
+        stable_percent=100,
+        candidate_percent=0,
+    )
+    candidate_configuration_sha256 = rollout_root_target_configuration_sha256(
+        root,
+        stable_percent=0,
+        candidate_percent=100,
+    )
     if (
-        claim.root_id != root.root_id
-        or claim.root_sha256 != root_sha256
-        or claim.status is not ServiceClaimStatus.ACTIVE
+        not active_service_claim_matches_root(
+            claim,
+            root,
+            stable_target_configuration_sha256=stable_configuration_sha256,
+            candidate_target_configuration_sha256=candidate_configuration_sha256,
+        )
+        or authority.changed_by != claim.operator_owner
+        or claim.operator_owner != root.approved_by
+        or claim.operator_owner == claim.workload_creator
+        or root.approved_by == claim.workload_creator
+        or authority.changed_by == claim.workload_creator
         or authority.root_id != root.root_id
         or authority.root_sha256 != root_sha256
         or authority.current_epoch != root.initial_epoch
@@ -401,6 +441,7 @@ def _validate_initial_rollout(
         or authority.cause is not EpochChangeCause.ROOT_CREATED
         or claim.claim_request_id != authority.request_id
         or claim.claim_evidence_id != authority.evidence_id
+        or claim.claimed_at != authority.changed_at
     ):
         raise ValueError("initial rollout records are not one atomic authority state")
 
@@ -429,7 +470,30 @@ def _validate_authority_advance(
         raise ValueError("authority replacement is not a monotonic advance")
 
 
-def _validate_claim_release(
+def _claim_ownership_binding(claim: ServiceClaimRecord) -> tuple[object, ...]:
+    return (
+        claim.target,
+        claim.root_id,
+        claim.root_sha256,
+        claim.stable_revision,
+        claim.candidate_revision,
+        claim.initial_epoch,
+        claim.baseline_service_generation,
+        claim.baseline_configuration_sha256,
+        claim.baseline_revision_configuration_sha256,
+        claim.candidate_revision_configuration_sha256,
+        claim.stable_target_configuration_sha256,
+        claim.candidate_target_configuration_sha256,
+        claim.operator_owner,
+        claim.workload_creator,
+        claim.terminal_release_condition,
+        claim.claim_request_id,
+        claim.claim_evidence_id,
+        claim.claimed_at,
+    )
+
+
+def _validate_claim_fence(
     configured_target: TargetBinding,
     expected: StoredRecord[ServiceClaimRecord],
     replacement: ServiceClaimRecord,
@@ -439,31 +503,22 @@ def _validate_claim_release(
         raise TypeError("service claim compare-and-set requires exact claim records")
     if current.target != configured_target or replacement.target != configured_target:
         raise ValueError("service claim does not match the configured target")
-    immutable_fields_match = (
-        replacement.target == current.target
-        and replacement.root_id == current.root_id
-        and replacement.root_sha256 == current.root_sha256
-        and replacement.claimed_by == current.claimed_by
-        and replacement.claim_request_id == current.claim_request_id
-        and replacement.claim_evidence_id == current.claim_evidence_id
-        and replacement.claimed_at == current.claimed_at
-    )
     if (
         current.status is not ServiceClaimStatus.ACTIVE
-        or replacement.status is not ServiceClaimStatus.RELEASED
-        or not immutable_fields_match
+        or replacement.status is not ServiceClaimStatus.RELEASING
+        or _claim_ownership_binding(replacement) != _claim_ownership_binding(current)
     ):
-        raise ValueError("service claim replacement is not an exact release")
+        raise ValueError("service claim replacement is not an exact epoch fence")
 
 
-def _validate_claim_release_authority(
+def _validate_claim_fence_authority(
     configured_target: TargetBinding,
     expected_claim: StoredRecord[ServiceClaimRecord],
     replacement_claim: ServiceClaimRecord,
     expected_authority: StoredRecord[EpochAuthorityRecord],
     replacement_authority: EpochAuthorityRecord,
 ) -> None:
-    _validate_claim_release(configured_target, expected_claim, replacement_claim)
+    _validate_claim_fence(configured_target, expected_claim, replacement_claim)
     _validate_authority_advance(
         configured_target,
         expected_authority,
@@ -476,13 +531,92 @@ def _validate_claim_release_authority(
         or current_claim.root_sha256 != current_authority.root_sha256
         or replacement_claim.root_id != replacement_authority.root_id
         or replacement_claim.root_sha256 != replacement_authority.root_sha256
-        or replacement_claim.released_by != replacement_authority.changed_by
-        or replacement_claim.release_request_id != replacement_authority.request_id
-        or replacement_claim.release_evidence_id != replacement_authority.evidence_id
-        or replacement_claim.released_at != replacement_authority.changed_at
+        or replacement_claim.release_fence_epoch
+        != replacement_authority.current_epoch
+        or replacement_claim.release_fence_authority_revision
+        != replacement_authority.revision
+        or replacement_claim.release_fenced_by != replacement_authority.changed_by
+        or replacement_claim.release_fence_request_id
+        != replacement_authority.request_id
+        or replacement_claim.release_fence_evidence_id
+        != replacement_authority.evidence_id
+        or replacement_claim.release_fenced_at != replacement_authority.changed_at
         or replacement_authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
     ):
-        raise ValueError("service claim release and authority advance are not one transition")
+        raise ValueError("service claim fence and authority advance are not one transition")
+
+
+def _validate_claim_release(
+    configured_target: TargetBinding,
+    expected_claim: StoredRecord[ServiceClaimRecord],
+    replacement_claim: ServiceClaimRecord,
+    expected_authority: StoredRecord[EpochAuthorityRecord],
+) -> None:
+    current = expected_claim.value
+    authority = expected_authority.value
+    if (
+        type(current) is not ServiceClaimRecord
+        or type(replacement_claim) is not ServiceClaimRecord
+        or type(authority) is not EpochAuthorityRecord
+    ):
+        raise TypeError("service claim release requires exact authority records")
+    if current.target != configured_target or replacement_claim.target != configured_target:
+        raise ValueError("service claim does not match the configured target")
+    if (
+        current.status is not ServiceClaimStatus.RELEASING
+        or replacement_claim.status is not ServiceClaimStatus.RELEASED
+        or _claim_ownership_binding(replacement_claim) != _claim_ownership_binding(current)
+        or replacement_claim.release_fence_epoch != current.release_fence_epoch
+        or replacement_claim.release_fence_authority_revision
+        != current.release_fence_authority_revision
+        or replacement_claim.release_fenced_by != current.release_fenced_by
+        or replacement_claim.release_fence_request_id
+        != current.release_fence_request_id
+        or replacement_claim.release_fence_evidence_id
+        != current.release_fence_evidence_id
+        or replacement_claim.release_fenced_at != current.release_fenced_at
+        or replacement_claim.terminal_root_proof != current.terminal_root_proof
+        or authority.target != current.target
+        or authority.root_id != current.root_id
+        or authority.root_sha256 != current.root_sha256
+        or authority.current_epoch != current.release_fence_epoch
+        or authority.revision != current.release_fence_authority_revision
+        or expected_authority.revision != authority.revision
+        or authority.changed_at != current.release_fenced_at
+    ):
+        raise ValueError("service claim replacement is not an exact fenced release")
+
+
+def _validate_released_takeover(
+    configured_target: TargetBinding,
+    expected_released_claim: StoredRecord[ServiceClaimRecord],
+    root: RolloutRoot,
+    claim: ServiceClaimRecord,
+    authority: EpochAuthorityRecord,
+    *,
+    verified_candidate_revision_configuration_sha256: str,
+) -> None:
+    _validate_initial_rollout(
+        configured_target,
+        root,
+        claim,
+        authority,
+        verified_candidate_revision_configuration_sha256=(
+            verified_candidate_revision_configuration_sha256
+        ),
+    )
+    previous = expected_released_claim.value
+    if type(previous) is not ServiceClaimRecord:
+        raise TypeError("released claim takeover requires an exact service claim")
+    if (
+        previous.target != configured_target
+        or previous.status is not ServiceClaimStatus.RELEASED
+        or previous.root_id == root.root_id
+        or previous.released_at is None
+        or root.stable_snapshot.captured_at <= previous.released_at
+        or claim.claimed_at < root.approved_at
+    ):
+        raise ValueError("new rollout does not follow one safely released claim")
 
 
 _RECEIPT_TRANSITIONS: Final = {
@@ -809,6 +943,22 @@ class FirestoreAuthorityStore:
         document_id: str,
         model_type: type[ModelT],
     ) -> _DecodedDocument[ModelT] | None:
+        decoded, _ = await self._strong_read_with_update_time(
+            kind=kind,
+            logical_id=logical_id,
+            document_id=document_id,
+            model_type=model_type,
+        )
+        return decoded
+
+    async def _strong_read_with_update_time[ModelT: StrictContractModel](
+        self,
+        *,
+        kind: AuthorityStorageKind,
+        logical_id: str,
+        document_id: str,
+        model_type: type[ModelT],
+    ) -> tuple[_DecodedDocument[ModelT] | None, datetime | None]:
         client = await self._client()
         reference = self._reference(client, kind, document_id)
         try:
@@ -820,7 +970,7 @@ class FirestoreAuthorityStore:
             raise
         except Exception:
             raise AuthorityStoreUnavailable from None
-        return self._decode_snapshot(
+        decoded = self._decode_snapshot(
             snapshot,
             reference=reference,
             kind=kind,
@@ -828,6 +978,13 @@ class FirestoreAuthorityStore:
             document_id=document_id,
             model_type=model_type,
         )
+        if decoded is None:
+            return None, None
+        try:
+            update_time = _aware_utc(cast(_ProviderSnapshotPort, snapshot).update_time)
+        except Exception:
+            raise AuthorityStoreCorruptRecord from None
+        return decoded, update_time
 
     async def _transaction_read[ModelT: StrictContractModel](
         self,
@@ -953,8 +1110,18 @@ class FirestoreAuthorityStore:
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
+        *,
+        verified_candidate_revision_configuration_sha256: str,
     ) -> CreatedRollout:
-        _validate_initial_rollout(self._target, root, service_claim, authority)
+        _validate_initial_rollout(
+            self._target,
+            root,
+            service_claim,
+            authority,
+            verified_candidate_revision_configuration_sha256=(
+                verified_candidate_revision_configuration_sha256
+            ),
+        )
         root_document = _prepared_document(
             kind=AuthorityStorageKind.ROLLOUT_ROOT,
             logical_id=root.root_id,
@@ -994,6 +1161,94 @@ class FirestoreAuthorityStore:
                 transaction.create(reference, _document_data(document.wrapper))
 
         await self._run_transaction(documents, create)
+        return CreatedRollout(
+            root=_stored(root_document),
+            service_claim=_stored(claim_document),
+            authority=_stored(authority_document),
+        )
+
+    async def create_rollout_after_release(
+        self,
+        expected_released_claim: StoredRecord[ServiceClaimRecord],
+        root: RolloutRoot,
+        service_claim: ServiceClaimRecord,
+        authority: EpochAuthorityRecord,
+        *,
+        verified_candidate_revision_configuration_sha256: str,
+    ) -> CreatedRollout:
+        _validate_released_takeover(
+            self._target,
+            expected_released_claim,
+            root,
+            service_claim,
+            authority,
+            verified_candidate_revision_configuration_sha256=(
+                verified_candidate_revision_configuration_sha256
+            ),
+        )
+        root_document = _prepared_document(
+            kind=AuthorityStorageKind.ROLLOUT_ROOT,
+            logical_id=root.root_id,
+            document_id=rollout_root_document_id(root.root_id),
+            revision=0,
+            value=root,
+        )
+        claim_logical_id = service_claim_logical_id(self._target)
+        claim_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM,
+            logical_id=claim_logical_id,
+            document_id=service_claim_document_id(self._target),
+            revision=expected_released_claim.revision + 1,
+            value=service_claim,
+        )
+        authority_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=authority.root_id,
+            document_id=epoch_authority_document_id(authority.root_id),
+            revision=0,
+            value=authority,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            root_document,
+            claim_document,
+            authority_document,
+        )
+
+        async def replace(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            claim_reference = self._reference(
+                client,
+                AuthorityStorageKind.SERVICE_CLAIM,
+                claim_document.document_id,
+            )
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=claim_reference,
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document.document_id,
+                model_type=ServiceClaimRecord,
+            )
+            if current_claim is None or current_claim.stored != expected_released_claim:
+                raise _ExpectedStateMismatch
+            root_reference = self._reference(
+                client,
+                AuthorityStorageKind.ROLLOUT_ROOT,
+                root_document.document_id,
+            )
+            authority_reference = self._reference(
+                client,
+                AuthorityStorageKind.EPOCH_AUTHORITY,
+                authority_document.document_id,
+            )
+            transaction.create(root_reference, _document_data(root_document.wrapper))
+            transaction.update(claim_reference, _document_data(claim_document.wrapper))
+            transaction.create(
+                authority_reference,
+                _document_data(authority_document.wrapper),
+            )
+
+        await self._run_transaction(documents, replace)
         return CreatedRollout(
             root=_stored(root_document),
             service_claim=_stored(claim_document),
@@ -1249,6 +1504,16 @@ class FirestoreAuthorityStore:
         )
         documents: tuple[_PreparedDocument[StrictContractModel], ...] = (document,)
 
+        current, update_time = await self._strong_read_with_update_time(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=replacement.root_id,
+            document_id=document.document_id,
+            model_type=EpochAuthorityRecord,
+        )
+        if current is None or current.stored != expected or update_time is None:
+            raise AuthorityStoreConflict
+        write_option = firestore_v1.LastUpdateOption(update_time)
+
         async def update(transaction: _TransactionPort) -> None:
             client = await self._client()
             reference = self._reference(
@@ -1256,29 +1521,23 @@ class FirestoreAuthorityStore:
                 AuthorityStorageKind.EPOCH_AUTHORITY,
                 epoch_authority_document_id(replacement.root_id),
             )
-            current = await self._transaction_read(
-                transaction,
-                reference=reference,
-                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
-                logical_id=replacement.root_id,
-                document_id=document.document_id,
-                model_type=EpochAuthorityRecord,
+            transaction.update(
+                reference,
+                _document_data(document.wrapper),
+                option=write_option,
             )
-            if current is None or current.stored != expected:
-                raise _ExpectedStateMismatch
-            transaction.update(reference, _document_data(document.wrapper))
 
         await self._run_transaction(documents, update)
         return _stored(document)
 
-    async def release_service_claim(
+    async def fence_service_claim(
         self,
         expected_claim: StoredRecord[ServiceClaimRecord],
         replacement_claim: ServiceClaimRecord,
         expected_authority: StoredRecord[EpochAuthorityRecord],
         replacement_authority: EpochAuthorityRecord,
-    ) -> ReleasedServiceClaim:
-        _validate_claim_release_authority(
+    ) -> FencedServiceClaim:
+        _validate_claim_fence_authority(
             self._target,
             expected_claim,
             replacement_claim,
@@ -1350,9 +1609,76 @@ class FirestoreAuthorityStore:
             )
 
         await self._run_transaction(documents, update)
-        return ReleasedServiceClaim(
+        return FencedServiceClaim(
             service_claim=_stored(claim_document),
             authority=_stored(authority_document),
+        )
+
+    async def release_service_claim(
+        self,
+        expected_claim: StoredRecord[ServiceClaimRecord],
+        replacement_claim: ServiceClaimRecord,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+    ) -> ReleasedServiceClaim:
+        _validate_claim_release(
+            self._target,
+            expected_claim,
+            replacement_claim,
+            expected_authority,
+        )
+        logical_id = service_claim_logical_id(self._target)
+        claim_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM,
+            logical_id=logical_id,
+            document_id=service_claim_document_id(self._target),
+            revision=expected_claim.revision + 1,
+            value=replacement_claim,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (claim_document,)
+
+        async def update(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            claim_reference = self._reference(
+                client,
+                AuthorityStorageKind.SERVICE_CLAIM,
+                claim_document.document_id,
+            )
+            authority_reference = self._reference(
+                client,
+                AuthorityStorageKind.EPOCH_AUTHORITY,
+                epoch_authority_document_id(expected_authority.value.root_id),
+            )
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=claim_reference,
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=logical_id,
+                document_id=claim_document.document_id,
+                model_type=ServiceClaimRecord,
+            )
+            current_authority = await self._transaction_read(
+                transaction,
+                reference=authority_reference,
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=expected_authority.value.root_id,
+                document_id=epoch_authority_document_id(
+                    expected_authority.value.root_id
+                ),
+                model_type=EpochAuthorityRecord,
+            )
+            if (
+                current_claim is None
+                or current_claim.stored != expected_claim
+                or current_authority is None
+                or current_authority.stored != expected_authority
+            ):
+                raise _ExpectedStateMismatch
+            transaction.update(claim_reference, _document_data(claim_document.wrapper))
+
+        await self._run_transaction(documents, update)
+        return ReleasedServiceClaim(
+            service_claim=_stored(claim_document),
+            authority=expected_authority,
         )
 
     async def read_receipt(
