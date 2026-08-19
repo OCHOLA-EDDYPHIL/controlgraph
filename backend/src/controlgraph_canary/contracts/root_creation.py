@@ -124,8 +124,14 @@ class RolloutPlanV1(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_revision_pair(self) -> Self:
-        if self.stable_revision == self.candidate_revision:
-            raise ValueError("rollout plan revisions must be distinct")
+        _validate_target(self.target)
+        prefix = f"{self.target.service_name}-"
+        if (
+            self.stable_revision == self.candidate_revision
+            or not self.stable_revision.startswith(prefix)
+            or not self.candidate_revision.startswith(prefix)
+        ):
+            raise ValueError("rollout plan revisions must be distinct and target-bound")
         return self
 
 
@@ -255,6 +261,13 @@ class RolloutRootContentV2(StrictContractModel):
         plan = self.rollout_plan
         snapshot = self.stable_snapshot
         bounds = self.authority_bounds
+        expected_reader = (
+            f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
+        )
+        if snapshot.captured_by != expected_reader:
+            raise ValueError("root snapshot was not captured by the configured verifier")
+        if snapshot.captured_at > self.approved_at:
+            raise ValueError("root approval predates its stable snapshot")
         if plan.stable_snapshot_sha256 != canonical_sha256(snapshot):
             raise ValueError("root plan does not bind the canonical stable snapshot")
         if plan.health_policy_sha256 != canonical_sha256(self.health_policy):
@@ -353,6 +366,7 @@ class SignedEvidenceEventV1(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_signature_bindings(self) -> Self:
+        _validate_target(self.event.target)
         _validate_signing_key(
             self.signing_key_version,
             project_id=self.event.target.project_id,
@@ -450,6 +464,10 @@ class RootCreationResultV1(StrictContractModel):
             or event.actor != self.winner_operator_identity
             or event.request_id != self.winner_request_id
             or event.receipt_id is not None
+            or event.reason_code is not None
+            or event.provider_operation is not None
+            or event.target_configuration_sha256
+            != self.root.content.stable_snapshot.configuration_sha256
             or event.subject_sha256 != canonical_sha256(self.evidence_subject)
             or self.signed_evidence.signing_key_version
             != self.root.content.evidence_signing_key_version
@@ -605,6 +623,7 @@ def evidence_signing_input_sha256(event: EvidenceEvent, key_version: str) -> str
 def _validate_target(target: TargetBinding) -> None:
     if (
         _CONTROLGRAPH_PROJECT.fullmatch(target.project_id) is None
+        or "reconcile" in target.project_id
         or target.region != "us-central1"
         or target.environment != "nonprod"
         or target.service_name != _REFERENCE_SERVICE

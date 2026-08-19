@@ -253,7 +253,9 @@ def _event(root: RolloutRootV2 | None = None, **changes: object) -> EvidenceEven
         "previous_event_sha256": None,
         "reason_code": None,
         "provider_operation": None,
-        "target_configuration_sha256": None,
+        "target_configuration_sha256": (
+            bound_root.content.stable_snapshot.configuration_sha256
+        ),
     }
     values.update(changes)
     return EvidenceEvent.model_validate(values)
@@ -514,6 +516,8 @@ def test_health_policy_rejects_non_deterministic_semantics(field: str, value: st
     "changes",
     [
         {"candidate_revision": STABLE},
+        {"stable_revision": "unrelated-service-stable-v1"},
+        {"candidate_revision": "unrelated-service-candidate-v1"},
         {"stable_percent": 89},
         {"candidate_percent": 11},
         {"maximum_recovery_attempts": 2},
@@ -584,6 +588,25 @@ def test_root_content_rejects_independently_valid_recombined_objects() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
+        {"approved_by": "Operator@example.test"},
+        {"snapshot": _snapshot(captured_by="untrusted@example.test")},
+        {
+            "snapshot": _snapshot(captured_at="2026-08-19T12:02:00Z"),
+            "approved_at": "2026-08-19T12:01:00Z",
+        },
+        {"target": _target(project_id="controlgraph-canary-reconcile")},
+    ],
+)
+def test_root_content_rejects_aliased_identity_or_forbidden_target(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        _content(**changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
         {"purpose": "CAPABILITY"},
         {"signing_algorithm": "RSA_SIGN_PSS_2048_SHA256"},
         {"signing_key_version": EVIDENCE_KEY.replace("evidence-signing", "capability-signing")},
@@ -609,6 +632,33 @@ def test_signed_evidence_uses_the_existing_canonical_signing_input() -> None:
     assert signed.signing_input_sha256 == evidence_signing_input_sha256(
         signed.event, signed.signing_key_version
     )
+
+
+@pytest.mark.parametrize(
+    "event_changes",
+    [
+        {"provider_operation": "operations/unrelated"},
+        {"target_configuration_sha256": None},
+        {"target_configuration_sha256": "4" * 64},
+    ],
+)
+def test_root_creation_evidence_rejects_non_root_event_fields(
+    event_changes: dict[str, object],
+) -> None:
+    result = _result()
+    event = _event(
+        result.root,
+        subject_sha256=canonical_sha256(result.evidence_subject),
+        occurred_at=result.created_at,
+        **event_changes,
+    )
+    signed = _signed_evidence(result.root, event=event)
+    values = result.model_dump(mode="python")
+    values["signed_evidence"] = signed
+    values["winner_evidence_sha256"] = canonical_sha256(signed)
+
+    with pytest.raises(ValidationError, match="root creation evidence"):
+        RootCreationResultV1.model_validate(values)
 
 
 def test_lineage_anchor_excludes_mutable_execution_and_time_facts() -> None:
