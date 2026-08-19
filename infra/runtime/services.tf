@@ -140,19 +140,23 @@ module "coordinator" {
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "coordinator" })
   environment = merge(local.common_environment, local.identity_environment.coordinator, {
-    CONTROLGRAPH_ROLE                  = "coordinator"
-    CONTROLGRAPH_SERVICE_NAME          = local.service_names.coordinator
-    CONTROLGRAPH_CONTROLLER_ID         = "${var.project_id}:${var.region}:coordinator"
-    CONTROLGRAPH_ISSUER_URL            = local.service_audiences.issuer
-    CONTROLGRAPH_VERIFIER_URL          = local.service_audiences.verifier
-    CONTROLGRAPH_EVIDENCE_WRITER_URL   = local.service_audiences.evidence_writer
-    CONTROLGRAPH_EVIDENCE_KEY_VERSION  = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
-    CONTROLGRAPH_EXECUTOR_URL          = local.service_audiences.executor
-    CONTROLGRAPH_RECOVERY_URL          = local.service_audiences.recovery
-    CONTROLGRAPH_EXECUTION_QUEUE       = local.execution_queue.name
-    CONTROLGRAPH_RECOVERY_QUEUE        = local.recovery_queue.name
-    CONTROLGRAPH_EXECUTION_TASK_CALLER = local.service_accounts.execution_task_caller
-    CONTROLGRAPH_RECOVERY_TASK_CALLER  = local.service_accounts.recovery_task_caller
+    CONTROLGRAPH_ROLE                                    = "coordinator"
+    CONTROLGRAPH_SERVICE_NAME                            = local.service_names.coordinator
+    CONTROLGRAPH_CONTROLLER_ID                           = "${var.project_id}:${var.region}:coordinator"
+    CONTROLGRAPH_ISSUER_URL                              = local.service_audiences.issuer
+    CONTROLGRAPH_VERIFIER_URL                            = local.service_audiences.verifier
+    CONTROLGRAPH_EVIDENCE_WRITER_URL                     = local.service_audiences.evidence_writer
+    CONTROLGRAPH_CAPABILITY_KEY_VERSION                  = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION                    = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256 = var.reference_target_candidate_configuration_sha256
+    CONTROLGRAPH_OPERATOR_EMAIL                          = local.runtime_identity_emails.operator
+    CONTROLGRAPH_OPERATOR_SUBJECT                        = local.runtime_identity_subjects.operator
+    CONTROLGRAPH_EXECUTOR_URL                            = local.service_audiences.executor
+    CONTROLGRAPH_RECOVERY_URL                            = local.service_audiences.recovery
+    CONTROLGRAPH_EXECUTION_QUEUE                         = local.execution_queue.name
+    CONTROLGRAPH_RECOVERY_QUEUE                          = local.recovery_queue.name
+    CONTROLGRAPH_EXECUTION_TASK_CALLER                   = local.service_accounts.execution_task_caller
+    CONTROLGRAPH_RECOVERY_TASK_CALLER                    = local.service_accounts.recovery_task_caller
   })
 }
 

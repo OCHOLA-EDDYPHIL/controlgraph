@@ -75,6 +75,16 @@ variable "reference_target_candidate_image" {
   }
 }
 
+variable "reference_target_candidate_configuration_sha256" {
+  description = "Canonical ControlGraph digest of the reviewed candidate Cloud Run revision configuration."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.reference_target_candidate_configuration_sha256))
+    error_message = "reference_target_candidate_configuration_sha256 must be one lowercase SHA-256 digest."
+  }
+}
+
 variable "reference_target_deployment_phase" {
   description = "Explicit stable-then-candidate release phase; candidate is also the reset definition."
   type        = string

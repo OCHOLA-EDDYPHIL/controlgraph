@@ -102,6 +102,10 @@ EVIDENCE_KEY_VERSION = (
     f"projects/{PROJECT}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
 )
+CAPABILITY_KEY_VERSION = (
+    f"projects/{PROJECT}/locations/us-central1/keyRings/controlgraph-signing/"
+    "cryptoKeys/capability-signing/cryptoKeyVersions/1"
+)
 OLD = datetime(2026, 8, 19, 11, 55, tzinfo=UTC)
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
@@ -766,7 +770,11 @@ def _coordinator_environment() -> dict[str, str]:
         "CONTROLGRAPH_AUTH_CALLER_SUBJECT": SUBJECT,
         "CONTROLGRAPH_VERIFIER_URL": VERIFIER_AUDIENCE,
         "CONTROLGRAPH_EVIDENCE_WRITER_URL": EVIDENCE_AUDIENCE,
+        "CONTROLGRAPH_CAPABILITY_KEY_VERSION": CAPABILITY_KEY_VERSION,
         "CONTROLGRAPH_EVIDENCE_KEY_VERSION": EVIDENCE_KEY_VERSION,
+        "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
+        "CONTROLGRAPH_OPERATOR_EMAIL": "operator@example.com",
+        "CONTROLGRAPH_OPERATOR_SUBJECT": SUBJECT,
     }
 
 

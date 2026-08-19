@@ -92,6 +92,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
             }
         )
+    if role is ServiceRole.API:
+        environment["CONTROLGRAPH_COORDINATOR_URL"] = (
+            f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+        )
     if role is ServiceRole.COORDINATOR:
         environment.update(
             {
@@ -107,6 +111,14 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
                     "cryptoKeyVersions/1"
                 ),
+                "CONTROLGRAPH_CAPABILITY_KEY_VERSION": (
+                    f"projects/{PROJECT_ID}/locations/us-central1/"
+                    "keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
+                    "cryptoKeyVersions/1"
+                ),
+                "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
+                "CONTROLGRAPH_OPERATOR_EMAIL": "operator@example.com",
+                "CONTROLGRAPH_OPERATOR_SUBJECT": SUBJECT,
             }
         )
     if role is ServiceRole.VERIFIER:

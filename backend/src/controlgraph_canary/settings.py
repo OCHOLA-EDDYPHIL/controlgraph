@@ -37,8 +37,14 @@ EVIDENCE_WRITER_ENVIRONMENT_KEYS = (
 COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_VERIFIER_URL",
     "CONTROLGRAPH_EVIDENCE_WRITER_URL",
+    "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
     "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+    "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256",
+    "CONTROLGRAPH_OPERATOR_EMAIL",
+    "CONTROLGRAPH_OPERATOR_SUBJECT",
 )
+
+API_ROOT_ENVIRONMENT_KEYS = ("CONTROLGRAPH_COORDINATOR_URL",)
 
 VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_TARGET_NETWORK_RESOURCE",
@@ -57,6 +63,8 @@ def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]
     role = environment.get("CONTROLGRAPH_ROLE")
     if type(role) is str and role.strip() == ServiceRole.EVIDENCE_WRITER.value:
         return REQUIRED_ENVIRONMENT_KEYS + EVIDENCE_WRITER_ENVIRONMENT_KEYS
+    if type(role) is str and role.strip() == ServiceRole.API.value:
+        return REQUIRED_ENVIRONMENT_KEYS + API_ROOT_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.COORDINATOR.value:
         return REQUIRED_ENVIRONMENT_KEYS + COORDINATOR_TRUST_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.VERIFIER.value:
@@ -79,12 +87,17 @@ class ControllerSettings:
     firestore_database: str
     mutations_enabled: bool
     environment: str
+    capability_key_version: str | None
     evidence_key_version: str | None
     signing_algorithm: str | None
     verifier_url: str | None
     evidence_writer_url: str | None
     target_network_resource: str | None
     target_subnetwork_resource: str | None
+    coordinator_url: str | None
+    candidate_revision_configuration_sha256: str | None
+    operator_identity: str | None
+    operator_subject: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
@@ -135,12 +148,24 @@ class ControllerSettings:
         if environment_name != "nonprod":
             raise ValueError("CONTROLGRAPH_ENVIRONMENT must be nonprod")
 
+        capability_key_version: str | None = None
         evidence_key_version: str | None = None
         signing_algorithm: str | None = None
         verifier_url: str | None = None
         evidence_writer_url: str | None = None
         target_network_resource: str | None = None
         target_subnetwork_resource: str | None = None
+        coordinator_url: str | None = None
+        candidate_revision_configuration_sha256: str | None = None
+        operator_identity: str | None = None
+        operator_subject: str | None = None
+        if service_role is ServiceRole.API:
+            coordinator_url = source["CONTROLGRAPH_COORDINATOR_URL"].strip()
+            _validate_service_url(
+                coordinator_url,
+                ServiceRole.COORDINATOR,
+                project_number,
+            )
         if service_role in {ServiceRole.EVIDENCE_WRITER, ServiceRole.COORDINATOR}:
             evidence_key_version = source["CONTROLGRAPH_EVIDENCE_KEY_VERSION"].strip()
             expected_key_version = re.compile(
@@ -155,6 +180,21 @@ class ControllerSettings:
             if signing_algorithm != SIGNING_ALGORITHM:
                 raise ValueError("CONTROLGRAPH_SIGNING_ALGORITHM is unsupported")
         if service_role is ServiceRole.COORDINATOR:
+            capability_key_version = source[
+                "CONTROLGRAPH_CAPABILITY_KEY_VERSION"
+            ].strip()
+            expected_capability_key_version = re.compile(
+                rf"^projects/{re.escape(project_id)}/locations/us-central1/"
+                r"keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
+                r"cryptoKeyVersions/[1-9][0-9]*$"
+            )
+            if (
+                expected_capability_key_version.fullmatch(capability_key_version)
+                is None
+            ):
+                raise ValueError(
+                    "CONTROLGRAPH_CAPABILITY_KEY_VERSION is outside its purpose"
+                )
             verifier_url = source["CONTROLGRAPH_VERIFIER_URL"].strip()
             evidence_writer_url = source["CONTROLGRAPH_EVIDENCE_WRITER_URL"].strip()
             _validate_service_url(verifier_url, ServiceRole.VERIFIER, project_number)
@@ -163,6 +203,23 @@ class ControllerSettings:
                 ServiceRole.EVIDENCE_WRITER,
                 project_number,
             )
+            candidate_revision_configuration_sha256 = source[
+                "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256"
+            ].strip()
+            if (
+                _DIGEST.fullmatch(
+                    f"sha256:{candidate_revision_configuration_sha256}"
+                )
+                is None
+            ):
+                raise ValueError(
+                    "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256 is invalid"
+                )
+            operator_identity = source["CONTROLGRAPH_OPERATOR_EMAIL"].strip()
+            operator_subject = source["CONTROLGRAPH_OPERATOR_SUBJECT"].strip()
+            _validate_operator_identity(operator_identity)
+            if _PROJECT_NUMBER.fullmatch(operator_subject) is None:
+                raise ValueError("CONTROLGRAPH_OPERATOR_SUBJECT is invalid")
         if service_role is ServiceRole.VERIFIER:
             target_network_resource = source[
                 "CONTROLGRAPH_TARGET_NETWORK_RESOURCE"
@@ -191,12 +248,19 @@ class ControllerSettings:
             firestore_database=firestore_database,
             mutations_enabled=False,
             environment=environment_name,
+            capability_key_version=capability_key_version,
             evidence_key_version=evidence_key_version,
             signing_algorithm=signing_algorithm,
             verifier_url=verifier_url,
             evidence_writer_url=evidence_writer_url,
             target_network_resource=target_network_resource,
             target_subnetwork_resource=target_subnetwork_resource,
+            coordinator_url=coordinator_url,
+            candidate_revision_configuration_sha256=(
+                candidate_revision_configuration_sha256
+            ),
+            operator_identity=operator_identity,
+            operator_subject=operator_subject,
         )
 
 
@@ -232,3 +296,16 @@ def _validate_target_resource(value: str, *, prefix: str) -> None:
         or "reconcile" in value.lower()
     ):
         raise ValueError("verifier target network resource is invalid")
+
+
+def _validate_operator_identity(value: str) -> None:
+    if (
+        re.fullmatch(
+            r"[a-z0-9][a-z0-9._%+\-]{0,63}@"
+            r"[a-z0-9](?:[a-z0-9.\-]{0,251}[a-z0-9])?",
+            value,
+        )
+        is None
+        or value.endswith(".iam.gserviceaccount.com")
+    ):
+        raise ValueError("CONTROLGRAPH_OPERATOR_EMAIL is invalid")
