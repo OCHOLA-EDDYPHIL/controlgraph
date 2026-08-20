@@ -69,7 +69,6 @@ locals {
       title       = "ControlGraph Cloud Run traffic mutator"
       description = "Read and update one bound Cloud Run service."
       permissions = [
-        "run.revisions.get",
         "run.services.get",
         "run.services.update",
       ]
@@ -109,6 +108,21 @@ check "run_snapshot_reader_is_get_only" {
       "run.services.get",
     ])
     error_message = "The snapshot reader role must contain only exact Cloud Run get permissions."
+  }
+}
+
+check "run_executor_roles_are_minimal" {
+  assert {
+    condition = (
+      toset(local.custom_iam_roles.run_traffic_mutator.permissions) == toset([
+        "run.services.get",
+        "run.services.update",
+      ]) &&
+      toset(local.custom_iam_roles.run_operation_reader.permissions) == toset([
+        "run.operations.get",
+      ])
+    )
+    error_message = "The executor Cloud Run roles must contain only target read/update and operation-read permissions."
   }
 }
 

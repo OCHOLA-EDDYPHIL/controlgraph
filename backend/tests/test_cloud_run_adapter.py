@@ -49,6 +49,7 @@ from controlgraph_canary.application.identity import (
 from controlgraph_canary.application.receipt_execution import (
     ReceiptMutationResult,
     ReceiptMutationStatus,
+    ReceiptReadbackResult,
     map_cloud_run_mutation_result,
 )
 from controlgraph_canary.authority.replay import (
@@ -76,6 +77,7 @@ from controlgraph_canary.contracts.root_creation import RolloutRootV2
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.integrations.google.cloud_run import (
     CloudRunV2Adapter,
+    CloudRunV2ReceiptReadback,
     CloudRunV2SnapshotReader,
 )
 
@@ -441,6 +443,25 @@ class _FakeServicesClient:
         return cast(_FakeOperation, self.update)
 
 
+class _GetOnlyServicesClient:
+    def __init__(self, *services: object) -> None:
+        self.services = list(services) or [_service()]
+        self.get_calls: list[tuple[run_v2.GetServiceRequest, object | None, float]] = []
+
+    async def get_service(
+        self,
+        request: run_v2.GetServiceRequest,
+        *,
+        retry: object | None,
+        timeout: float,
+    ) -> run_v2.Service:
+        self.get_calls.append((request, retry, timeout))
+        response = self.services.pop(0) if len(self.services) > 1 else self.services[0]
+        if isinstance(response, BaseException):
+            raise response
+        return cast(run_v2.Service, response)
+
+
 class _FakeRevisionsClient:
     def __init__(self, *, concurrency: int = 8) -> None:
         self.responses = {
@@ -474,11 +495,15 @@ def _service(
     stable_revision: str = STABLE,
     candidate_revision: str = CANDIDATE,
     template_revision: str = CANDIDATE,
+    latest_created_revision: str | None = None,
+    latest_ready_revision: str | None = None,
     concurrency: int = 8,
     etag: str = "etag-after-8",
     ready_state: run_v2.Condition.State = run_v2.Condition.State.CONDITION_SUCCEEDED,
     traffic_tags: tuple[str, str] = ("stable", "candidate"),
     status_tags: tuple[str, str] = ("stable", "candidate"),
+    status_stable_percent: int | None = None,
+    status_candidate_percent: int | None = None,
 ) -> run_v2.Service:
     return run_v2.Service(
         name=resource_name,
@@ -489,8 +514,8 @@ def _service(
         reconciling=False,
         terminal_condition=run_v2.Condition(type_="Ready", state=ready_state),
         conditions=[run_v2.Condition(type_="Ready", state=ready_state)],
-        latest_ready_revision=candidate_revision,
-        latest_created_revision=candidate_revision,
+        latest_ready_revision=latest_ready_revision or candidate_revision,
+        latest_created_revision=latest_created_revision or candidate_revision,
         template=run_v2.RevisionTemplate(
             revision=template_revision,
             max_instance_request_concurrency=concurrency,
@@ -499,13 +524,21 @@ def _service(
             run_v2.TrafficTarget(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=stable_revision,
-                percent=stable_percent,
+                percent=(
+                    stable_percent
+                    if status_stable_percent is None
+                    else status_stable_percent
+                ),
                 tag=traffic_tags[0],
             ),
             run_v2.TrafficTarget(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=candidate_revision,
-                percent=candidate_percent,
+                percent=(
+                    candidate_percent
+                    if status_candidate_percent is None
+                    else status_candidate_percent
+                ),
                 tag=traffic_tags[1],
             ),
         ],
@@ -634,6 +667,18 @@ def _snapshot_reader(
         configured_project_id=PROJECT_ID,
         services_client_factory=lambda: services,
         revisions_client_factory=lambda: revision_client,
+    )
+
+
+def _receipt_readback(
+    services: _GetOnlyServicesClient,
+    *,
+    configuration: CloudRunTargetConfiguration | None = None,
+) -> CloudRunV2ReceiptReadback:
+    return CloudRunV2ReceiptReadback(
+        configuration=configuration or _configuration(),
+        configured_project_id=PROJECT_ID,
+        services_client_factory=lambda: services,
     )
 
 
@@ -800,6 +845,198 @@ async def test_snapshot_reader_gets_the_exact_positive_traffic_revision() -> Non
     assert positive.revision == traffic_revision
     assert revision.revision == traffic_revision
     assert [call[0].name for call in revisions.calls] == [resource]
+
+
+@_async_test
+async def test_receipt_readback_uses_a_fresh_exact_get_and_provider_state() -> None:
+    services = _GetOnlyServicesClient(
+        _service(90, 10, concurrency=8, etag="etag-readback-1"),
+        _service(80, 20, concurrency=9, etag="etag-readback-2"),
+    )
+    readback = _receipt_readback(services)
+    expected = target_configuration_projection(
+        _verified().request.intent,
+        expected_concurrency=8,
+    )
+
+    first = await readback.readback(expected)
+    second = await readback.readback(expected)
+
+    assert first == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-readback-1",
+    )
+    assert second == ReceiptReadbackResult(
+        state=replace(
+            expected,
+            stable_percent=80,
+            candidate_percent=20,
+            concurrency=9,
+        ),
+        observed_etag="etag-readback-2",
+    )
+    assert second.state != expected
+    assert [(call[0].name, call[1], call[2]) for call in services.get_calls] == [
+        (SERVICE_RESOURCE, None, 5.0),
+        (SERVICE_RESOURCE, None, 5.0),
+    ]
+    public_callables = {
+        name
+        for name in dir(readback)
+        if not name.startswith("_") and callable(getattr(readback, name))
+    }
+    assert public_callables == {"readback"}
+    assert not hasattr(readback, "mutate")
+    assert not hasattr(readback, "update_service")
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        replace(
+            target_configuration_projection(
+                _verified().request.intent,
+                expected_concurrency=8,
+            ),
+            target=_target(project_id="controlgraph-canary-d4e5f6"),
+        ),
+        replace(
+            target_configuration_projection(
+                _verified().request.intent,
+                expected_concurrency=8,
+            ),
+            stable_revision=f"{SERVICE}-stable-v2",
+        ),
+        replace(
+            target_configuration_projection(
+                _verified().request.intent,
+                expected_concurrency=8,
+            ),
+            candidate_revision=f"{SERVICE}-candidate-v2",
+        ),
+        replace(
+            target_configuration_projection(
+                _verified().request.intent,
+                expected_concurrency=8,
+            ),
+            concurrency=9,
+        ),
+    ],
+)
+@_async_test
+async def test_receipt_readback_rejects_unbound_expectations_without_provider_access(
+    expected: TargetConfigurationProjection,
+) -> None:
+    services = _GetOnlyServicesClient()
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation == ReceiptReadbackResult(state=None, observed_etag=None)
+    assert services.get_calls == []
+
+
+@pytest.mark.parametrize(
+    ("provider_response", "observed_etag"),
+    [
+        (RuntimeError("synthetic unavailable detail"), None),
+        (object(), None),
+        (
+            _service(
+                ready_state=cast(
+                    run_v2.Condition.State,
+                    run_v2.Condition.State.CONDITION_PENDING,
+                )
+            ),
+            "etag-after-8",
+        ),
+        (
+            _service(stable_revision=f"{SERVICE}-unapproved-v2"),
+            "etag-after-8",
+        ),
+        (
+            _service(status_stable_percent=100, status_candidate_percent=0),
+            "etag-after-8",
+        ),
+        (
+            _service(template_revision=f"{SERVICE}-unapproved-v2"),
+            "etag-after-8",
+        ),
+        (
+            _service(latest_created_revision=f"{SERVICE}-unapproved-v2"),
+            "etag-after-8",
+        ),
+        (
+            _service(latest_ready_revision=f"{SERVICE}-unapproved-v2"),
+            "etag-after-8",
+        ),
+    ],
+)
+@_async_test
+async def test_receipt_readback_fails_closed_on_unavailable_or_unsettled_state(
+    provider_response: object,
+    observed_etag: str | None,
+) -> None:
+    services = _GetOnlyServicesClient(provider_response)
+    expected = target_configuration_projection(
+        _verified().request.intent,
+        expected_concurrency=8,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=None,
+        observed_etag=observed_etag,
+    )
+    assert len(services.get_calls) == 1
+
+
+@_async_test
+async def test_receipt_readback_propagates_cancellation() -> None:
+    services = _GetOnlyServicesClient(asyncio.CancelledError())
+    expected = target_configuration_projection(
+        _verified().request.intent,
+        expected_concurrency=8,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _receipt_readback(services).readback(expected)
+
+    assert len(services.get_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("target", "configured_project", "message"),
+    [
+        (_target(project_id="other-project"), PROJECT_ID, "configured ControlGraph project"),
+        (_target(region="europe-west1"), PROJECT_ID, "must use us-central1"),
+        (
+            _target(service_name="other-reference-target"),
+            PROJECT_ID,
+            "belong to the configured service",
+        ),
+        (_target(), "shared-project", "configured ControlGraph project"),
+    ],
+)
+def test_receipt_readback_constructor_rejects_unbound_coordinates(
+    target: TargetBinding,
+    configured_project: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        CloudRunV2ReceiptReadback(
+            configuration=_configuration(target=target),
+            configured_project_id=configured_project,
+            services_client_factory=lambda: _GetOnlyServicesClient(),
+        )
+
+
+def test_receipt_readback_requires_one_approved_concurrency() -> None:
+    with pytest.raises(ValueError, match="share the approved concurrency"):
+        _receipt_readback(
+            _GetOnlyServicesClient(),
+            configuration=_configuration(candidate_concurrency=9),
+        )
 
 
 @pytest.mark.parametrize("role", [ServiceRole.EXECUTOR, ServiceRole.RECOVERY])

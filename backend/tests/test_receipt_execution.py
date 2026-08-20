@@ -582,17 +582,31 @@ def test_commit_response_loss_adopts_claim_without_dispatch_proof() -> None:
         store = _Store(events, adopt_fresh=True)
         reader = _Reader(_snapshot(), events)
         adapter = _Adapter(_applied(), events)
-        result = await _coordinator(
+        clock = _Clock()
+        readback = _Readback([_exact_readback()], events)
+        coordinator = _coordinator(
             store,
             reader,
             adapter,
-            _Readback([_exact_readback()], events),
-            _Clock(),
-        ).execute(_verified())
+            readback,
+            clock,
+        )
+        result = await coordinator.execute(_verified())
 
         assert type(result) is ReceiptExecutionStored
         assert result.reason_code is ReasonCode.RECEIPT_IN_PROGRESS
         assert adapter.calls == []
+        assert "authority" not in events
+        assert readback.calls == []
+
+        clock.value = datetime(2026, 8, 19, 12, 4, 1, tzinfo=UTC)
+        recovered = await coordinator.execute(_verified())
+
+        assert type(recovered) is ReceiptExecutionStored
+        assert recovered.receipt.value.outcome is ReceiptOutcome.VERIFIED
+        assert recovered.receipt.value.observed_authority_epoch is None
+        assert adapter.calls == []
+        assert len(readback.calls) == 1
         assert "authority" not in events
 
     asyncio.run(scenario())
@@ -1190,6 +1204,62 @@ def test_expired_verified_input_creates_no_receipt_and_malformed_input_is_reject
             await coordinator.execute(object())  # type: ignore[arg-type]
         assert store.record is None
         assert events == ["receipt-read"]
+
+    asyncio.run(scenario())
+
+
+def test_delayed_first_delivery_refuses_a_claim_without_recovery_time() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        adapter = _Adapter(_applied(), events)
+        readback = _Readback([_exact_readback()], events)
+        coordinator = _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            adapter,
+            readback,
+            _Clock(datetime(2026, 8, 19, 12, 3, 30, tzinfo=UTC)),
+        )
+
+        result = await coordinator.execute(_verified())
+
+        assert result == ReceiptExecutionDenied(ReasonCode.CAPABILITY_EXPIRED)
+        assert store.record is None
+        assert adapter.calls == []
+        assert readback.calls == []
+        assert events == ["receipt-read"]
+
+    asyncio.run(scenario())
+
+
+def test_expired_orphaned_claim_uses_readback_without_mutation() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        clock = _Clock()
+        store = _Store(events, adopt_fresh=True)
+        adapter = _Adapter(_applied(), events)
+        readback = _Readback([_exact_readback()], events)
+        coordinator = _coordinator(
+            store,
+            _Reader(_snapshot(), events),
+            adapter,
+            readback,
+            clock,
+        )
+        claimed = await coordinator.execute(_verified())
+        assert type(claimed) is ReceiptExecutionStored
+        assert claimed.receipt.value.outcome is ReceiptOutcome.CLAIMED
+        event_count = len(events)
+        clock.value = datetime(2026, 8, 19, 12, 6, tzinfo=UTC)
+
+        recovered = await coordinator.execute(_verified())
+
+        assert type(recovered) is ReceiptExecutionStored
+        assert recovered.receipt.value.outcome is ReceiptOutcome.VERIFIED
+        assert recovered.receipt.value.observed_authority_epoch is None
+        assert adapter.calls == []
+        assert events[event_count:] == ["receipt-read", "readback", "cas", "cas"]
 
     asyncio.run(scenario())
 

@@ -42,7 +42,7 @@ run "stable_revision_starts_at_the_bounded_baseline" {
   }
 }
 
-run "candidate_revision_preserves_the_explicit_stable_reset" {
+run "candidate_configuration_shape_is_bounded" {
   command = plan
 
   variables {
@@ -71,7 +71,7 @@ run "candidate_revision_preserves_the_explicit_stable_reset" {
         target.percent == 0 && target.tag == "candidate"
       ]) == 1
     )
-    error_message = "The candidate phase must retain the explicit 100-percent stable, zero-percent candidate reset."
+    error_message = "The static candidate configuration must declare 100-percent stable and zero-percent candidate traffic."
   }
 }
 

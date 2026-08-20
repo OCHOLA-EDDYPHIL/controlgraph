@@ -50,6 +50,7 @@ from controlgraph_canary.application.signing import (
     build_signing_input,
 )
 from controlgraph_canary.application.stable_snapshot import stable_configuration_sha256
+from controlgraph_canary.application.tasks import AddressedTask, TaskEnqueueResult
 from controlgraph_canary.contracts import (
     EvidenceEvent,
     EvidenceKind,
@@ -769,6 +770,9 @@ def _coordinator_environment() -> dict[str, str]:
             f"controlgraph-api@{PROJECT}.iam.gserviceaccount.com"
         ),
         "CONTROLGRAPH_AUTH_CALLER_SUBJECT": SUBJECT,
+        "CONTROLGRAPH_ISSUER_URL": (
+            f"https://controlgraph-issuer-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
         "CONTROLGRAPH_VERIFIER_URL": VERIFIER_AUDIENCE,
         "CONTROLGRAPH_EVIDENCE_WRITER_URL": EVIDENCE_AUDIENCE,
         "CONTROLGRAPH_CAPABILITY_KEY_VERSION": CAPABILITY_KEY_VERSION,
@@ -776,7 +780,31 @@ def _coordinator_environment() -> dict[str, str]:
         "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
         "CONTROLGRAPH_OPERATOR_EMAIL": "operator@example.com",
         "CONTROLGRAPH_OPERATOR_SUBJECT": SUBJECT,
+        "CONTROLGRAPH_EXECUTOR_URL": (
+            f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        "CONTROLGRAPH_RECOVERY_URL": (
+            f"https://controlgraph-recovery-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        "CONTROLGRAPH_EXECUTION_QUEUE": "controlgraph-execution",
+        "CONTROLGRAPH_RECOVERY_QUEUE": "controlgraph-recovery",
+        "CONTROLGRAPH_EXECUTION_TASK_CALLER": (
+            f"cg-execution-task-caller@{PROJECT}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_RECOVERY_TASK_CALLER": (
+            f"cg-recovery-task-caller@{PROJECT}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL": (
+            f"controlgraph-executor@{PROJECT}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
     }
+
+
+class _UnusedTaskEnqueuer:
+    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+        del task, now
+        raise AssertionError("settings composition must not enqueue a task")
 
 
 def test_coordinator_settings_and_runtime_compose_only_exact_trust_clients() -> None:
@@ -792,6 +820,7 @@ def test_coordinator_settings_and_runtime_compose_only_exact_trust_clients() -> 
         environment=environment,
         internal_transport=transport,
         kms_client=object(),
+        task_enqueuer=_UnusedTaskEnqueuer(),
     )
     assert isinstance(app.state.controlgraph_trust_clients, CoordinatorTrustClients)
     assert isinstance(

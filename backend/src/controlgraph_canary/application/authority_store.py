@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
@@ -13,6 +14,7 @@ from controlgraph_canary.authority.replay import (
     MutationTargetKey,
     mutation_identity,
 )
+from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import (
     EpochAuthorityRecord,
     ExecutionReceipt,
@@ -94,24 +96,51 @@ _DIRECT_RECEIPT_CREATE_KEY = _DirectReceiptCreateKey()
 class DirectReceiptCreate:
     """One-use proof of an uninterrupted, directly confirmed receipt create."""
 
-    __slots__ = ("_available", "_binding", "_claimed_receipt", "_lock")
+    __slots__ = (
+        "_attempt_id",
+        "_available",
+        "_binding",
+        "_claimed_receipt",
+        "_lock",
+        "_request_sha256",
+    )
 
     def __init__(
         self,
         key: _DirectReceiptCreateKey,
         claimed_receipt: StoredRecord[ExecutionReceipt],
         binding: MutationBinding,
+        *,
+        attempt_id: str | None = None,
+        request_sha256: str | None = None,
     ) -> None:
         if key is not _DIRECT_RECEIPT_CREATE_KEY:
-            raise TypeError("direct receipt-create proof is store-issued")
+            raise TypeError("direct receipt-create proof is authority-issued")
         _validate_initial_receipt_claim(claimed_receipt)
         if type(binding) is not MutationBinding or not _receipt_matches_binding(
             claimed_receipt.value,
             binding,
         ):
             raise ValueError("direct receipt create does not match its mutation binding")
+        if (attempt_id is None) != (request_sha256 is None):
+            raise ValueError("direct receipt-create transport binding is incomplete")
+        if attempt_id is not None and (
+            type(attempt_id) is not str
+            or not attempt_id
+            or attempt_id != attempt_id.strip()
+            or len(attempt_id) > 128
+        ):
+            raise ValueError("direct receipt-create attempt binding is invalid")
+        if request_sha256 is not None and (
+            type(request_sha256) is not str
+            or len(request_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in request_sha256)
+        ):
+            raise ValueError("direct receipt-create request binding is invalid")
         self._claimed_receipt = claimed_receipt
         self._binding = binding
+        self._attempt_id = attempt_id
+        self._request_sha256 = request_sha256
         self._available = True
         self._lock = Lock()
 
@@ -124,6 +153,52 @@ class DirectReceiptCreate:
         """Issue only after a store directly confirms its initial create."""
 
         return cls(_DIRECT_RECEIPT_CREATE_KEY, claimed_receipt, binding)
+
+    @classmethod
+    def _from_direct_authority_confirmation(
+        cls,
+        claimed_receipt: StoredRecord[ExecutionReceipt],
+        binding: MutationBinding,
+        *,
+        attempt_id: str,
+        request_sha256: str,
+        confirmed_attempt_id: str,
+        confirmed_request_sha256: str,
+        confirmed_receipt_sha256: str,
+        confirmed_mutation_sha256: str,
+    ) -> DirectReceiptCreate:
+        """Issue only for a response bound to the exact one-shot facade request."""
+
+        values = (
+            attempt_id,
+            request_sha256,
+            confirmed_attempt_id,
+            confirmed_request_sha256,
+            confirmed_receipt_sha256,
+            confirmed_mutation_sha256,
+        )
+        if any(type(value) is not str for value in values):
+            raise TypeError("direct receipt-create confirmation binding is invalid")
+        if (
+            not hmac.compare_digest(attempt_id, confirmed_attempt_id)
+            or not hmac.compare_digest(request_sha256, confirmed_request_sha256)
+            or not hmac.compare_digest(
+                canonical_sha256(claimed_receipt.value),
+                confirmed_receipt_sha256,
+            )
+            or not hmac.compare_digest(
+                mutation_identity(binding),
+                confirmed_mutation_sha256,
+            )
+        ):
+            raise ValueError("direct receipt-create confirmation does not match its request")
+        return cls(
+            _DIRECT_RECEIPT_CREATE_KEY,
+            claimed_receipt,
+            binding,
+            attempt_id=attempt_id,
+            request_sha256=request_sha256,
+        )
 
     def _take_claim(
         self,

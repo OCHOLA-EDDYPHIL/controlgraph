@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Sequence
+from threading import Lock
 from typing import Protocol, cast
 
 from controlgraph_canary.application.identity import ServiceRole
@@ -177,6 +178,49 @@ def _load_version(
     raise _error(SigningErrorCode.KEY_VERSION_DISABLED, "KMS key version is not enabled")
 
 
+def _load_public_key(client: _KmsClient, profile: SigningProfile) -> str:
+    try:
+        raw_response = client.get_public_key({"name": profile.key_version})
+        response = cast(_PublicKeyResponse, raw_response)
+        response_name = response.name
+        algorithm_name = _enum_name(response.algorithm)
+        public_key_pem = response.pem
+        public_key_crc32c = response.pem_crc32c
+    except SigningError:
+        raise
+    except Exception:
+        raise _error(
+            SigningErrorCode.PROVIDER_FAILURE,
+            "KMS public key lookup failed",
+        ) from None
+
+    if type(response_name) is not str or response_name != profile.key_version:
+        raise _error(
+            SigningErrorCode.KEY_VERSION_MISMATCH,
+            "KMS returned another public key version",
+        )
+    if algorithm_name != SIGNING_ALGORITHM or algorithm_name != profile.algorithm:
+        raise _error(
+            SigningErrorCode.ALGORITHM_MISMATCH,
+            "KMS public key algorithm is invalid",
+        )
+    if type(public_key_pem) is not str:
+        raise _error(SigningErrorCode.PUBLIC_KEY_INVALID, "KMS public key PEM is invalid")
+    try:
+        public_key_bytes = public_key_pem.encode("ascii")
+    except UnicodeEncodeError:
+        raise _error(
+            SigningErrorCode.PUBLIC_KEY_INVALID,
+            "KMS public key PEM is invalid",
+        ) from None
+    if (
+        type(public_key_crc32c) is not int
+        or public_key_crc32c != _crc32c(public_key_bytes)
+    ):
+        raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
+    return public_key_pem
+
+
 async def _load_version_async(
     client: _AsyncKmsClient,
     profile: SigningProfile,
@@ -213,7 +257,8 @@ class GoogleKmsDigestSigner:
         if type(profile) is not SigningProfile:
             raise _error(SigningErrorCode.PROFILE_INVALID, "KMS profile is invalid")
         self._profile = profile
-        self._client = _default_client() if client is None else cast(_KmsClient, client)
+        self._client = None if client is None else cast(_KmsClient, client)
+        self._client_lock = Lock()
 
     @property
     def profile(self) -> SigningProfile:
@@ -222,7 +267,8 @@ class GoogleKmsDigestSigner:
     def sign_digest(self, digest: bytes) -> bytes:
         if type(digest) is not bytes or len(digest) != 32:
             raise _error(SigningErrorCode.DIGEST_MISMATCH, "signing digest must be SHA-256")
-        _load_version(self._client, self._profile, permit_disabled=False)
+        client = self._get_client()
+        _load_version(client, self._profile, permit_disabled=False)
         digest_crc32c = _crc32c(digest)
         request: dict[str, object] = {
             "name": self._profile.key_version,
@@ -230,7 +276,7 @@ class GoogleKmsDigestSigner:
             "digest_crc32c": digest_crc32c,
         }
         try:
-            raw_response = self._client.asymmetric_sign(request)
+            raw_response = client.asymmetric_sign(request)
             response = cast(_SignResponse, raw_response)
             response_name = response.name
             signature = response.signature
@@ -252,6 +298,17 @@ class GoogleKmsDigestSigner:
         if type(signature_crc32c) is not int or signature_crc32c != _crc32c(signature):
             raise _error(SigningErrorCode.CRC_MISMATCH, "KMS signature CRC32C is invalid")
         return signature
+
+    def _get_client(self) -> _KmsClient:
+        client = self._client
+        if client is not None:
+            return client
+        with self._client_lock:
+            client = self._client
+            if client is None:
+                client = _default_client()
+                self._client = client
+        return client
 
 
 class GoogleKmsAsyncDigestSigner:
@@ -437,6 +494,81 @@ class GoogleKmsEvidenceSignatureVerifier:
         ).verify(signed.event, detached)
 
 
+class GoogleKmsCapabilityTrustLoader:
+    """Load one enabled capability key version for an execution service."""
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        service_role: ServiceRole,
+        key_version: str,
+        client: object | None = None,
+    ) -> None:
+        if type(service_role) is not ServiceRole or service_role not in {
+            ServiceRole.EXECUTOR,
+            ServiceRole.RECOVERY,
+        }:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "capability trust role is invalid",
+            )
+        try:
+            profile = SigningProfile.capability(project_id, key_version)
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "capability trust profile is invalid",
+            ) from None
+        self._profile = profile
+        self._service_role = service_role
+        self._client = None if client is None else cast(_KmsClient, client)
+
+    @property
+    def project_id(self) -> str:
+        return self._profile.project_id
+
+    @property
+    def service_role(self) -> ServiceRole:
+        return self._service_role
+
+    @property
+    def key_version(self) -> str:
+        return self._profile.key_version
+
+    @property
+    def key_resource(self) -> str:
+        return self._profile.key_resource
+
+    def load(self) -> TrustBundleVerifier:
+        """Load exact enabled public material and return capability-only trust."""
+
+        client = self._client
+        if client is None:
+            client = _default_client()
+            self._client = client
+        state = _load_version(client, self._profile, permit_disabled=False)
+        public_key_pem = _load_public_key(client, self._profile)
+        bundle = TrustBundle(
+            entries=(
+                make_trust_bundle_entry(
+                    profile=self._profile,
+                    state=state,
+                    public_key_pem=public_key_pem,
+                ),
+            )
+        )
+        return TrustBundleVerifier(
+            VerificationProfile.capability(
+                self._profile.project_id,
+                self._profile.key_resource,
+            ),
+            bundle,
+        )
+
+
 class GoogleKmsTrustBundlePublisher:
     """Publish both fixed-purpose trust sets through the API service role."""
 
@@ -464,40 +596,7 @@ class GoogleKmsTrustBundlePublisher:
         entries = []
         for profile in selected_profiles:
             state = _load_version(client, profile, permit_disabled=True)
-            try:
-                raw_response = client.get_public_key({"name": profile.key_version})
-                response = cast(_PublicKeyResponse, raw_response)
-                response_name = response.name
-                algorithm_name = _enum_name(response.algorithm)
-                public_key_pem = response.pem
-                public_key_crc32c = response.pem_crc32c
-            except SigningError:
-                raise
-            except Exception:
-                raise _error(
-                    SigningErrorCode.PROVIDER_FAILURE,
-                    "KMS public key lookup failed",
-                ) from None
-
-            if type(response_name) is not str or response_name != profile.key_version:
-                raise _error(
-                    SigningErrorCode.KEY_VERSION_MISMATCH,
-                    "KMS returned another public key version",
-                )
-            if algorithm_name != SIGNING_ALGORITHM or algorithm_name != profile.algorithm:
-                raise _error(
-                    SigningErrorCode.ALGORITHM_MISMATCH, "KMS public key algorithm is invalid"
-                )
-            if type(public_key_pem) is not str:
-                raise _error(SigningErrorCode.PUBLIC_KEY_INVALID, "KMS public key PEM is invalid")
-            try:
-                pem_bytes = public_key_pem.encode("ascii")
-            except UnicodeEncodeError:
-                raise _error(
-                    SigningErrorCode.PUBLIC_KEY_INVALID, "KMS public key PEM is invalid"
-                ) from None
-            if type(public_key_crc32c) is not int or public_key_crc32c != _crc32c(pem_bytes):
-                raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
+            public_key_pem = _load_public_key(client, profile)
             entries.append(
                 make_trust_bundle_entry(
                     profile=profile,
@@ -547,6 +646,7 @@ class GoogleKmsTrustBundlePublisher:
 
 __all__ = [
     "GoogleKmsAsyncDigestSigner",
+    "GoogleKmsCapabilityTrustLoader",
     "GoogleKmsDigestSigner",
     "GoogleKmsEvidenceSignatureVerifier",
     "GoogleKmsTrustBundlePublisher",

@@ -31,7 +31,7 @@ module "executor" {
   project_id      = var.project_id
   region          = var.region
   service_name    = local.service_names.executor
-  description     = "Private mutation-disabled ControlGraph executor shell."
+  description     = "Private target-bound ControlGraph canary executor."
   container_image = var.controller_image
   service_account = local.service_accounts.executor
   ingress         = "INGRESS_TRAFFIC_INTERNAL_ONLY"
@@ -40,10 +40,14 @@ module "executor" {
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "executor" })
   environment = merge(local.common_environment, local.identity_environment.executor, {
-    CONTROLGRAPH_ROLE                   = "executor"
-    CONTROLGRAPH_SERVICE_NAME           = local.service_names.executor
-    CONTROLGRAPH_CONTROLLER_ID          = "${var.project_id}:${var.region}:executor"
-    CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_ROLE                       = "executor"
+    CONTROLGRAPH_SERVICE_NAME               = local.service_names.executor
+    CONTROLGRAPH_CONTROLLER_ID              = "${var.project_id}:${var.region}:executor"
+    CONTROLGRAPH_MUTATIONS_ENABLED          = "true"
+    CONTROLGRAPH_CAPABILITY_KEY_VERSION     = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_COORDINATOR_URL            = local.service_audiences.coordinator
+    CONTROLGRAPH_TARGET_NETWORK_RESOURCE    = data.terraform_remote_state.foundation.outputs.network.network_id
+    CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   })
 }
 
@@ -157,6 +161,8 @@ module "coordinator" {
     CONTROLGRAPH_RECOVERY_QUEUE                          = local.recovery_queue.name
     CONTROLGRAPH_EXECUTION_TASK_CALLER                   = local.service_accounts.execution_task_caller
     CONTROLGRAPH_RECOVERY_TASK_CALLER                    = local.service_accounts.recovery_task_caller
+    CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL               = local.service_accounts.executor
+    CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT             = tostring(local.service_subjects.executor)
   })
 }
 

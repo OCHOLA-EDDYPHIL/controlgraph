@@ -96,6 +96,17 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
             }
         )
+    if role is ServiceRole.ISSUER:
+        environment.update(
+            {
+                "CONTROLGRAPH_CAPABILITY_KEY_VERSION": (
+                    f"projects/{PROJECT_ID}/locations/us-central1/"
+                    "keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
+                    "cryptoKeyVersions/1"
+                ),
+                "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
+            }
+        )
     if role is ServiceRole.API:
         environment["CONTROLGRAPH_COORDINATOR_URL"] = (
             f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
@@ -103,6 +114,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
     if role is ServiceRole.COORDINATOR:
         environment.update(
             {
+                "CONTROLGRAPH_ISSUER_URL": (
+                    f"https://controlgraph-issuer-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
                 "CONTROLGRAPH_VERIFIER_URL": (
                     f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
                 ),
@@ -123,6 +138,26 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
                 "CONTROLGRAPH_OPERATOR_EMAIL": "operator@example.com",
                 "CONTROLGRAPH_OPERATOR_SUBJECT": SUBJECT,
+                "CONTROLGRAPH_EXECUTOR_URL": (
+                    f"https://controlgraph-executor-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
+                "CONTROLGRAPH_RECOVERY_URL": (
+                    f"https://controlgraph-recovery-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
+                "CONTROLGRAPH_EXECUTION_QUEUE": "controlgraph-execution",
+                "CONTROLGRAPH_RECOVERY_QUEUE": "controlgraph-recovery",
+                "CONTROLGRAPH_EXECUTION_TASK_CALLER": (
+                    f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_RECOVERY_TASK_CALLER": (
+                    f"cg-recovery-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL": (
+                    f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
             }
         )
     if role is ServiceRole.VERIFIER:
@@ -362,15 +397,17 @@ def test_runtime_composition_uses_startup_policy_for_google_verification() -> No
             environment=environment,
             token_verifier=verify_token,
             clock=lambda: 1_776_236_400.0,
+            kms_client=object(),
         )
     )
     response = client.post(
         protected_paths(role)[0],
+        content=b"{}",
         headers={"Authorization": "Bearer exact.test.credential"},
     )
 
-    assert response.status_code == 503
-    assert response.json()["code"] == "MUTATION_DISABLED"
+    assert response.status_code == 400
+    assert response.json()["code"] == "CONTRACT_INVALID"
     assert calls == [("exact.test.credential", expected_audience)]
 
 
@@ -420,7 +457,13 @@ def test_service_app_rejects_a_policy_for_another_role() -> None:
     tuple(
         role
         for role in ServiceRole
-        if role not in {ServiceRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER}
+        if role
+        not in {
+            ServiceRole.COORDINATOR,
+            ServiceRole.EVIDENCE_WRITER,
+            ServiceRole.ISSUER,
+            ServiceRole.EXECUTOR,
+        }
     ),
 )
 def test_runtime_rejects_kms_clients_outside_evidence_trust_roles(

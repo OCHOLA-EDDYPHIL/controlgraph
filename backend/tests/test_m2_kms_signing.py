@@ -10,6 +10,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
+from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.application.signing import (
     SIGNING_ALGORITHM,
     DetachedSignature,
@@ -33,6 +34,7 @@ from controlgraph_canary.contracts import (
     TargetBinding,
 )
 from controlgraph_canary.integrations.google.kms import (
+    GoogleKmsCapabilityTrustLoader,
     GoogleKmsDigestSigner,
     GoogleKmsTrustBundlePublisher,
 )
@@ -565,10 +567,15 @@ class _FakeKmsClient:
         self.versions = {version.profile.key_version: version for version in versions}
         self.version_requests: list[dict[str, object]] = []
         self.sign_requests: list[dict[str, object]] = []
+        self.public_key_requests: list[dict[str, object]] = []
         self.verified_digest_crc32c = True
         self.signature_crc_offset = 0
         self.public_key_crc_offset = 0
         self.response_name: str | None = None
+        self.version_response_name: str | None = None
+        self.public_key_response_name: str | None = None
+        self.public_key_algorithm: str | None = None
+        self.public_key_pem: str | None = None
         self.provider_failure: str | None = None
 
     def get_crypto_key_version(self, request: dict[str, object]) -> object:
@@ -578,7 +585,7 @@ class _FakeKmsClient:
         name = cast(str, request["name"])
         version = self.versions[name]
         return SimpleNamespace(
-            name=self.response_name or name,
+            name=self.version_response_name or self.response_name or name,
             state=version.state,
             algorithm=version.algorithm,
         )
@@ -602,17 +609,181 @@ class _FakeKmsClient:
         )
 
     def get_public_key(self, request: dict[str, object]) -> object:
+        self.public_key_requests.append(request)
         if self.provider_failure == "public_key":
             raise RuntimeError("provider diagnostic must remain private")
         name = cast(str, request["name"])
         version = self.versions[name]
-        pem = _public_pem(version.private_key)
+        pem = self.public_key_pem or _public_pem(version.private_key)
         return SimpleNamespace(
-            name=self.response_name or name,
-            algorithm=version.algorithm,
+            name=self.public_key_response_name or self.response_name or name,
+            algorithm=self.public_key_algorithm or version.algorithm,
             pem=pem,
             pem_crc32c=google_crc32c.value(pem.encode("ascii")) + self.public_key_crc_offset,
         )
+
+
+@pytest.mark.parametrize("service_role", [ServiceRole.EXECUTOR, ServiceRole.RECOVERY])
+def test_kms_capability_trust_loader_verifies_only_the_exact_enabled_version(
+    service_role: ServiceRole,
+) -> None:
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V1)
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    fake = _FakeKmsClient([_FakeKeyVersion(profile, private_key)])
+    loader = GoogleKmsCapabilityTrustLoader(
+        project_id=PROJECT_ID,
+        service_role=service_role,
+        key_version=CAPABILITY_V1,
+        client=fake,
+    )
+
+    verifier = loader.load()
+
+    assert loader.project_id == PROJECT_ID
+    assert loader.service_role is service_role
+    assert loader.key_version == CAPABILITY_V1
+    assert loader.key_resource == CAPABILITY_KEY
+    assert verifier.profile == VerificationProfile.capability(PROJECT_ID, CAPABILITY_KEY)
+    assert verifier.profile.purpose is SigningPurpose.CAPABILITY
+    assert fake.version_requests == [{"name": CAPABILITY_V1}]
+    assert fake.public_key_requests == [{"name": CAPABILITY_V1}]
+    assert fake.sign_requests == []
+    public_callables = {
+        name
+        for name in dir(loader)
+        if not name.startswith("_") and callable(getattr(loader, name))
+    }
+    assert public_callables == {"load"}
+    assert not hasattr(loader, "sign")
+    assert not hasattr(loader, "sign_digest")
+
+    payload = _capability()
+    verifier.verify(payload, _local_signature(profile, payload, private_key))
+
+    other_private_key = ec.generate_private_key(ec.SECP256R1())
+    other_profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V2)
+    other_payload = _capability(CAPABILITY_V2)
+    with pytest.raises(SigningError) as untrusted:
+        verifier.verify(
+            other_payload,
+            _local_signature(other_profile, other_payload, other_private_key),
+        )
+    assert untrusted.value.code is SigningErrorCode.KEY_VERSION_UNTRUSTED
+
+
+@pytest.mark.parametrize(
+    "service_role",
+    [
+        ServiceRole.API,
+        ServiceRole.COORDINATOR,
+        ServiceRole.ISSUER,
+        ServiceRole.VERIFIER,
+        ServiceRole.EVIDENCE_WRITER,
+        "executor",
+    ],
+)
+def test_kms_capability_trust_loader_rejects_other_roles_before_kms_access(
+    service_role: object,
+) -> None:
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V1)
+    fake = _FakeKmsClient([_FakeKeyVersion(profile, ec.generate_private_key(ec.SECP256R1()))])
+
+    with pytest.raises(SigningError) as failure:
+        GoogleKmsCapabilityTrustLoader(
+            project_id=PROJECT_ID,
+            service_role=cast(ServiceRole, service_role),
+            key_version=CAPABILITY_V1,
+            client=fake,
+        )
+
+    assert failure.value.code is SigningErrorCode.PROFILE_INVALID
+    assert fake.version_requests == []
+    assert fake.public_key_requests == []
+
+
+@pytest.mark.parametrize(
+    ("project_id", "key_version"),
+    [
+        ("shared-project", CAPABILITY_V1),
+        (PROJECT_ID, EVIDENCE_V1),
+        ("controlgraph-canary-test02", CAPABILITY_V1),
+    ],
+)
+def test_kms_capability_trust_loader_rejects_unbound_profiles_before_kms_access(
+    project_id: str,
+    key_version: str,
+) -> None:
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V1)
+    fake = _FakeKmsClient([_FakeKeyVersion(profile, ec.generate_private_key(ec.SECP256R1()))])
+
+    with pytest.raises(SigningError) as failure:
+        GoogleKmsCapabilityTrustLoader(
+            project_id=project_id,
+            service_role=ServiceRole.EXECUTOR,
+            key_version=key_version,
+            client=fake,
+        )
+
+    assert failure.value.code is SigningErrorCode.PROFILE_INVALID
+    assert fake.version_requests == []
+    assert fake.public_key_requests == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("disabled", SigningErrorCode.KEY_VERSION_DISABLED),
+        ("version_algorithm", SigningErrorCode.ALGORITHM_MISMATCH),
+        ("version_name", SigningErrorCode.KEY_VERSION_MISMATCH),
+        ("public_algorithm", SigningErrorCode.ALGORITHM_MISMATCH),
+        ("public_name", SigningErrorCode.KEY_VERSION_MISMATCH),
+        ("public_crc", SigningErrorCode.CRC_MISMATCH),
+        ("public_pem", SigningErrorCode.PUBLIC_KEY_INVALID),
+        ("version_failure", SigningErrorCode.PROVIDER_FAILURE),
+        ("public_failure", SigningErrorCode.PROVIDER_FAILURE),
+    ],
+)
+def test_kms_capability_trust_loader_fails_closed_on_provider_integrity_errors(
+    mutation: str,
+    code: SigningErrorCode,
+) -> None:
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V1)
+    version = _FakeKeyVersion(profile, ec.generate_private_key(ec.SECP256R1()))
+    fake = _FakeKmsClient([version])
+    if mutation == "disabled":
+        version.state = "DISABLED"
+    elif mutation == "version_algorithm":
+        version.algorithm = "EC_SIGN_P384_SHA384"
+    elif mutation == "version_name":
+        fake.version_response_name = CAPABILITY_V2
+    elif mutation == "public_algorithm":
+        fake.public_key_algorithm = "EC_SIGN_P384_SHA384"
+    elif mutation == "public_name":
+        fake.public_key_response_name = CAPABILITY_V2
+    elif mutation == "public_crc":
+        fake.public_key_crc_offset = 1
+    elif mutation == "public_pem":
+        fake.public_key_pem = "-----BEGIN PUBLIC KEY-----\ninvalid\n-----END PUBLIC KEY-----\n"
+    elif mutation == "version_failure":
+        fake.provider_failure = "version"
+    else:
+        fake.provider_failure = "public_key"
+    loader = GoogleKmsCapabilityTrustLoader(
+        project_id=PROJECT_ID,
+        service_role=ServiceRole.EXECUTOR,
+        key_version=CAPABILITY_V1,
+        client=fake,
+    )
+
+    with pytest.raises(SigningError) as failure:
+        loader.load()
+
+    assert failure.value.code is code
+    assert fake.sign_requests == []
+    if code is SigningErrorCode.PROVIDER_FAILURE:
+        assert failure.value.__cause__ is None
+        assert failure.value.__suppress_context__ is True
+        assert "provider diagnostic" not in str(failure.value)
 
 
 def test_payload_project_substitution_is_rejected_before_kms_access() -> None:
@@ -647,6 +818,31 @@ def test_kms_signer_sends_and_verifies_crc32c_without_key_selection_inputs() -> 
         }
     ]
     assert set(fake.sign_requests[0]) == {"name", "digest", "digest_crc32c"}
+
+
+def test_kms_signer_defers_default_credentials_until_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V1)
+    calls = 0
+
+    def unavailable_client() -> object:
+        nonlocal calls
+        calls += 1
+        raise SigningError(SigningErrorCode.PROVIDER_FAILURE, "unavailable")
+
+    monkeypatch.setattr(
+        "controlgraph_canary.integrations.google.kms._default_client",
+        unavailable_client,
+    )
+
+    signer = GoogleKmsDigestSigner(profile)
+
+    assert calls == 0
+    with pytest.raises(SigningError) as failure:
+        signer.sign_digest(b"d" * 32)
+    assert failure.value.code is SigningErrorCode.PROVIDER_FAILURE
+    assert calls == 1
 
 
 @pytest.mark.parametrize(

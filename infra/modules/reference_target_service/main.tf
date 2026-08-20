@@ -111,6 +111,10 @@ resource "google_cloud_run_v2_service" "reference" {
 
   lifecycle {
     prevent_destroy = true
+
+    # Creation establishes the safe 100/0 baseline. Subsequent traffic belongs
+    # to the epoch-fenced controller while Terraform retains every other field.
+    ignore_changes = [traffic]
   }
 }
 

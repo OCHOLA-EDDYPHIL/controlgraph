@@ -20,6 +20,7 @@ IDENTITY_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_AUTH_CALLER_ROLE",
     "CONTROLGRAPH_AUTH_CALLER_SUBJECT",
 )
+RECEIPT_AUTHORITY_PATH = "/v1/internal/authority/receipts"
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
@@ -109,7 +110,11 @@ class RouteAuthenticationPolicy:
         _validate_project_number(self.project_number)
         if type(self.service_role) is not ServiceRole:
             raise ValueError("service role is invalid")
-        if self.path != protected_path(self.service_role):
+        receipt_authority_route = (
+            self.service_role is ServiceRole.COORDINATOR
+            and self.path == RECEIPT_AUTHORITY_PATH
+        )
+        if not receipt_authority_route and self.path != protected_path(self.service_role):
             raise ValueError("protected path does not match the service role")
         _validate_audience(self.audience, self.service_role)
         expected_audience = (
@@ -118,7 +123,11 @@ class RouteAuthenticationPolicy:
         )
         if self.audience != expected_audience:
             raise ValueError("route audience does not match its project coordinates")
-        expected_caller_role = expected_route_caller_role(self.service_role)
+        expected_caller_role = (
+            CallerRole.EXECUTOR
+            if receipt_authority_route
+            else expected_route_caller_role(self.service_role)
+        )
         if self.caller.role is not expected_caller_role:
             raise ValueError("caller role does not match the protected route")
         if self.caller.role is CallerRole.OPERATOR:
@@ -378,6 +387,7 @@ def _validate_audience(value: str, service_role: ServiceRole) -> None:
 
 __all__ = [
     "IDENTITY_ENVIRONMENT_KEYS",
+    "RECEIPT_AUTHORITY_PATH",
     "AuthenticationContext",
     "AuthenticationDenialCode",
     "AuthenticationError",

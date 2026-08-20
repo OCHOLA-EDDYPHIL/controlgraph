@@ -86,7 +86,7 @@ variable "reference_target_candidate_configuration_sha256" {
 }
 
 variable "reference_target_deployment_phase" {
-  description = "Explicit stable-then-candidate release phase; candidate is also the reset definition."
+  description = "Explicit stable-then-candidate revision staging phase; creation establishes the safe traffic baseline."
   type        = string
 
   validation {

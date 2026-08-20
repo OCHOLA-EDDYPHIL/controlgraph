@@ -35,6 +35,7 @@ EVIDENCE_WRITER_ENVIRONMENT_KEYS = (
 )
 
 COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_ISSUER_URL",
     "CONTROLGRAPH_VERIFIER_URL",
     "CONTROLGRAPH_EVIDENCE_WRITER_URL",
     "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
@@ -42,9 +43,29 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256",
     "CONTROLGRAPH_OPERATOR_EMAIL",
     "CONTROLGRAPH_OPERATOR_SUBJECT",
+    "CONTROLGRAPH_EXECUTOR_URL",
+    "CONTROLGRAPH_RECOVERY_URL",
+    "CONTROLGRAPH_EXECUTION_QUEUE",
+    "CONTROLGRAPH_RECOVERY_QUEUE",
+    "CONTROLGRAPH_EXECUTION_TASK_CALLER",
+    "CONTROLGRAPH_RECOVERY_TASK_CALLER",
+    "CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL",
+    "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT",
 )
 
 API_ROOT_ENVIRONMENT_KEYS = ("CONTROLGRAPH_COORDINATOR_URL",)
+
+ISSUER_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
+    "CONTROLGRAPH_SIGNING_ALGORITHM",
+)
+
+EXECUTOR_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
+    "CONTROLGRAPH_COORDINATOR_URL",
+    "CONTROLGRAPH_TARGET_NETWORK_RESOURCE",
+    "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE",
+)
 
 VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_TARGET_NETWORK_RESOURCE",
@@ -65,6 +86,16 @@ def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]
         return REQUIRED_ENVIRONMENT_KEYS + EVIDENCE_WRITER_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.API.value:
         return REQUIRED_ENVIRONMENT_KEYS + API_ROOT_ENVIRONMENT_KEYS
+    if type(role) is str and role.strip() == ServiceRole.ISSUER.value:
+        return REQUIRED_ENVIRONMENT_KEYS + ISSUER_ENVIRONMENT_KEYS
+    mutations_enabled = environment.get("CONTROLGRAPH_MUTATIONS_ENABLED")
+    if (
+        type(role) is str
+        and role.strip() == ServiceRole.EXECUTOR.value
+        and type(mutations_enabled) is str
+        and mutations_enabled.strip().lower() == "true"
+    ):
+        return REQUIRED_ENVIRONMENT_KEYS + EXECUTOR_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.COORDINATOR.value:
         return REQUIRED_ENVIRONMENT_KEYS + COORDINATOR_TRUST_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.VERIFIER.value:
@@ -92,6 +123,15 @@ class ControllerSettings:
     signing_algorithm: str | None
     verifier_url: str | None
     evidence_writer_url: str | None
+    issuer_url: str | None
+    executor_url: str | None
+    recovery_url: str | None
+    execution_queue: str | None
+    recovery_queue: str | None
+    execution_task_caller: str | None
+    recovery_task_caller: str | None
+    receipt_authority_caller_identity: str | None
+    receipt_authority_caller_subject: str | None
     target_network_resource: str | None
     target_subnetwork_resource: str | None
     coordinator_url: str | None
@@ -143,8 +183,9 @@ class ControllerSettings:
             raise ValueError("CONTROLGRAPH_FIRESTORE_DATABASE must be controlgraph-authority")
         if mutation_flag not in {"true", "false"}:
             raise ValueError("CONTROLGRAPH_MUTATIONS_ENABLED must be true or false")
-        if mutation_flag != "false":
-            raise ValueError("M2 service shells must keep mutations disabled")
+        mutations_enabled = mutation_flag == "true"
+        if mutations_enabled and service_role is not ServiceRole.EXECUTOR:
+            raise ValueError("only the executor may enable controlled mutations")
         if environment_name != "nonprod":
             raise ValueError("CONTROLGRAPH_ENVIRONMENT must be nonprod")
 
@@ -153,13 +194,25 @@ class ControllerSettings:
         signing_algorithm: str | None = None
         verifier_url: str | None = None
         evidence_writer_url: str | None = None
+        issuer_url: str | None = None
+        executor_url: str | None = None
+        recovery_url: str | None = None
+        execution_queue: str | None = None
+        recovery_queue: str | None = None
+        execution_task_caller: str | None = None
+        recovery_task_caller: str | None = None
+        receipt_authority_caller_identity: str | None = None
+        receipt_authority_caller_subject: str | None = None
         target_network_resource: str | None = None
         target_subnetwork_resource: str | None = None
         coordinator_url: str | None = None
         candidate_revision_configuration_sha256: str | None = None
         operator_identity: str | None = None
         operator_subject: str | None = None
-        if service_role is ServiceRole.API:
+        executor_mutation_enabled = (
+            service_role is ServiceRole.EXECUTOR and mutations_enabled
+        )
+        if service_role is ServiceRole.API or executor_mutation_enabled:
             coordinator_url = source["CONTROLGRAPH_COORDINATOR_URL"].strip()
             _validate_service_url(
                 coordinator_url,
@@ -175,11 +228,14 @@ class ControllerSettings:
             )
             if expected_key_version.fullmatch(evidence_key_version) is None:
                 raise ValueError("CONTROLGRAPH_EVIDENCE_KEY_VERSION is outside its purpose")
-        if service_role is ServiceRole.EVIDENCE_WRITER:
+        if service_role in {ServiceRole.EVIDENCE_WRITER, ServiceRole.ISSUER}:
             signing_algorithm = source["CONTROLGRAPH_SIGNING_ALGORITHM"].strip()
             if signing_algorithm != SIGNING_ALGORITHM:
                 raise ValueError("CONTROLGRAPH_SIGNING_ALGORITHM is unsupported")
-        if service_role is ServiceRole.COORDINATOR:
+        if service_role in {
+            ServiceRole.COORDINATOR,
+            ServiceRole.ISSUER,
+        } or executor_mutation_enabled:
             capability_key_version = source[
                 "CONTROLGRAPH_CAPABILITY_KEY_VERSION"
             ].strip()
@@ -195,8 +251,11 @@ class ControllerSettings:
                 raise ValueError(
                     "CONTROLGRAPH_CAPABILITY_KEY_VERSION is outside its purpose"
                 )
+        if service_role is ServiceRole.COORDINATOR:
+            issuer_url = source["CONTROLGRAPH_ISSUER_URL"].strip()
             verifier_url = source["CONTROLGRAPH_VERIFIER_URL"].strip()
             evidence_writer_url = source["CONTROLGRAPH_EVIDENCE_WRITER_URL"].strip()
+            _validate_service_url(issuer_url, ServiceRole.ISSUER, project_number)
             _validate_service_url(verifier_url, ServiceRole.VERIFIER, project_number)
             _validate_service_url(
                 evidence_writer_url,
@@ -220,7 +279,45 @@ class ControllerSettings:
             _validate_operator_identity(operator_identity)
             if _PROJECT_NUMBER.fullmatch(operator_subject) is None:
                 raise ValueError("CONTROLGRAPH_OPERATOR_SUBJECT is invalid")
-        if service_role is ServiceRole.VERIFIER:
+            executor_url = source["CONTROLGRAPH_EXECUTOR_URL"].strip()
+            recovery_url = source["CONTROLGRAPH_RECOVERY_URL"].strip()
+            _validate_service_url(executor_url, ServiceRole.EXECUTOR, project_number)
+            _validate_service_url(recovery_url, ServiceRole.RECOVERY, project_number)
+            execution_queue = source["CONTROLGRAPH_EXECUTION_QUEUE"].strip()
+            recovery_queue = source["CONTROLGRAPH_RECOVERY_QUEUE"].strip()
+            if execution_queue != "controlgraph-execution":
+                raise ValueError("CONTROLGRAPH_EXECUTION_QUEUE is invalid")
+            if recovery_queue != "controlgraph-recovery":
+                raise ValueError("CONTROLGRAPH_RECOVERY_QUEUE is invalid")
+            execution_task_caller = source[
+                "CONTROLGRAPH_EXECUTION_TASK_CALLER"
+            ].strip()
+            recovery_task_caller = source[
+                "CONTROLGRAPH_RECOVERY_TASK_CALLER"
+            ].strip()
+            _validate_task_caller(
+                execution_task_caller,
+                project_id=project_id,
+                account_id="cg-execution-task-caller",
+            )
+            _validate_task_caller(
+                recovery_task_caller,
+                project_id=project_id,
+                account_id="cg-recovery-task-caller",
+            )
+            receipt_authority_caller_identity = source[
+                "CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL"
+            ].strip()
+            if receipt_authority_caller_identity != (
+                f"controlgraph-executor@{project_id}.iam.gserviceaccount.com"
+            ):
+                raise ValueError("receipt authority caller identity is invalid")
+            receipt_authority_caller_subject = source[
+                "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT"
+            ].strip()
+            if _PROJECT_NUMBER.fullmatch(receipt_authority_caller_subject) is None:
+                raise ValueError("receipt authority caller subject is invalid")
+        if service_role is ServiceRole.VERIFIER or executor_mutation_enabled:
             target_network_resource = source[
                 "CONTROLGRAPH_TARGET_NETWORK_RESOURCE"
             ].strip()
@@ -246,13 +343,22 @@ class ControllerSettings:
             build_digest=build_digest,
             contract_version=contract_version,
             firestore_database=firestore_database,
-            mutations_enabled=False,
+            mutations_enabled=mutations_enabled,
             environment=environment_name,
             capability_key_version=capability_key_version,
             evidence_key_version=evidence_key_version,
             signing_algorithm=signing_algorithm,
             verifier_url=verifier_url,
             evidence_writer_url=evidence_writer_url,
+            issuer_url=issuer_url,
+            executor_url=executor_url,
+            recovery_url=recovery_url,
+            execution_queue=execution_queue,
+            recovery_queue=recovery_queue,
+            execution_task_caller=execution_task_caller,
+            recovery_task_caller=recovery_task_caller,
+            receipt_authority_caller_identity=receipt_authority_caller_identity,
+            receipt_authority_caller_subject=receipt_authority_caller_subject,
             target_network_resource=target_network_resource,
             target_subnetwork_resource=target_subnetwork_resource,
             coordinator_url=coordinator_url,
@@ -296,6 +402,16 @@ def _validate_target_resource(value: str, *, prefix: str) -> None:
         or "reconcile" in value.lower()
     ):
         raise ValueError("verifier target network resource is invalid")
+
+
+def _validate_task_caller(
+    value: str,
+    *,
+    project_id: str,
+    account_id: str,
+) -> None:
+    if value != f"{account_id}@{project_id}.iam.gserviceaccount.com":
+        raise ValueError("task caller identity is invalid")
 
 
 def _validate_operator_identity(value: str) -> None:
