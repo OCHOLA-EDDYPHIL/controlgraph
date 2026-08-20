@@ -126,6 +126,18 @@ check "run_executor_roles_are_minimal" {
   }
 }
 
+check "task_oidc_actor_is_act_as_only" {
+  assert {
+    condition = (
+      local.custom_iam_roles.task_oidc_actor.role_id == "controlgraph.taskOidcActor" &&
+      toset(local.custom_iam_roles.task_oidc_actor.permissions) == toset([
+        "iam.serviceAccounts.actAs",
+      ])
+    )
+    error_message = "The task OIDC actor role must contain only service-account actAs permission."
+  }
+}
+
 check "tasks_controller_is_queue_control_only" {
   assert {
     condition = toset(local.custom_iam_roles.tasks_controller.permissions) == toset([
