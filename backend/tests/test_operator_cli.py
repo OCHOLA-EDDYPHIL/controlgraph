@@ -463,6 +463,7 @@ def test_all_operator_commands_use_one_fixed_shell_free_api_post(
         call = poster.calls[0]
         assert call["url"] == f"{origin}/v1/operator/commands"
         assert call["body"] == canonical_json_bytes(command)  # type: ignore[arg-type]
+        assert call["timeout"] == 30.0
         output = capsys.readouterr().out
         assert "header.payload.signature" not in output
         assert output.strip() == canonical_json_bytes(result).decode("utf-8")  # type: ignore[arg-type]
