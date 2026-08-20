@@ -74,6 +74,12 @@ resource "google_service_account_iam_member" "cloud_tasks_token_creator" {
   member             = google_project_service_identity.cloud_tasks.member
 }
 
+resource "google_service_account_iam_member" "executor_reference_target_act_as" {
+  service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names.reference
+  role               = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.task_oidc_actor
+  member             = "serviceAccount:${local.service_accounts.executor}"
+}
+
 locals {
   run_invokers = {
     api = {
@@ -203,11 +209,16 @@ check "executor_target_mutation_is_service_scoped" {
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.name == module.reference_target.target.name &&
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_traffic_mutator &&
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.member == "serviceAccount:${local.service_accounts.executor}" &&
+      data.terraform_remote_state.foundation.outputs.service_account_names.reference == "projects/${var.project_id}/serviceAccounts/controlgraph-reference@${var.project_id}.iam.gserviceaccount.com" &&
+      data.terraform_remote_state.foundation.outputs.custom_iam_role_names.task_oidc_actor == "projects/${var.project_id}/roles/controlgraph.taskOidcActor" &&
+      google_service_account_iam_member.executor_reference_target_act_as.service_account_id == data.terraform_remote_state.foundation.outputs.service_account_names.reference &&
+      google_service_account_iam_member.executor_reference_target_act_as.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.task_oidc_actor &&
+      google_service_account_iam_member.executor_reference_target_act_as.member == "serviceAccount:controlgraph-executor@${var.project_id}.iam.gserviceaccount.com" &&
       google_project_iam_member.executor_operation_reader.project == var.project_id &&
       google_project_iam_member.executor_operation_reader.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_operation_reader &&
       google_project_iam_member.executor_operation_reader.member == "serviceAccount:${local.service_accounts.executor}" &&
       google_project_iam_member.executor_operation_reader.condition[0].expression == "resource.name.startsWith('projects/${var.project_id}/locations/${var.region}/operations/')"
     )
-    error_message = "The executor may mutate only the fixed reference service and read operation status only in the fixed project region."
+    error_message = "The executor may mutate only the fixed reference service, act as only its fixed runtime identity, and read operation status only in the fixed project region."
   }
 }

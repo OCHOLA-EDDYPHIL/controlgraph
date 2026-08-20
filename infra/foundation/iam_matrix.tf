@@ -92,6 +92,10 @@ locals {
       api      = "run.googleapis.com"
       boundary = "the disposable reference target probe"
     }
+    reference_target_act_as = {
+      api      = "iam.googleapis.com"
+      boundary = "the fixed reference-target runtime service account"
+    }
     run_target_canary_or_promote = {
       api      = "run.googleapis.com"
       boundary = "traffic on the one bound target through the executor application contract"
@@ -163,6 +167,7 @@ locals {
       "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
+      "reference_target_act_as",
       "run_coordinator_invoke",
       "run_operation_read",
       "run_target_canary_or_promote",
@@ -171,6 +176,7 @@ locals {
       "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
+      "reference_target_act_as",
       "run_operation_read",
       "run_target_restore_stable",
     ])
@@ -250,6 +256,7 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
+        "reference_target_act_as",
         "run_coordinator_invoke",
         "run_operation_read",
         "run_target_canary_or_promote",
@@ -406,6 +413,29 @@ check "operator_permissions_are_bounded" {
       local.identity_implemented_allows.operator == local.identity_expected_allows.operator
     )
     error_message = "The operator may invoke the API and control only the fixed execution queue."
+  }
+}
+
+check "reference_target_act_as_staging_is_closed" {
+  assert {
+    condition = (
+      toset([
+        for identity, allows in local.identity_expected_allows : identity
+        if contains(allows, "reference_target_act_as")
+      ]) == toset(["executor", "recovery"]) &&
+      toset([
+        for identity, allows in local.identity_implemented_allows : identity
+        if contains(allows, "reference_target_act_as")
+      ]) == toset(["executor"]) &&
+      contains(
+        setsubtract(
+          local.identity_expected_allows.recovery,
+          local.identity_implemented_allows.recovery,
+        ),
+        "reference_target_act_as",
+      )
+    )
+    error_message = "Reference-target actAs authority must remain implemented for executor only, with recovery pending."
   }
 }
 
