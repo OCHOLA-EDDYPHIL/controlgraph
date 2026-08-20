@@ -183,6 +183,32 @@ resource "google_project_iam_member" "executor_operation_reader" {
   }
 }
 
+resource "google_cloud_run_v2_service_iam_member" "recovery_target_stable_restorer" {
+  project  = var.project_id
+  location = var.region
+  name     = module.reference_target.target.name
+  role     = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_stable_restorer
+  member   = "serviceAccount:${local.service_accounts.recovery}"
+}
+
+resource "google_project_iam_member" "recovery_operation_reader" {
+  project = var.project_id
+  role    = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_operation_reader
+  member  = "serviceAccount:${local.service_accounts.recovery}"
+
+  condition {
+    title       = "controlgraph_recovery_us_central1_operations"
+    description = "Read only Cloud Run operation status in the fixed runtime region."
+    expression  = "resource.name.startsWith('projects/${var.project_id}/locations/${var.region}/operations/')"
+  }
+}
+
+resource "google_project_iam_member" "verifier_monitoring_health_reader" {
+  project = var.project_id
+  role    = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.monitoring_health_reader
+  member  = "serviceAccount:${local.service_accounts.verifier}"
+}
+
 check "verifier_snapshot_reader_is_service_scoped" {
   assert {
     condition = (
@@ -209,5 +235,33 @@ check "executor_target_mutation_is_service_scoped" {
       google_project_iam_member.executor_operation_reader.condition[0].expression == "resource.name.startsWith('projects/${var.project_id}/locations/${var.region}/operations/')"
     )
     error_message = "The executor may mutate only the fixed reference service and read operation status only in the fixed project region."
+  }
+}
+
+check "recovery_target_restore_is_service_scoped" {
+  assert {
+    condition = (
+      google_cloud_run_v2_service_iam_member.recovery_target_stable_restorer.project == var.project_id &&
+      google_cloud_run_v2_service_iam_member.recovery_target_stable_restorer.location == var.region &&
+      google_cloud_run_v2_service_iam_member.recovery_target_stable_restorer.name == module.reference_target.target.name &&
+      google_cloud_run_v2_service_iam_member.recovery_target_stable_restorer.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_stable_restorer &&
+      google_cloud_run_v2_service_iam_member.recovery_target_stable_restorer.member == "serviceAccount:${local.service_accounts.recovery}" &&
+      google_project_iam_member.recovery_operation_reader.project == var.project_id &&
+      google_project_iam_member.recovery_operation_reader.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_operation_reader &&
+      google_project_iam_member.recovery_operation_reader.member == "serviceAccount:${local.service_accounts.recovery}" &&
+      google_project_iam_member.recovery_operation_reader.condition[0].expression == "resource.name.startsWith('projects/${var.project_id}/locations/${var.region}/operations/')"
+    )
+    error_message = "Recovery may update only the fixed reference service and read operation status only in the fixed project region."
+  }
+}
+
+check "verifier_monitoring_access_is_read_only" {
+  assert {
+    condition = (
+      google_project_iam_member.verifier_monitoring_health_reader.project == var.project_id &&
+      google_project_iam_member.verifier_monitoring_health_reader.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.monitoring_health_reader &&
+      google_project_iam_member.verifier_monitoring_health_reader.member == "serviceAccount:${local.service_accounts.verifier}"
+    )
+    error_message = "The verifier Monitoring grant must remain bound to its dedicated-project read-only role."
   }
 }
