@@ -31,6 +31,7 @@ run "stable_revision_starts_at_the_bounded_baseline" {
     condition = (
       google_cloud_run_v2_service.reference.template[0].scaling[0].min_instance_count == 0 &&
       google_cloud_run_v2_service.reference.template[0].scaling[0].max_instance_count == 1 &&
+      google_cloud_run_v2_service.reference.scaling[0].min_instance_count == 0 &&
       length(google_cloud_run_v2_service.reference.traffic) == 1 &&
       length([
         for target in google_cloud_run_v2_service.reference.traffic : target
