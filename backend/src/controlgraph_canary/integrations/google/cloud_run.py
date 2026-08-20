@@ -650,7 +650,12 @@ class CloudRunV2ReferenceTargetResetter:
             or service.generation != service.observed_generation
             or service.template_revision != REFERENCE_TARGET_CANDIDATE_REVISION
             or service.latest_created_revision != REFERENCE_TARGET_CANDIDATE_REVISION
-            or service.latest_ready_revision != REFERENCE_TARGET_CANDIDATE_REVISION
+            or service.latest_ready_revision
+            not in {
+                _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION,
+                REFERENCE_TARGET_STABLE_REVISION,
+                REFERENCE_TARGET_CANDIDATE_REVISION,
+            }
             or stable.reconciling
             or stable.ready_state is not CloudRunReadyState.READY
             or stable.generation != stable.observed_generation
@@ -1172,9 +1177,18 @@ def _decode_service(
         observed_generation=value.observed_generation,
         reconciling=value.reconciling,
         ready_state=_decode_ready_condition(value.terminal_condition),
-        latest_ready_revision=value.latest_ready_revision,
-        latest_created_revision=value.latest_created_revision,
-        template_revision=value.template.revision,
+        latest_ready_revision=_decode_provider_revision_name(
+            value.latest_ready_revision,
+            configuration=configuration,
+        ),
+        latest_created_revision=_decode_provider_revision_name(
+            value.latest_created_revision,
+            configuration=configuration,
+        ),
+        template_revision=_decode_provider_revision_name(
+            value.template.revision,
+            configuration=configuration,
+        ),
         template_concurrency=value.template.max_instance_request_concurrency,
         traffic=traffic,
         traffic_statuses=traffic_statuses,
@@ -1197,11 +1211,16 @@ def _decode_revision(
         raise ValueError("Cloud Run revision does not have one authoritative Ready condition")
     immutable_configuration = _decode_revision_configuration(value)
     configuration.validate_revision_configuration(immutable_configuration)
+    service_resource = value.service
+    if service_resource == configuration.target.service_name:
+        service_resource = configuration.service_resource
+    if service_resource != configuration.service_resource:
+        raise ValueError("Cloud Run revision service is outside the configured target")
     return CloudRunRevisionState(
         target=configuration.target,
         revision=expected_revision,
         resource_name=value.name,
-        service_resource=value.service,
+        service_resource=service_resource,
         uid=value.uid,
         etag=value.etag,
         generation=value.generation,
@@ -1211,6 +1230,22 @@ def _decode_revision(
         concurrency=value.max_instance_request_concurrency,
         configuration=immutable_configuration,
     )
+
+
+def _decode_provider_revision_name(
+    value: object,
+    *,
+    configuration: CloudRunTargetConfiguration,
+) -> str:
+    if type(value) is not str:
+        raise TypeError("Cloud Run revision name is invalid")
+    resource_prefix = f"{configuration.service_resource}/revisions/"
+    revision = value.removeprefix(resource_prefix) if value.startswith(resource_prefix) else value
+    if value != revision and "/" in revision:
+        raise ValueError("Cloud Run revision resource is invalid")
+    if configuration.revision_resource_name(revision) != f"{resource_prefix}{revision}":
+        raise ValueError("Cloud Run revision is outside the configured service")
+    return revision
 
 
 def _decode_ready_condition(value: object) -> CloudRunReadyState:

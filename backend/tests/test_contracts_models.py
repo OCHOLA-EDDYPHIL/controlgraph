@@ -80,6 +80,28 @@ def test_stable_snapshot_accepts_one_explicit_unserved_revision() -> None:
     assert value.traffic[1].percent == 0
 
 
+def test_stable_snapshot_preserves_a_provider_quoted_etag() -> None:
+    value = StableSnapshot.model_validate(
+        {
+            **snapshot().model_dump(mode="python"),
+            "provider_etag": '"provider-etag=="',
+        }
+    )
+
+    assert value.provider_etag == '"provider-etag=="'
+
+
+@pytest.mark.parametrize("provider_etag", ['""', '"unclosed', 'embedded"quote'])
+def test_stable_snapshot_rejects_malformed_quoted_etags(provider_etag: str) -> None:
+    with pytest.raises(ValidationError):
+        StableSnapshot.model_validate(
+            {
+                **snapshot().model_dump(mode="python"),
+                "provider_etag": provider_etag,
+            }
+        )
+
+
 def test_stable_snapshot_requires_an_explicit_revision_configuration_digest() -> None:
     data = snapshot().model_dump(mode="python")
     del data["stable_revision_configuration_sha256"]

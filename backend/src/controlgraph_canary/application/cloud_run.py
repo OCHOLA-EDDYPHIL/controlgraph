@@ -22,7 +22,9 @@ CLOUD_RUN_REVISION_CONFIGURATION_V1: Final = (
     "controlgraph.cloud-run-revision-configuration/v1"
 )
 _CLOUD_RUN_NAME: Final = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_OPAQUE_TOKEN: Final = re.compile(r"^[A-Za-z0-9._~:/+=-]+$")
+_OPAQUE_TOKEN: Final = re.compile(
+    r'^(?:[A-Za-z0-9._~:/+=-]+|"[A-Za-z0-9._~:/+=-]+")$'
+)
 _IMMUTABLE_IMAGE: Final = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 _SERVICE_ACCOUNT: Final = re.compile(
     r"^[a-z0-9][a-z0-9-]{0,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$"

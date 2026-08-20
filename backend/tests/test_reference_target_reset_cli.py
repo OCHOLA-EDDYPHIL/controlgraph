@@ -102,3 +102,23 @@ def test_reference_target_reset_command_rejects_an_unbound_project_before_cloud(
     assert json.loads(capsys.readouterr().out) == {
         "code": "REFERENCE_TARGET_RESET_COMMAND_INVALID"
     }
+
+
+def test_reference_target_reset_request_preserves_a_provider_quoted_etag() -> None:
+    request = ReferenceTargetResetRequest(
+        expected_etag='"provider-etag=="',
+        confirmation="RESET_REFERENCE_TARGET_BASELINE",
+    )
+
+    assert request.expected_etag == '"provider-etag=="'
+
+
+@pytest.mark.parametrize("expected_etag", ['""', '"unclosed', 'embedded"quote'])
+def test_reference_target_reset_request_rejects_malformed_quoted_etags(
+    expected_etag: str,
+) -> None:
+    with pytest.raises(ValueError, match="expected etag"):
+        ReferenceTargetResetRequest(
+            expected_etag=expected_etag,
+            confirmation="RESET_REFERENCE_TARGET_BASELINE",
+        )

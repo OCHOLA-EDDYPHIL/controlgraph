@@ -18,7 +18,9 @@ REFERENCE_TARGET_CONCURRENCY: Final = 8
 REFERENCE_TARGET_RESET_CONFIRMATION: Final = "RESET_REFERENCE_TARGET_BASELINE"
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
-_OPAQUE_ETAG: Final = re.compile(r"^[A-Za-z0-9._~+/=:-]{1,512}$")
+_OPAQUE_ETAG: Final = re.compile(
+    r'^(?:[A-Za-z0-9._~+/=:-]{1,512}|"[A-Za-z0-9._~+/=:-]{1,510}")$'
+)
 _OPERATION_NAME: Final = re.compile(r"^[A-Za-z0-9._~+/=:-]{1,512}$")
 
 

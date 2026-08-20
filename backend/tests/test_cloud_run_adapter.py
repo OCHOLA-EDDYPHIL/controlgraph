@@ -913,6 +913,37 @@ async def test_exact_service_and_revision_reads_use_only_fixed_resources() -> No
 
 
 @_async_test
+async def test_service_read_preserves_a_provider_quoted_etag() -> None:
+    quoted_etag = '"' + "A" * 151 + '"'
+    service = _service(
+        etag=quoted_etag,
+        latest_ready_revision=(
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-stable-v1"
+        ),
+        latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
+    )
+    revisions = _FakeRevisionsClient()
+    for response in revisions.responses.values():
+        response.service = SERVICE
+        response.etag = quoted_etag
+
+    state = await _adapter(
+        _FakeServicesClient(service=service),
+        revisions=revisions,
+    ).read_target()
+
+    assert state.service.etag == quoted_etag
+    assert state.service.latest_ready_revision == (
+        "controlgraph-reference-target-stable-v1"
+    )
+    assert state.service.latest_created_revision == CANDIDATE
+    assert state.stable_revision.service_resource == SERVICE_RESOURCE
+    assert state.stable_revision.etag == quoted_etag
+    assert state.candidate_revision.service_resource == SERVICE_RESOURCE
+    assert state.candidate_revision.etag == quoted_etag
+
+
+@_async_test
 async def test_verifier_snapshot_reader_has_only_exact_read_operations() -> None:
     services = _FakeServicesClient(service=_service(100, 0))
     revisions = _FakeRevisionsClient()
@@ -1764,6 +1795,10 @@ async def test_reference_target_reset_migrates_the_retained_v1_baseline_to_v2() 
         candidate_revision=CANDIDATE,
         etag="etag-before-migration",
         generation=8,
+        latest_ready_revision=(
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-stable-v1"
+        ),
+        latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
     del before.traffic[1:]
     del before.traffic_statuses[1:]
