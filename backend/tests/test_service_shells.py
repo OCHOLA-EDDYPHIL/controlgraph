@@ -17,6 +17,10 @@ from controlgraph_canary.application.identity import (
     runtime_route_policy,
     runtime_service_name,
 )
+from controlgraph_canary.application.promotion_execution import (
+    ApiPromotionClient,
+    CoordinatorPromotionRelay,
+)
 from controlgraph_canary.application.revocation_relay import (
     ApiEpochRevocationClient,
     CoordinatorEpochRevocationRelay,
@@ -239,6 +243,10 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
             module.app.state.controlgraph_epoch_revocation_client,
             ApiEpochRevocationClient,
         )
+        assert isinstance(
+            module.app.state.controlgraph_promotion_client,
+            ApiPromotionClient,
+        )
     if role is ServiceRole.COORDINATOR:
         assert isinstance(
             module.app.state.controlgraph_root_creation_relay,
@@ -247,6 +255,10 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
         assert isinstance(
             module.app.state.controlgraph_epoch_revocation_relay,
             CoordinatorEpochRevocationRelay,
+        )
+        assert isinstance(
+            module.app.state.controlgraph_promotion_relay,
+            CoordinatorPromotionRelay,
         )
 
     health = client.get("/healthz")

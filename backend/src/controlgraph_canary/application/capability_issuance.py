@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,7 +12,14 @@ from enum import StrEnum
 from typing import Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
-from controlgraph_canary.application.authority_store import AuthorityStoreError
+from controlgraph_canary.application.authority_store import (
+    AuthorityStoreCorruptRecord,
+    AuthorityStoreError,
+    StoredRecord,
+)
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_v2_target_configuration_sha256,
+)
 from controlgraph_canary.application.root_authority import (
     RootAuthorityBundleReader,
     TrustedRootAuthority,
@@ -39,6 +47,7 @@ from controlgraph_canary.authority.policy import (
 )
 from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 from controlgraph_canary.contracts.codec import (
+    ContractError,
     RestrictedJson,
     canonical_json_value_bytes,
     canonical_sha256,
@@ -49,14 +58,22 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
     EpochAuthorityRecord,
+    ExecutionReceipt,
+    ReceiptOutcome,
     SignedCapability,
     TargetBinding,
+)
+from controlgraph_canary.contracts.promotion_execution import (
+    VerifiedApplyReceiptLocatorV1,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
 )
-from controlgraph_canary.contracts.storage import ServiceClaimStatus
+from controlgraph_canary.contracts.storage import (
+    ServiceClaimStatus,
+    execution_receipt_logical_id,
+)
 
 CAPABILITY_IDENTITY_V1 = "controlgraph.capability-identity/v1"
 CAPABILITY_IDENTITY_DOMAIN = b"controlgraph.capability-identity/v1\0"
@@ -164,6 +181,35 @@ class CapabilityIssuanceRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PromotionCapabilityIssuanceRequest:
+    """Root preconditions and exact verified canary receipt selected for promotion."""
+
+    root_id: str
+    expected_root_sha256: str
+    expected_epoch: int
+    request_id: str
+    idempotency_key: str
+    verified_apply_receipt: VerifiedApplyReceiptLocatorV1
+
+    def __post_init__(self) -> None:
+        _validate_identifier("root_id", self.root_id)
+        if (
+            type(self.expected_root_sha256) is not str
+            or _SHA256.fullmatch(self.expected_root_sha256) is None
+        ):
+            raise ValueError("expected_root_sha256 is invalid")
+        if (
+            type(self.expected_epoch) is not int
+            or not 1 <= self.expected_epoch <= MAX_SAFE_INTEGER
+        ):
+            raise ValueError("expected_epoch is invalid")
+        _validate_identifier("request_id", self.request_id)
+        _validate_identifier("idempotency_key", self.idempotency_key)
+        if type(self.verified_apply_receipt) is not VerifiedApplyReceiptLocatorV1:
+            raise ValueError("verified_apply_receipt is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class CapabilityIssuerConfiguration:
     """Fixed issuer, handler, target, and lifetime bindings."""
 
@@ -240,6 +286,19 @@ class CapabilityLineageResolver(Protocol):
 
 
 @runtime_checkable
+class VerifiedApplyReceiptReader(Protocol):
+    """Strongly read one durable execution receipt selected by logical key."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def read_receipt(
+        self,
+        idempotency_key: str,
+    ) -> StoredRecord[ExecutionReceipt] | None: ...
+
+
+@runtime_checkable
 class CapabilityEnvelopeVerifier(Protocol):
     """Verify one signed capability against the configured trust policy."""
 
@@ -303,6 +362,7 @@ class CapabilityIssuer:
         configuration: CapabilityIssuerConfiguration,
         lineage_resolver: CapabilityLineageResolver | None = None,
         envelope_verifier: CapabilityEnvelopeVerifier | None = None,
+        receipt_reader: VerifiedApplyReceiptReader | None = None,
     ) -> None:
         if type(configuration) is not CapabilityIssuerConfiguration:
             raise TypeError("an exact capability issuer configuration is required")
@@ -317,11 +377,22 @@ class CapabilityIssuer:
             raise ValueError("issuer signer project does not match the configured target")
         if (lineage_resolver is None) != (envelope_verifier is None):
             raise ValueError("lineage resolution and verification must be configured together")
+        if receipt_reader is not None:
+            try:
+                receipt_target = receipt_reader.target
+            except Exception:
+                raise TypeError("a target-bound receipt reader is required") from None
+            if (
+                type(receipt_target) is not TargetBinding
+                or receipt_target != configuration.target
+            ):
+                raise ValueError("receipt reader target does not match issuer configuration")
         self._store = store
         self._signer = signer
         self._configuration = configuration
         self._lineage_resolver = lineage_resolver
         self._envelope_verifier = envelope_verifier
+        self._receipt_reader = receipt_reader
 
     async def issue(
         self,
@@ -339,10 +410,87 @@ class CapabilityIssuer:
         lineage = await self._resolve_lineage(request.parent_capability_id)
         parent_digest, expires_second = self._validate_parent_lineage(
             state,
-            request,
             lineage,
             issued_second,
         )
+        envelope = self._issue_trusted(
+            state=state,
+            request=request,
+            issued_at=issued_at,
+            issued_second=issued_second,
+            expires_second=expires_second,
+            lineage=lineage,
+            parent_digest=parent_digest,
+            action=CapabilityAction.APPLY_CANARY,
+            provider_etag=state.root.content.stable_snapshot.provider_etag,
+        )
+        confirmed_state = await self._read_trusted_state(request.root_id, issued_second)
+        self._validate_expected_state(confirmed_state, request)
+        if confirmed_state.snapshot != state.snapshot:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        return envelope
+
+    async def issue_promotion(
+        self,
+        request: PromotionCapabilityIssuanceRequest,
+        *,
+        principal: AuthenticatedIssuancePrincipal | None,
+        now: datetime,
+    ) -> SignedCapability:
+        """Issue one root-scoped promotion from an exact durable 90/10 receipt."""
+
+        if type(request) is not PromotionCapabilityIssuanceRequest:
+            raise TypeError("an exact promotion issuance request is required")
+        issued_at, issued_second = _utc_second(now)
+        self._authorize(principal)
+        state = await self._read_trusted_state(request.root_id, issued_second)
+        self._validate_expected_state(state, request)
+        source_receipt = await self._read_verified_apply_receipt(
+            state,
+            request,
+            issued_second,
+        )
+        observed_etag = source_receipt.value.observed_etag
+        if observed_etag is None:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        envelope = self._issue_trusted(
+            state=state,
+            request=request,
+            issued_at=issued_at,
+            issued_second=issued_second,
+            expires_second=None,
+            lineage=(),
+            parent_digest=None,
+            action=CapabilityAction.PROMOTE_CANDIDATE,
+            provider_etag=observed_etag,
+        )
+        confirmed_state = await self._read_trusted_state(request.root_id, issued_second)
+        self._validate_expected_state(confirmed_state, request)
+        confirmed_receipt = await self._read_verified_apply_receipt(
+            confirmed_state,
+            request,
+            issued_second,
+        )
+        if (
+            confirmed_state.snapshot != state.snapshot
+            or confirmed_receipt != source_receipt
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        return envelope
+
+    def _issue_trusted(
+        self,
+        *,
+        state: _TrustedIssuanceState,
+        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
+        issued_at: str,
+        issued_second: int,
+        expires_second: int | None,
+        lineage: tuple[SignedCapability, ...],
+        parent_digest: str | None,
+        action: CapabilityAction,
+        provider_etag: str,
+    ) -> SignedCapability:
         configured_expiry = issued_second + self._configuration.lifetime_seconds
         if expires_second is not None:
             configured_expiry = min(configured_expiry, expires_second)
@@ -357,6 +505,8 @@ class CapabilityIssuer:
             issued_at=issued_at,
             expires_at=expires_at,
             parent_digest=parent_digest,
+            action=action,
+            provider_etag=provider_etag,
         )
         child_scope = capability_scope_from_claims(claims, state.root)
         if lineage:
@@ -394,17 +544,13 @@ class CapabilityIssuer:
             claims_sha256=canonical_sha256(claims),
             signature=detached.signature,
         )
-        self._validate_complete_lineage(state, request, (*lineage, envelope))
-        confirmed_state = await self._read_trusted_state(request.root_id, issued_second)
-        self._validate_expected_state(confirmed_state, request)
-        if confirmed_state.snapshot != state.snapshot:
-            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        self._validate_complete_lineage(state, (*lineage, envelope))
         return envelope
 
     @staticmethod
     def _validate_expected_state(
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest,
+        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
     ) -> None:
         if (
             state.root.root_sha256 != request.expected_root_sha256
@@ -450,6 +596,10 @@ class CapabilityIssuer:
             or bounds.executor_audience != self._configuration.handler_audience
             or bounds.apply_canary.subject_identity != self._configuration.subject_identity
             or bounds.apply_canary.audience != self._configuration.handler_audience
+            or bounds.promote_candidate.subject_identity
+            != self._configuration.subject_identity
+            or bounds.promote_candidate.audience
+            != self._configuration.handler_audience
             or bounds.capability_signing_key_version != self._signer.profile.key_version
             or self._configuration.lifetime_seconds
             > bounds.maximum_capability_lifetime_seconds
@@ -466,6 +616,77 @@ class CapabilityIssuer:
             lineage_anchor=state.lineage_anchor,
             authority=authority,
         )
+
+    async def _read_verified_apply_receipt(
+        self,
+        state: _TrustedIssuanceState,
+        request: PromotionCapabilityIssuanceRequest,
+        issued_second: int,
+    ) -> StoredRecord[ExecutionReceipt]:
+        reader = self._receipt_reader
+        if reader is None:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        locator = request.verified_apply_receipt
+        try:
+            stored = await reader.read_receipt(locator.idempotency_key)
+        except AuthorityStoreCorruptRecord:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        except AuthorityStoreError:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
+        except Exception:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
+        if type(stored) is not StoredRecord or type(stored.value) is not ExecutionReceipt:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        receipt = stored.value
+        root = state.root
+        content = root.content
+        plan = content.rollout_plan
+        expected_poststate_sha256 = rollout_root_v2_target_configuration_sha256(
+            root,
+            stable_percent=90,
+            candidate_percent=10,
+        )
+        expected_receipt_id = execution_receipt_logical_id(
+            content.target,
+            locator.idempotency_key,
+        )
+        try:
+            receipt_sha256 = canonical_sha256(receipt)
+        except (ContractError, TypeError, ValueError):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        if (
+            stored.revision < 2
+            or receipt.receipt_id != locator.receipt_id
+            or receipt.receipt_id != expected_receipt_id
+            or receipt.request_id != locator.request_id
+            or receipt.idempotency_key != locator.idempotency_key
+            or receipt.capability_sha256 != locator.capability_sha256
+            or receipt.mutation_sha256 != locator.mutation_sha256
+            or receipt.expected_poststate_sha256
+            != locator.expected_poststate_sha256
+            or receipt.provider_operation != locator.provider_operation
+            or not hmac.compare_digest(
+                receipt_sha256,
+                locator.receipt_sha256,
+            )
+            or receipt.target != content.target
+            or receipt.root_id != request.root_id
+            or receipt.root_sha256 != request.expected_root_sha256
+            or receipt.epoch != request.expected_epoch
+            or receipt.action is not CapabilityAction.APPLY_CANARY
+            or receipt.plan_sha256 != canonical_sha256(plan)
+            or receipt.provider_etag != content.stable_snapshot.provider_etag
+            or receipt.expected_poststate_sha256 != expected_poststate_sha256
+            or receipt.outcome is not ReceiptOutcome.VERIFIED
+            or receipt.reason_code is not None
+            or receipt.provider_operation is None
+            or receipt.observed_etag is None
+            or receipt.observed_authority_epoch != request.expected_epoch
+            or receipt.created_at < content.approved_at
+            or _parse_utc_second(receipt.updated_at) > issued_second
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        return stored
 
     async def _resolve_lineage(
         self,
@@ -510,7 +731,6 @@ class CapabilityIssuer:
     def _validate_parent_lineage(
         self,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest,
         lineage: tuple[SignedCapability, ...],
         issued_second: int,
     ) -> tuple[str | None, int | None]:
@@ -537,14 +757,13 @@ class CapabilityIssuer:
             ):
                 raise _deny(CapabilityIssuanceErrorCode.LINEAGE_INVALID)
             previous_claims = claims
-        self._validate_complete_lineage(state, request, lineage)
+        self._validate_complete_lineage(state, lineage)
         parent = lineage[-1]
         return parent.claims_sha256, _parse_utc_second(parent.claims.expires_at)
 
     def _validate_complete_lineage(
         self,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest,
         lineage: tuple[SignedCapability, ...],
     ) -> None:
         try:
@@ -581,16 +800,24 @@ class CapabilityIssuer:
         self,
         *,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest,
+        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
         issued_at: str,
         expires_at: str,
         parent_digest: str | None,
+        action: CapabilityAction,
+        provider_etag: str,
     ) -> CapabilityClaims:
         root = state.root
         content = root.content
         plan = content.rollout_plan
-        identity_material: RestrictedJson = {
-            "action": CapabilityAction.APPLY_CANARY.value,
+        if action is CapabilityAction.APPLY_CANARY:
+            grant = content.authority_bounds.apply_canary
+        elif action is CapabilityAction.PROMOTE_CANDIDATE:
+            grant = content.authority_bounds.promote_candidate
+        else:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        identity_material: dict[str, RestrictedJson] = {
+            "action": action.value,
             "audience": self._configuration.handler_audience,
             "epoch": state.authority.current_epoch,
             "expires_at": expires_at,
@@ -605,6 +832,13 @@ class CapabilityIssuer:
             "subject": self._configuration.subject_identity,
             "target": content.target.model_dump(mode="json"),
         }
+        if type(request) is PromotionCapabilityIssuanceRequest:
+            identity_material["verified_apply_receipt"] = (
+                cast(
+                    RestrictedJson,
+                    request.verified_apply_receipt.model_dump(mode="json"),
+                )
+            )
         return CapabilityClaims(
             schema_version=CAPABILITY_CLAIMS_V1,
             capability_id=_capability_id(identity_material),
@@ -615,14 +849,14 @@ class CapabilityIssuer:
             root_id=root.root_id,
             root_sha256=root.root_sha256,
             epoch=state.authority.current_epoch,
-            action=CapabilityAction.APPLY_CANARY,
+            action=action,
             stable_revision=plan.stable_revision,
             candidate_revision=plan.candidate_revision,
-            stable_percent=plan.stable_percent,
-            candidate_percent=plan.candidate_percent,
+            stable_percent=grant.stable_percent,
+            candidate_percent=grant.candidate_percent,
             concurrency=None,
             plan_sha256=canonical_sha256(plan),
-            provider_etag=content.stable_snapshot.provider_etag,
+            provider_etag=provider_etag,
             request_id=request.request_id,
             idempotency_key=request.idempotency_key,
             parent_capability_sha256=parent_digest,
@@ -647,5 +881,7 @@ __all__ = [
     "CapabilityIssuer",
     "CapabilityIssuerConfiguration",
     "CapabilityLineageResolver",
+    "PromotionCapabilityIssuanceRequest",
     "TrustBundleCapabilityVerifier",
+    "VerifiedApplyReceiptReader",
 ]
