@@ -46,6 +46,11 @@ from controlgraph_canary.application.identity import (
     protected_path,
 )
 from controlgraph_canary.application.receipt_authority import ReceiptAuthorityService
+from controlgraph_canary.application.revocation import EpochRevocationError
+from controlgraph_canary.application.revocation_relay import (
+    ApiEpochRevocationClient,
+    CoordinatorEpochRevocationRelay,
+)
 from controlgraph_canary.application.root_relay import (
     ApiRootCreationClient,
     CoordinatorRootCreationRelay,
@@ -70,6 +75,13 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
+from controlgraph_canary.contracts.revocation import (
+    EPOCH_REVOCATION_RELAY_RESPONSE_V1,
+    EpochRevocationCommandV1,
+    EpochRevocationFailureCode,
+    EpochRevocationInvocationV1,
+    EpochRevocationRelayResponseV1,
+)
 from controlgraph_canary.contracts.root_creation import RootCreationCommandV1
 from controlgraph_canary.contracts.root_relay import RootCreationInvocationV1
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
@@ -166,6 +178,15 @@ class CanaryExecutionDenied(BaseModel):
     correlation_id: str
 
 
+class EpochRevocationDenied(BaseModel):
+    """Payload-free manual revocation failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -183,6 +204,8 @@ def create_service_app(
     coordinator_root_creation_relay: CoordinatorRootCreationRelay | None = None,
     api_canary_client: ApiCanaryClient | None = None,
     coordinator_canary_relay: CoordinatorCanaryRelay | None = None,
+    api_epoch_revocation_client: ApiEpochRevocationClient | None = None,
+    coordinator_epoch_revocation_relay: CoordinatorEpochRevocationRelay | None = None,
     capability_issuance_service: CapabilityIssuanceService | None = None,
     receipt_authority_service: ReceiptAuthorityService | None = None,
     receipt_authority_authentication_policy: RouteAuthenticationPolicy | None = None,
@@ -224,6 +247,13 @@ def create_service_app(
         raise ValueError("canary dispatch is limited to the API route")
     if coordinator_canary_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("canary coordination is limited to the coordinator route")
+    if api_epoch_revocation_client is not None and role is not ServiceRole.API:
+        raise ValueError("manual revocation is limited to the API route")
+    if (
+        coordinator_epoch_revocation_relay is not None
+        and role is not ServiceRole.COORDINATOR
+    ):
+        raise ValueError("revocation coordination is limited to the coordinator route")
     if capability_issuance_service is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability issuance is limited to the issuer route")
     if (receipt_authority_service is None) != (
@@ -330,7 +360,9 @@ def create_service_app(
             )
         request.state.authentication = context
         if role is ServiceRole.API and (
-            api_root_creation_client is not None or api_canary_client is not None
+            api_root_creation_client is not None
+            or api_canary_client is not None
+            or api_epoch_revocation_client is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -340,17 +372,27 @@ def create_service_app(
                         raise RootRelayError(RootRelayErrorCode.CONFIGURATION_INVALID)
                     root_result = await api_root_creation_client.create(command, context)
                     response_body = canonical_json_bytes(root_result)
-                else:
-                    if type(command) is not ApplyCanaryCommandV1:
-                        raise CanaryExecutionError(
-                            CanaryExecutionErrorCode.COMMAND_DENIED
-                        )
+                elif type(command) is ApplyCanaryCommandV1:
                     if api_canary_client is None:
                         raise CanaryExecutionError(
                             CanaryExecutionErrorCode.CONFIGURATION_INVALID
                         )
                     canary_result = await api_canary_client.dispatch(command, context)
                     response_body = canonical_json_bytes(canary_result)
+                else:
+                    if type(command) is not EpochRevocationCommandV1:
+                        raise EpochRevocationError(
+                            EpochRevocationFailureCode.COMMAND_DENIED
+                        )
+                    if api_epoch_revocation_client is None:
+                        raise EpochRevocationError(
+                            EpochRevocationFailureCode.STORE_UNAVAILABLE
+                        )
+                    revocation_result = await api_epoch_revocation_client.revoke(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(revocation_result)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
@@ -361,6 +403,8 @@ def create_service_app(
                 return _root_creation_denial(error.code.value, correlation_id)
             except CanaryExecutionError as error:
                 return _canary_execution_denial(error.code.value, correlation_id)
+            except EpochRevocationError as error:
+                return _epoch_revocation_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -375,6 +419,7 @@ def create_service_app(
         if role is ServiceRole.COORDINATOR and (
             coordinator_root_creation_relay is not None
             or coordinator_canary_relay is not None
+            or coordinator_epoch_revocation_relay is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -387,11 +432,7 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(root_result)
-                else:
-                    if type(invocation) is not ApplyCanaryInvocationV1:
-                        raise CanaryExecutionError(
-                            CanaryExecutionErrorCode.COMMAND_DENIED
-                        )
+                elif type(invocation) is ApplyCanaryInvocationV1:
                     if coordinator_canary_relay is None:
                         raise CanaryExecutionError(
                             CanaryExecutionErrorCode.CONFIGURATION_INVALID
@@ -401,6 +442,35 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(canary_result)
+                else:
+                    if type(invocation) is not EpochRevocationInvocationV1:
+                        raise EpochRevocationError(
+                            EpochRevocationFailureCode.COMMAND_DENIED
+                        )
+                    if coordinator_epoch_revocation_relay is None:
+                        raise EpochRevocationError(
+                            EpochRevocationFailureCode.STORE_UNAVAILABLE
+                        )
+                    try:
+                        revocation_result = (
+                            await coordinator_epoch_revocation_relay.revoke(
+                                invocation,
+                                context,
+                            )
+                        )
+                    except EpochRevocationError as error:
+                        revocation_outcome = EpochRevocationRelayResponseV1(
+                            schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
+                            result=None,
+                            failure_code=error.code,
+                        )
+                    else:
+                        revocation_outcome = EpochRevocationRelayResponseV1(
+                            schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
+                            result=revocation_result,
+                            failure_code=None,
+                        )
+                    response_body = canonical_json_bytes(revocation_outcome)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
@@ -411,6 +481,8 @@ def create_service_app(
                 return _root_creation_denial(error.code.value, correlation_id)
             except CanaryExecutionError as error:
                 return _canary_execution_denial(error.code.value, correlation_id)
+            except EpochRevocationError as error:
+                return _epoch_revocation_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -617,24 +689,34 @@ def protected_paths(role: ServiceRole) -> tuple[str, ...]:
 
 def _decode_api_command(
     body: bytes,
-) -> RootCreationCommandV1 | ApplyCanaryCommandV1:
+) -> RootCreationCommandV1 | ApplyCanaryCommandV1 | EpochRevocationCommandV1:
     try:
         return decode_contract(body, RootCreationCommandV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
-    return decode_contract(body, ApplyCanaryCommandV1)
+    try:
+        return decode_contract(body, ApplyCanaryCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, EpochRevocationCommandV1)
 
 
 def _decode_coordinator_invocation(
     body: bytes,
-) -> RootCreationInvocationV1 | ApplyCanaryInvocationV1:
+) -> RootCreationInvocationV1 | ApplyCanaryInvocationV1 | EpochRevocationInvocationV1:
     try:
         return decode_contract(body, RootCreationInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
-    return decode_contract(body, ApplyCanaryInvocationV1)
+    try:
+        return decode_contract(body, ApplyCanaryInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, EpochRevocationInvocationV1)
 
 
 def _authentication_denial(
@@ -756,6 +838,30 @@ def _canary_execution_denial(code: str, correlation_id: str) -> JSONResponse:
         CanaryExecutionErrorCode.ISSUANCE_DENIED.value,
     }:
         status_code = 403
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+def _epoch_revocation_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = EpochRevocationDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        EpochRevocationFailureCode.CALLER_DENIED.value,
+        EpochRevocationFailureCode.COMMAND_DENIED.value,
+    }:
+        status_code = 403
+    elif code in {
+        EpochRevocationFailureCode.ROOT_NOT_FOUND.value,
+        EpochRevocationFailureCode.ROOT_MISMATCH.value,
+        EpochRevocationFailureCode.ACTIVE_CLAIM_REQUIRED.value,
+        EpochRevocationFailureCode.EPOCH_MISMATCH.value,
+        EpochRevocationFailureCode.IDENTITY_CONFLICT.value,
+    }:
+        status_code = 409
+    else:
+        status_code = 503
     return JSONResponse(
         status_code=status_code,
         content=response.model_dump(mode="json"),

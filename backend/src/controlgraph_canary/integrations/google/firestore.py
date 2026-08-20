@@ -40,6 +40,11 @@ from controlgraph_canary.application.cloud_run import (
     rollout_root_target_configuration_sha256,
     target_configuration_projection_sha256,
 )
+from controlgraph_canary.application.evidence_chain import current_evidence_chain_head
+from controlgraph_canary.application.revocation_store import (
+    EpochRevocationState,
+    EpochRevocationWriteResult,
+)
 from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts.base import StrictContractModel
 from controlgraph_canary.contracts.codec import (
@@ -47,13 +52,24 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     decode_contract,
 )
+from controlgraph_canary.contracts.evidence import EvidenceChainHeadV1
 from controlgraph_canary.contracts.models import (
     EpochAuthorityRecord,
     EpochChangeCause,
+    EvidenceKind,
     ExecutionReceipt,
     ReceiptOutcome,
     RolloutRoot,
     TargetBinding,
+)
+from controlgraph_canary.contracts.revocation import (
+    EpochRevocationAuditV1,
+    EpochRevocationCommitV1,
+    EpochRevocationIdentityKind,
+    EpochRevocationIdentityV1,
+    EpochRevocationInvocationV1,
+    EpochRevocationResultV1,
+    epoch_revocation_request_sha256,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
@@ -73,6 +89,11 @@ from controlgraph_canary.contracts.storage import (
     capability_lineage_anchor_document_id,
     capability_lineage_anchor_logical_id,
     epoch_authority_document_id,
+    epoch_revocation_audit_document_id,
+    epoch_revocation_identity_document_id,
+    epoch_revocation_identity_logical_id,
+    epoch_revocation_result_document_id,
+    evidence_chain_head_document_id,
     execution_receipt_document_id,
     execution_receipt_logical_id,
     rollout_root_document_id,
@@ -486,6 +507,170 @@ def _validate_authority_advance(
         or replacement.changed_at < current.changed_at
     ):
         raise ValueError("authority replacement is not a monotonic advance")
+
+
+def _validate_epoch_revocation_commit(
+    configured_target: TargetBinding,
+    expected: EpochRevocationState,
+    commit: EpochRevocationCommitV1,
+) -> None:
+    if (
+        type(expected) is not EpochRevocationState
+        or type(commit) is not EpochRevocationCommitV1
+        or expected.root_bundle is None
+        or expected.request_identity is not None
+        or expected.idempotency_identity is not None
+        or expected.result is not None
+        or expected.attempt_audit is not None
+    ):
+        raise TypeError("epoch revocation commit requires exact state and records")
+    invocation = expected.invocation
+    command = invocation.command
+    request_sha256 = epoch_revocation_request_sha256(invocation)
+    bundle = expected.root_bundle
+    root = bundle.root.value
+    claim = bundle.service_claim.value
+    authority = bundle.authority
+    replacement = commit.replacement_authority
+    _validate_authority_advance(configured_target, authority, replacement)
+    if (
+        root.content.target != configured_target
+        or root.root_id != command.root_id
+        or root.root_sha256 != command.expected_root_sha256
+        or claim.status is not ServiceClaimStatus.ACTIVE
+        or bundle.service_claim.revision % 3 != 0
+        or claim.root_id != root.root_id
+        or claim.root_sha256 != root.root_sha256
+        or authority.value.current_epoch != command.expected_epoch
+        or replacement.cause is not EpochChangeCause.OPERATOR_REVOCATION
+        or replacement.changed_by != invocation.operator_identity
+        or replacement.request_id != command.request_id
+    ):
+        raise ValueError("epoch revocation does not match active root authority")
+    result = commit.result
+    subject = commit.evidence_subject
+    signed = commit.signed_evidence
+    event = signed.event
+    evidence_sha256 = canonical_sha256(signed)
+    if (
+        result.request_sha256 != request_sha256
+        or result.result_id != f"cgrevoke:{request_sha256}"
+        or result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != root.root_id
+        or result.root_sha256 != root.root_sha256
+        or result.target != configured_target
+        or result.operator_identity != invocation.operator_identity
+        or result.operator_subject != invocation.operator_subject
+        or result.reason != command.reason
+        or result.previous_epoch != authority.value.current_epoch
+        or result.new_epoch != replacement.current_epoch
+        or result.evidence_id != replacement.evidence_id
+        or result.evidence_sha256 != evidence_sha256
+        or result.evidence_subject != subject
+        or result.committed_at != replacement.changed_at
+        or subject.root_id != result.root_id
+        or subject.root_sha256 != result.root_sha256
+        or subject.request_sha256 != request_sha256
+        or subject.request_id != result.request_id
+        or subject.idempotency_key != result.idempotency_key
+        or subject.operator_identity != result.operator_identity
+        or subject.operator_subject != result.operator_subject
+        or subject.reason != result.reason
+        or subject.service_claim_sha256 != canonical_sha256(claim)
+        or subject.previous_authority_sha256 != canonical_sha256(authority.value)
+        or subject.replacement_authority_sha256 != canonical_sha256(replacement)
+        or subject.previous_epoch != result.previous_epoch
+        or subject.new_epoch != result.new_epoch
+        or subject.evidence_id != result.evidence_id
+        or subject.committed_at != result.committed_at
+        or event.evidence_id != result.evidence_id
+        or event.root_id != result.root_id
+        or event.root_sha256 != result.root_sha256
+        or event.target != configured_target
+        or event.epoch != result.new_epoch
+        or event.kind is not EvidenceKind.EPOCH_ADVANCED
+        or event.actor != invocation.operator_identity
+        or event.request_id != command.request_id
+        or event.receipt_id is not None
+        or event.occurred_at != result.committed_at
+        or event.subject_sha256 != canonical_sha256(subject)
+        or event.reason_code is not None
+        or event.provider_operation is not None
+        or event.target_configuration_sha256 is not None
+        or signed.signing_key_version != root.content.evidence_signing_key_version
+    ):
+        raise ValueError("epoch revocation result and evidence are incoherent")
+    predecessor_head = current_evidence_chain_head(
+        bundle,
+        target=configured_target,
+        stored_head=expected.chain_head,
+        head_evidence=expected.head_evidence,
+    )
+    predecessor = (
+        bundle.signed_evidence.value
+        if expected.chain_head is None
+        else cast(StoredRecord[SignedEvidenceEventV1], expected.head_evidence).value
+    )
+    predecessor_sequence = predecessor_head.sequence
+    head = commit.chain_head
+    if (
+        event.sequence != predecessor_sequence + 1
+        or event.previous_event_sha256 != canonical_sha256(predecessor)
+        or event.occurred_at < predecessor_head.updated_at
+        or head.root_id != result.root_id
+        or head.root_sha256 != result.root_sha256
+        or head.target != configured_target
+        or head.sequence != event.sequence
+        or head.evidence_id != event.evidence_id
+        or head.evidence_sha256 != evidence_sha256
+        or head.kind is not event.kind
+        or head.epoch != event.epoch
+        or head.updated_at != event.occurred_at
+    ):
+        raise ValueError("epoch revocation evidence-chain update is invalid")
+    identities = (
+        (
+            commit.request_identity,
+            EpochRevocationIdentityKind.REQUEST,
+            command.request_id,
+        ),
+        (
+            commit.idempotency_identity,
+            EpochRevocationIdentityKind.IDEMPOTENCY,
+            command.idempotency_key,
+        ),
+    )
+    if any(
+        identity.identity_kind is not kind
+        or identity.identity_value != value
+        or identity.root_id != result.root_id
+        or identity.root_sha256 != result.root_sha256
+        or identity.request_sha256 != request_sha256
+        or identity.result_id != result.result_id
+        or identity.claimed_at != result.committed_at
+        for identity, kind, value in identities
+    ):
+        raise ValueError("epoch revocation identity claims are invalid")
+    audit = commit.audit
+    if (
+        audit.audit_id != invocation.attempt_id
+        or audit.attempt_id != invocation.attempt_id
+        or audit.request_sha256 != request_sha256
+        or audit.root_id != result.root_id
+        or audit.root_sha256 != result.root_sha256
+        or audit.expected_epoch != command.expected_epoch
+        or audit.request_id != command.request_id
+        or audit.idempotency_key != command.idempotency_key
+        or audit.operator_identity != invocation.operator_identity
+        or audit.operator_subject != invocation.operator_subject
+        or audit.outcome.value != "COMMITTED"
+        or audit.result_id != result.result_id
+        or audit.evidence_id != result.evidence_id
+        or audit.new_epoch != result.new_epoch
+        or audit.recorded_at != result.committed_at
+    ):
+        raise ValueError("epoch revocation accepted audit is invalid")
 
 
 def _claim_ownership_binding(claim: ServiceClaimRecord) -> tuple[object, ...]:
@@ -1753,6 +1938,670 @@ class FirestoreAuthorityStore:
         except (TypeError, ValueError):
             raise AuthorityStoreCorruptRecord from None
         return decoded_bundle
+
+    async def read_epoch_revocation_state(
+        self,
+        invocation: EpochRevocationInvocationV1,
+    ) -> EpochRevocationState:
+        """Read the exact root, chain, identities, and result in one transaction."""
+
+        if type(invocation) is not EpochRevocationInvocationV1:
+            raise TypeError("epoch revocation state requires an exact invocation")
+        command = invocation.command
+        request_sha256 = epoch_revocation_request_sha256(invocation)
+        result_logical_id = f"cgrevoke:{request_sha256}"
+        decoded_state: EpochRevocationState | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal decoded_state
+            client = await self._client()
+            root_id = command.root_id
+            root_document_id = rollout_root_v2_document_id(root_id)
+            authority_document_id = epoch_authority_document_id(root_id)
+            creation_result_document_id = root_creation_result_document_id(root_id)
+            decoded_root = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRootV2,
+            )
+            decoded_authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            decoded_creation_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROOT_CREATION_RESULT,
+                    creation_result_document_id,
+                ),
+                kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
+                logical_id=root_id,
+                document_id=creation_result_document_id,
+                model_type=RootCreationResultV1,
+            )
+            root_specific = (
+                decoded_root,
+                decoded_authority,
+                decoded_creation_result,
+            )
+            root_bundle: RootCreationBundle | None = None
+            decoded_root_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
+            if any(record is not None for record in root_specific):
+                if any(record is None for record in root_specific):
+                    raise AuthorityStoreCorruptRecord
+                root_record = cast(_DecodedDocument[RolloutRootV2], decoded_root)
+                authority_record = cast(
+                    _DecodedDocument[EpochAuthorityRecord],
+                    decoded_authority,
+                )
+                creation_record = cast(
+                    _DecodedDocument[RootCreationResultV1],
+                    decoded_creation_result,
+                )
+                creation = creation_record.value
+                claim_logical_id = service_claim_logical_id(self._target)
+                claim_document_id = service_claim_document_id(self._target)
+                anchor_logical_id = creation.winner_lineage_anchor_id
+                anchor_document_id = capability_lineage_anchor_document_id(
+                    creation.lineage_anchor
+                )
+                root_evidence_id = creation.winner_evidence_id
+                root_evidence_document_id = signed_evidence_event_document_id(
+                    root_evidence_id
+                )
+                decoded_claim = await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SERVICE_CLAIM,
+                        claim_document_id,
+                    ),
+                    kind=AuthorityStorageKind.SERVICE_CLAIM,
+                    logical_id=claim_logical_id,
+                    document_id=claim_document_id,
+                    model_type=ServiceClaimRecord,
+                )
+                decoded_anchor = await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+                        anchor_document_id,
+                    ),
+                    kind=AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+                    logical_id=anchor_logical_id,
+                    document_id=anchor_document_id,
+                    model_type=CapabilityLineageAnchorV1,
+                )
+                decoded_root_evidence = await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        root_evidence_document_id,
+                    ),
+                    kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    logical_id=root_evidence_id,
+                    document_id=root_evidence_document_id,
+                    model_type=SignedEvidenceEventV1,
+                )
+                if (
+                    decoded_claim is None
+                    or decoded_anchor is None
+                    or decoded_root_evidence is None
+                ):
+                    raise AuthorityStoreCorruptRecord
+                root_bundle = RootCreationBundle(
+                    root=root_record.stored,
+                    service_claim=decoded_claim.stored,
+                    authority=authority_record.stored,
+                    lineage_anchor=decoded_anchor.stored,
+                    signed_evidence=decoded_root_evidence.stored,
+                    creation_result=creation_record.stored,
+                )
+
+            head_document_id = evidence_chain_head_document_id(root_id)
+            decoded_head = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                    head_document_id,
+                ),
+                kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                logical_id=root_id,
+                document_id=head_document_id,
+                model_type=EvidenceChainHeadV1,
+            )
+            decoded_head_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
+            if decoded_head is not None:
+                if (
+                    decoded_root_evidence is not None
+                    and decoded_head.value.evidence_id
+                    == decoded_root_evidence.value.event.evidence_id
+                ):
+                    decoded_head_evidence = decoded_root_evidence
+                else:
+                    head_evidence_id = decoded_head.value.evidence_id
+                    head_evidence_document_id = signed_evidence_event_document_id(
+                        head_evidence_id
+                    )
+                    decoded_head_evidence = await self._transaction_read(
+                        transaction,
+                        reference=self._reference(
+                            client,
+                            AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                            head_evidence_document_id,
+                        ),
+                        kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        logical_id=head_evidence_id,
+                        document_id=head_evidence_document_id,
+                        model_type=SignedEvidenceEventV1,
+                    )
+                    if decoded_head_evidence is None:
+                        raise AuthorityStoreCorruptRecord
+
+            request_identity_logical_id = epoch_revocation_identity_logical_id(
+                EpochRevocationIdentityKind.REQUEST.value,
+                command.request_id,
+            )
+            request_identity_document_id = epoch_revocation_identity_document_id(
+                EpochRevocationIdentityKind.REQUEST.value,
+                command.request_id,
+            )
+            idempotency_identity_logical_id = epoch_revocation_identity_logical_id(
+                EpochRevocationIdentityKind.IDEMPOTENCY.value,
+                command.idempotency_key,
+            )
+            idempotency_identity_document_id = epoch_revocation_identity_document_id(
+                EpochRevocationIdentityKind.IDEMPOTENCY.value,
+                command.idempotency_key,
+            )
+            decoded_request_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                    request_identity_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                logical_id=request_identity_logical_id,
+                document_id=request_identity_document_id,
+                model_type=EpochRevocationIdentityV1,
+            )
+            decoded_idempotency_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                    idempotency_identity_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                logical_id=idempotency_identity_logical_id,
+                document_id=idempotency_identity_document_id,
+                model_type=EpochRevocationIdentityV1,
+            )
+            result_document_id = epoch_revocation_result_document_id(result_logical_id)
+            decoded_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                    result_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                logical_id=result_logical_id,
+                document_id=result_document_id,
+                model_type=EpochRevocationResultV1,
+            )
+            decoded_result_evidence: (
+                _DecodedDocument[SignedEvidenceEventV1] | None
+            ) = None
+            if decoded_result is not None:
+                result_evidence_id = decoded_result.value.evidence_id
+                if (
+                    decoded_head_evidence is not None
+                    and decoded_head_evidence.value.event.evidence_id
+                    == result_evidence_id
+                ):
+                    decoded_result_evidence = decoded_head_evidence
+                elif (
+                    decoded_root_evidence is not None
+                    and decoded_root_evidence.value.event.evidence_id
+                    == result_evidence_id
+                ):
+                    decoded_result_evidence = decoded_root_evidence
+                else:
+                    result_evidence_document_id = signed_evidence_event_document_id(
+                        result_evidence_id
+                    )
+                    decoded_result_evidence = await self._transaction_read(
+                        transaction,
+                        reference=self._reference(
+                            client,
+                            AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                            result_evidence_document_id,
+                        ),
+                        kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        logical_id=result_evidence_id,
+                        document_id=result_evidence_document_id,
+                        model_type=SignedEvidenceEventV1,
+                    )
+                    if decoded_result_evidence is None:
+                        raise AuthorityStoreCorruptRecord
+            audit_document_id = epoch_revocation_audit_document_id(
+                invocation.attempt_id
+            )
+            decoded_audit = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                    audit_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                logical_id=invocation.attempt_id,
+                document_id=audit_document_id,
+                model_type=EpochRevocationAuditV1,
+            )
+            decoded_state = EpochRevocationState(
+                invocation=invocation,
+                root_bundle=root_bundle,
+                chain_head=None if decoded_head is None else decoded_head.stored,
+                head_evidence=(
+                    None
+                    if decoded_head_evidence is None
+                    else decoded_head_evidence.stored
+                ),
+                request_identity=(
+                    None
+                    if decoded_request_identity is None
+                    else decoded_request_identity.stored
+                ),
+                idempotency_identity=(
+                    None
+                    if decoded_idempotency_identity is None
+                    else decoded_idempotency_identity.stored
+                ),
+                result=None if decoded_result is None else decoded_result.stored,
+                result_evidence=(
+                    None
+                    if decoded_result_evidence is None
+                    else decoded_result_evidence.stored
+                ),
+                attempt_audit=(
+                    None if decoded_audit is None else decoded_audit.stored
+                ),
+            )
+
+        await self._run_consistent_read(read)
+        if decoded_state is None:
+            raise AuthorityStoreUnavailable
+        if decoded_state.root_bundle is not None:
+            try:
+                _validate_read_root_creation_bundle(
+                    self._target,
+                    decoded_state.root_bundle,
+                )
+            except (TypeError, ValueError):
+                raise AuthorityStoreCorruptRecord from None
+        return decoded_state
+
+    async def commit_epoch_revocation(
+        self,
+        expected: EpochRevocationState,
+        commit: EpochRevocationCommitV1,
+    ) -> EpochRevocationWriteResult:
+        """Atomically advance authority and append the signed evidence bundle."""
+
+        _validate_epoch_revocation_commit(self._target, expected, commit)
+        root_bundle = cast(RootCreationBundle, expected.root_bundle)
+        authority_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=commit.replacement_authority.root_id,
+            document_id=epoch_authority_document_id(
+                commit.replacement_authority.root_id
+            ),
+            revision=commit.replacement_authority.revision,
+            value=commit.replacement_authority,
+        )
+        evidence_id = commit.signed_evidence.event.evidence_id
+        evidence_document = _prepared_document(
+            kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+            logical_id=evidence_id,
+            document_id=signed_evidence_event_document_id(evidence_id),
+            revision=0,
+            value=commit.signed_evidence,
+        )
+        head_document = _prepared_document(
+            kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+            logical_id=commit.chain_head.root_id,
+            document_id=evidence_chain_head_document_id(commit.chain_head.root_id),
+            revision=commit.chain_head.sequence,
+            value=commit.chain_head,
+        )
+        result_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+            logical_id=commit.result.result_id,
+            document_id=epoch_revocation_result_document_id(commit.result.result_id),
+            revision=0,
+            value=commit.result,
+        )
+        request_identity_logical_id = epoch_revocation_identity_logical_id(
+            commit.request_identity.identity_kind.value,
+            commit.request_identity.identity_value,
+        )
+        request_identity_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+            logical_id=request_identity_logical_id,
+            document_id=epoch_revocation_identity_document_id(
+                commit.request_identity.identity_kind.value,
+                commit.request_identity.identity_value,
+            ),
+            revision=0,
+            value=commit.request_identity,
+        )
+        idempotency_identity_logical_id = epoch_revocation_identity_logical_id(
+            commit.idempotency_identity.identity_kind.value,
+            commit.idempotency_identity.identity_value,
+        )
+        idempotency_identity_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+            logical_id=idempotency_identity_logical_id,
+            document_id=epoch_revocation_identity_document_id(
+                commit.idempotency_identity.identity_kind.value,
+                commit.idempotency_identity.identity_value,
+            ),
+            revision=0,
+            value=commit.idempotency_identity,
+        )
+        audit_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+            logical_id=commit.audit.audit_id,
+            document_id=epoch_revocation_audit_document_id(commit.audit.audit_id),
+            revision=0,
+            value=commit.audit,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            authority_document,
+            evidence_document,
+            head_document,
+            result_document,
+            request_identity_document,
+            idempotency_identity_document,
+            audit_document,
+        )
+
+        async def write(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            root_id = commit.result.root_id
+            current_root = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                    rollout_root_v2_document_id(root_id),
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                logical_id=root_id,
+                document_id=rollout_root_v2_document_id(root_id),
+                model_type=RolloutRootV2,
+            )
+            claim_logical_id = service_claim_logical_id(self._target)
+            claim_document_id = service_claim_document_id(self._target)
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document_id,
+                model_type=ServiceClaimRecord,
+            )
+            current_authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document.document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            current_head = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                    head_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                logical_id=root_id,
+                document_id=head_document.document_id,
+                model_type=EvidenceChainHeadV1,
+            )
+            expected_predecessor = (
+                root_bundle.signed_evidence
+                if expected.chain_head is None
+                else expected.head_evidence
+            )
+            if expected_predecessor is None:
+                raise _ExpectedStateMismatch
+            predecessor_evidence_id = expected_predecessor.value.event.evidence_id
+            predecessor_document_id = signed_evidence_event_document_id(
+                predecessor_evidence_id
+            )
+            current_predecessor = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    predecessor_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=predecessor_evidence_id,
+                document_id=predecessor_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+            current_request_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                    request_identity_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                logical_id=request_identity_logical_id,
+                document_id=request_identity_document.document_id,
+                model_type=EpochRevocationIdentityV1,
+            )
+            current_idempotency_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                    idempotency_identity_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                logical_id=idempotency_identity_logical_id,
+                document_id=idempotency_identity_document.document_id,
+                model_type=EpochRevocationIdentityV1,
+            )
+            current_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                    result_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                logical_id=commit.result.result_id,
+                document_id=result_document.document_id,
+                model_type=EpochRevocationResultV1,
+            )
+            current_audit = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                    audit_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                logical_id=commit.audit.audit_id,
+                document_id=audit_document.document_id,
+                model_type=EpochRevocationAuditV1,
+            )
+            if (
+                current_root is None
+                or current_root.stored != root_bundle.root
+                or current_claim is None
+                or current_claim.stored != root_bundle.service_claim
+                or current_authority is None
+                or current_authority.stored != root_bundle.authority
+                or (
+                    None if current_head is None else current_head.stored
+                )
+                != expected.chain_head
+                or current_predecessor is None
+                or current_predecessor.stored != expected_predecessor
+                or (
+                    None
+                    if current_request_identity is None
+                    else current_request_identity.stored
+                )
+                != expected.request_identity
+                or (
+                    None
+                    if current_idempotency_identity is None
+                    else current_idempotency_identity.stored
+                )
+                != expected.idempotency_identity
+                or (None if current_result is None else current_result.stored)
+                != expected.result
+                or (None if current_audit is None else current_audit.stored)
+                != expected.attempt_audit
+            ):
+                raise _ExpectedStateMismatch
+            authority_reference = self._reference(
+                client,
+                AuthorityStorageKind.EPOCH_AUTHORITY,
+                authority_document.document_id,
+            )
+            head_reference = self._reference(
+                client,
+                AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                head_document.document_id,
+            )
+            transaction.update(
+                authority_reference,
+                _document_data(authority_document.wrapper),
+            )
+            transaction.create(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    evidence_document.document_id,
+                ),
+                _document_data(evidence_document.wrapper),
+            )
+            if current_head is None:
+                transaction.create(
+                    head_reference,
+                    _document_data(head_document.wrapper),
+                )
+            else:
+                transaction.update(
+                    head_reference,
+                    _document_data(head_document.wrapper),
+                )
+            for document in (
+                result_document,
+                request_identity_document,
+                idempotency_identity_document,
+                audit_document,
+            ):
+                transaction.create(
+                    self._reference(
+                        client,
+                        document.wrapper.record_kind,
+                        document.document_id,
+                    ),
+                    _document_data(document.wrapper),
+                )
+
+        await self._run_transaction(documents, write)
+        return EpochRevocationWriteResult(
+            authority=_stored(authority_document),
+            signed_evidence=_stored(evidence_document),
+            chain_head=_stored(head_document),
+            result=_stored(result_document),
+            request_identity=_stored(request_identity_document),
+            idempotency_identity=_stored(idempotency_identity_document),
+            audit=_stored(audit_document),
+        )
+
+    async def record_epoch_revocation_audit(
+        self,
+        audit: EpochRevocationAuditV1,
+    ) -> StoredRecord[EpochRevocationAuditV1]:
+        """Create or exactly adopt one immutable per-attempt audit record."""
+
+        if type(audit) is not EpochRevocationAuditV1:
+            raise TypeError("epoch revocation audit must be exact")
+        document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+            logical_id=audit.audit_id,
+            document_id=epoch_revocation_audit_document_id(audit.audit_id),
+            revision=0,
+            value=audit,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (document,)
+
+        async def create(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            transaction.create(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                    document.document_id,
+                ),
+                _document_data(document.wrapper),
+            )
+
+        try:
+            await self._run_transaction(documents, create)
+        except AuthorityStoreConflict:
+            current = await self._strong_read(
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                logical_id=audit.audit_id,
+                document_id=document.document_id,
+                model_type=EpochRevocationAuditV1,
+            )
+            if current is None or current.value != audit or current.wrapper.revision != 0:
+                raise
+            return current.stored
+        return _stored(document)
 
     async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None:
         decoded = await self._strong_read(

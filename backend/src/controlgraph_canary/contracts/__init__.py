@@ -11,6 +11,7 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
     encode_base64url,
 )
+from controlgraph_canary.contracts.evidence import EvidenceChainHeadV1
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
@@ -30,6 +31,20 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
     TaskRequest,
     TrafficAllocation,
+)
+from controlgraph_canary.contracts.revocation import (
+    EpochRevocationAuditOutcome,
+    EpochRevocationAuditV1,
+    EpochRevocationCommandV1,
+    EpochRevocationCommitV1,
+    EpochRevocationEvidenceSubjectV1,
+    EpochRevocationFailureCode,
+    EpochRevocationIdentityKind,
+    EpochRevocationIdentityV1,
+    EpochRevocationInvocationV1,
+    EpochRevocationResultV1,
+    epoch_revocation_evidence_id,
+    epoch_revocation_request_sha256,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
@@ -67,6 +82,17 @@ __all__ = [
     "ContractErrorCode",
     "EpochAuthorityRecord",
     "EpochChangeCause",
+    "EpochRevocationAuditOutcome",
+    "EpochRevocationAuditV1",
+    "EpochRevocationCommandV1",
+    "EpochRevocationCommitV1",
+    "EpochRevocationEvidenceSubjectV1",
+    "EpochRevocationFailureCode",
+    "EpochRevocationIdentityKind",
+    "EpochRevocationIdentityV1",
+    "EpochRevocationInvocationV1",
+    "EpochRevocationResultV1",
+    "EvidenceChainHeadV1",
     "EvidenceEvent",
     "EvidenceKind",
     "ExecutionReceipt",
@@ -103,6 +129,8 @@ __all__ = [
     "decode_base64url",
     "decode_contract",
     "encode_base64url",
+    "epoch_revocation_evidence_id",
+    "epoch_revocation_request_sha256",
     "evidence_payload_sha256",
     "evidence_signing_input_sha256",
     "root_creation_request_sha256",

@@ -27,11 +27,17 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     decode_contract,
 )
+from controlgraph_canary.contracts.evidence import EvidenceChainHeadV1
 from controlgraph_canary.contracts.models import (
     EpochAuthorityRecord,
     ExecutionReceipt,
     RolloutRoot,
     TargetBinding,
+)
+from controlgraph_canary.contracts.revocation import (
+    EpochRevocationAuditV1,
+    EpochRevocationIdentityV1,
+    EpochRevocationResultV1,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
@@ -461,6 +467,10 @@ class AuthorityStorageKind(StrEnum):
     CAPABILITY_LINEAGE_ANCHOR = "controlgraph-capability-lineage-anchors-v1"
     SIGNED_EVIDENCE_EVENT = "controlgraph-signed-evidence-events-v1"
     ROOT_CREATION_RESULT = "controlgraph-root-creation-results-v1"
+    EVIDENCE_CHAIN_HEAD = "controlgraph-evidence-chain-heads-v1"
+    EPOCH_REVOCATION_IDENTITY = "controlgraph-epoch-revocation-identities-v1"
+    EPOCH_REVOCATION_RESULT = "controlgraph-epoch-revocation-results-v1"
+    EPOCH_REVOCATION_AUDIT = "controlgraph-epoch-revocation-audits-v1"
 
 
 class AuthorityStorageDocument(StrictContractModel):
@@ -485,6 +495,10 @@ class AuthorityStorageDocument(StrictContractModel):
             | CapabilityLineageAnchorV1
             | SignedEvidenceEventV1
             | RootCreationResultV1
+            | EvidenceChainHeadV1
+            | EpochRevocationIdentityV1
+            | EpochRevocationResultV1
+            | EpochRevocationAuditV1
         ]
         if self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT:
             model_type = RolloutRoot
@@ -500,8 +514,16 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = CapabilityLineageAnchorV1
         elif self.record_kind is AuthorityStorageKind.SIGNED_EVIDENCE_EVENT:
             model_type = SignedEvidenceEventV1
-        else:
+        elif self.record_kind is AuthorityStorageKind.ROOT_CREATION_RESULT:
             model_type = RootCreationResultV1
+        elif self.record_kind is AuthorityStorageKind.EVIDENCE_CHAIN_HEAD:
+            model_type = EvidenceChainHeadV1
+        elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY:
+            model_type = EpochRevocationIdentityV1
+        elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_RESULT:
+            model_type = EpochRevocationResultV1
+        else:
+            model_type = EpochRevocationAuditV1
         try:
             payload = decode_contract(self.canonical_payload, model_type)
         except ContractError as error:
@@ -514,6 +536,9 @@ class AuthorityStorageDocument(StrictContractModel):
             AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
             AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
             AuthorityStorageKind.ROOT_CREATION_RESULT,
+            AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+            AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+            AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
         }
         if self.record_kind in immutable_kinds and self.revision != 0:
             raise ValueError("immutable authority record must remain at revision zero")
@@ -522,6 +547,11 @@ class AuthorityStorageDocument(StrictContractModel):
             and self.revision != cast(EpochAuthorityRecord, payload).revision
         ):
             raise ValueError("authority storage and payload revisions do not match")
+        if (
+            self.record_kind is AuthorityStorageKind.EVIDENCE_CHAIN_HEAD
+            and self.revision != cast(EvidenceChainHeadV1, payload).sequence
+        ):
+            raise ValueError("evidence head storage and sequence revisions do not match")
         if self.record_kind is AuthorityStorageKind.SERVICE_CLAIM:
             claim = cast(ServiceClaimRecord, payload)
             expected_revision_remainder = {
@@ -551,6 +581,18 @@ class AuthorityStorageDocument(StrictContractModel):
             if result.outcome != "CREATED":
                 raise ValueError("persisted root creation result must identify the winner")
             expected_logical_id = result.root.root_id
+        elif self.record_kind is AuthorityStorageKind.EVIDENCE_CHAIN_HEAD:
+            expected_logical_id = cast(EvidenceChainHeadV1, payload).root_id
+        elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY:
+            identity = cast(EpochRevocationIdentityV1, payload)
+            expected_logical_id = epoch_revocation_identity_logical_id(
+                identity.identity_kind.value,
+                identity.identity_value,
+            )
+        elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_RESULT:
+            expected_logical_id = cast(EpochRevocationResultV1, payload).result_id
+        elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_AUDIT:
+            expected_logical_id = cast(EpochRevocationAuditV1, payload).audit_id
         else:
             expected_logical_id = cast(
                 RolloutRoot | RolloutRootV2 | EpochAuthorityRecord,
@@ -637,6 +679,41 @@ def root_creation_result_document_id(root_id: str) -> str:
     return _document_id(AuthorityStorageKind.ROOT_CREATION_RESULT, root_id)
 
 
+def evidence_chain_head_document_id(root_id: str) -> str:
+    """Return the document ID for one root's mutable evidence-chain head."""
+
+    return _document_id(AuthorityStorageKind.EVIDENCE_CHAIN_HEAD, root_id)
+
+
+def epoch_revocation_identity_logical_id(kind: str, identity_value: str) -> str:
+    """Return the collision domain for one revocation request identity."""
+
+    if kind not in {"REQUEST", "IDEMPOTENCY"}:
+        raise ValueError("revocation identity kind is invalid")
+    return f"{kind}:{_LogicalIdentity(value=identity_value).value}"
+
+
+def epoch_revocation_identity_document_id(kind: str, identity_value: str) -> str:
+    """Return the immutable document ID for one revocation identity claim."""
+
+    return _document_id(
+        AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+        epoch_revocation_identity_logical_id(kind, identity_value),
+    )
+
+
+def epoch_revocation_result_document_id(result_id: str) -> str:
+    """Return the immutable document ID for one committed revocation result."""
+
+    return _document_id(AuthorityStorageKind.EPOCH_REVOCATION_RESULT, result_id)
+
+
+def epoch_revocation_audit_document_id(audit_id: str) -> str:
+    """Return the immutable document ID for one authenticated attempt audit."""
+
+    return _document_id(AuthorityStorageKind.EPOCH_REVOCATION_AUDIT, audit_id)
+
+
 def execution_receipt_logical_id(target: TargetBinding, idempotency_key: str) -> str:
     """Return one target-bound claim identity for an idempotency key."""
 
@@ -682,6 +759,11 @@ __all__ = [
     "capability_lineage_anchor_document_id",
     "capability_lineage_anchor_logical_id",
     "epoch_authority_document_id",
+    "epoch_revocation_audit_document_id",
+    "epoch_revocation_identity_document_id",
+    "epoch_revocation_identity_logical_id",
+    "epoch_revocation_result_document_id",
+    "evidence_chain_head_document_id",
     "execution_receipt_document_id",
     "execution_receipt_logical_id",
     "rollout_root_document_id",
