@@ -503,7 +503,7 @@ class CloudRunV2ReferenceTargetResetter:
         before = await self._read_target()
         before_traffic = self._admit_target(
             before,
-            allow_previous_stable_baseline=True,
+            allow_reset_precursor=True,
         )
         if before.service.etag != request.expected_etag:
             raise ReferenceTargetResetError(
@@ -629,7 +629,7 @@ class CloudRunV2ReferenceTargetResetter:
         self,
         state: CloudRunTargetState,
         *,
-        allow_previous_stable_baseline: bool = False,
+        allow_reset_precursor: bool = False,
     ) -> tuple[int, int] | None:
         if type(state) is not CloudRunTargetState:
             raise ReferenceTargetResetError(
@@ -667,9 +667,19 @@ class CloudRunV2ReferenceTargetResetter:
             raise ReferenceTargetResetError(
                 ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
             )
-        if allow_previous_stable_baseline and (
-            self._is_previous_stable_baseline(service.traffic)
-            and self._is_previous_stable_baseline(service.traffic_statuses)
+        if allow_reset_precursor and any(
+            self._is_stable_only_baseline(
+                service.traffic,
+                revision=revision,
+            )
+            and self._is_stable_only_baseline(
+                service.traffic_statuses,
+                revision=revision,
+            )
+            for revision in (
+                _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION,
+                REFERENCE_TARGET_STABLE_REVISION,
+            )
         ):
             return None
         traffic = self._traffic_pair(service.traffic)
@@ -678,14 +688,28 @@ class CloudRunV2ReferenceTargetResetter:
             raise ReferenceTargetResetError(
                 ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
             )
+        if traffic == (100, 0) and (
+            len(service.traffic) != 2
+            or len(service.traffic_statuses) != 2
+            or service.latest_ready_revision != REFERENCE_TARGET_CANDIDATE_REVISION
+        ):
+            if allow_reset_precursor and (
+                len(service.traffic) == 2 and len(service.traffic_statuses) == 2
+            ):
+                return None
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
         return traffic
 
-    def _is_previous_stable_baseline(
+    def _is_stable_only_baseline(
         self,
         allocations: Sequence[CloudRunTrafficAllocation | CloudRunTrafficStatus],
+        *,
+        revision: str,
     ) -> bool:
         return len(allocations) == 1 and (
-            allocations[0].revision == _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION
+            allocations[0].revision == revision
             and allocations[0].percent == 100
             and allocations[0].tag == "stable"
         )
