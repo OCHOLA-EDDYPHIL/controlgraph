@@ -194,7 +194,7 @@ check "verifier_snapshot_reader_is_service_scoped" {
     condition = (
       google_cloud_run_v2_service_iam_member.verifier_target_snapshot.project == var.project_id &&
       google_cloud_run_v2_service_iam_member.verifier_target_snapshot.location == var.region &&
-      google_cloud_run_v2_service_iam_member.verifier_target_snapshot.name == module.reference_target.target.name &&
+      trimprefix(google_cloud_run_v2_service_iam_member.verifier_target_snapshot.name, "projects/${var.project_id}/locations/${var.region}/services/") == module.reference_target.target.name &&
       google_cloud_run_v2_service_iam_member.verifier_target_snapshot.member == "serviceAccount:${local.service_accounts.verifier}"
     )
     error_message = "The verifier snapshot role must remain bound only on the fixed reference service."
@@ -206,7 +206,7 @@ check "executor_target_mutation_is_service_scoped" {
     condition = (
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.project == var.project_id &&
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.location == var.region &&
-      google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.name == module.reference_target.target.name &&
+      trimprefix(google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.name, "projects/${var.project_id}/locations/${var.region}/services/") == module.reference_target.target.name &&
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.run_traffic_mutator &&
       google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.member == "serviceAccount:${local.service_accounts.executor}" &&
       data.terraform_remote_state.foundation.outputs.service_account_names.reference == "projects/${var.project_id}/serviceAccounts/controlgraph-reference@${var.project_id}.iam.gserviceaccount.com" &&
