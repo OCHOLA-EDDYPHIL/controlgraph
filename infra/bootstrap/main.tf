@@ -27,7 +27,6 @@ resource "google_storage_bucket" "terraform_state" {
   location = upper(var.region)
 
   storage_class               = "STANDARD"
-  rpo                         = "DEFAULT"
   force_destroy               = false
   public_access_prevention    = "enforced"
   uniform_bucket_level_access = true
