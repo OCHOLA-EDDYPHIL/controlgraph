@@ -144,7 +144,7 @@ def _revision_configuration(*, digest: str) -> CloudRunRevisionConfiguration:
         port_name="http1",
         container_port=8080,
         cpu_limit="1",
-        memory_limit="256Mi",
+        memory_limit="512Mi",
         cpu_idle=True,
         startup_cpu_boost=False,
         startup_probe=CloudRunHttpProbe(

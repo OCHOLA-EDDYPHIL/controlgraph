@@ -72,9 +72,11 @@ run "candidate_configuration_shape_is_bounded" {
     condition = (
       google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-candidate-v1" &&
       google_cloud_run_v2_service.reference.template[0].containers[0].image == var.candidate_image &&
+      google_cloud_run_v2_service.reference.template[0].execution_environment == "EXECUTION_ENVIRONMENT_GEN2" &&
+      google_cloud_run_v2_service.reference.template[0].containers[0].resources[0].limits["memory"] == "512Mi" &&
       length(google_cloud_run_v2_service.reference.traffic) == 2
     )
-    error_message = "The candidate deployment must create the fixed candidate revision from its immutable image."
+    error_message = "The candidate deployment must create the fixed Gen2 candidate revision from its immutable image and supported memory bound."
   }
 
   assert {

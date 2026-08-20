@@ -525,17 +525,20 @@ class _FakeRevisionsClient:
         concurrency: int = 8,
         stable_image: str = REFERENCE_IMAGE,
         candidate_image: str = REFERENCE_IMAGE,
+        memory_limit: str = "512Mi",
     ) -> None:
         self.responses = {
             f"{SERVICE_RESOURCE}/revisions/{STABLE}": _revision(
                 STABLE,
                 concurrency,
                 image=stable_image,
+                memory_limit=memory_limit,
             ),
             f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}": _revision(
                 CANDIDATE,
                 concurrency,
                 image=candidate_image,
+                memory_limit=memory_limit,
             ),
         }
         self.calls: list[tuple[run_v2.GetRevisionRequest, object | None, float]] = []
@@ -647,6 +650,7 @@ def _revision(
     volumes: list[run_v2.Volume] | None = None,
     containers: list[run_v2.Container] | None = None,
     service_account: str | None = None,
+    memory_limit: str = "512Mi",
     network_resource: str = NETWORK_RESOURCE,
     subnetwork_resource: str = SUBNETWORK_RESOURCE,
     labels: dict[str, str] | None = None,
@@ -658,7 +662,7 @@ def _revision(
         env=[] if env is None else env,
         ports=[run_v2.ContainerPort(name="http1", container_port=8080)],
         resources=run_v2.ResourceRequirements(
-            limits={"cpu": "1", "memory": "256Mi"},
+            limits={"cpu": "1", "memory": memory_limit},
             cpu_idle=True,
             startup_cpu_boost=False,
         ),
@@ -1793,6 +1797,25 @@ async def test_reference_target_reset_denies_an_unexpected_immutable_image() -> 
     revisions = _FakeRevisionsClient(
         stable_image=REFERENCE_IMAGE,
         candidate_image=RESET_CANDIDATE_IMAGE,
+    )
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services, revisions=revisions).reset(_reset_request())
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+    assert services.update_calls == []
+
+
+@_async_test
+async def test_reference_target_reset_denies_an_unexpected_memory_limit() -> None:
+    services = _ResetServicesClient(
+        [_service(0, 100, etag="etag-before-reset")],
+        update=AssertionError("memory mismatch must not update"),
+    )
+    revisions = _FakeRevisionsClient(
+        stable_image=RESET_STABLE_IMAGE,
+        candidate_image=RESET_CANDIDATE_IMAGE,
+        memory_limit="256Mi",
     )
 
     with pytest.raises(ReferenceTargetResetError) as raised:
