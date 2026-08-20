@@ -1,0 +1,176 @@
+name: Publish immutable images
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: controlgraph-image-publication
+  cancel-in-progress: false
+
+jobs:
+  publish-images:
+    name: Publish immutable images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: controlgraph-image-builder
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      controller_image: ${{ steps.publish.outputs.controller_image }}
+      reference_target_stable_image: ${{ steps.publish.outputs.reference_target_stable_image }}
+      reference_target_candidate_image: ${{ steps.publish.outputs.reference_target_candidate_image }}
+    env:
+      CONTROLGRAPH_PROJECT_ID: ${{ vars.CONTROLGRAPH_PROJECT_ID }}
+      CONTROLGRAPH_PROJECT_NUMBER: ${{ vars.CONTROLGRAPH_PROJECT_NUMBER }}
+      CONTROLGRAPH_REGION: us-central1
+      CONTROLGRAPH_ARTIFACT_REPOSITORY: controlgraph-canary
+      DOCKER_BUILDKIT: "1"
+
+    steps:
+      - name: Validate the closed publication boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "OCHOLA-EDDYPHIL/controlgraph" ]]
+          [[ "$GITHUB_REPOSITORY_ID" == "1338673889" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "OCHOLA-EDDYPHIL/controlgraph/.github/workflows/deploy.yml@refs/heads/main" ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CONTROLGRAPH_PROJECT_ID" =~ ^controlgraph-canary-[a-z0-9]{6,10}$ ]]
+          [[ "$CONTROLGRAPH_PROJECT_ID" != *reconcile* ]]
+          [[ "$CONTROLGRAPH_PROJECT_NUMBER" =~ ^[1-9][0-9]{5,19}$ ]]
+          [[ "$CONTROLGRAPH_REGION" == "us-central1" ]]
+          [[ "$CONTROLGRAPH_ARTIFACT_REPOSITORY" == "controlgraph-canary" ]]
+
+      - name: Check out the dispatched main revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify the exact source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git status --porcelain=v1)" ]]
+          [[ "$(git show -s --format=%H HEAD)" == "$GITHUB_SHA" ]]
+
+      - name: Build all reviewed image targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry="${CONTROLGRAPH_REGION}-docker.pkg.dev/${CONTROLGRAPH_PROJECT_ID}/${CONTROLGRAPH_ARTIFACT_REPOSITORY}"
+          image_tag="sha-${GITHUB_SHA}"
+          images=(
+            "controller:controller"
+            "reference-stable:reference-stable"
+            "reference-candidate:reference-candidate"
+          )
+
+          for image_target in "${images[@]}"; do
+            image_name="${image_target%%:*}"
+            target="${image_target##*:}"
+            image="${registry}/${image_name}:${image_tag}"
+            docker build \
+              --pull \
+              --platform linux/amd64 \
+              --file backend/Dockerfile \
+              --target "$target" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --tag "$image" \
+              backend
+            [[ "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$image")" == "$GITHUB_SHA" ]]
+          done
+
+      - name: Authenticate as the image builder
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.CONTROLGRAPH_PROJECT_ID }}
+          workload_identity_provider: projects/${{ vars.CONTROLGRAPH_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/controlgraph-github/providers/github-main
+          service_account: cg-ci-image-builder@${{ vars.CONTROLGRAPH_PROJECT_ID }}.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_lifetime: 900s
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Authenticate Docker to the dedicated registry
+        shell: bash
+        env:
+          CONTROLGRAPH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$CONTROLGRAPH_ACCESS_TOKEN" \
+            | docker login \
+                --username oauth2accesstoken \
+                --password-stdin \
+                "${CONTROLGRAPH_REGION}-docker.pkg.dev"
+
+      - name: Push and emit immutable references
+        id: publish
+        shell: bash
+        env:
+          CONTROLGRAPH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          registry="${CONTROLGRAPH_REGION}-docker.pkg.dev/${CONTROLGRAPH_PROJECT_ID}/${CONTROLGRAPH_ARTIFACT_REPOSITORY}"
+          image_tag="sha-${GITHUB_SHA}"
+          images=(
+            "controller:controller_image"
+            "reference-stable:reference_target_stable_image"
+            "reference-candidate:reference_target_candidate_image"
+          )
+          digests=()
+          references=()
+
+          for image_output in "${images[@]}"; do
+            image_name="${image_output%%:*}"
+            output_name="${image_output##*:}"
+            tagged_image="${registry}/${image_name}:${image_tag}"
+            docker push "$tagged_image"
+            manifest_url="https://${CONTROLGRAPH_REGION}-docker.pkg.dev/v2/${CONTROLGRAPH_PROJECT_ID}/${CONTROLGRAPH_ARTIFACT_REPOSITORY}/${image_name}/manifests/${image_tag}"
+            digest="$(
+              curl \
+                --fail \
+                --silent \
+                --show-error \
+                --head \
+                --config - \
+                "$manifest_url" <<CURL_CONFIG \
+                | awk "tolower(\$1) == \"docker-content-digest:\" { gsub(\"\\\\r\", \"\", \$2); digest = \$2 } END { print digest }"
+          header = "Authorization: Bearer ${CONTROLGRAPH_ACCESS_TOKEN}"
+          header = "Accept: application/vnd.oci.image.manifest.v1+json"
+          header = "Accept: application/vnd.docker.distribution.manifest.v2+json"
+          CURL_CONFIG
+            )"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            immutable_reference="${registry}/${image_name}@${digest}"
+            [[ "$immutable_reference" == "${registry}/"*"@sha256:"* ]]
+            printf '%s=%s\n' "$output_name" "$immutable_reference" >> "$GITHUB_OUTPUT"
+            digests+=("$digest")
+            references+=("${output_name} = \"${immutable_reference}\"")
+          done
+
+          [[ "${digests[0]}" != "${digests[1]}" ]]
+          [[ "${digests[0]}" != "${digests[2]}" ]]
+          [[ "${digests[1]}" != "${digests[2]}" ]]
+
+          {
+            printf '### Immutable runtime image inputs\n\n'
+            printf 'Built from revision %s on refs/heads/main.\n\n' "$GITHUB_SHA"
+            printf '```hcl\n'
+            printf '%s\n' "${references[@]}"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove registry credentials
+        if: always()
+        shell: bash
+        run: docker logout "${CONTROLGRAPH_REGION}-docker.pkg.dev" >/dev/null 2>&1 || true
