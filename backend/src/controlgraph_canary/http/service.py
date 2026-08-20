@@ -46,6 +46,14 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     protected_path,
 )
+from controlgraph_canary.application.operator_observability import (
+    ApiOperatorObservationClient,
+    CoordinatorOperatorObservationRelay,
+    OperatorObservationError,
+    OperatorObservationErrorCode,
+    StableSnapshotCaptureService,
+    TargetTrafficObservationService,
+)
 from controlgraph_canary.application.promotion_execution import (
     ApiPromotionClient,
     CoordinatorPromotionRelay,
@@ -95,6 +103,16 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
+from controlgraph_canary.contracts.operator_observability import (
+    ExecutionReceiptReadCommandV1,
+    ExecutionReceiptReadInvocationV1,
+    StableSnapshotCaptureCommandV1,
+    StableSnapshotCaptureInvocationV1,
+    StableSnapshotCaptureRequestV1,
+    TargetTrafficReadCommandV1,
+    TargetTrafficReadInvocationV1,
+    TargetTrafficReadRequestV1,
+)
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionCapabilityIssuanceCommandV1,
     PromotionCommandV1,
@@ -239,6 +257,15 @@ class ServiceClaimClassificationDenied(BaseModel):
     correlation_id: str
 
 
+class OperatorObservationDenied(BaseModel):
+    """Payload-free stable denial for one bounded operator observation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -254,6 +281,12 @@ def create_service_app(
     root_preflight_service: RootPreflightService | None = None,
     api_root_creation_client: ApiRootCreationClient | None = None,
     coordinator_root_creation_relay: CoordinatorRootCreationRelay | None = None,
+    stable_snapshot_capture_service: StableSnapshotCaptureService | None = None,
+    target_traffic_observation_service: TargetTrafficObservationService | None = None,
+    api_operator_observation_client: ApiOperatorObservationClient | None = None,
+    coordinator_operator_observation_relay: (
+        CoordinatorOperatorObservationRelay | None
+    ) = None,
     api_canary_client: ApiCanaryClient | None = None,
     coordinator_canary_relay: CoordinatorCanaryRelay | None = None,
     api_promotion_client: ApiPromotionClient | None = None,
@@ -305,6 +338,20 @@ def create_service_app(
         raise ValueError("operator root creation is limited to the API route")
     if coordinator_root_creation_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("root creation coordination is limited to the coordinator route")
+    if stable_snapshot_capture_service is not None and role is not ServiceRole.VERIFIER:
+        raise ValueError("stable snapshot capture is limited to the verifier route")
+    if (
+        target_traffic_observation_service is not None
+        and role is not ServiceRole.VERIFIER
+    ):
+        raise ValueError("target traffic observation is limited to the verifier route")
+    if api_operator_observation_client is not None and role is not ServiceRole.API:
+        raise ValueError("operator observations are limited to the API route")
+    if (
+        coordinator_operator_observation_relay is not None
+        and role is not ServiceRole.COORDINATOR
+    ):
+        raise ValueError("operator observation coordination is coordinator-limited")
     if api_canary_client is not None and role is not ServiceRole.API:
         raise ValueError("canary dispatch is limited to the API route")
     if coordinator_canary_relay is not None and role is not ServiceRole.COORDINATOR:
@@ -456,6 +503,7 @@ def create_service_app(
             or api_promotion_client is not None
             or api_epoch_revocation_client is not None
             or api_service_claim_release_client is not None
+            or api_operator_observation_client is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -488,6 +536,40 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(release_result)
+                elif type(command) is StableSnapshotCaptureCommandV1:
+                    if api_operator_observation_client is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    snapshot_result = (
+                        await api_operator_observation_client.capture_snapshot(
+                            command,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(snapshot_result)
+                elif type(command) is ExecutionReceiptReadCommandV1:
+                    if api_operator_observation_client is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    receipt_result = await api_operator_observation_client.read_receipt(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(receipt_result)
+                elif type(command) is TargetTrafficReadCommandV1:
+                    if api_operator_observation_client is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    traffic_result = (
+                        await api_operator_observation_client.read_target_traffic(
+                            command,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(traffic_result)
                 else:
                     if type(command) is not EpochRevocationCommandV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
@@ -515,6 +597,8 @@ def create_service_app(
                     error.code.value,
                     correlation_id,
                 )
+            except OperatorObservationError as error:
+                return _operator_observation_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -532,6 +616,7 @@ def create_service_app(
             or coordinator_promotion_relay is not None
             or coordinator_epoch_revocation_relay is not None
             or coordinator_service_claim_release_relay is not None
+            or coordinator_operator_observation_relay is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -589,6 +674,42 @@ def create_service_app(
                             failure_code=None,
                         )
                     response_body = canonical_json_bytes(release_outcome)
+                elif type(invocation) is StableSnapshotCaptureInvocationV1:
+                    if coordinator_operator_observation_relay is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    snapshot_result = (
+                        await coordinator_operator_observation_relay.capture_snapshot(
+                            invocation,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(snapshot_result)
+                elif type(invocation) is ExecutionReceiptReadInvocationV1:
+                    if coordinator_operator_observation_relay is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    receipt_result = (
+                        await coordinator_operator_observation_relay.read_receipt(
+                            invocation,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(receipt_result)
+                elif type(invocation) is TargetTrafficReadInvocationV1:
+                    if coordinator_operator_observation_relay is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    traffic_result = (
+                        await coordinator_operator_observation_relay.read_target_traffic(
+                            invocation,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(traffic_result)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
@@ -629,6 +750,8 @@ def create_service_app(
                     error.code.value,
                     correlation_id,
                 )
+            except OperatorObservationError as error:
+                return _operator_observation_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -699,6 +822,8 @@ def create_service_app(
         if role is ServiceRole.VERIFIER and (
             root_preflight_service is not None
             or service_claim_classification_service is not None
+            or stable_snapshot_capture_service is not None
+            or target_traffic_observation_service is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -713,6 +838,26 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(preflight_result)
+                elif type(verifier_request) is StableSnapshotCaptureRequestV1:
+                    if stable_snapshot_capture_service is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    snapshot_result = await stable_snapshot_capture_service.capture(
+                        verifier_request,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(snapshot_result)
+                elif type(verifier_request) is TargetTrafficReadRequestV1:
+                    if target_traffic_observation_service is None:
+                        raise OperatorObservationError(
+                            OperatorObservationErrorCode.CONFIGURATION_INVALID
+                        )
+                    traffic_result = await target_traffic_observation_service.observe(
+                        verifier_request,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(traffic_result)
                 else:
                     if (
                         type(verifier_request)
@@ -742,6 +887,8 @@ def create_service_app(
                     error.code.value,
                     correlation_id,
                 )
+            except OperatorObservationError as error:
+                return _operator_observation_denial(error.code.value, correlation_id)
             except Exception:
                 return _root_preflight_denial(
                     RootPreflightErrorCode.UNAVAILABLE.value,
@@ -943,6 +1090,9 @@ def _decode_api_command(
     | ApplyCanaryCommandV1
     | PromotionCommandV1
     | ServiceClaimReleaseCommandV1
+    | StableSnapshotCaptureCommandV1
+    | ExecutionReceiptReadCommandV1
+    | TargetTrafficReadCommandV1
     | EpochRevocationCommandV1
 ):
     try:
@@ -965,6 +1115,21 @@ def _decode_api_command(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, StableSnapshotCaptureCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, ExecutionReceiptReadCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TargetTrafficReadCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, EpochRevocationCommandV1)
 
 
@@ -975,6 +1140,9 @@ def _decode_coordinator_invocation(
     | ApplyCanaryInvocationV1
     | PromotionInvocationV1
     | ServiceClaimReleaseInvocationV1
+    | StableSnapshotCaptureInvocationV1
+    | ExecutionReceiptReadInvocationV1
+    | TargetTrafficReadInvocationV1
     | EpochRevocationInvocationV1
 ):
     try:
@@ -997,14 +1165,44 @@ def _decode_coordinator_invocation(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, StableSnapshotCaptureInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, ExecutionReceiptReadInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TargetTrafficReadInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, EpochRevocationInvocationV1)
 
 
 def _decode_verifier_request(
     body: bytes,
-) -> RootPreflightRequestV1 | ServiceClaimClassificationRequestV1:
+) -> (
+    RootPreflightRequestV1
+    | StableSnapshotCaptureRequestV1
+    | TargetTrafficReadRequestV1
+    | ServiceClaimClassificationRequestV1
+):
     try:
         return decode_contract(body, RootPreflightRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, StableSnapshotCaptureRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TargetTrafficReadRequestV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -1240,6 +1438,31 @@ def _receipt_authority_denial(code: str, correlation_id: str) -> JSONResponse:
     )
 
 
+def _operator_observation_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = OperatorObservationDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        OperatorObservationErrorCode.CALLER_DENIED.value,
+        OperatorObservationErrorCode.OPERATOR_DENIED.value,
+        OperatorObservationErrorCode.COMMAND_DENIED.value,
+        OperatorObservationErrorCode.TARGET_DENIED.value,
+    }:
+        status_code = 403
+    elif code == OperatorObservationErrorCode.RECEIPT_NOT_FOUND.value:
+        status_code = 404
+    elif code in {
+        OperatorObservationErrorCode.CAPTURE_DENIED.value,
+        OperatorObservationErrorCode.TARGET_STATE_DENIED.value,
+    }:
+        status_code = 409
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
 async def _read_contract_body(request: Request) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
@@ -1282,6 +1505,7 @@ __all__ = [
     "CapabilityDenied",
     "DisabledWork",
     "EvidenceSigningDenied",
+    "OperatorObservationDenied",
     "RootCreationDenied",
     "RootPreflightDenied",
     "ServiceClaimClassificationDenied",

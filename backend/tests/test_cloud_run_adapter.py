@@ -822,9 +822,8 @@ async def test_verifier_snapshot_reader_has_only_exact_read_operations() -> None
         for name in dir(reader)
         if not name.startswith("_") and callable(getattr(reader, name))
     }
-    assert public_callables == {"read_revision", "read_service"}
+    assert public_callables == {"read_revision", "read_service", "read_target"}
     assert not hasattr(reader, "mutate")
-    assert not hasattr(reader, "read_target")
 
 
 @_async_test
