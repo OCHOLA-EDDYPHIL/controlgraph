@@ -1587,7 +1587,9 @@ def test_malformed_promotion_command_stops_at_api_decoder() -> None:
         content=b'{"schema_version":"controlgraph.promotion-command/v1"}',
         headers={
             CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact.test.credential",
-            SERVERLESS_AUTHORIZATION_HEADER: "Bearer exact.test.credential",
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                "bearer exact.test.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         },
     )
 

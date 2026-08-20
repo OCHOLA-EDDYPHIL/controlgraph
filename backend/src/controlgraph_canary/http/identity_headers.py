@@ -53,17 +53,18 @@ def _single(headers: Headers, name: str) -> str | None:
 def _same_identity_envelope(controlgraph: str, serverless: str) -> bool:
     if not _bounded_ascii(controlgraph) or not _bounded_ascii(serverless):
         return False
-    if serverless == controlgraph:
-        return True
-    if not controlgraph.startswith("Bearer "):
+    if not controlgraph.startswith("Bearer ") or not serverless.startswith("bearer "):
         return False
-    token = controlgraph.removeprefix("Bearer ")
-    prefix, separator, signature = token.rpartition(".")
-    return bool(
-        prefix
-        and separator
-        and signature
-        and serverless == f"{prefix}.{_REMOVED_SIGNATURE}"
+    controlgraph_parts = controlgraph.removeprefix("Bearer ").split(".")
+    serverless_parts = serverless.removeprefix("bearer ").split(".")
+    return (
+        len(controlgraph_parts) == 3
+        and len(serverless_parts) == 3
+        and all(controlgraph_parts)
+        and all(serverless_parts[:2])
+        and controlgraph_parts[2] != _REMOVED_SIGNATURE
+        and serverless_parts[2] == _REMOVED_SIGNATURE
+        and controlgraph_parts[:2] == serverless_parts[:2]
     )
 
 

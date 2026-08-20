@@ -931,7 +931,9 @@ def test_api_http_route_authenticates_and_returns_canonical_traffic_observation(
         "/v1/operator/commands",
         headers={
             CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer synthetic.observation.token",
-            SERVERLESS_AUTHORIZATION_HEADER: "Bearer synthetic.observation.token",
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                "bearer synthetic.observation.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         },
         content=canonical_json_bytes(_traffic_command()),
     )
