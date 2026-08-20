@@ -321,7 +321,7 @@ class _Authenticator:
         authorization_header: str | None,
         policy: RouteAuthenticationPolicy,
     ) -> AuthenticationContext:
-        assert authorization_header == "Bearer exact-token"
+        assert authorization_header == "Bearer exact.header.token"
         assert policy.caller.role is self.principal.role
         return self.principal
 
@@ -404,8 +404,10 @@ def test_api_http_route_accepts_the_strict_revocation_command() -> None:
         protected_path(ServiceRole.API),
         content=canonical_json_bytes(_command()),
         headers={
-            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact-token",
-            SERVERLESS_AUTHORIZATION_HEADER: "Bearer exact-token",
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact.header.token",
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                "bearer exact.header.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         },
     )
 
@@ -447,7 +449,7 @@ def test_coordinator_http_route_accepts_only_the_bound_invocation() -> None:
     response = client.post(
         protected_path(ServiceRole.COORDINATOR),
         content=canonical_json_bytes(invocation),
-        headers={"Authorization": "Bearer exact-token"},
+        headers={"Authorization": "Bearer exact.header.token"},
     )
 
     assert response.status_code == 200
@@ -591,8 +593,10 @@ def test_api_and_coordinator_relay_one_exact_proof_on_the_existing_post_path() -
         protected_path(ServiceRole.API),
         content=canonical_json_bytes(records.proof_command),
         headers={
-            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact-token",
-            SERVERLESS_AUTHORIZATION_HEADER: "Bearer exact-token",
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact.header.token",
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                "bearer exact.header.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         },
     )
     assert api_response.status_code == 200
@@ -616,7 +620,7 @@ def test_api_and_coordinator_relay_one_exact_proof_on_the_existing_post_path() -
     coordinator_response = coordinator_http.post(
         protected_path(ServiceRole.COORDINATOR),
         content=canonical_json_bytes(records.proof_invocation),
-        headers={"Authorization": "Bearer exact-token"},
+        headers={"Authorization": "Bearer exact.header.token"},
     )
     assert coordinator_response.status_code == 200
     proof_outcome = decode_contract(

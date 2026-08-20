@@ -75,9 +75,13 @@ CALLER_ACCOUNT_IDS = {
 
 def _credential_headers(role: ServiceRole, value: str) -> dict[str, str]:
     if role is ServiceRole.API:
+        prefix, separator, signature = value.removeprefix("Bearer ").rpartition(".")
+        assert prefix and separator and signature
         return {
             CONTROLGRAPH_AUTHORIZATION_HEADER: value,
-            SERVERLESS_AUTHORIZATION_HEADER: value,
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                f"bearer {prefix}.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         }
     return {"Authorization": value}
 
@@ -312,7 +316,7 @@ def test_every_protected_route_remains_disabled_without_reading_sensitive_body(
     policy = runtime_route_policy(role, _environment(role))
     sensitive_marker = "unmistakably-synthetic-capability"
     token_marker = "unmistakably-synthetic-token"
-    authorization = f"Bearer {token_marker}"
+    authorization = f"Bearer header.payload.{token_marker}"
     authenticator = _ExactTestAuthenticator(authorization)
     client = TestClient(
         create_service_app(
@@ -537,9 +541,76 @@ def test_api_runtime_verifies_operator_token_against_oauth_client_audience() -> 
         ],
         [
             (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
             (
                 SERVERLESS_AUTHORIZATION_HEADER,
                 "Bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "header.payload.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer other.payload.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer header.payload.extra.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer header.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer one.two.three.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer one.two.three.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer .payload.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer .payload.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header..signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer header..SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "bearer header.payload.signature"),
+        ],
+        [
+            (
+                CONTROLGRAPH_AUTHORIZATION_HEADER,
+                "Bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE",
             ),
         ],
     ],
@@ -579,7 +650,7 @@ def test_operator_envelope_admits_cloud_run_signature_removal() -> None:
         headers={
             CONTROLGRAPH_AUTHORIZATION_HEADER: credential,
             SERVERLESS_AUTHORIZATION_HEADER: (
-                "header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+                "bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
             ),
         },
     )
