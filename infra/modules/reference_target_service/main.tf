@@ -4,8 +4,6 @@ locals {
   candidate_revision = "controlgraph-reference-target-candidate-v1"
   active_revision    = var.deployment_phase == "stable" ? local.stable_revision : local.candidate_revision
   active_image       = var.deployment_phase == "stable" ? var.stable_image : var.candidate_image
-  stable_digest      = try(regex("sha256:([0-9a-f]{64})$", var.stable_image)[0], "")
-  candidate_digest   = try(regex("sha256:([0-9a-f]{64})$", var.candidate_image)[0], "")
   labels = {
     application = "controlgraph"
     component   = "reference-target"
@@ -126,17 +124,6 @@ check "reference_target_coordinates_are_fixed" {
       var.service_account == "controlgraph-reference@${var.project_id}.iam.gserviceaccount.com"
     )
     error_message = "The reference target must use the dedicated project, us-central1, and fixed reference identity."
-  }
-}
-
-check "reference_target_images_are_distinct_and_immutable" {
-  assert {
-    condition = (
-      local.stable_digest != local.candidate_digest &&
-      can(regex("@sha256:[0-9a-f]{64}$", var.stable_image)) &&
-      can(regex("@sha256:[0-9a-f]{64}$", var.candidate_image))
-    )
-    error_message = "Stable and candidate images must be distinct immutable sha256 references."
   }
 }
 

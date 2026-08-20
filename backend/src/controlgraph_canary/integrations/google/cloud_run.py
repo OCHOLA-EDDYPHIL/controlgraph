@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Final, Protocol, cast
 
 from google.api_core import exceptions as api_exceptions
@@ -33,6 +33,17 @@ from controlgraph_canary.application.cloud_run import (
 from controlgraph_canary.application.execution import MutationPermit
 from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.application.receipt_execution import ReceiptReadbackResult
+from controlgraph_canary.application.reference_target_reset import (
+    REFERENCE_TARGET_CANDIDATE_REVISION,
+    REFERENCE_TARGET_CONCURRENCY,
+    REFERENCE_TARGET_STABLE_REVISION,
+    ReferenceTargetResetConfiguration,
+    ReferenceTargetResetError,
+    ReferenceTargetResetErrorCode,
+    ReferenceTargetResetOutcome,
+    ReferenceTargetResetRequest,
+    ReferenceTargetResetResult,
+)
 from controlgraph_canary.contracts.models import CapabilityAction, MutationIntent, TargetBinding
 
 CLOUD_RUN_REGION: Final = "us-central1"
@@ -444,6 +455,376 @@ class CloudRunV2Adapter:
             configuration=self._configuration,
             expected_revision=expected_revision,
         )
+
+
+class CloudRunV2ReferenceTargetResetter:
+    """Explicitly restore the configured disposable target before an acceptance run."""
+
+    def __init__(
+        self,
+        *,
+        configuration: ReferenceTargetResetConfiguration,
+        services_client_factory: ServicesClientFactory | None = None,
+        revisions_client_factory: RevisionsClientFactory | None = None,
+    ) -> None:
+        if type(configuration) is not ReferenceTargetResetConfiguration:
+            raise TypeError("an exact reference-target reset configuration is required")
+        if services_client_factory is not None and not callable(services_client_factory):
+            raise TypeError("Cloud Run services client factory must be callable")
+        if revisions_client_factory is not None and not callable(revisions_client_factory):
+            raise TypeError("Cloud Run revisions client factory must be callable")
+        self._reset_configuration = configuration
+        self._target_configuration = configuration.target_configuration
+        self._services_client_factory = services_client_factory or _default_services_client_factory
+        self._revisions_client_factory = (
+            revisions_client_factory or _default_revisions_client_factory
+        )
+        self._services: _ServicesClientPort | None = None
+        self._revisions: _RevisionsClientPort | None = None
+        self._services_lock = asyncio.Lock()
+        self._revisions_lock = asyncio.Lock()
+
+    @property
+    def configuration(self) -> ReferenceTargetResetConfiguration:
+        return self._reset_configuration
+
+    async def reset(
+        self,
+        request: ReferenceTargetResetRequest,
+    ) -> ReferenceTargetResetResult:
+        """Make at most one conditional update and require a fresh exact readback."""
+
+        if type(request) is not ReferenceTargetResetRequest:
+            raise TypeError("an exact reference-target reset request is required")
+        before = await self._read_target()
+        before_traffic = self._admit_target(before)
+        if before.service.etag != request.expected_etag:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+            )
+        if before_traffic == (100, 0):
+            confirmed = await self._read_target()
+            if (
+                self._admit_target(confirmed) != (100, 0)
+                or confirmed.service.etag != before.service.etag
+                or confirmed.service.generation != before.service.generation
+            ):
+                raise ReferenceTargetResetError(
+                    ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+                )
+            return ReferenceTargetResetResult(
+                configuration=self.configuration,
+                request=request,
+                outcome=ReferenceTargetResetOutcome.ALREADY_BASELINE,
+                previous_generation=before.service.generation,
+                observed_generation=confirmed.service.generation,
+                observed_etag=confirmed.service.etag,
+                operation_name=None,
+            )
+
+        acknowledged, operation_name = await self._update_baseline(before.service.etag)
+        try:
+            observed = await self._read_target()
+            observed_traffic = self._admit_target(observed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+            ) from None
+        if (
+            observed_traffic != (100, 0)
+            or observed.service.generation <= before.service.generation
+            or observed.service.etag == before.service.etag
+        ):
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+            )
+        outcome = (
+            ReferenceTargetResetOutcome.RESET_APPLIED
+            if acknowledged
+            else ReferenceTargetResetOutcome.RESET_CONFIRMED_AFTER_UNKNOWN
+        )
+        return ReferenceTargetResetResult(
+            configuration=self.configuration,
+            request=request,
+            outcome=outcome,
+            previous_generation=before.service.generation,
+            observed_generation=observed.service.generation,
+            observed_etag=observed.service.etag,
+            operation_name=operation_name,
+        )
+
+    async def _read_target(self) -> CloudRunTargetState:
+        try:
+            service, stable, candidate = await asyncio.gather(
+                self._read_service(),
+                self._read_revision(REFERENCE_TARGET_STABLE_REVISION),
+                self._read_revision(REFERENCE_TARGET_CANDIDATE_REVISION),
+            )
+            return CloudRunTargetState(
+                service=service,
+                stable_revision=stable,
+                candidate_revision=candidate,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ReferenceTargetResetError:
+            raise
+        except Exception:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            ) from None
+
+    async def _read_service(self) -> CloudRunServiceState:
+        request = run_v2.GetServiceRequest(name=self._target_configuration.service_resource)
+        try:
+            client = await self._services_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                response = await client.get_service(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+            return _decode_service(response, configuration=self._target_configuration)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            ) from None
+
+    async def _read_revision(self, revision_name: str) -> CloudRunRevisionState:
+        request = run_v2.GetRevisionRequest(
+            name=self._target_configuration.revision_resource_name(revision_name)
+        )
+        try:
+            client = await self._revisions_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                response = await client.get_revision(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+            return _decode_revision(
+                response,
+                configuration=self._target_configuration,
+                expected_revision=revision_name,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            ) from None
+
+    def _admit_target(self, state: CloudRunTargetState) -> tuple[int, int]:
+        if type(state) is not CloudRunTargetState:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
+        service = state.service
+        stable = state.stable_revision
+        candidate = state.candidate_revision
+        if (
+            service.target != self.configuration.target
+            or stable.revision != REFERENCE_TARGET_STABLE_REVISION
+            or candidate.revision != REFERENCE_TARGET_CANDIDATE_REVISION
+            or stable.configuration
+            != self._expected_revision_configuration(self.configuration.stable_image)
+            or candidate.configuration
+            != self._expected_revision_configuration(self.configuration.candidate_image)
+            or service.reconciling
+            or service.ready_state is not CloudRunReadyState.READY
+            or service.generation != service.observed_generation
+            or service.template_revision != REFERENCE_TARGET_CANDIDATE_REVISION
+            or service.latest_created_revision != REFERENCE_TARGET_CANDIDATE_REVISION
+            or service.latest_ready_revision != REFERENCE_TARGET_CANDIDATE_REVISION
+            or stable.reconciling
+            or stable.ready_state is not CloudRunReadyState.READY
+            or stable.generation != stable.observed_generation
+            or candidate.reconciling
+            or candidate.ready_state is not CloudRunReadyState.READY
+            or candidate.generation != candidate.observed_generation
+        ):
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
+        traffic = self._traffic_pair(service.traffic)
+        statuses = self._traffic_pair(service.traffic_statuses)
+        if traffic != statuses or traffic not in {(100, 0), (90, 10), (0, 100)}:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
+        return traffic
+
+    def _expected_revision_configuration(
+        self,
+        image: str,
+    ) -> CloudRunRevisionConfiguration:
+        return CloudRunRevisionConfiguration(
+            image=image,
+            service_account=(
+                f"controlgraph-reference@{self.configuration.project_id}.iam.gserviceaccount.com"
+            ),
+            execution_environment=CloudRunExecutionEnvironment.GEN2,
+            timeout_seconds=5,
+            concurrency=REFERENCE_TARGET_CONCURRENCY,
+            min_instance_count=0,
+            max_instance_count=1,
+            container_name="reference-target",
+            command=(),
+            args=(),
+            working_dir=None,
+            port_name="http1",
+            container_port=8080,
+            cpu_limit="1",
+            memory_limit="256Mi",
+            cpu_idle=True,
+            startup_cpu_boost=False,
+            startup_probe=CloudRunHttpProbe(
+                path="/healthz",
+                port=8080,
+                initial_delay_seconds=0,
+                timeout_seconds=2,
+                period_seconds=5,
+                failure_threshold=12,
+            ),
+            liveness_probe=CloudRunHttpProbe(
+                path="/healthz",
+                port=8080,
+                initial_delay_seconds=5,
+                timeout_seconds=2,
+                period_seconds=10,
+                failure_threshold=3,
+            ),
+            vpc_connector=None,
+            vpc_egress=CloudRunVpcEgress.ALL_TRAFFIC,
+            network_interfaces=(
+                CloudRunNetworkInterface(
+                    network=self.configuration.network_resource,
+                    subnetwork=self.configuration.subnetwork_resource,
+                    tags=(),
+                ),
+            ),
+        )
+
+    def _traffic_pair(
+        self,
+        allocations: Sequence[CloudRunTrafficAllocation | CloudRunTrafficStatus],
+    ) -> tuple[int, int]:
+        expected_tags = {
+            REFERENCE_TARGET_STABLE_REVISION: "stable",
+            REFERENCE_TARGET_CANDIDATE_REVISION: "candidate",
+        }
+        observed: dict[str, int] = {}
+        for allocation in allocations:
+            if (
+                allocation.revision not in expected_tags
+                or allocation.tag != expected_tags[allocation.revision]
+            ):
+                raise ReferenceTargetResetError(
+                    ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+                )
+            observed[allocation.revision] = allocation.percent
+        return (
+            observed.get(REFERENCE_TARGET_STABLE_REVISION, 0),
+            observed.get(REFERENCE_TARGET_CANDIDATE_REVISION, 0),
+        )
+
+    async def _update_baseline(self, etag: str) -> tuple[bool, str | None]:
+        request = run_v2.UpdateServiceRequest(
+            service=run_v2.Service(
+                name=self._target_configuration.service_resource,
+                etag=etag,
+                traffic=[
+                    run_v2.TrafficTarget(
+                        type_=_REVISION_ALLOCATION,
+                        revision=REFERENCE_TARGET_STABLE_REVISION,
+                        percent=100,
+                        tag="stable",
+                    ),
+                    run_v2.TrafficTarget(
+                        type_=_REVISION_ALLOCATION,
+                        revision=REFERENCE_TARGET_CANDIDATE_REVISION,
+                        percent=0,
+                        tag="candidate",
+                    ),
+                ],
+            ),
+            update_mask={"paths": ["traffic"]},
+            validate_only=False,
+            allow_missing=False,
+        )
+        try:
+            client = await self._services_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                operation = await client.update_service(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+        except _KNOWN_PRECONDITION_FAILURES:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+            ) from None
+        except _KNOWN_SAFE_REJECTIONS:
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.PROVIDER_REJECTED
+            ) from None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False, None
+        operation_name = _operation_name(operation)
+        if operation_name is None:
+            return False, None
+        try:
+            async with asyncio.timeout(CLOUD_RUN_OPERATION_TIMEOUT_SECONDS):
+                response = await operation.result(timeout=CLOUD_RUN_OPERATION_TIMEOUT_SECONDS)
+            service = _decode_service(response, configuration=self._target_configuration)
+            if self._traffic_pair(service.traffic) != (100, 0):
+                return False, operation_name
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False, operation_name
+        return True, operation_name
+
+    async def _services_client(self) -> _ServicesClientPort:
+        if self._services is not None:
+            return self._services
+        async with self._services_lock:
+            if self._services is None:
+                try:
+                    client = self._services_client_factory()
+                    if not all(
+                        callable(getattr(client, name, None))
+                        for name in ("get_service", "update_service")
+                    ):
+                        raise TypeError("Cloud Run services client is incomplete")
+                except Exception:
+                    raise ReferenceTargetResetError(
+                        ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+                    ) from None
+                self._services = client
+        return self._services
+
+    async def _revisions_client(self) -> _RevisionsClientPort:
+        if self._revisions is not None:
+            return self._revisions
+        async with self._revisions_lock:
+            if self._revisions is None:
+                try:
+                    client = self._revisions_client_factory()
+                    if not callable(getattr(client, "get_revision", None)):
+                        raise TypeError("Cloud Run revisions client is incomplete")
+                except Exception:
+                    raise ReferenceTargetResetError(
+                        ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+                    ) from None
+                self._revisions = client
+        return self._revisions
 
 
 class CloudRunV2ReceiptReadback:

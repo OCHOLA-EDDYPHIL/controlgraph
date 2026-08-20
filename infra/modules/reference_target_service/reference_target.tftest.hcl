@@ -4,8 +4,8 @@ variables {
   project_id      = "controlgraph-canary-abc123"
   region          = "us-central1"
   service_account = "controlgraph-reference@controlgraph-canary-abc123.iam.gserviceaccount.com"
-  stable_image    = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-images/reference-stable@sha256:1111111111111111111111111111111111111111111111111111111111111111"
-  candidate_image = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-images/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  stable_image    = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-canary/reference-stable@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  candidate_image = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-canary/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
   network         = "projects/controlgraph-canary-abc123/global/networks/controlgraph"
   subnetwork      = "projects/controlgraph-canary-abc123/regions/us-central1/subnetworks/controlgraph"
 }
@@ -39,6 +39,25 @@ run "stable_revision_starts_at_the_bounded_baseline" {
       ]) == 1
     )
     error_message = "The stable deployment must scale from zero to one and route 100 percent to stable."
+  }
+
+  assert {
+    condition = (
+      output.target.baseline_reset.project_id == var.project_id &&
+      output.target.baseline_reset.region == "us-central1" &&
+      output.target.baseline_reset.service_name == "controlgraph-reference-target" &&
+      output.target.baseline_reset.stable_revision == "controlgraph-reference-target-stable-v1" &&
+      output.target.baseline_reset.candidate_revision == "controlgraph-reference-target-candidate-v1" &&
+      output.target.baseline_reset.stable_image == var.stable_image &&
+      output.target.baseline_reset.candidate_image == var.candidate_image &&
+      output.target.baseline_reset.network_resource == var.network &&
+      output.target.baseline_reset.subnetwork_resource == var.subnetwork &&
+      output.target.baseline_reset.concurrency == 8 &&
+      output.target.baseline_reset.stable_percent == 100 &&
+      output.target.baseline_reset.candidate_percent == 0 &&
+      output.target.baseline_reset.confirmation == "RESET_REFERENCE_TARGET_BASELINE"
+    )
+    error_message = "The explicit baseline-reset inputs must remain fixed to the deployed reference target."
   }
 }
 
@@ -80,8 +99,19 @@ run "matching_image_digests_are_rejected" {
 
   variables {
     deployment_phase = "stable"
-    candidate_image  = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-images/a-different-name@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    candidate_image  = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-canary/reference-candidate@sha256:1111111111111111111111111111111111111111111111111111111111111111"
   }
 
-  expect_failures = [check.reference_target_images_are_distinct_and_immutable]
+  expect_failures = [var.candidate_image]
+}
+
+run "candidate_repository_substitution_is_rejected" {
+  command = plan
+
+  variables {
+    deployment_phase = "candidate"
+    candidate_image  = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/other/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  }
+
+  expect_failures = [var.candidate_image]
 }
