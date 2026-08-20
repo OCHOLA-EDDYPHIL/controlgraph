@@ -136,6 +136,10 @@ from controlgraph_canary.contracts.storage import (
     execution_receipt_logical_id,
     promotion_dispatch_document_id,
 )
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.integrations.google.firestore import FirestoreAuthorityStore
 
@@ -1581,7 +1585,10 @@ def test_malformed_promotion_command_stops_at_api_decoder() -> None:
     response = TestClient(app).post(
         protected_path(ServiceRole.API),
         content=b'{"schema_version":"controlgraph.promotion-command/v1"}',
-        headers={"Authorization": "Bearer exact.test.credential"},
+        headers={
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact.test.credential",
+            SERVERLESS_AUTHORIZATION_HEADER: "Bearer exact.test.credential",
+        },
     )
 
     assert response.status_code == 400

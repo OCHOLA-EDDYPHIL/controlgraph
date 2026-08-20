@@ -51,6 +51,10 @@ from controlgraph_canary.contracts.root_relay import (
     ROOT_CREATION_INVOCATION_V1,
     RootCreationInvocationV1,
 )
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.http.service import create_service_app, protected_paths
 from controlgraph_canary.integrations.google.internal_transport import (
     GoogleOneShotOidcTransport,
@@ -71,6 +75,10 @@ API_IDENTITY = f"controlgraph-api@{PROJECT}.iam.gserviceaccount.com"
 ISSUED_AT = 1_776_236_400
 EXPIRES_AT = ISSUED_AT + 600
 AUTHORIZATION = "Bearer aaa.bbb.ccc"
+OPERATOR_HEADERS = {
+    CONTROLGRAPH_AUTHORIZATION_HEADER: AUTHORIZATION,
+    SERVERLESS_AUTHORIZATION_HEADER: AUTHORIZATION,
+}
 
 
 def _identity_environment(role: ServiceRole) -> dict[str, str]:
@@ -362,7 +370,7 @@ def test_api_http_route_accepts_only_public_command_fields() -> None:
     response = client.post(
         protected_paths(ServiceRole.API)[0],
         content=canonical_json_bytes(_command()),
-        headers={"Authorization": AUTHORIZATION},
+        headers=OPERATOR_HEADERS,
     )
     assert response.status_code == 200
     assert decode_contract(response.content, RootCreationResultV1) == _write_result().result
@@ -373,7 +381,7 @@ def test_api_http_route_accepts_only_public_command_fields() -> None:
     denied = client.post(
         protected_paths(ServiceRole.API)[0],
         content=body,
-        headers={"Authorization": AUTHORIZATION},
+        headers=OPERATOR_HEADERS,
     )
     assert denied.status_code == 400
     assert denied.json()["code"] == "CONTRACT_INVALID"
@@ -431,7 +439,7 @@ def test_http_authentication_precedes_root_body_parsing() -> None:
     response = client.post(
         protected_paths(ServiceRole.API)[0],
         content=f'{{"payload":"{marker}"}}',
-        headers={"Authorization": AUTHORIZATION},
+        headers=OPERATOR_HEADERS,
     )
     assert response.status_code == 401
     assert response.json()["code"] == "AUTH_CREDENTIAL_INVALID"

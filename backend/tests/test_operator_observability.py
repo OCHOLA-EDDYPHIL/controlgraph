@@ -82,6 +82,10 @@ from controlgraph_canary.contracts.operator_observability import (
     TargetTrafficReadResultV1,
 )
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.services.runtime import create_runtime_service_app
 
@@ -925,7 +929,10 @@ def test_api_http_route_authenticates_and_returns_canonical_traffic_observation(
 
     response = TestClient(app).post(
         "/v1/operator/commands",
-        headers={"Authorization": "Bearer synthetic.observation.token"},
+        headers={
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer synthetic.observation.token",
+            SERVERLESS_AUTHORIZATION_HEADER: "Bearer synthetic.observation.token",
+        },
         content=canonical_json_bytes(_traffic_command()),
     )
 
