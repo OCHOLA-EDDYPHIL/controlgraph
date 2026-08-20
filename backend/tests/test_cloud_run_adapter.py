@@ -52,6 +52,14 @@ from controlgraph_canary.application.receipt_execution import (
     ReceiptReadbackResult,
     map_cloud_run_mutation_result,
 )
+from controlgraph_canary.application.reference_target_reset import (
+    REFERENCE_TARGET_RESET_CONFIRMATION,
+    ReferenceTargetResetConfiguration,
+    ReferenceTargetResetError,
+    ReferenceTargetResetErrorCode,
+    ReferenceTargetResetOutcome,
+    ReferenceTargetResetRequest,
+)
 from controlgraph_canary.authority.replay import (
     MutationAction,
     MutationBinding,
@@ -78,6 +86,7 @@ from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.integrations.google.cloud_run import (
     CloudRunV2Adapter,
     CloudRunV2ReceiptReadback,
+    CloudRunV2ReferenceTargetResetter,
     CloudRunV2SnapshotReader,
 )
 
@@ -98,6 +107,18 @@ NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
 REFERENCE_IMAGE = (
     f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-images/reference-target"
     f"@sha256:{'1' * 64}"
+)
+RESET_STABLE_IMAGE = (
+    f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-canary/reference-stable"
+    f"@sha256:{'4' * 64}"
+)
+RESET_CANDIDATE_IMAGE = (
+    f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-canary/reference-candidate"
+    f"@sha256:{'5' * 64}"
+)
+RESET_CANDIDATE_SAME_DIGEST = (
+    f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-canary/reference-candidate"
+    f"@sha256:{'4' * 64}"
 )
 NETWORK_RESOURCE = f"projects/{PROJECT_ID}/global/networks/controlgraph"
 SUBNETWORK_RESOURCE = (
@@ -462,13 +483,59 @@ class _GetOnlyServicesClient:
         return cast(run_v2.Service, response)
 
 
+class _ResetServicesClient:
+    def __init__(self, services: list[object], *, update: object) -> None:
+        self.services = services
+        self.update = update
+        self.get_calls: list[tuple[run_v2.GetServiceRequest, object | None, float]] = []
+        self.update_calls: list[tuple[run_v2.UpdateServiceRequest, object | None, float]] = []
+
+    async def get_service(
+        self,
+        request: run_v2.GetServiceRequest,
+        *,
+        retry: object | None,
+        timeout: float,
+    ) -> run_v2.Service:
+        self.get_calls.append((request, retry, timeout))
+        if not self.services:
+            raise AssertionError("unexpected reset service read")
+        response = self.services.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return cast(run_v2.Service, response)
+
+    async def update_service(
+        self,
+        request: run_v2.UpdateServiceRequest,
+        *,
+        retry: object | None,
+        timeout: float,
+    ) -> _FakeOperation:
+        self.update_calls.append((request, retry, timeout))
+        if isinstance(self.update, BaseException):
+            raise self.update
+        return cast(_FakeOperation, self.update)
+
+
 class _FakeRevisionsClient:
-    def __init__(self, *, concurrency: int = 8) -> None:
+    def __init__(
+        self,
+        *,
+        concurrency: int = 8,
+        stable_image: str = REFERENCE_IMAGE,
+        candidate_image: str = REFERENCE_IMAGE,
+    ) -> None:
         self.responses = {
-            f"{SERVICE_RESOURCE}/revisions/{STABLE}": _revision(STABLE, concurrency),
+            f"{SERVICE_RESOURCE}/revisions/{STABLE}": _revision(
+                STABLE,
+                concurrency,
+                image=stable_image,
+            ),
             f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}": _revision(
                 CANDIDATE,
                 concurrency,
+                image=candidate_image,
             ),
         }
         self.calls: list[tuple[run_v2.GetRevisionRequest, object | None, float]] = []
@@ -504,12 +571,16 @@ def _service(
     status_tags: tuple[str, str] = ("stable", "candidate"),
     status_stable_percent: int | None = None,
     status_candidate_percent: int | None = None,
+    generation: int = 8,
+    observed_generation: int | None = None,
 ) -> run_v2.Service:
     return run_v2.Service(
         name=resource_name,
         uid="synthetic-service-uid",
-        generation=8,
-        observed_generation=8,
+        generation=generation,
+        observed_generation=(
+            generation if observed_generation is None else observed_generation
+        ),
         etag=etag,
         reconciling=False,
         terminal_condition=run_v2.Condition(type_="Ready", state=ready_state),
@@ -679,6 +750,42 @@ def _receipt_readback(
         configuration=configuration or _configuration(),
         configured_project_id=PROJECT_ID,
         services_client_factory=lambda: services,
+    )
+
+
+def _reset_configuration(**changes: str) -> ReferenceTargetResetConfiguration:
+    values = {
+        "project_id": PROJECT_ID,
+        "stable_image": RESET_STABLE_IMAGE,
+        "candidate_image": RESET_CANDIDATE_IMAGE,
+        "network_resource": NETWORK_RESOURCE,
+        "subnetwork_resource": SUBNETWORK_RESOURCE,
+    }
+    values.update(changes)
+    return ReferenceTargetResetConfiguration(**values)
+
+
+def _resetter(
+    services: _ResetServicesClient,
+    *,
+    revisions: _FakeRevisionsClient | None = None,
+    configuration: ReferenceTargetResetConfiguration | None = None,
+) -> CloudRunV2ReferenceTargetResetter:
+    revision_client = revisions or _FakeRevisionsClient(
+        stable_image=RESET_STABLE_IMAGE,
+        candidate_image=RESET_CANDIDATE_IMAGE,
+    )
+    return CloudRunV2ReferenceTargetResetter(
+        configuration=configuration or _reset_configuration(),
+        services_client_factory=lambda: services,
+        revisions_client_factory=lambda: revision_client,
+    )
+
+
+def _reset_request(etag: str = "etag-before-reset") -> ReferenceTargetResetRequest:
+    return ReferenceTargetResetRequest(
+        expected_etag=etag,
+        confirmation=REFERENCE_TARGET_RESET_CONFIRMATION,
     )
 
 
@@ -1568,3 +1675,194 @@ def test_target_configuration_projection_rejects_mismatched_declared_state() -> 
     mismatched_revision = recovery.model_copy(update={"candidate_revision": "other-candidate-v1"})
     with pytest.raises(ValueError, match="target service"):
         target_configuration_projection(mismatched_revision, expected_concurrency=8)
+
+
+def test_reference_target_reset_configuration_is_exact_and_immutable() -> None:
+    configuration = _reset_configuration()
+
+    assert configuration.target == _target()
+    assert configuration.target_configuration == _configuration()
+    with pytest.raises(AttributeError):
+        configuration.project_id = "controlgraph-canary-other1"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"project_id": "shared-project"},
+        {"project_id": "controlgraph-canary-reconcile"},
+        {"stable_image": "reference-stable:latest"},
+        {
+            "stable_image": (
+                f"us-central1-docker.pkg.dev/{PROJECT_ID}/other/reference-stable"
+                f"@sha256:{'4' * 64}"
+            )
+        },
+        {"candidate_image": RESET_STABLE_IMAGE},
+        {"candidate_image": RESET_CANDIDATE_SAME_DIGEST},
+        {"network_resource": "projects/shared/global/networks/controlgraph"},
+        {"subnetwork_resource": "projects/shared/regions/us-central1/subnets/controlgraph"},
+    ],
+)
+def test_reference_target_reset_configuration_rejects_substitution(
+    changes: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError):
+        _reset_configuration(**changes)
+
+
+@_async_test
+async def test_reference_target_reset_uses_one_conditional_traffic_update_and_readback() -> None:
+    before = _service(0, 100, etag="etag-before-reset", generation=8)
+    after = _service(100, 0, etag="etag-after-reset", generation=9)
+    operation = _FakeOperation(after, name="operations/reference-target-reset-1")
+    services = _ResetServicesClient([before, after], update=operation)
+    revisions = _FakeRevisionsClient(
+        stable_image=RESET_STABLE_IMAGE,
+        candidate_image=RESET_CANDIDATE_IMAGE,
+    )
+
+    result = await _resetter(services, revisions=revisions).reset(_reset_request())
+
+    assert result.outcome is ReferenceTargetResetOutcome.RESET_APPLIED
+    assert result.previous_generation == 8
+    assert result.observed_generation == 9
+    assert result.observed_etag == "etag-after-reset"
+    assert result.operation_name == "operations/reference-target-reset-1"
+    assert len(services.get_calls) == 2
+    assert len(revisions.calls) == 4
+    assert len(services.update_calls) == 1
+    request, retry, timeout = services.update_calls[0]
+    assert retry is None
+    assert timeout == 5.0
+    assert request.service.name == SERVICE_RESOURCE
+    assert request.service.etag == "etag-before-reset"
+    assert request.update_mask.paths == ["traffic"]
+    assert request.allow_missing is False
+    assert request.validate_only is False
+    assert [(item.revision, item.percent, item.tag) for item in request.service.traffic] == [
+        (STABLE, 100, "stable"),
+        (CANDIDATE, 0, "candidate"),
+    ]
+    provider_fields = {
+        descriptor.name for descriptor, _value in run_v2.Service.pb(request.service).ListFields()
+    }
+    assert provider_fields == {"name", "traffic", "etag"}
+    assert operation.calls == [30.0]
+
+
+@_async_test
+async def test_reference_target_reset_confirms_an_existing_baseline_without_update() -> None:
+    first = _service(100, 0, etag="etag-baseline", generation=8)
+    confirmed = _service(100, 0, etag="etag-baseline", generation=8)
+    services = _ResetServicesClient(
+        [first, confirmed],
+        update=AssertionError("baseline must not be rewritten"),
+    )
+
+    result = await _resetter(services).reset(_reset_request("etag-baseline"))
+
+    assert result.outcome is ReferenceTargetResetOutcome.ALREADY_BASELINE
+    assert result.operation_name is None
+    assert result.previous_generation == result.observed_generation == 8
+    assert services.update_calls == []
+    assert len(services.get_calls) == 2
+
+
+@_async_test
+async def test_reference_target_reset_denies_stale_etag_before_provider_update() -> None:
+    services = _ResetServicesClient(
+        [_service(0, 100, etag="etag-current")],
+        update=AssertionError("stale reset must not update"),
+    )
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services).reset(_reset_request("etag-stale"))
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+    assert services.update_calls == []
+    assert len(services.get_calls) == 1
+
+
+@_async_test
+async def test_reference_target_reset_denies_an_unexpected_immutable_image() -> None:
+    services = _ResetServicesClient(
+        [_service(0, 100, etag="etag-before-reset")],
+        update=AssertionError("image mismatch must not update"),
+    )
+    revisions = _FakeRevisionsClient(
+        stable_image=REFERENCE_IMAGE,
+        candidate_image=RESET_CANDIDATE_IMAGE,
+    )
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services, revisions=revisions).reset(_reset_request())
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+    assert services.update_calls == []
+
+
+@_async_test
+async def test_reference_target_reset_resolves_unknown_outcome_only_by_exact_readback() -> None:
+    before = _service(90, 10, etag="etag-before-reset", generation=8)
+    after = _service(100, 0, etag="etag-after-reset", generation=9)
+    services = _ResetServicesClient(
+        [before, after],
+        update=RuntimeError("synthetic unknown provider outcome"),
+    )
+
+    result = await _resetter(services).reset(_reset_request())
+
+    assert result.outcome is ReferenceTargetResetOutcome.RESET_CONFIRMED_AFTER_UNKNOWN
+    assert result.operation_name is None
+    assert len(services.update_calls) == 1
+    assert len(services.get_calls) == 2
+
+
+@_async_test
+async def test_reference_target_reset_preserves_unknown_when_readback_is_not_baseline() -> None:
+    before = _service(90, 10, etag="etag-before-reset", generation=8)
+    unchanged = _service(90, 10, etag="etag-before-reset", generation=8)
+    services = _ResetServicesClient(
+        [before, unchanged],
+        update=RuntimeError("synthetic unknown provider outcome"),
+    )
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services).reset(_reset_request())
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+    assert len(services.update_calls) == 1
+    assert len(services.get_calls) == 2
+
+
+@_async_test
+async def test_reference_target_reset_maps_known_rejection_without_retry() -> None:
+    services = _ResetServicesClient(
+        [_service(0, 100, etag="etag-before-reset")],
+        update=_provider_error(api_exceptions.FailedPrecondition, "synthetic etag race"),
+    )
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services).reset(_reset_request())
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+    assert len(services.update_calls) == 1
+    assert len(services.get_calls) == 1
+
+
+def test_reference_target_resetter_exposes_no_general_cloud_run_surface() -> None:
+    services = _ResetServicesClient(
+        [_service(100, 0, etag="etag-baseline")],
+        update=AssertionError("not called"),
+    )
+    resetter = _resetter(services)
+
+    public_callables = {
+        name
+        for name in dir(resetter)
+        if not name.startswith("_") and callable(getattr(resetter, name))
+    }
+    assert public_callables == {"reset"}
+    assert not hasattr(resetter, "update_service")
+    assert not hasattr(resetter, "delete")

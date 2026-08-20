@@ -18,8 +18,11 @@ variable "stable_image" {
   type        = string
 
   validation {
-    condition     = can(regex("^.+@sha256:[0-9a-f]{64}$", var.stable_image))
-    error_message = "stable_image must be pinned to a lowercase sha256 digest."
+    condition = can(regex(
+      "^${var.region}-docker\\.pkg\\.dev/${var.project_id}/controlgraph-canary/reference-stable@sha256:[0-9a-f]{64}$",
+      var.stable_image,
+    ))
+    error_message = "stable_image must be the dedicated stable repository pinned to a lowercase sha256 digest."
   }
 }
 
@@ -28,8 +31,19 @@ variable "candidate_image" {
   type        = string
 
   validation {
-    condition     = can(regex("^.+@sha256:[0-9a-f]{64}$", var.candidate_image))
-    error_message = "candidate_image must be pinned to a lowercase sha256 digest."
+    condition = can(regex(
+      "^${var.region}-docker\\.pkg\\.dev/${var.project_id}/controlgraph-canary/reference-candidate@sha256:[0-9a-f]{64}$",
+      var.candidate_image,
+    ))
+    error_message = "candidate_image must be the dedicated candidate repository pinned to a lowercase sha256 digest."
+  }
+
+  validation {
+    condition = (
+      try(regex("sha256:([0-9a-f]{64})$", var.stable_image)[0], "") !=
+      try(regex("sha256:([0-9a-f]{64})$", var.candidate_image)[0], "")
+    )
+    error_message = "candidate_image must use a digest distinct from stable_image."
   }
 }
 

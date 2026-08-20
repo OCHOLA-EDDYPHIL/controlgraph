@@ -23,5 +23,20 @@ output "target" {
       stable_percent    = 100
       candidate_percent = 0
     }
+    baseline_reset = {
+      project_id          = var.project_id
+      region              = var.region
+      service_name        = local.service_name
+      stable_revision     = local.stable_revision
+      candidate_revision  = local.candidate_revision
+      stable_image        = var.stable_image
+      candidate_image     = var.candidate_image
+      network_resource    = var.network
+      subnetwork_resource = var.subnetwork
+      concurrency         = 8
+      stable_percent      = 100
+      candidate_percent   = 0
+      confirmation        = "RESET_REFERENCE_TARGET_BASELINE"
+    }
   }
 }

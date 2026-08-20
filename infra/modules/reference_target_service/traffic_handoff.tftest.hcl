@@ -4,8 +4,8 @@ variables {
   project_id      = "controlgraph-canary-abc123"
   region          = "us-central1"
   service_account = "controlgraph-reference@controlgraph-canary-abc123.iam.gserviceaccount.com"
-  stable_image    = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-images/reference-stable@sha256:1111111111111111111111111111111111111111111111111111111111111111"
-  candidate_image = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-images/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  stable_image    = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-canary/reference-stable@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  candidate_image = "us-central1-docker.pkg.dev/controlgraph-canary-abc123/controlgraph-canary/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
   network         = "projects/controlgraph-canary-abc123/global/networks/controlgraph"
   subnetwork      = "projects/controlgraph-canary-abc123/regions/us-central1/subnetworks/controlgraph"
 }
