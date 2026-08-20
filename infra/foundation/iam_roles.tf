@@ -73,12 +73,29 @@ locals {
         "run.services.update",
       ]
     }
+    run_stable_restorer = {
+      role_id     = "controlgraph.runStableRestorer"
+      title       = "ControlGraph Cloud Run stable restorer"
+      description = "Read and update one bound Cloud Run service through the restore-only recovery contract."
+      permissions = [
+        "run.services.get",
+        "run.services.update",
+      ]
+    }
     run_operation_reader = {
       role_id     = "controlgraph.runOperationReader"
       title       = "ControlGraph Cloud Run operation reader"
       description = "Read the result of a Cloud Run control-plane operation."
       permissions = [
         "run.operations.get",
+      ]
+    }
+    monitoring_health_reader = {
+      role_id     = "controlgraph.monitoringHealthReader"
+      title       = "ControlGraph Monitoring health reader"
+      description = "List health time series in the dedicated ControlGraph project without metric mutation."
+      permissions = [
+        "monitoring.timeSeries.list",
       ]
     }
   }
@@ -123,6 +140,31 @@ check "run_executor_roles_are_minimal" {
       ])
     )
     error_message = "The executor Cloud Run roles must contain only target read/update and operation-read permissions."
+  }
+}
+
+check "run_recovery_roles_are_minimal" {
+  assert {
+    condition = (
+      local.custom_iam_roles.run_stable_restorer.role_id != local.custom_iam_roles.run_traffic_mutator.role_id &&
+      toset(local.custom_iam_roles.run_stable_restorer.permissions) == toset([
+        "run.services.get",
+        "run.services.update",
+      ]) &&
+      toset(local.custom_iam_roles.run_operation_reader.permissions) == toset([
+        "run.operations.get",
+      ])
+    )
+    error_message = "The recovery Cloud Run roles must remain distinct and contain only target read/update and operation-read permissions."
+  }
+}
+
+check "monitoring_health_reader_is_read_only" {
+  assert {
+    condition = toset(local.custom_iam_roles.monitoring_health_reader.permissions) == toset([
+      "monitoring.timeSeries.list",
+    ])
+    error_message = "The verifier Monitoring role must contain only time-series read permission."
   }
 }
 
