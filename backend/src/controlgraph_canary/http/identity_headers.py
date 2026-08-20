@@ -55,7 +55,10 @@ def _same_identity_envelope(controlgraph: str, serverless: str) -> bool:
         return False
     if serverless == controlgraph:
         return True
-    prefix, separator, signature = controlgraph.rpartition(".")
+    if not controlgraph.startswith("Bearer "):
+        return False
+    token = controlgraph.removeprefix("Bearer ")
+    prefix, separator, signature = token.rpartition(".")
     return bool(
         prefix
         and separator

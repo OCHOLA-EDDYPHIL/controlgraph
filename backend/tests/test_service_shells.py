@@ -535,6 +535,13 @@ def test_api_runtime_verifies_operator_token_against_oauth_client_audience() -> 
             (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
             (SERVERLESS_AUTHORIZATION_HEADER, "Bearer other.payload.signature"),
         ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (
+                SERVERLESS_AUTHORIZATION_HEADER,
+                "Bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE",
+            ),
+        ],
     ],
 )
 def test_operator_route_rejects_incomplete_duplicate_or_ambiguous_envelopes(
@@ -572,7 +579,7 @@ def test_operator_envelope_admits_cloud_run_signature_removal() -> None:
         headers={
             CONTROLGRAPH_AUTHORIZATION_HEADER: credential,
             SERVERLESS_AUTHORIZATION_HEADER: (
-                "Bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+                "header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
             ),
         },
     )
