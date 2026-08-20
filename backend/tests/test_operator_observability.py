@@ -159,7 +159,14 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
         }
     )
     if role is ServiceRole.API:
-        environment["CONTROLGRAPH_COORDINATOR_URL"] = COORDINATOR_AUDIENCE
+        environment.update(
+            {
+                "CONTROLGRAPH_COORDINATOR_URL": COORDINATOR_AUDIENCE,
+                "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
+                    "32555940559.apps.googleusercontent.com"
+                ),
+            }
+        )
     elif role is ServiceRole.VERIFIER:
         environment.update(
             {

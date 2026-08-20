@@ -449,7 +449,6 @@ def test_all_operator_commands_use_one_fixed_shell_free_api_post(
                     "gcloud",
                     "auth",
                     "print-identity-token",
-                    f"--audiences={origin}",
                 ),
                 {
                     "capture_output": True,

@@ -200,7 +200,15 @@ def create_runtime_service_app(
     }:
         raise ValueError("KMS dependencies are limited to signing and trust roles")
     policy = runtime_route_policy(role, source)
-    authenticator = GoogleIdentityVerifier(verifier=token_verifier, clock=clock)
+    authenticator = GoogleIdentityVerifier(
+        verifier=token_verifier,
+        clock=clock,
+        operator_oauth_client_audience=(
+            settings.operator_oauth_client_audience
+            if role is ServiceRole.API
+            else None
+        ),
+    )
     evidence_signing_service = None
     classification_evidence_signing_service = None
     classification_evidence_authentication_policy = None

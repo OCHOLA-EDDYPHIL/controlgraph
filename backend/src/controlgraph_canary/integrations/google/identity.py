@@ -12,6 +12,7 @@ from controlgraph_canary.application.identity import (
     AuthenticationContext,
     AuthenticationDenialCode,
     AuthenticationError,
+    CallerRole,
     RouteAuthenticationPolicy,
 )
 
@@ -25,6 +26,9 @@ _MAX_CLOCK_SKEW_SECONDS = 60
 _MAX_TOKEN_LIFETIME_SECONDS = 3_660
 _GOOGLE_REQUEST_TIMEOUT_SECONDS = 5.0
 _JWT_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
+_GOOGLE_OAUTH_CLIENT_AUDIENCE = re.compile(
+    r"^[0-9]{6,32}(?:-[a-z0-9]{6,128})?\.apps\.googleusercontent\.com$"
+)
 
 
 class IdentityTokenVerifier(Protocol):
@@ -129,9 +133,12 @@ class GoogleIdentityVerifier:
         self,
         verifier: IdentityTokenVerifier | None = None,
         clock: Callable[[], float] | None = None,
+        *,
+        operator_oauth_client_audience: str | None = None,
     ) -> None:
         self._verifier = verifier or _default_google_verifier
         self._clock = clock or time.time
+        self._operator_oauth_client_audience = operator_oauth_client_audience
 
     def authenticate(
         self,
@@ -143,10 +150,23 @@ class GoogleIdentityVerifier:
         try:
             if type(policy) is not RouteAuthenticationPolicy:
                 raise _denied(AuthenticationDenialCode.CONFIGURATION_INVALID)
-            audience = _bounded_ascii(policy.audience, maximum=_MAX_AUDIENCE_BYTES)
+            route_audience = _bounded_ascii(
+                policy.audience,
+                maximum=_MAX_AUDIENCE_BYTES,
+            )
+            verification_audience = route_audience
+            if policy.caller.role is CallerRole.OPERATOR:
+                configured_audience = self._operator_oauth_client_audience
+                if (
+                    type(configured_audience) is not str
+                    or _GOOGLE_OAUTH_CLIENT_AUDIENCE.fullmatch(configured_audience)
+                    is None
+                ):
+                    raise _denied(AuthenticationDenialCode.CONFIGURATION_INVALID)
+                verification_audience = configured_audience
             token = _extract_bearer_token(authorization_header)
             try:
-                claims = self._verifier(token, audience)
+                claims = self._verifier(token, verification_audience)
             except AuthenticationError:
                 raise
             except Exception:
@@ -157,7 +177,7 @@ class GoogleIdentityVerifier:
             issuer = claims.get("iss")
             if issuer not in _GOOGLE_ISSUERS:
                 raise _denied(AuthenticationDenialCode.ISSUER_DENIED)
-            if claims.get("aud") != audience:
+            if claims.get("aud") != verification_audience:
                 raise _denied(AuthenticationDenialCode.AUDIENCE_DENIED)
 
             email = claims.get("email")
@@ -204,7 +224,7 @@ class GoogleIdentityVerifier:
                 email=verified_email,
                 subject=verified_subject,
                 issuer=issuer,
-                audience=audience,
+                audience=route_audience,
                 issued_at=issued_at,
                 expires_at=expires_at,
             )

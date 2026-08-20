@@ -19,6 +19,10 @@ PROJECT_NUMBER = "123456789012"
 CALLER_EMAIL = f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
 CALLER_SUBJECT = "123456789012345678901"
 AUDIENCE = f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+API_AUDIENCE = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
+OPERATOR_EMAIL = "operator@example.com"
+OPERATOR_SUBJECT = "223456789012345678901"
+OPERATOR_OAUTH_CLIENT_AUDIENCE = "32555940559.apps.googleusercontent.com"
 TOKEN = "synthetic_header.synthetic_payload.synthetic_signature"
 NOW = 1_776_236_400.0
 
@@ -39,6 +43,22 @@ def policy():
     )
 
 
+def operator_policy():
+    return runtime_route_policy(
+        ServiceRole.API,
+        {
+            "CONTROLGRAPH_PROJECT_ID": PROJECT_ID,
+            "CONTROLGRAPH_PROJECT_NUMBER": PROJECT_NUMBER,
+            "CONTROLGRAPH_REGION": "us-central1",
+            "CONTROLGRAPH_ROLE": "api",
+            "CONTROLGRAPH_AUTH_AUDIENCE": API_AUDIENCE,
+            "CONTROLGRAPH_AUTH_CALLER_ROLE": "operator",
+            "CONTROLGRAPH_AUTH_CALLER_EMAIL": OPERATOR_EMAIL,
+            "CONTROLGRAPH_AUTH_CALLER_SUBJECT": OPERATOR_SUBJECT,
+        },
+    )
+
+
 def claims(**changes: object) -> dict[str, object]:
     values: dict[str, object] = {
         "iss": "https://accounts.google.com",
@@ -50,6 +70,16 @@ def claims(**changes: object) -> dict[str, object]:
         "nbf": int(NOW) - 60,
         "exp": int(NOW) + 3_000,
     }
+    values.update(changes)
+    return values
+
+
+def operator_claims(**changes: object) -> dict[str, object]:
+    values = claims(
+        aud=OPERATOR_OAUTH_CLIENT_AUDIENCE,
+        email=OPERATOR_EMAIL,
+        sub=OPERATOR_SUBJECT,
+    )
     values.update(changes)
     return values
 
@@ -82,6 +112,63 @@ def test_google_identity_verifier_returns_bounded_context_for_exact_caller(
     assert context.expires_at == int(NOW) + 3_000
     assert backend.calls == [(TOKEN, AUDIENCE)]
     assert not hasattr(context, "token")
+
+
+def test_operator_token_uses_oauth_audience_and_seals_route_context() -> None:
+    backend = CapturingVerifier(operator_claims())
+    verifier = GoogleIdentityVerifier(
+        backend,
+        clock=lambda: NOW,
+        operator_oauth_client_audience=OPERATOR_OAUTH_CLIENT_AUDIENCE,
+    )
+
+    context = verifier.authenticate(f"Bearer {TOKEN}", operator_policy())
+
+    assert context.role is CallerRole.OPERATOR
+    assert context.email == OPERATOR_EMAIL
+    assert context.subject == OPERATOR_SUBJECT
+    assert context.audience == API_AUDIENCE
+    assert backend.calls == [(TOKEN, OPERATOR_OAUTH_CLIENT_AUDIENCE)]
+
+
+@pytest.mark.parametrize(
+    "configured_audience",
+    [
+        None,
+        "",
+        API_AUDIENCE,
+        "32555940559.apps.googleusercontent.com ",
+        "client.apps.googleusercontent.com",
+    ],
+)
+def test_operator_verification_fails_closed_without_exact_oauth_audience(
+    configured_audience: str | None,
+) -> None:
+    backend = CapturingVerifier(operator_claims())
+
+    with pytest.raises(AuthenticationError) as failure:
+        GoogleIdentityVerifier(
+            backend,
+            clock=lambda: NOW,
+            operator_oauth_client_audience=configured_audience,
+        ).authenticate(f"Bearer {TOKEN}", operator_policy())
+
+    assert failure.value.code is AuthenticationDenialCode.CONFIGURATION_INVALID
+    assert backend.calls == []
+
+
+def test_operator_token_cannot_substitute_route_audience_for_oauth_audience() -> None:
+    backend = CapturingVerifier(operator_claims(aud=API_AUDIENCE))
+
+    with pytest.raises(AuthenticationError) as failure:
+        GoogleIdentityVerifier(
+            backend,
+            clock=lambda: NOW,
+            operator_oauth_client_audience=OPERATOR_OAUTH_CLIENT_AUDIENCE,
+        ).authenticate(f"Bearer {TOKEN}", operator_policy())
+
+    assert failure.value.code is AuthenticationDenialCode.AUDIENCE_DENIED
+    assert backend.calls == [(TOKEN, OPERATOR_OAUTH_CLIENT_AUDIENCE)]
 
 
 @pytest.mark.parametrize(

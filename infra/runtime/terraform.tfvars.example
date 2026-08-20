@@ -9,3 +9,4 @@ reference_target_candidate_configuration_sha256 = "33333333333333333333333333333
 reference_target_deployment_phase                    = "stable"
 operator_principal                                   = "user:operator@example.com"
 operator_subject                                     = "123456789012345678901"
+operator_oauth_client_audience                       = "123456789012.apps.googleusercontent.com"

@@ -114,3 +114,13 @@ variable "operator_subject" {
     error_message = "operator_subject must be one explicit numeric Google identity subject."
   }
 }
+
+variable "operator_oauth_client_audience" {
+  description = "Exact non-secret Google OAuth client audience emitted for the approved human operator."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]{6,32}(-[a-z0-9]{6,128})?\\.apps\\.googleusercontent\\.com$", var.operator_oauth_client_audience))
+    error_message = "operator_oauth_client_audience must be one exact Google OAuth client ID audience."
+  }
+}
