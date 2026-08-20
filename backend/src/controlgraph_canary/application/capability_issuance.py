@@ -37,6 +37,7 @@ from controlgraph_canary.authority.policy import (
     check_attenuation,
     validate_lineage,
 )
+from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 from controlgraph_canary.contracts.codec import (
     RestrictedJson,
     canonical_json_value_bytes,
@@ -64,6 +65,7 @@ MAX_CAPABILITY_LIFETIME_SECONDS = 900
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SERVICE_ACCOUNT = re.compile(
     r"^controlgraph-(?:coordinator|issuer|executor)@"
     r"controlgraph-canary-[a-z0-9]{6,10}\.iam\.gserviceaccount\.com$"
@@ -78,6 +80,7 @@ class CapabilityIssuanceErrorCode(StrEnum):
     CALLER_UNAUTHORIZED = "CAPABILITY_CALLER_UNAUTHORIZED"
     TRUSTED_STATE_UNAVAILABLE = "CAPABILITY_TRUSTED_STATE_UNAVAILABLE"
     TRUSTED_STATE_INVALID = "CAPABILITY_TRUSTED_STATE_INVALID"
+    EXPECTED_STATE_MISMATCH = "CAPABILITY_EXPECTED_STATE_MISMATCH"
     LINEAGE_NOT_FOUND = "CAPABILITY_LINEAGE_NOT_FOUND"
     LINEAGE_INVALID = "CAPABILITY_LINEAGE_INVALID"
     LINEAGE_UNVERIFIED = "CAPABILITY_LINEAGE_UNVERIFIED"
@@ -136,12 +139,24 @@ class CapabilityIssuanceRequest:
     """Unprivileged locators and request identities admitted by the issuer."""
 
     root_id: str
+    expected_root_sha256: str
+    expected_epoch: int
     request_id: str
     idempotency_key: str
     parent_capability_id: str | None = None
 
     def __post_init__(self) -> None:
         _validate_identifier("root_id", self.root_id)
+        if (
+            type(self.expected_root_sha256) is not str
+            or _SHA256.fullmatch(self.expected_root_sha256) is None
+        ):
+            raise ValueError("expected_root_sha256 is invalid")
+        if (
+            type(self.expected_epoch) is not int
+            or not 1 <= self.expected_epoch <= MAX_SAFE_INTEGER
+        ):
+            raise ValueError("expected_epoch is invalid")
         _validate_identifier("request_id", self.request_id)
         _validate_identifier("idempotency_key", self.idempotency_key)
         if self.parent_capability_id is not None:
@@ -320,6 +335,7 @@ class CapabilityIssuer:
         issued_at, issued_second = _utc_second(now)
         self._authorize(principal)
         state = await self._read_trusted_state(request.root_id, issued_second)
+        self._validate_expected_state(state, request)
         lineage = await self._resolve_lineage(request.parent_capability_id)
         parent_digest, expires_second = self._validate_parent_lineage(
             state,
@@ -380,9 +396,21 @@ class CapabilityIssuer:
         )
         self._validate_complete_lineage(state, request, (*lineage, envelope))
         confirmed_state = await self._read_trusted_state(request.root_id, issued_second)
+        self._validate_expected_state(confirmed_state, request)
         if confirmed_state.snapshot != state.snapshot:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return envelope
+
+    @staticmethod
+    def _validate_expected_state(
+        state: _TrustedIssuanceState,
+        request: CapabilityIssuanceRequest,
+    ) -> None:
+        if (
+            state.root.root_sha256 != request.expected_root_sha256
+            or state.authority.current_epoch != request.expected_epoch
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.EXPECTED_STATE_MISMATCH)
 
     def _authorize(self, principal: AuthenticatedIssuancePrincipal | None) -> None:
         if principal is None:

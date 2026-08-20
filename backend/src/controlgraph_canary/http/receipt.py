@@ -74,7 +74,7 @@ def create_receipt_task_handler(
         result = await coordinator.execute(verified)
         if type(result) is ReceiptExecutionStored:
             receipt = result.receipt
-            status_code = 202 if receipt.value.outcome is ReceiptOutcome.CLAIMED else 200
+            status_code = 503 if receipt.value.outcome is ReceiptOutcome.CLAIMED else 200
             stored_response = StoredReceiptTaskResponse.from_stored(receipt)
             return JSONResponse(
                 status_code=status_code,

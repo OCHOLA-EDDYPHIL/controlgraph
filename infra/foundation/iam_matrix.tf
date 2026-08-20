@@ -82,7 +82,7 @@ locals {
     }
     run_operation_read = {
       api      = "run.googleapis.com"
-      boundary = "operations produced by the bound reference target"
+      boundary = "read-only operation status in us-central1 within the dedicated project"
     }
     run_recovery_invoke = {
       api      = "run.googleapis.com"
@@ -163,6 +163,7 @@ locals {
       "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
+      "run_coordinator_invoke",
       "run_operation_read",
       "run_target_canary_or_promote",
     ])
@@ -247,6 +248,9 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
+        "run_coordinator_invoke",
+        "run_operation_read",
+        "run_target_canary_or_promote",
       ])
       recovery = toset([
         "firestore_authority_read",

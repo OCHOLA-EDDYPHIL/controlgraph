@@ -38,6 +38,46 @@ def test_runtime_settings_bind_role_and_environment() -> None:
     assert settings.signing_algorithm is None
 
 
+def test_enabled_executor_requires_and_binds_exact_mutation_configuration() -> None:
+    environment = _environment()
+    environment.update(
+        {
+            "CONTROLGRAPH_MUTATIONS_ENABLED": "true",
+            "CONTROLGRAPH_CAPABILITY_KEY_VERSION": (
+                "projects/controlgraph-canary-abc123/locations/us-central1/"
+                "keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
+                "cryptoKeyVersions/1"
+            ),
+            "CONTROLGRAPH_COORDINATOR_URL": (
+                "https://controlgraph-coordinator-123456789012."
+                "us-central1.run.app"
+            ),
+            "CONTROLGRAPH_TARGET_NETWORK_RESOURCE": (
+                "projects/controlgraph-canary-abc123/global/networks/"
+                "controlgraph-network"
+            ),
+            "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE": (
+                "projects/controlgraph-canary-abc123/regions/us-central1/"
+                "subnetworks/controlgraph-runtime"
+            ),
+        }
+    )
+
+    settings = ControllerSettings.from_environment(environment)
+
+    assert settings.mutations_enabled is True
+    assert settings.coordinator_url == environment["CONTROLGRAPH_COORDINATOR_URL"]
+    assert settings.capability_key_version == environment[
+        "CONTROLGRAPH_CAPABILITY_KEY_VERSION"
+    ]
+    assert settings.target_network_resource == environment[
+        "CONTROLGRAPH_TARGET_NETWORK_RESOURCE"
+    ]
+    assert settings.target_subnetwork_resource == environment[
+        "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"
+    ]
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -50,7 +90,7 @@ def test_runtime_settings_bind_role_and_environment() -> None:
         ("CONTROLGRAPH_BUILD_DIGEST", "latest"),
         ("CONTROLGRAPH_CONTRACT_VERSION", "controlgraph.contract/v2"),
         ("CONTROLGRAPH_FIRESTORE_DATABASE", "(default)"),
-        ("CONTROLGRAPH_MUTATIONS_ENABLED", "true"),
+        ("CONTROLGRAPH_MUTATIONS_ENABLED", "enabled"),
         ("CONTROLGRAPH_ENVIRONMENT", "prod"),
     ],
 )

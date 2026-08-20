@@ -16,6 +16,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from controlgraph_canary import __version__
+from controlgraph_canary.application.authority_store import AuthorityStoreError
+from controlgraph_canary.application.canary_execution import (
+    ApiCanaryClient,
+    CanaryExecutionError,
+    CanaryExecutionErrorCode,
+    CapabilityIssuanceService,
+    CoordinatorCanaryRelay,
+)
 from controlgraph_canary.application.capability_verification import (
     CapabilityRequestVerifier,
     CapabilityVerificationError,
@@ -27,14 +35,17 @@ from controlgraph_canary.application.evidence_signing import (
     EvidenceSigningService,
 )
 from controlgraph_canary.application.identity import (
+    RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     AuthenticationDenialCode,
     AuthenticationError,
+    CallerRole,
     IdentityAuthenticator,
     RouteAuthenticationPolicy,
     ServiceRole,
     protected_path,
 )
+from controlgraph_canary.application.receipt_authority import ReceiptAuthorityService
 from controlgraph_canary.application.root_relay import (
     ApiRootCreationClient,
     CoordinatorRootCreationRelay,
@@ -47,8 +58,14 @@ from controlgraph_canary.application.root_trust import (
     RootPreflightService,
 )
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
+from controlgraph_canary.contracts.canary_execution import (
+    ApplyCanaryCommandV1,
+    ApplyCanaryInvocationV1,
+    CapabilityIssuanceCommandV1,
+)
 from controlgraph_canary.contracts.codec import (
     ContractError,
+    ContractErrorCode,
     canonical_json_bytes,
     decode_contract,
 )
@@ -87,7 +104,7 @@ class ServiceMetadata(BaseModel):
 
 
 class DisabledWork(BaseModel):
-    """Stable fail-closed response before M3 enforcement is composed."""
+    """Stable fail-closed response when no protected handler is composed."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -140,6 +157,15 @@ class RootCreationDenied(BaseModel):
     correlation_id: str
 
 
+class CanaryExecutionDenied(BaseModel):
+    """Payload-free issuance or dispatch failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -155,8 +181,14 @@ def create_service_app(
     root_preflight_service: RootPreflightService | None = None,
     api_root_creation_client: ApiRootCreationClient | None = None,
     coordinator_root_creation_relay: CoordinatorRootCreationRelay | None = None,
+    api_canary_client: ApiCanaryClient | None = None,
+    coordinator_canary_relay: CoordinatorCanaryRelay | None = None,
+    capability_issuance_service: CapabilityIssuanceService | None = None,
+    receipt_authority_service: ReceiptAuthorityService | None = None,
+    receipt_authority_authentication_policy: RouteAuthenticationPolicy | None = None,
+    mutation_enabled: bool = False,
 ) -> FastAPI:
-    """Create one authenticated role shell with no enabled mutation operation."""
+    """Create one authenticated role shell with explicitly bounded work."""
 
     if type(role) is not ServiceRole:
         raise ValueError("service role is invalid")
@@ -166,6 +198,12 @@ def create_service_app(
         raise ValueError("authentication policy does not match the service role")
     if verified_task_handler is not None and capability_verifier is None:
         raise ValueError("a protected task handler requires capability verification")
+    if verified_task_handler is not None and not mutation_enabled:
+        raise ValueError("a protected task handler requires mutation enablement")
+    if mutation_enabled and (
+        capability_verifier is None or verified_task_handler is None
+    ):
+        raise ValueError("mutation enablement requires the complete protected task path")
     if (capability_verifier is not None or verified_task_handler is not None) and role not in {
         ServiceRole.EXECUTOR,
         ServiceRole.RECOVERY,
@@ -182,6 +220,30 @@ def create_service_app(
         and role is not ServiceRole.COORDINATOR
     ):
         raise ValueError("root creation coordination is limited to the coordinator route")
+    if api_canary_client is not None and role is not ServiceRole.API:
+        raise ValueError("canary dispatch is limited to the API route")
+    if coordinator_canary_relay is not None and role is not ServiceRole.COORDINATOR:
+        raise ValueError("canary coordination is limited to the coordinator route")
+    if capability_issuance_service is not None and role is not ServiceRole.ISSUER:
+        raise ValueError("capability issuance is limited to the issuer route")
+    if (receipt_authority_service is None) != (
+        receipt_authority_authentication_policy is None
+    ):
+        raise ValueError("receipt authority service and policy must be configured together")
+    if receipt_authority_service is not None and (
+        role is not ServiceRole.COORDINATOR
+        or type(receipt_authority_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or receipt_authority_authentication_policy.service_role
+        is not ServiceRole.COORDINATOR
+        or receipt_authority_authentication_policy.path != RECEIPT_AUTHORITY_PATH
+        or receipt_authority_authentication_policy.caller.role is not CallerRole.EXECUTOR
+    ):
+        raise ValueError("receipt authority is limited to the executor-to-coordinator route")
+    if type(mutation_enabled) is not bool or (
+        mutation_enabled and role not in {ServiceRole.EXECUTOR, ServiceRole.RECOVERY}
+    ):
+        raise ValueError("mutation enablement is limited to execution roles")
     if build_digest is None:
         build_digest = os.environ.get("CONTROLGRAPH_BUILD_DIGEST")
     if build_digest is not None and _DIGEST.fullmatch(build_digest) is None:
@@ -234,7 +296,7 @@ def create_service_app(
             application_version=__version__,
             service_role=role,
             build_digest=build_digest,
-            mutation_enabled=False,
+            mutation_enabled=mutation_enabled,
             correlation_id=correlation_id,
         )
 
@@ -267,23 +329,41 @@ def create_service_app(
                 correlation_id,
             )
         request.state.authentication = context
-        if role is ServiceRole.API and api_root_creation_client is not None:
+        if role is ServiceRole.API and (
+            api_root_creation_client is not None or api_canary_client is not None
+        ):
             try:
                 body = await _read_contract_body(request)
-                command = decode_contract(body, RootCreationCommandV1)
-                creation_result = await api_root_creation_client.create(command, context)
-                response_body = canonical_json_bytes(creation_result)
+                command = _decode_api_command(body)
+                if type(command) is RootCreationCommandV1:
+                    if api_root_creation_client is None:
+                        raise RootRelayError(RootRelayErrorCode.CONFIGURATION_INVALID)
+                    root_result = await api_root_creation_client.create(command, context)
+                    response_body = canonical_json_bytes(root_result)
+                else:
+                    if type(command) is not ApplyCanaryCommandV1:
+                        raise CanaryExecutionError(
+                            CanaryExecutionErrorCode.COMMAND_DENIED
+                        )
+                    if api_canary_client is None:
+                        raise CanaryExecutionError(
+                            CanaryExecutionErrorCode.CONFIGURATION_INVALID
+                        )
+                    canary_result = await api_canary_client.dispatch(command, context)
+                    response_body = canonical_json_bytes(canary_result)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
-                return _root_creation_denial("CONTRACT_INVALID", correlation_id)
+                return _canary_execution_denial("CONTRACT_INVALID", correlation_id)
             except ContractError as error:
-                return _root_creation_denial(error.code.value, correlation_id)
+                return _canary_execution_denial(error.code.value, correlation_id)
             except RootRelayError as error:
                 return _root_creation_denial(error.code.value, correlation_id)
+            except CanaryExecutionError as error:
+                return _canary_execution_denial(error.code.value, correlation_id)
             except Exception:
-                return _root_creation_denial(
-                    RootRelayErrorCode.CREATION_UNAVAILABLE.value,
+                return _canary_execution_denial(
+                    CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
                     correlation_id,
                 )
             return Response(
@@ -292,29 +372,74 @@ def create_service_app(
                 media_type="application/json",
                 headers={"X-ControlGraph-Correlation-Id": correlation_id},
             )
-        if (
-            role is ServiceRole.COORDINATOR
-            and coordinator_root_creation_relay is not None
+        if role is ServiceRole.COORDINATOR and (
+            coordinator_root_creation_relay is not None
+            or coordinator_canary_relay is not None
         ):
             try:
                 body = await _read_contract_body(request)
-                invocation = decode_contract(body, RootCreationInvocationV1)
-                creation_result = await coordinator_root_creation_relay.create(
-                    invocation,
-                    context,
-                )
-                response_body = canonical_json_bytes(creation_result)
+                invocation = _decode_coordinator_invocation(body)
+                if type(invocation) is RootCreationInvocationV1:
+                    if coordinator_root_creation_relay is None:
+                        raise RootRelayError(RootRelayErrorCode.CONFIGURATION_INVALID)
+                    root_result = await coordinator_root_creation_relay.create(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(root_result)
+                else:
+                    if type(invocation) is not ApplyCanaryInvocationV1:
+                        raise CanaryExecutionError(
+                            CanaryExecutionErrorCode.COMMAND_DENIED
+                        )
+                    if coordinator_canary_relay is None:
+                        raise CanaryExecutionError(
+                            CanaryExecutionErrorCode.CONFIGURATION_INVALID
+                        )
+                    canary_result = await coordinator_canary_relay.dispatch(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(canary_result)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
-                return _root_creation_denial("CONTRACT_INVALID", correlation_id)
+                return _canary_execution_denial("CONTRACT_INVALID", correlation_id)
             except ContractError as error:
-                return _root_creation_denial(error.code.value, correlation_id)
+                return _canary_execution_denial(error.code.value, correlation_id)
             except RootRelayError as error:
                 return _root_creation_denial(error.code.value, correlation_id)
+            except CanaryExecutionError as error:
+                return _canary_execution_denial(error.code.value, correlation_id)
             except Exception:
-                return _root_creation_denial(
-                    RootRelayErrorCode.CREATION_UNAVAILABLE.value,
+                return _canary_execution_denial(
+                    CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
+                    correlation_id,
+                )
+            return Response(
+                content=response_body,
+                status_code=200,
+                media_type="application/json",
+                headers={"X-ControlGraph-Correlation-Id": correlation_id},
+            )
+        if role is ServiceRole.ISSUER and capability_issuance_service is not None:
+            try:
+                body = await _read_contract_body(request)
+                issuance_command = decode_contract(body, CapabilityIssuanceCommandV1)
+                capability = await capability_issuance_service.issue(
+                    issuance_command,
+                    context,
+                )
+                response_body = canonical_json_bytes(capability)
+            except asyncio.CancelledError:
+                raise
+            except ContractError as error:
+                return _canary_execution_denial(error.code.value, correlation_id)
+            except CanaryExecutionError as error:
+                return _canary_execution_denial(error.code.value, correlation_id)
+            except Exception:
+                return _canary_execution_denial(
+                    CanaryExecutionErrorCode.ISSUANCE_DENIED.value,
                     correlation_id,
                 )
             return Response(
@@ -408,8 +533,79 @@ def create_service_app(
             headers={"X-ControlGraph-Correlation-Id": correlation_id},
         )
 
+    async def receipt_authority_work(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        policy = receipt_authority_authentication_policy
+        service = receipt_authority_service
+        if (
+            authenticator is None
+            or type(policy) is not RouteAuthenticationPolicy
+            or type(service) is not ReceiptAuthorityService
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CONFIGURATION_INVALID,
+                correlation_id,
+            )
+        authorization_headers = request.headers.getlist("authorization")
+        if len(authorization_headers) > 1:
+            return _authentication_denial(
+                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
+                correlation_id,
+            )
+        authorization_header = (
+            authorization_headers[0] if authorization_headers else None
+        )
+        try:
+            context = authenticator.authenticate(authorization_header, policy)
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if (
+            type(context) is not AuthenticationContext
+            or context.role is not CallerRole.EXECUTOR
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            body = await _read_contract_body(request)
+            response_body = await service.handle(body)
+        except asyncio.CancelledError:
+            raise
+        except CapabilityVerificationError:
+            return _receipt_authority_denial("CONTRACT_INVALID", correlation_id)
+        except AuthorityStoreError:
+            return _receipt_authority_denial(
+                "RECEIPT_AUTHORITY_UNAVAILABLE",
+                correlation_id,
+            )
+        except Exception:
+            return _receipt_authority_denial(
+                "RECEIPT_AUTHORITY_UNAVAILABLE",
+                correlation_id,
+            )
+        return Response(
+            content=response_body,
+            status_code=200,
+            media_type="application/json",
+            headers={"X-ControlGraph-Correlation-Id": correlation_id},
+        )
+
     for path in protected_paths(role):
         app.add_api_route(path, protected_work, methods=["POST"], include_in_schema=False)
+    if receipt_authority_service is not None:
+        app.add_api_route(
+            RECEIPT_AUTHORITY_PATH,
+            receipt_authority_work,
+            methods=["POST"],
+            include_in_schema=False,
+        )
     return app
 
 
@@ -417,6 +613,28 @@ def protected_paths(role: ServiceRole) -> tuple[str, ...]:
     """Return the closed route set for deployment and local conformance checks."""
 
     return (protected_path(role),)
+
+
+def _decode_api_command(
+    body: bytes,
+) -> RootCreationCommandV1 | ApplyCanaryCommandV1:
+    try:
+        return decode_contract(body, RootCreationCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, ApplyCanaryCommandV1)
+
+
+def _decode_coordinator_invocation(
+    body: bytes,
+) -> RootCreationInvocationV1 | ApplyCanaryInvocationV1:
+    try:
+        return decode_contract(body, RootCreationInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, ApplyCanaryInvocationV1)
 
 
 def _authentication_denial(
@@ -518,6 +736,37 @@ def _root_creation_denial(code: str, correlation_id: str) -> JSONResponse:
         status_code = 503
     return JSONResponse(
         status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+def _canary_execution_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = CanaryExecutionDenied(code=code, correlation_id=correlation_id)
+    status_code = 503
+    if code in {
+        ContractErrorCode.INVALID.value,
+        ContractErrorCode.VERSION_UNSUPPORTED.value,
+    }:
+        status_code = 400
+    elif code in {
+        CanaryExecutionErrorCode.CALLER_DENIED.value,
+        CanaryExecutionErrorCode.OPERATOR_DENIED.value,
+        CanaryExecutionErrorCode.COMMAND_DENIED.value,
+        CanaryExecutionErrorCode.ISSUANCE_DENIED.value,
+    }:
+        status_code = 403
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+def _receipt_authority_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = CanaryExecutionDenied(code=code, correlation_id=correlation_id)
+    return JSONResponse(
+        status_code=400 if code == "CONTRACT_INVALID" else 503,
         content=response.model_dump(mode="json"),
         headers={"X-ControlGraph-Correlation-Id": correlation_id},
     )

@@ -47,6 +47,7 @@ from controlgraph_canary.contracts import (
     canonical_sha256,
     encode_base64url,
 )
+from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 from controlgraph_canary.contracts.storage import (
     SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1,
     SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1,
@@ -269,8 +270,11 @@ def configuration(**overrides: object) -> CapabilityIssuerConfiguration:
 
 
 def request(**overrides: object) -> CapabilityIssuanceRequest:
+    root, _, authority = trusted_records()
     values: dict[str, object] = {
-        "root_id": trusted_records()[0].root_id,
+        "root_id": root.root_id,
+        "expected_root_sha256": root.root_sha256,
+        "expected_epoch": authority.current_epoch,
         "request_id": "request-issue-001",
         "idempotency_key": "intent-apply-001",
     }
@@ -367,7 +371,7 @@ def test_claims_and_signing_input_are_deterministic_for_identical_trusted_inputs
     assert len(first.claims.capability_id) == 70
 
 
-def test_epoch_is_loaded_from_current_authority_and_cannot_be_selected_by_request() -> None:
+def test_matching_expected_epoch_is_loaded_from_current_authority() -> None:
     root, claim, authority = trusted_records()
     advanced = EpochAuthorityRecord(
         **{
@@ -383,9 +387,50 @@ def test_epoch_is_loaded_from_current_authority_and_cannot_be_selected_by_reques
     )
     value, _, _ = issuer(store=FakeAuthorityStore(root=root, claim=claim, authority=advanced))
 
-    envelope = issue(value)
+    envelope = issue(value, request(expected_epoch=2))
 
     assert envelope.claims.epoch == 2
+
+
+@pytest.mark.parametrize("expected_epoch", [1, 3])
+def test_stale_or_future_expected_epoch_is_denied_before_signing(
+    expected_epoch: int,
+) -> None:
+    root, claim, authority = trusted_records()
+    advanced = EpochAuthorityRecord(
+        **{
+            **authority.model_dump(mode="python"),
+            "current_epoch": 2,
+            "previous_epoch": 1,
+            "revision": 1,
+            "cause": EpochChangeCause.OPERATOR_REVOCATION,
+            "request_id": "request-revoke-001",
+            "evidence_id": "evidence-revoke-001",
+            "changed_at": "2026-08-19T12:01:30Z",
+        }
+    )
+    value, backend, store = issuer(
+        store=FakeAuthorityStore(root=root, claim=claim, authority=advanced)
+    )
+
+    with pytest.raises(CapabilityIssuanceError) as denied:
+        issue(value, request(expected_epoch=expected_epoch))
+
+    assert denied.value.code is CapabilityIssuanceErrorCode.EXPECTED_STATE_MISMATCH
+    assert backend.digests == []
+    assert store.reads == [f"snapshot:{root.root_id}"]
+
+
+def test_mismatched_expected_root_digest_is_denied_before_signing() -> None:
+    root, _, _ = trusted_records()
+    value, backend, store = issuer()
+
+    with pytest.raises(CapabilityIssuanceError) as denied:
+        issue(value, request(expected_root_sha256=ZERO_DIGEST))
+
+    assert denied.value.code is CapabilityIssuanceErrorCode.EXPECTED_STATE_MISMATCH
+    assert backend.digests == []
+    assert store.reads == [f"snapshot:{root.root_id}"]
 
 
 @pytest.mark.parametrize("release_claim", [False, True])
@@ -424,7 +469,11 @@ def test_authority_change_during_signing_never_returns_current_authority(
     with pytest.raises(CapabilityIssuanceError) as denied:
         issue(value)
 
-    assert denied.value.code is CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID
+    assert denied.value.code is (
+        CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID
+        if release_claim
+        else CapabilityIssuanceErrorCode.EXPECTED_STATE_MISMATCH
+    )
     assert len(backend.digests) == 1
     assert store.reads == [f"snapshot:{root.root_id}", f"snapshot:{root.root_id}"]
 
@@ -509,13 +558,17 @@ def test_signed_envelope_adapts_to_exact_trust_bundle_verification() -> None:
 def test_request_surface_has_no_target_action_method_lifetime_or_key_selector() -> None:
     assert {field.name for field in fields(CapabilityIssuanceRequest)} == {
         "root_id",
+        "expected_root_sha256",
+        "expected_epoch",
         "request_id",
         "idempotency_key",
         "parent_capability_id",
     }
     with pytest.raises(TypeError):
         CapabilityIssuanceRequest(  # type: ignore[call-arg]
-            root_id="root-001",
+            root_id=trusted_records()[0].root_id,
+            expected_root_sha256=trusted_records()[0].root_sha256,
+            expected_epoch=trusted_records()[2].current_epoch,
             request_id="request-001",
             idempotency_key="intent-001",
             method="run.services.patch",
@@ -545,6 +598,11 @@ def test_only_authenticated_configured_coordinator_can_request_issuance(
     "overrides",
     [
         {"root_id": "root-*"},
+        {"expected_root_sha256": "A" * 64},
+        {"expected_root_sha256": "0" * 63},
+        {"expected_epoch": 0},
+        {"expected_epoch": True},
+        {"expected_epoch": MAX_SAFE_INTEGER + 1},
         {"request_id": "request?"},
         {"idempotency_key": "intent[0]"},
         {"parent_capability_id": "parent-*"},

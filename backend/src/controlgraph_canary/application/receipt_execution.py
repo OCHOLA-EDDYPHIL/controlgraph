@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreError,
@@ -48,6 +48,11 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
 )
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
+
+RECEIPT_ORPHAN_GRACE_SECONDS: Final = 60
+# A new claim needs the orphan grace plus the queue's 30-second maximum
+# backoff so a later delivery can reach readback before task expiry.
+RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS: Final = 90
 
 
 class ReceiptMutationStatus(StrEnum):
@@ -301,8 +306,11 @@ class ReceiptExecutionCoordinator:
         except (TypeError, ValueError):
             return ReceiptExecutionDenied(ReasonCode.TARGET_BINDING_MISMATCH)
         now = _require_utc_second(self._clock())
-        if _utc_second_text(now) >= verified.request.expires_at:
-            return await self._adopt_expired_replay(
+        expires_at = _utc_second_datetime(verified.request.expires_at)
+        if now + timedelta(
+            seconds=RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
+        ) >= expires_at:
+            return await self._adopt_without_new_claim(
                 verified,
                 expected_state,
                 binding,
@@ -434,7 +442,7 @@ class ReceiptExecutionCoordinator:
             verified,
         )
 
-    async def _adopt_expired_replay(
+    async def _adopt_without_new_claim(
         self,
         verified: VerifiedMutation,
         expected_state: TargetConfigurationProjection,
@@ -450,8 +458,6 @@ class ReceiptExecutionCoordinator:
             return ReceiptExecutionDenied(ReasonCode.CAPABILITY_EXPIRED)
         if not _valid_adopted_receipt(stored, binding, verified):
             return ReceiptExecutionDenied(ReasonCode.IDEMPOTENCY_CONFLICT)
-        if stored.value.outcome is ReceiptOutcome.CLAIMED:
-            return ReceiptExecutionDenied(ReasonCode.CAPABILITY_EXPIRED)
         return await self._handle_existing(
             stored,
             expected_state,
@@ -475,7 +481,7 @@ class ReceiptExecutionCoordinator:
             return ReceiptExecutionStored(stored, receipt.reason_code)
         if receipt.outcome is ReceiptOutcome.CLAIMED:
             now = _require_utc_second(self._clock())
-            if _utc_second_text(now) < receipt.dispatch_not_after:
+            if now < _orphan_recovery_at(receipt):
                 return ReceiptExecutionStored(stored, ReasonCode.RECEIPT_IN_PROGRESS)
         return await self._readback_only(
             stored,
@@ -921,11 +927,27 @@ def _utc_second_text(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _orphan_recovery_at(receipt: ExecutionReceipt) -> datetime:
+    created = _utc_second_datetime(receipt.created_at)
+    deadline = _utc_second_datetime(receipt.dispatch_not_after)
+    latest_reachable = max(created, deadline - timedelta(seconds=1))
+    return min(
+        created + timedelta(seconds=RECEIPT_ORPHAN_GRACE_SECONDS),
+        latest_reachable,
+    )
+
+
+def _utc_second_datetime(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
 def _now_utc_second() -> datetime:
     return datetime.now(UTC).replace(microsecond=0)
 
 
 __all__ = [
+    "RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS",
+    "RECEIPT_ORPHAN_GRACE_SECONDS",
     "ReceiptClassifyingMutationAdapter",
     "ReceiptExecutionCoordinator",
     "ReceiptExecutionDenied",

@@ -9,7 +9,7 @@ resource "google_cloud_tasks_queue" "execution" {
   }
 
   retry_config {
-    max_attempts       = 3
+    max_attempts       = 6
     max_retry_duration = "900s"
     min_backoff        = "5s"
     max_backoff        = "30s"
@@ -71,7 +71,7 @@ resource "google_cloud_tasks_queue" "recovery" {
   }
 
   retry_config {
-    max_attempts       = 3
+    max_attempts       = 6
     max_retry_duration = "900s"
     min_backoff        = "5s"
     max_backoff        = "30s"

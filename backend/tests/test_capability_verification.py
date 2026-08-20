@@ -928,6 +928,7 @@ class _JoinedConformancePath:
                 lineage_reader,
             ),
             verified_task_handler=traced_handler,
+            mutation_enabled=True,
         )
 
 
@@ -1513,7 +1514,7 @@ def test_concurrent_exact_duplicate_has_one_joined_cloud_run_dispatch() -> None:
         winner = winner_future.result(timeout=3)
         replay = _post_task(duplicate_client, role, payload)
 
-    assert duplicate.status_code == 202
+    assert duplicate.status_code == 503
     assert duplicate.json()["receipt"]["outcome"] == ReceiptOutcome.CLAIMED.value
     assert duplicate.json()["storage_revision"] == 0
     assert winner.status_code == 200
@@ -1541,6 +1542,25 @@ def test_http_composition_cannot_install_a_task_handler_without_the_verifier() -
             authenticator=_ExactAuthenticator(_caller(ServiceRole.EXECUTOR)),
             authentication_policy=_policy(ServiceRole.EXECUTOR),
             verified_task_handler=protected_handler,
+        )
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    verifier = _verifier(ServiceRole.EXECUTOR, private_key, _RootReader())
+    with pytest.raises(ValueError, match="requires mutation enablement"):
+        create_service_app(
+            ServiceRole.EXECUTOR,
+            authenticator=_ExactAuthenticator(_caller(ServiceRole.EXECUTOR)),
+            authentication_policy=_policy(ServiceRole.EXECUTOR),
+            capability_verifier=verifier,
+            verified_task_handler=protected_handler,
+        )
+    with pytest.raises(ValueError, match="complete protected task path"):
+        create_service_app(
+            ServiceRole.EXECUTOR,
+            authenticator=_ExactAuthenticator(_caller(ServiceRole.EXECUTOR)),
+            authentication_policy=_policy(ServiceRole.EXECUTOR),
+            capability_verifier=verifier,
+            mutation_enabled=True,
         )
 
 

@@ -28,9 +28,11 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunTrafficAllocation,
     CloudRunTrafficStatus,
     CloudRunVpcEgress,
+    TargetConfigurationProjection,
 )
 from controlgraph_canary.application.execution import MutationPermit
 from controlgraph_canary.application.identity import ServiceRole
+from controlgraph_canary.application.receipt_execution import ReceiptReadbackResult
 from controlgraph_canary.contracts.models import CapabilityAction, MutationIntent, TargetBinding
 
 CLOUD_RUN_REGION: Final = "us-central1"
@@ -87,6 +89,16 @@ class _ServicesClientPort(Protocol):
     ) -> _AsyncOperationPort: ...
 
 
+class _ReadOnlyServicesClientPort(Protocol):
+    async def get_service(
+        self,
+        request: run_v2.GetServiceRequest,
+        *,
+        retry: object | None,
+        timeout: float,
+    ) -> run_v2.Service: ...
+
+
 class _RevisionsClientPort(Protocol):
     async def get_revision(
         self,
@@ -98,11 +110,16 @@ class _RevisionsClientPort(Protocol):
 
 
 type ServicesClientFactory = Callable[[], _ServicesClientPort]
+type ReadOnlyServicesClientFactory = Callable[[], _ReadOnlyServicesClientPort]
 type RevisionsClientFactory = Callable[[], _RevisionsClientPort]
 
 
 def _default_services_client_factory() -> _ServicesClientPort:
     return cast(_ServicesClientPort, run_v2.ServicesAsyncClient())
+
+
+def _default_read_only_services_client_factory() -> _ReadOnlyServicesClientPort:
+    return cast(_ReadOnlyServicesClientPort, run_v2.ServicesAsyncClient())
 
 
 def _default_revisions_client_factory() -> _RevisionsClientPort:
@@ -427,6 +444,129 @@ class CloudRunV2Adapter:
             configuration=self._configuration,
             expected_revision=expected_revision,
         )
+
+
+class CloudRunV2ReceiptReadback:
+    """Fresh read-only receipt observation for one fixed reference service."""
+
+    def __init__(
+        self,
+        *,
+        configuration: CloudRunTargetConfiguration,
+        configured_project_id: str,
+        services_client_factory: ReadOnlyServicesClientFactory | None = None,
+    ) -> None:
+        if type(configuration) is not CloudRunTargetConfiguration:
+            raise TypeError("an exact Cloud Run target configuration is required")
+        target = configuration.target
+        if (
+            type(configured_project_id) is not str
+            or _CONTROLGRAPH_PROJECT_ID.fullmatch(configured_project_id) is None
+            or target.project_id != configured_project_id
+        ):
+            raise ValueError("Cloud Run project is not the configured ControlGraph project")
+        if target.region != CLOUD_RUN_REGION:
+            raise ValueError("Cloud Run target must use us-central1")
+        if target.service_name != CLOUD_RUN_REFERENCE_SERVICE:
+            raise ValueError("Cloud Run receipt readback is sealed to the reference service")
+        if configuration.stable_concurrency != configuration.candidate_concurrency:
+            raise ValueError("declared revisions must share the approved concurrency")
+        if services_client_factory is not None and not callable(services_client_factory):
+            raise TypeError("Cloud Run services client factory must be callable")
+        self._configuration = configuration
+        self._services_client_factory = (
+            services_client_factory or _default_read_only_services_client_factory
+        )
+        self._services: _ReadOnlyServicesClientPort | None = None
+        self._services_lock = asyncio.Lock()
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._configuration.target
+
+    async def readback(
+        self,
+        expected: TargetConfigurationProjection,
+    ) -> ReceiptReadbackResult:
+        """Read a fresh provider configuration without carrying mutation authority."""
+
+        if type(expected) is not TargetConfigurationProjection:
+            raise TypeError("Cloud Run receipt readback requires an exact expectation")
+        configuration = self._configuration
+        if (
+            expected.target != configuration.target
+            or expected.stable_revision != configuration.stable_revision
+            or expected.candidate_revision != configuration.candidate_revision
+            or expected.concurrency != configuration.stable_concurrency
+        ):
+            return _closed_readback()
+
+        request = run_v2.GetServiceRequest(name=configuration.service_resource)
+        try:
+            client = await self._services_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                provider_service = await client.get_service(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _closed_readback()
+
+        try:
+            service = _decode_service(provider_service, configuration=configuration)
+        except (TypeError, ValueError):
+            return _closed_readback()
+        if (
+            service.reconciling
+            or service.ready_state is not CloudRunReadyState.READY
+            or service.generation != service.observed_generation
+            or service.template_revision != configuration.candidate_revision
+            or service.latest_created_revision != configuration.candidate_revision
+            or service.latest_ready_revision != configuration.candidate_revision
+        ):
+            return _closed_readback(service.etag)
+
+        traffic = {item.revision: item.percent for item in service.traffic}
+        observed_traffic = {
+            item.revision: item.percent for item in service.traffic_statuses
+        }
+        if traffic != observed_traffic or set(traffic) != {
+            configuration.stable_revision,
+            configuration.candidate_revision,
+        }:
+            return _closed_readback(service.etag)
+        try:
+            observed = TargetConfigurationProjection(
+                target=configuration.target,
+                stable_revision=configuration.stable_revision,
+                candidate_revision=configuration.candidate_revision,
+                stable_percent=traffic[configuration.stable_revision],
+                candidate_percent=traffic[configuration.candidate_revision],
+                concurrency=service.template_concurrency,
+            )
+        except (TypeError, ValueError):
+            return _closed_readback(service.etag)
+        return ReceiptReadbackResult(
+            state=observed,
+            observed_etag=service.etag,
+        )
+
+    async def _services_client(self) -> _ReadOnlyServicesClientPort:
+        if self._services is not None:
+            return self._services
+        async with self._services_lock:
+            if self._services is None:
+                try:
+                    client = self._services_client_factory()
+                    if not callable(getattr(client, "get_service", None)):
+                        raise TypeError("Cloud Run services client is incomplete")
+                except Exception:
+                    raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+                self._services = client
+        return self._services
 
 
 class CloudRunV2SnapshotReader:
@@ -844,13 +984,19 @@ def _ambiguous(
     )
 
 
+def _closed_readback(observed_etag: str | None = None) -> ReceiptReadbackResult:
+    return ReceiptReadbackResult(state=None, observed_etag=observed_etag)
+
+
 __all__ = [
     "CLOUD_RUN_OPERATION_TIMEOUT_SECONDS",
     "CLOUD_RUN_REFERENCE_SERVICE",
     "CLOUD_RUN_REGION",
     "CLOUD_RUN_RPC_TIMEOUT_SECONDS",
     "CloudRunV2Adapter",
+    "CloudRunV2ReceiptReadback",
     "CloudRunV2SnapshotReader",
+    "ReadOnlyServicesClientFactory",
     "RevisionsClientFactory",
     "ServicesClientFactory",
 ]

@@ -19,6 +19,7 @@ from controlgraph_canary.application.candidate_revision import (
     CandidateValidationError,
 )
 from controlgraph_canary.application.identity import (
+    RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     CallerRole,
     RouteAuthenticationPolicy,
@@ -150,6 +151,7 @@ class CoordinatorInternalRoute:
     caller_role: CallerRole
     service_role: ServiceRole
     audience: str
+    override_path: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -158,12 +160,21 @@ class CoordinatorInternalRoute:
             or "reconcile" in self.project_id
             or type(self.project_number) is not str
             or _PROJECT_NUMBER.fullmatch(self.project_number) is None
-            or (self.caller_role, self.service_role)
-            not in {
-                (CallerRole.API, ServiceRole.COORDINATOR),
-                (CallerRole.COORDINATOR, ServiceRole.VERIFIER),
-                (CallerRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER),
-            }
+            or not self._route_pair_is_valid()
+            or (
+                self.override_path is not None
+                and self.override_path != RECEIPT_AUTHORITY_PATH
+            )
+            or (
+                self.override_path == RECEIPT_AUTHORITY_PATH
+                and (self.caller_role, self.service_role)
+                != (CallerRole.EXECUTOR, ServiceRole.COORDINATOR)
+            )
+            or (
+                (self.caller_role, self.service_role)
+                == (CallerRole.EXECUTOR, ServiceRole.COORDINATOR)
+                and self.override_path != RECEIPT_AUTHORITY_PATH
+            )
         ):
             raise ValueError("coordinator internal route coordinates are invalid")
         expected = (
@@ -187,9 +198,18 @@ class CoordinatorInternalRoute:
         ):
             raise ValueError("coordinator internal route audience is invalid")
 
+    def _route_pair_is_valid(self) -> bool:
+        return (self.caller_role, self.service_role) in {
+            (CallerRole.API, ServiceRole.COORDINATOR),
+            (CallerRole.COORDINATOR, ServiceRole.ISSUER),
+            (CallerRole.COORDINATOR, ServiceRole.VERIFIER),
+            (CallerRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER),
+            (CallerRole.EXECUTOR, ServiceRole.COORDINATOR),
+        }
+
     @property
     def path(self) -> str:
-        return protected_path(self.service_role)
+        return self.override_path or protected_path(self.service_role)
 
     @property
     def url(self) -> str:

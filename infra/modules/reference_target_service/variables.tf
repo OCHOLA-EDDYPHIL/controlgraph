@@ -34,7 +34,7 @@ variable "candidate_image" {
 }
 
 variable "deployment_phase" {
-  description = "Explicit staged release selector; reapplying candidate restores the 100-percent stable baseline."
+  description = "Explicit stable-then-candidate revision staging selector; creation establishes the safe traffic baseline."
   type        = string
 
   validation {
