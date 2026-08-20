@@ -13,6 +13,7 @@ from controlgraph_canary.contracts.revocation import (
     EpochRevocationCommitV1,
     EpochRevocationIdentityV1,
     EpochRevocationInvocationV1,
+    EpochRevocationProofCommandV1,
     EpochRevocationResultV1,
 )
 from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
@@ -50,6 +51,21 @@ class EpochRevocationWriteResult:
     audit: StoredRecord[EpochRevocationAuditV1]
 
 
+@dataclass(frozen=True, slots=True)
+class EpochRevocationProofState:
+    """One exact-key consistent read used only for operator proof retrieval."""
+
+    command: EpochRevocationProofCommandV1
+    authority: StoredRecord[EpochAuthorityRecord]
+    signed_evidence: StoredRecord[SignedEvidenceEventV1]
+    result: StoredRecord[EpochRevocationResultV1]
+    audit: StoredRecord[EpochRevocationAuditV1]
+
+    def __post_init__(self) -> None:
+        if type(self.command) is not EpochRevocationProofCommandV1:
+            raise TypeError("revocation proof state requires an exact command")
+
+
 @runtime_checkable
 class EpochRevocationStore(Protocol):
     """Narrow coordinator-only persistence operations for epoch revocation."""
@@ -74,7 +90,22 @@ class EpochRevocationStore(Protocol):
     ) -> StoredRecord[EpochRevocationAuditV1]: ...
 
 
+@runtime_checkable
+class EpochRevocationProofStore(Protocol):
+    """Exact-key coordinator read required to build one revocation proof."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def read_epoch_revocation_proof(
+        self,
+        command: EpochRevocationProofCommandV1,
+    ) -> EpochRevocationProofState | None: ...
+
+
 __all__ = [
+    "EpochRevocationProofState",
+    "EpochRevocationProofStore",
     "EpochRevocationState",
     "EpochRevocationStore",
     "EpochRevocationWriteResult",

@@ -24,13 +24,21 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
 )
 from controlgraph_canary.contracts.revocation import (
+    EPOCH_REVOCATION_CALL_OUTCOME_V1,
     EPOCH_REVOCATION_INVOCATION_V1,
+    EPOCH_REVOCATION_PROOF_INVOCATION_V1,
+    EpochRevocationCallOutcomeV1,
     EpochRevocationCommandV1,
     EpochRevocationFailureCode,
     EpochRevocationInvocationV1,
+    EpochRevocationProofCommandV1,
+    EpochRevocationProofInvocationV1,
+    EpochRevocationProofRelayResponseV1,
+    EpochRevocationProofV1,
     EpochRevocationRelayResponseV1,
     EpochRevocationResultV1,
     epoch_revocation_evidence_id,
+    epoch_revocation_proof_matches_command,
     epoch_revocation_request_sha256,
 )
 
@@ -50,6 +58,16 @@ class EpochRevokerPort(Protocol):
         *,
         code: EpochRevocationFailureCode,
     ) -> None: ...
+
+
+@runtime_checkable
+class EpochRevocationProofPort(Protocol):
+    async def read(
+        self,
+        invocation: EpochRevocationProofInvocationV1,
+        *,
+        principal: AuthenticationContext | None,
+    ) -> EpochRevocationProofV1: ...
 
 
 class ApiEpochRevocationClient:
@@ -85,7 +103,7 @@ class ApiEpochRevocationClient:
         self,
         command: EpochRevocationCommandV1,
         principal: AuthenticationContext,
-    ) -> EpochRevocationResultV1:
+    ) -> EpochRevocationCallOutcomeV1:
         if type(command) is not EpochRevocationCommandV1:
             raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
         if not _context_matches(principal, self._policy, CallerRole.OPERATOR):
@@ -119,12 +137,65 @@ class ApiEpochRevocationClient:
             raise EpochRevocationError(EpochRevocationFailureCode.OUTCOME_UNKNOWN) from None
         if outcome.failure_code is not None:
             raise EpochRevocationError(outcome.failure_code)
-        result = outcome.result
-        if result is None:
+        call_outcome = outcome.outcome
+        if call_outcome is None:
             raise EpochRevocationError(EpochRevocationFailureCode.OUTCOME_UNKNOWN)
-        if not _result_matches(result, invocation, self._route):
+        if not _call_outcome_matches(call_outcome, invocation, self._route):
             raise EpochRevocationError(EpochRevocationFailureCode.OUTCOME_UNKNOWN)
-        return result
+        return call_outcome
+
+    async def proof(
+        self,
+        command: EpochRevocationProofCommandV1,
+        principal: AuthenticationContext,
+    ) -> EpochRevocationProofV1:
+        """Retrieve one exact proof through the same authenticated relay."""
+
+        if type(command) is not EpochRevocationProofCommandV1:
+            raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
+        if not _context_matches(principal, self._policy, CallerRole.OPERATOR):
+            raise EpochRevocationError(EpochRevocationFailureCode.CALLER_DENIED)
+        try:
+            invocation = EpochRevocationProofInvocationV1(
+                schema_version=EPOCH_REVOCATION_PROOF_INVOCATION_V1,
+                command=command,
+                operator_identity=principal.email,
+                operator_subject=principal.subject,
+                operator_issuer=cast(
+                    Literal["accounts.google.com", "https://accounts.google.com"],
+                    principal.issuer,
+                ),
+                operator_audience=principal.audience,
+                operator_issued_at=principal.issued_at,
+                operator_expires_at=principal.expires_at,
+            )
+        except (TypeError, ValueError):
+            raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED) from None
+        try:
+            body = await self._transport.post(self._route, canonical_json_bytes(invocation))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise EpochRevocationError(EpochRevocationFailureCode.PROOF_DENIED) from None
+        try:
+            outcome = decode_contract(body, EpochRevocationProofRelayResponseV1)
+        except (ContractError, TypeError, ValueError):
+            raise EpochRevocationError(EpochRevocationFailureCode.PROOF_DENIED) from None
+        if outcome.failure_code is not None:
+            raise EpochRevocationError(EpochRevocationFailureCode.PROOF_DENIED)
+        proof = outcome.proof
+        if (
+            proof is None
+            or not epoch_revocation_proof_matches_command(proof, command)
+            or proof.result.operator_identity != invocation.operator_identity
+            or proof.result.operator_subject != invocation.operator_subject
+            or proof.result.target.project_id != self._route.project_id
+            or proof.result.target.region != "us-central1"
+            or proof.result.target.environment != "nonprod"
+            or proof.result.target.service_name != "controlgraph-reference-target"
+        ):
+            raise EpochRevocationError(EpochRevocationFailureCode.PROOF_DENIED)
+        return proof
 
 
 class CoordinatorEpochRevocationRelay:
@@ -136,6 +207,7 @@ class CoordinatorEpochRevocationRelay:
         authentication_policy: RouteAuthenticationPolicy,
         operator_policy: RouteAuthenticationPolicy,
         revoker: EpochRevokerPort,
+        proof_reader: EpochRevocationProofPort,
     ) -> None:
         if (
             type(authentication_policy) is not RouteAuthenticationPolicy
@@ -147,17 +219,19 @@ class CoordinatorEpochRevocationRelay:
             or operator_policy.project_id != authentication_policy.project_id
             or operator_policy.project_number != authentication_policy.project_number
             or not isinstance(revoker, EpochRevokerPort)
+            or not isinstance(proof_reader, EpochRevocationProofPort)
         ):
             raise TypeError("revocation coordinator relay configuration is invalid")
         self._authentication_policy = authentication_policy
         self._operator_policy = operator_policy
         self._revoker = revoker
+        self._proof_reader = proof_reader
 
     async def revoke(
         self,
         invocation: EpochRevocationInvocationV1,
         caller: AuthenticationContext,
-    ) -> EpochRevocationResultV1:
+    ) -> EpochRevocationCallOutcomeV1:
         if not _context_matches(caller, self._authentication_policy, CallerRole.API):
             raise EpochRevocationError(EpochRevocationFailureCode.CALLER_DENIED)
         if type(invocation) is not EpochRevocationInvocationV1:
@@ -177,7 +251,44 @@ class CoordinatorEpochRevocationRelay:
                 code=EpochRevocationFailureCode.CALLER_DENIED,
             )
             raise EpochRevocationError(EpochRevocationFailureCode.CALLER_DENIED)
-        return await self._revoker.revoke(invocation, principal=operator)
+        result = await self._revoker.revoke(invocation, principal=operator)
+        return EpochRevocationCallOutcomeV1(
+            schema_version=EPOCH_REVOCATION_CALL_OUTCOME_V1,
+            attempt_id=invocation.attempt_id,
+            audit_id=invocation.attempt_id,
+            result=result,
+        )
+
+    async def proof(
+        self,
+        invocation: EpochRevocationProofInvocationV1,
+        caller: AuthenticationContext,
+    ) -> EpochRevocationProofV1:
+        """Authenticate the relay and return one exact verified proof."""
+
+        if not _context_matches(caller, self._authentication_policy, CallerRole.API):
+            raise EpochRevocationError(EpochRevocationFailureCode.CALLER_DENIED)
+        if type(invocation) is not EpochRevocationProofInvocationV1:
+            raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
+        operator = AuthenticationContext(
+            role=CallerRole.OPERATOR,
+            email=invocation.operator_identity,
+            subject=invocation.operator_subject,
+            issuer=invocation.operator_issuer,
+            audience=invocation.operator_audience,
+            issued_at=invocation.operator_issued_at,
+            expires_at=invocation.operator_expires_at,
+        )
+        if not _context_matches(operator, self._operator_policy, CallerRole.OPERATOR):
+            raise EpochRevocationError(EpochRevocationFailureCode.CALLER_DENIED)
+        try:
+            return await self._proof_reader.read(invocation, principal=operator)
+        except asyncio.CancelledError:
+            raise
+        except EpochRevocationError:
+            raise EpochRevocationError(EpochRevocationFailureCode.PROOF_DENIED) from None
+        except Exception:
+            raise EpochRevocationError(EpochRevocationFailureCode.PROOF_DENIED) from None
 
 
 def _context_matches(
@@ -230,6 +341,19 @@ def _result_matches(
     )
 
 
+def _call_outcome_matches(
+    outcome: EpochRevocationCallOutcomeV1,
+    invocation: EpochRevocationInvocationV1,
+    route: CoordinatorInternalRoute,
+) -> bool:
+    return (
+        type(outcome) is EpochRevocationCallOutcomeV1
+        and outcome.attempt_id == invocation.attempt_id
+        and outcome.audit_id == invocation.attempt_id
+        and _result_matches(outcome.result, invocation, route)
+    )
+
+
 def _new_attempt_id() -> str:
     return f"cgrevoke-attempt-{uuid4().hex}"
 
@@ -237,5 +361,6 @@ def _new_attempt_id() -> str:
 __all__ = [
     "ApiEpochRevocationClient",
     "CoordinatorEpochRevocationRelay",
+    "EpochRevocationProofPort",
     "EpochRevokerPort",
 ]

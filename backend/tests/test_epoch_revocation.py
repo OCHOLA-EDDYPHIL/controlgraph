@@ -40,6 +40,7 @@ from controlgraph_canary.application.identity import (
     protected_path,
 )
 from controlgraph_canary.application.revocation import EpochRevocationError, EpochRevoker
+from controlgraph_canary.application.revocation_proof import EpochRevocationProofService
 from controlgraph_canary.application.signing import PurposeSealedSigner, SigningProfile
 from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64url
 from controlgraph_canary.contracts.evidence import (
@@ -56,10 +57,15 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_COMMAND_V1,
     EPOCH_REVOCATION_INVOCATION_V1,
+    EPOCH_REVOCATION_PROOF_COMMAND_V1,
+    EPOCH_REVOCATION_PROOF_INVOCATION_V1,
     EpochRevocationAuditOutcome,
     EpochRevocationCommandV1,
     EpochRevocationFailureCode,
     EpochRevocationInvocationV1,
+    EpochRevocationProofCommandV1,
+    EpochRevocationProofInvocationV1,
+    EpochRevocationResultV1,
 )
 from controlgraph_canary.contracts.root_creation import (
     SIGNED_EVIDENCE_EVENT_V1,
@@ -69,6 +75,7 @@ from controlgraph_canary.contracts.root_creation import (
 )
 from controlgraph_canary.contracts.storage import (
     AuthorityStorageKind,
+    epoch_revocation_audit_document_id,
     evidence_chain_head_document_id,
     signed_evidence_event_document_id,
 )
@@ -89,6 +96,12 @@ class _EvidenceClient:
         self.key_version = key_version
         self.calls: list[EvidenceEvent] = []
         self.on_sign: object | None = None
+        self.verifications: list[SignedEvidenceEventV1] = []
+        self.reject_verification = False
+
+    @property
+    def evidence_key_version(self) -> str:
+        return self.key_version
 
     async def sign(self, event: EvidenceEvent) -> SignedEvidenceEventV1:
         self.calls.append(event)
@@ -107,6 +120,11 @@ class _EvidenceClient:
             ),
             signature=encode_base64url(b"synthetic-revocation-signature"),
         )
+
+    async def verify(self, signed: SignedEvidenceEventV1) -> None:
+        self.verifications.append(signed)
+        if self.reject_verification:
+            raise ValueError("synthetic evidence rejection")
 
 
 class _ConcurrentEvidenceClient(_EvidenceClient):
@@ -257,6 +275,44 @@ def _invocation(
     )
 
 
+def _proof_command(
+    invocation: EpochRevocationInvocationV1,
+    result: EpochRevocationResultV1,
+) -> EpochRevocationProofCommandV1:
+    return EpochRevocationProofCommandV1(
+        schema_version=EPOCH_REVOCATION_PROOF_COMMAND_V1,
+        root_id=result.root_id,
+        root_sha256=result.root_sha256,
+        previous_epoch=result.previous_epoch,
+        new_epoch=result.new_epoch,
+        reason=result.reason,
+        request_sha256=result.request_sha256,
+        request_id=result.request_id,
+        idempotency_key=result.idempotency_key,
+        result_id=result.result_id,
+        evidence_id=result.evidence_id,
+        evidence_sha256=result.evidence_sha256,
+        attempt_id=invocation.attempt_id,
+        audit_id=invocation.attempt_id,
+    )
+
+
+def _proof_invocation(
+    invocation: EpochRevocationInvocationV1,
+    result: EpochRevocationResultV1,
+) -> EpochRevocationProofInvocationV1:
+    return EpochRevocationProofInvocationV1(
+        schema_version=EPOCH_REVOCATION_PROOF_INVOCATION_V1,
+        command=_proof_command(invocation, result),
+        operator_identity=invocation.operator_identity,
+        operator_subject=invocation.operator_subject,
+        operator_issuer=invocation.operator_issuer,
+        operator_audience=invocation.operator_audience,
+        operator_issued_at=invocation.operator_issued_at,
+        operator_expires_at=invocation.operator_expires_at,
+    )
+
+
 async def _created_store() -> tuple[
     FirestoreAuthorityStore,
     _FakeClient,
@@ -316,6 +372,62 @@ def test_revocation_commits_authority_evidence_head_result_identities_and_audit(
         assert state.attempt_audit.value.outcome is EpochRevocationAuditOutcome.COMMITTED
         assert runner.write_result_counts[-2:] == [7, 0]
         assert len(client.documents) == 12
+
+    asyncio.run(scenario())
+
+
+def test_exact_key_revocation_proof_reads_and_verifies_the_complete_attempt() -> None:
+    async def scenario() -> None:
+        store, client, _, untyped_records = await _created_store()
+        records = untyped_records
+        evidence = _EvidenceClient(records.root.content.evidence_signing_key_version)
+        revoker = EpochRevoker(
+            store=store,
+            evidence_client=evidence,
+            operator_policy=_policy(),
+            clock=lambda: NOW,
+        )
+        invocation = _invocation(
+            root_id=records.root.root_id,
+            root_sha256=records.root.root_sha256,
+            attempt_id="cgrevoke-attempt-proof-001",
+        )
+        result = await revoker.revoke(invocation, principal=_principal())
+        proof_invocation = _proof_invocation(invocation, result)
+        state = await store.read_epoch_revocation_proof(proof_invocation.command)
+        assert state is not None
+        assert state.authority.value.current_epoch == result.new_epoch
+        assert state.signed_evidence.value.event.evidence_id == result.evidence_id
+        assert state.result.value == result
+        assert state.audit.value.audit_id == invocation.attempt_id
+
+        service = EpochRevocationProofService(
+            store=store,
+            evidence_verifier=evidence,
+            operator_policy=_policy(),
+        )
+        proof = await service.read(proof_invocation, principal=_principal())
+
+        assert proof.authority == state.authority.value
+        assert proof.signed_evidence == state.signed_evidence.value
+        assert proof.result == result
+        assert proof.audit == state.audit.value
+        assert evidence.verifications == [proof.signed_evidence]
+
+        evidence.reject_verification = True
+        with pytest.raises(EpochRevocationError) as signature_denial:
+            await service.read(proof_invocation, principal=_principal())
+        assert signature_denial.value.code is EpochRevocationFailureCode.PROOF_DENIED
+
+        evidence.reject_verification = False
+        audit_path = (
+            f"{AuthorityStorageKind.EPOCH_REVOCATION_AUDIT.value}/"
+            f"{epoch_revocation_audit_document_id(invocation.attempt_id)}"
+        )
+        del client.documents[audit_path]
+        with pytest.raises(EpochRevocationError) as absence_denial:
+            await service.read(proof_invocation, principal=_principal())
+        assert absence_denial.value.code is EpochRevocationFailureCode.PROOF_DENIED
 
     asyncio.run(scenario())
 

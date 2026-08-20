@@ -119,10 +119,14 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionInvocationV1,
 )
 from controlgraph_canary.contracts.revocation import (
+    EPOCH_REVOCATION_PROOF_RELAY_RESPONSE_V1,
     EPOCH_REVOCATION_RELAY_RESPONSE_V1,
     EpochRevocationCommandV1,
     EpochRevocationFailureCode,
     EpochRevocationInvocationV1,
+    EpochRevocationProofCommandV1,
+    EpochRevocationProofInvocationV1,
+    EpochRevocationProofRelayResponseV1,
     EpochRevocationRelayResponseV1,
 )
 from controlgraph_canary.contracts.root_creation import RootCreationCommandV1
@@ -570,16 +574,26 @@ def create_service_app(
                         )
                     )
                     response_body = canonical_json_bytes(traffic_result)
+                elif type(command) is EpochRevocationProofCommandV1:
+                    if api_epoch_revocation_client is None:
+                        raise EpochRevocationError(
+                            EpochRevocationFailureCode.PROOF_DENIED
+                        )
+                    revocation_proof = await api_epoch_revocation_client.proof(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(revocation_proof)
                 else:
                     if type(command) is not EpochRevocationCommandV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
                     if api_epoch_revocation_client is None:
                         raise EpochRevocationError(EpochRevocationFailureCode.STORE_UNAVAILABLE)
-                    revocation_result = await api_epoch_revocation_client.revoke(
+                    revocation_call_outcome = await api_epoch_revocation_client.revoke(
                         command,
                         context,
                     )
-                    response_body = canonical_json_bytes(revocation_result)
+                    response_body = canonical_json_bytes(revocation_call_outcome)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
@@ -710,29 +724,58 @@ def create_service_app(
                         )
                     )
                     response_body = canonical_json_bytes(traffic_result)
+                elif type(invocation) is EpochRevocationProofInvocationV1:
+                    if coordinator_epoch_revocation_relay is None:
+                        raise EpochRevocationError(
+                            EpochRevocationFailureCode.PROOF_DENIED
+                        )
+                    try:
+                        revocation_proof = (
+                            await coordinator_epoch_revocation_relay.proof(
+                                invocation,
+                                context,
+                            )
+                        )
+                    except EpochRevocationError:
+                        proof_outcome = EpochRevocationProofRelayResponseV1(
+                            schema_version=(
+                                EPOCH_REVOCATION_PROOF_RELAY_RESPONSE_V1
+                            ),
+                            proof=None,
+                            failure_code=EpochRevocationFailureCode.PROOF_DENIED,
+                        )
+                    else:
+                        proof_outcome = EpochRevocationProofRelayResponseV1(
+                            schema_version=(
+                                EPOCH_REVOCATION_PROOF_RELAY_RESPONSE_V1
+                            ),
+                            proof=revocation_proof,
+                            failure_code=None,
+                        )
+                    response_body = canonical_json_bytes(proof_outcome)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
                     if coordinator_epoch_revocation_relay is None:
                         raise EpochRevocationError(EpochRevocationFailureCode.STORE_UNAVAILABLE)
                     try:
-                        revocation_result = await coordinator_epoch_revocation_relay.revoke(
+                        revocation_call = await coordinator_epoch_revocation_relay.revoke(
                             invocation,
                             context,
                         )
                     except EpochRevocationError as error:
-                        revocation_outcome = EpochRevocationRelayResponseV1(
+                        revocation_relay_outcome = EpochRevocationRelayResponseV1(
                             schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
-                            result=None,
+                            outcome=None,
                             failure_code=error.code,
                         )
                     else:
-                        revocation_outcome = EpochRevocationRelayResponseV1(
+                        revocation_relay_outcome = EpochRevocationRelayResponseV1(
                             schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
-                            result=revocation_result,
+                            outcome=revocation_call,
                             failure_code=None,
                         )
-                    response_body = canonical_json_bytes(revocation_outcome)
+                    response_body = canonical_json_bytes(revocation_relay_outcome)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
@@ -1093,6 +1136,7 @@ def _decode_api_command(
     | StableSnapshotCaptureCommandV1
     | ExecutionReceiptReadCommandV1
     | TargetTrafficReadCommandV1
+    | EpochRevocationProofCommandV1
     | EpochRevocationCommandV1
 ):
     try:
@@ -1130,6 +1174,11 @@ def _decode_api_command(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, EpochRevocationProofCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, EpochRevocationCommandV1)
 
 
@@ -1143,6 +1192,7 @@ def _decode_coordinator_invocation(
     | StableSnapshotCaptureInvocationV1
     | ExecutionReceiptReadInvocationV1
     | TargetTrafficReadInvocationV1
+    | EpochRevocationProofInvocationV1
     | EpochRevocationInvocationV1
 ):
     try:
@@ -1177,6 +1227,11 @@ def _decode_coordinator_invocation(
             raise
     try:
         return decode_contract(body, TargetTrafficReadInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, EpochRevocationProofInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -1354,6 +1409,7 @@ def _epoch_revocation_denial(code: str, correlation_id: str) -> JSONResponse:
     if code in {
         EpochRevocationFailureCode.CALLER_DENIED.value,
         EpochRevocationFailureCode.COMMAND_DENIED.value,
+        EpochRevocationFailureCode.PROOF_DENIED.value,
     }:
         status_code = 403
     elif code in {

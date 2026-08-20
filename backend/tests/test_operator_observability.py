@@ -531,6 +531,7 @@ class _RuntimeStore(_Store):
     claim_or_adopt_receipt = _unreachable
     compare_and_set_receipt = _unreachable
     read_epoch_revocation_state = _unreachable
+    read_epoch_revocation_proof = _unreachable
     commit_epoch_revocation = _unreachable
     record_epoch_revocation_audit = _unreachable
     read_service_claim_release_state = _unreachable
