@@ -1423,8 +1423,9 @@ async def test_mutation_uses_one_traffic_only_conditional_request(
         (CANDIDATE, candidate_percent, "candidate"),
     ]
     assert len(services.update_calls) == 1
-    request, retry, _timeout = services.update_calls[0]
+    request, retry, timeout = services.update_calls[0]
     assert retry is None
+    assert timeout == 15.0
     assert request.service.name == SERVICE_RESOURCE
     assert request.service.etag == "etag-before-7"
     assert request.update_mask.paths == ["traffic"]

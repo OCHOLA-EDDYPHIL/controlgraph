@@ -49,6 +49,7 @@ from controlgraph_canary.contracts.models import CapabilityAction, MutationInten
 CLOUD_RUN_REGION: Final = "us-central1"
 CLOUD_RUN_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
 CLOUD_RUN_RPC_TIMEOUT_SECONDS: Final = 5.0
+_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS: Final = 15.0
 CLOUD_RUN_OPERATION_TIMEOUT_SECONDS: Final = 30.0
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
@@ -289,11 +290,11 @@ class CloudRunV2Adapter:
                 CloudRunMutationReason.PROVIDER_REJECTED,
             )
         try:
-            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+            async with asyncio.timeout(_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS):
                 operation = await client.update_service(
                     request,
                     retry=None,
-                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                    timeout=_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS,
                 )
         except _KNOWN_PRECONDITION_FAILURES:
             return _failed_safe(

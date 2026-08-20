@@ -336,7 +336,7 @@ class _MutationServicesClient:
         timeout: float,
     ) -> _Operation:
         assert retry is None
-        assert timeout == 5.0
+        assert timeout == 15.0
         self.events.append("cloud-run-update")
         self.update_calls.append(request)
         return self._operation
