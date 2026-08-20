@@ -34,6 +34,12 @@ from controlgraph_canary.contracts.models import (
     RolloutRoot,
     TargetBinding,
 )
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionDispatchIdentityKind,
+    PromotionDispatchIdentityV1,
+    PromotionDispatchRecordV1,
+    PromotionDispatchState,
+)
 from controlgraph_canary.contracts.revocation import (
     EpochRevocationAuditV1,
     EpochRevocationIdentityV1,
@@ -49,9 +55,10 @@ from controlgraph_canary.contracts.root_creation import (
 SERVICE_CLAIM_V2: Final = "controlgraph.service-claim/v2"
 AUTHORITY_STORAGE_DOCUMENT_V1: Final = "controlgraph.authority-storage-document/v1"
 FIRESTORE_DOCUMENT_ID_DOMAIN: Final = b"controlgraph.firestore-document-id/v1\0"
-SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1: Final = (
-    "controlgraph.service-claim-terminal-root-proof/v1"
+_PROMOTION_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
+    b"controlgraph.promotion-dispatch-identity-logical-id/v1\0"
 )
+SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1: Final = "controlgraph.service-claim-terminal-root-proof/v1"
 SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1: Final = (
     "controlgraph.service-claim-target-classification-proof/v1"
 )
@@ -122,9 +129,7 @@ class ServiceClaimTerminalRootProof(StrictContractModel):
 class ServiceClaimTargetClassificationProof(StrictContractModel):
     """Canonical reference to verifier classification evidence presented for release."""
 
-    schema_version: Literal[
-        "controlgraph.service-claim-target-classification-proof/v1"
-    ]
+    schema_version: Literal["controlgraph.service-claim-target-classification-proof/v1"]
     target: TargetBinding
     root_id: Identifier
     root_sha256: Sha256Digest
@@ -142,9 +147,7 @@ class ServiceClaimTargetClassificationProof(StrictContractModel):
     @model_validator(mode="after")
     def validate_independent_reader(self) -> Self:
         _require_service_claim_target(self.target)
-        expected_reader = (
-            f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
-        )
+        expected_reader = f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
         if self.classified_by != expected_reader:
             raise ValueError("target classification is not bound to the verifier identity")
         return self
@@ -168,9 +171,7 @@ class ServiceClaimRecord(StrictContractModel):
     candidate_target_configuration_sha256: Sha256Digest
     operator_owner: BoundedText
     workload_creator: Literal["controlgraph.api/v1"]
-    terminal_release_condition: Literal[
-        "FENCED_EPOCH_AND_INDEPENDENT_TARGET_CLASSIFICATION_V2"
-    ]
+    terminal_release_condition: Literal["FENCED_EPOCH_AND_INDEPENDENT_TARGET_CLASSIFICATION_V2"]
     status: ServiceClaimStatus
     claim_request_id: Identifier
     claim_evidence_id: Identifier
@@ -235,12 +236,8 @@ class ServiceClaimRecord(StrictContractModel):
         ):
             raise ValueError("service claim terminal proof does not match its root and target")
         expected_configuration = {
-            ServiceClaimTerminalRootState.PROMOTED: (
-                self.candidate_target_configuration_sha256
-            ),
-            ServiceClaimTerminalRootState.RECOVERED: (
-                self.stable_target_configuration_sha256
-            ),
+            ServiceClaimTerminalRootState.PROMOTED: (self.candidate_target_configuration_sha256),
+            ServiceClaimTerminalRootState.RECOVERED: (self.stable_target_configuration_sha256),
         }[terminal.state]
         if terminal.target_configuration_sha256 != expected_configuration:
             raise ValueError("terminal root proof does not match the expected target state")
@@ -306,9 +303,7 @@ class ServiceClaimRecord(StrictContractModel):
         ):
             raise ValueError("claim transition evidence must be independent")
         released_at = cast(str, self.released_at)
-        if not (
-            release_fenced_at <= classification.classified_at <= released_at
-        ):
+        if not (release_fenced_at <= classification.classified_at <= released_at):
             raise ValueError("service claim release proof times are not ordered")
         return self
 
@@ -332,9 +327,7 @@ def service_claim_matches_root(
         )
     ):
         return False
-    expected_reader = (
-        f"controlgraph-verifier@{root.target.project_id}.iam.gserviceaccount.com"
-    )
+    expected_reader = f"controlgraph-verifier@{root.target.project_id}.iam.gserviceaccount.com"
     return (
         claim.target == root.target
         and claim.root_id == root.root_id
@@ -342,26 +335,14 @@ def service_claim_matches_root(
         and claim.stable_revision == root.stable_snapshot.stable_revision
         and claim.candidate_revision == root.candidate_revision
         and claim.initial_epoch == root.initial_epoch
-        and (
-            claim.baseline_service_generation
-            == root.stable_snapshot.service_generation
-        )
-        and (
-            claim.baseline_configuration_sha256
-            == root.stable_snapshot.configuration_sha256
-        )
+        and (claim.baseline_service_generation == root.stable_snapshot.service_generation)
+        and (claim.baseline_configuration_sha256 == root.stable_snapshot.configuration_sha256)
         and (
             claim.baseline_revision_configuration_sha256
             == root.stable_snapshot.stable_revision_configuration_sha256
         )
-        and (
-            claim.stable_target_configuration_sha256
-            == stable_target_configuration_sha256
-        )
-        and (
-            claim.candidate_target_configuration_sha256
-            == candidate_target_configuration_sha256
-        )
+        and (claim.stable_target_configuration_sha256 == stable_target_configuration_sha256)
+        and (claim.candidate_target_configuration_sha256 == candidate_target_configuration_sha256)
         and claim.operator_owner == root.approved_by
         and claim.workload_creator == "controlgraph.api/v1"
         and claim.terminal_release_condition == SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
@@ -409,9 +390,7 @@ def service_claim_matches_root_v2(
     content = root.content
     snapshot = content.stable_snapshot
     plan = content.rollout_plan
-    expected_reader = (
-        f"controlgraph-verifier@{content.target.project_id}.iam.gserviceaccount.com"
-    )
+    expected_reader = f"controlgraph-verifier@{content.target.project_id}.iam.gserviceaccount.com"
     return (
         claim.target == content.target
         and claim.root_id == root.root_id
@@ -474,6 +453,8 @@ class AuthorityStorageKind(StrEnum):
     SERVICE_CLAIM_RELEASE_IDENTITY = "controlgraph-service-claim-release-identities-v1"
     SERVICE_CLAIM_RELEASE_PROGRESS = "controlgraph-service-claim-release-progress-v1"
     SERVICE_CLAIM_RELEASE_RESULT = "controlgraph-service-claim-release-results-v1"
+    PROMOTION_DISPATCH_IDENTITY = "controlgraph-promotion-dispatch-identities-v1"
+    PROMOTION_DISPATCH = "controlgraph-promotion-dispatches-v1"
 
 
 class AuthorityStorageDocument(StrictContractModel):
@@ -514,6 +495,10 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = EpochRevocationResultV1
         elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_AUDIT:
             model_type = EpochRevocationAuditV1
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY:
+            model_type = PromotionDispatchIdentityV1
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH:
+            model_type = PromotionDispatchRecordV1
         else:
             from controlgraph_canary.contracts.service_claim_release import (
                 ServiceClaimReleaseIdentityV1,
@@ -551,6 +536,7 @@ class AuthorityStorageDocument(StrictContractModel):
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+            AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
         }
         if self.record_kind in immutable_kinds and self.revision != 0:
             raise ValueError("immutable authority record must remain at revision zero")
@@ -605,6 +591,24 @@ class AuthorityStorageDocument(StrictContractModel):
             expected_logical_id = cast(EpochRevocationResultV1, payload).result_id
         elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_AUDIT:
             expected_logical_id = cast(EpochRevocationAuditV1, payload).audit_id
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY:
+            promotion_identity = cast(PromotionDispatchIdentityV1, payload)
+            expected_logical_id = promotion_dispatch_identity_logical_id(
+                promotion_identity.identity_kind.value,
+                promotion_identity.identity_value,
+            )
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH:
+            dispatch = cast(PromotionDispatchRecordV1, payload)
+            expected_revision = {
+                PromotionDispatchState.PREPARED: 0,
+                PromotionDispatchState.ENQUEUE_STARTED: 1,
+                PromotionDispatchState.CREATED: 2,
+                PromotionDispatchState.DUPLICATE: 2,
+                PromotionDispatchState.AMBIGUOUS: 2,
+            }[dispatch.state]
+            if self.revision != expected_revision:
+                raise ValueError("promotion dispatch state and storage revision do not match")
+            expected_logical_id = dispatch.dispatch_id
         elif self.record_kind in {
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
@@ -785,6 +789,39 @@ def service_claim_release_result_document_id(result_id: str) -> str:
     return _document_id(AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT, result_id)
 
 
+def promotion_dispatch_identity_logical_id(kind: str, identity_value: str) -> str:
+    """Return the collision domain for one promotion dispatch identity."""
+
+    if kind not in {
+        PromotionDispatchIdentityKind.REQUEST.value,
+        PromotionDispatchIdentityKind.IDEMPOTENCY.value,
+    }:
+        raise ValueError("promotion dispatch identity kind is invalid")
+    identity = _LogicalIdentity(value=identity_value).value
+    digest = hashlib.sha256(
+        _PROMOTION_IDENTITY_LOGICAL_ID_DOMAIN
+        + kind.encode("ascii")
+        + b"\0"
+        + identity.encode("ascii")
+    ).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def promotion_dispatch_identity_document_id(kind: str, identity_value: str) -> str:
+    """Return the immutable document ID for one promotion identity claim."""
+
+    return _document_id(
+        AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+        promotion_dispatch_identity_logical_id(kind, identity_value),
+    )
+
+
+def promotion_dispatch_document_id(dispatch_id: str) -> str:
+    """Return the document ID for one monotonic promotion dispatch."""
+
+    return _document_id(AuthorityStorageKind.PROMOTION_DISPATCH, dispatch_id)
+
+
 def execution_receipt_logical_id(target: TargetBinding, idempotency_key: str) -> str:
     """Return one target-bound claim identity for an idempotency key."""
 
@@ -837,6 +874,9 @@ __all__ = [
     "evidence_chain_head_document_id",
     "execution_receipt_document_id",
     "execution_receipt_logical_id",
+    "promotion_dispatch_document_id",
+    "promotion_dispatch_identity_document_id",
+    "promotion_dispatch_identity_logical_id",
     "rollout_root_document_id",
     "rollout_root_v2_document_id",
     "root_creation_result_document_id",

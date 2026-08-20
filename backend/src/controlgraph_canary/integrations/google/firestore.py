@@ -41,6 +41,10 @@ from controlgraph_canary.application.cloud_run import (
     target_configuration_projection_sha256,
 )
 from controlgraph_canary.application.evidence_chain import current_evidence_chain_head
+from controlgraph_canary.application.promotion_store import (
+    DirectPromotionEnqueueStart,
+    PromotionEnqueuePermit,
+)
 from controlgraph_canary.application.revocation_store import (
     EpochRevocationState,
     EpochRevocationWriteResult,
@@ -67,6 +71,16 @@ from controlgraph_canary.contracts.models import (
     ReceiptOutcome,
     RolloutRoot,
     TargetBinding,
+)
+from controlgraph_canary.contracts.promotion_execution import (
+    PROMOTION_DISPATCH_IDENTITY_V1,
+    PromotionCommandV1,
+    PromotionDispatchIdentityKind,
+    PromotionDispatchIdentityV1,
+    PromotionDispatchRecordV1,
+    PromotionDispatchState,
+    promotion_command_sha256,
+    promotion_dispatch_id,
 )
 from controlgraph_canary.contracts.revocation import (
     EpochRevocationAuditV1,
@@ -115,6 +129,9 @@ from controlgraph_canary.contracts.storage import (
     evidence_chain_head_document_id,
     execution_receipt_document_id,
     execution_receipt_logical_id,
+    promotion_dispatch_document_id,
+    promotion_dispatch_identity_document_id,
+    promotion_dispatch_identity_logical_id,
     rollout_root_document_id,
     rollout_root_v2_document_id,
     root_creation_result_document_id,
@@ -459,10 +476,7 @@ def _validate_initial_rollout(
 ) -> None:
     if (
         type(verified_candidate_revision_configuration_sha256) is not str
-        or _SHA256_DIGEST.fullmatch(
-            verified_candidate_revision_configuration_sha256
-        )
-        is None
+        or _SHA256_DIGEST.fullmatch(verified_candidate_revision_configuration_sha256) is None
     ):
         raise ValueError("verified candidate configuration is not a SHA-256 digest")
     if (
@@ -757,15 +771,11 @@ def _validate_claim_fence_authority(
         or current_claim.root_sha256 != current_authority.root_sha256
         or replacement_claim.root_id != replacement_authority.root_id
         or replacement_claim.root_sha256 != replacement_authority.root_sha256
-        or replacement_claim.release_fence_epoch
-        != replacement_authority.current_epoch
-        or replacement_claim.release_fence_authority_revision
-        != replacement_authority.revision
+        or replacement_claim.release_fence_epoch != replacement_authority.current_epoch
+        or replacement_claim.release_fence_authority_revision != replacement_authority.revision
         or replacement_claim.release_fenced_by != replacement_authority.changed_by
-        or replacement_claim.release_fence_request_id
-        != replacement_authority.request_id
-        or replacement_claim.release_fence_evidence_id
-        != replacement_authority.evidence_id
+        or replacement_claim.release_fence_request_id != replacement_authority.request_id
+        or replacement_claim.release_fence_evidence_id != replacement_authority.evidence_id
         or replacement_claim.release_fenced_at != replacement_authority.changed_at
         or replacement_authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
     ):
@@ -796,10 +806,8 @@ def _validate_claim_release(
         or replacement_claim.release_fence_authority_revision
         != current.release_fence_authority_revision
         or replacement_claim.release_fenced_by != current.release_fenced_by
-        or replacement_claim.release_fence_request_id
-        != current.release_fence_request_id
-        or replacement_claim.release_fence_evidence_id
-        != current.release_fence_evidence_id
+        or replacement_claim.release_fence_request_id != current.release_fence_request_id
+        or replacement_claim.release_fence_evidence_id != current.release_fence_evidence_id
         or replacement_claim.release_fenced_at != current.release_fenced_at
         or replacement_claim.terminal_root_proof != current.terminal_root_proof
         or authority.target != current.target
@@ -1565,8 +1573,7 @@ def _validate_initial_root_creation_bundle(
             stable_target_configuration_sha256=stable_configuration_sha256,
             candidate_target_configuration_sha256=candidate_configuration_sha256,
         )
-        or creation_result.winner_service_claim_id
-        != service_claim_logical_id(configured_target)
+        or creation_result.winner_service_claim_id != service_claim_logical_id(configured_target)
         or creation_result.winner_service_claim_sha256 != canonical_sha256(claim)
         or claim.claim_request_id != creation_result.winner_request_id
         or claim.claim_evidence_id != signed_evidence.event.evidence_id
@@ -1778,6 +1785,120 @@ def _validate_receipt_replacement(
         raise ValueError("receipt replacement changes its provider operation")
     if replacement == current:
         raise ValueError("receipt replacement does not change durable state")
+
+
+def _validate_promotion_record(
+    configured_target: TargetBinding,
+    command: PromotionCommandV1,
+    record: PromotionDispatchRecordV1,
+) -> None:
+    if type(command) is not PromotionCommandV1 or type(record) is not PromotionDispatchRecordV1:
+        raise TypeError("promotion dispatch requires exact contracts")
+    command_sha256 = promotion_command_sha256(command)
+    if (
+        record.target != configured_target
+        or record.command_sha256 != command_sha256
+        or record.dispatch_id != promotion_dispatch_id(command_sha256)
+        or record.request_id != command.request_id
+        or record.idempotency_key != command.idempotency_key
+        or record.root_id != command.root_id
+        or record.root_sha256 != command.expected_root_sha256
+        or record.epoch != command.expected_epoch
+        or record.verified_apply_receipt != command.verified_apply_receipt
+        or record.source_receipt_sha256 != command.verified_apply_receipt.receipt_sha256
+    ):
+        raise ValueError("promotion dispatch does not match its command")
+
+
+def _promotion_dispatch_identity(
+    record: PromotionDispatchRecordV1,
+    kind: PromotionDispatchIdentityKind,
+) -> PromotionDispatchIdentityV1:
+    identity_value = (
+        record.request_id
+        if kind is PromotionDispatchIdentityKind.REQUEST
+        else record.idempotency_key
+    )
+    return PromotionDispatchIdentityV1(
+        schema_version=PROMOTION_DISPATCH_IDENTITY_V1,
+        identity_kind=kind,
+        identity_value=identity_value,
+        dispatch_id=record.dispatch_id,
+        command_sha256=record.command_sha256,
+        root_id=record.root_id,
+        root_sha256=record.root_sha256,
+        epoch=record.epoch,
+        source_receipt_sha256=record.source_receipt_sha256,
+        claimed_at=record.prepared_at,
+    )
+
+
+def _promotion_identity_matches_record(
+    identity: PromotionDispatchIdentityV1,
+    record: PromotionDispatchRecordV1,
+    kind: PromotionDispatchIdentityKind,
+) -> bool:
+    return identity == _promotion_dispatch_identity(record, kind)
+
+
+def _validate_promotion_replacement(
+    configured_target: TargetBinding,
+    expected: StoredRecord[PromotionDispatchRecordV1],
+    replacement: PromotionDispatchRecordV1,
+) -> None:
+    if (
+        type(expected) is not StoredRecord
+        or type(expected.value) is not PromotionDispatchRecordV1
+        or type(replacement) is not PromotionDispatchRecordV1
+    ):
+        raise TypeError("promotion compare-and-set requires exact records")
+    current = expected.value
+    if current.target != configured_target or replacement.target != configured_target:
+        raise ValueError("promotion dispatch target does not match configuration")
+    immutable_fields = (
+        "schema_version",
+        "dispatch_id",
+        "command_sha256",
+        "request_id",
+        "idempotency_key",
+        "target",
+        "root_id",
+        "root_sha256",
+        "epoch",
+        "verified_apply_receipt",
+        "source_receipt_sha256",
+        "task_sha256",
+        "task_name",
+        "task",
+        "prepared_at",
+    )
+    if any(getattr(current, field) != getattr(replacement, field) for field in immutable_fields):
+        raise ValueError("promotion replacement changes an immutable binding")
+    terminal_states = {
+        PromotionDispatchState.CREATED,
+        PromotionDispatchState.DUPLICATE,
+        PromotionDispatchState.AMBIGUOUS,
+    }
+    if current.state is PromotionDispatchState.PREPARED:
+        valid = (
+            expected.revision == 0
+            and replacement.state is PromotionDispatchState.ENQUEUE_STARTED
+            and replacement.enqueue_started_at is not None
+            and replacement.terminal_at is None
+            and replacement.result is None
+        )
+    elif current.state is PromotionDispatchState.ENQUEUE_STARTED:
+        valid = (
+            expected.revision == 1
+            and replacement.state in terminal_states
+            and replacement.enqueue_started_at == current.enqueue_started_at
+            and replacement.terminal_at is not None
+            and replacement.result is not None
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("promotion replacement is not a monotonic transition")
 
 
 class FirestoreAuthorityStore:
@@ -2524,9 +2645,7 @@ class FirestoreAuthorityStore:
             claim_logical_id = service_claim_logical_id(self._target)
             claim_document_id = service_claim_document_id(self._target)
             anchor_logical_id = result.winner_lineage_anchor_id
-            anchor_document_id = capability_lineage_anchor_document_id(
-                result.lineage_anchor
-            )
+            anchor_document_id = capability_lineage_anchor_document_id(result.lineage_anchor)
             evidence_logical_id = result.winner_evidence_id
             evidence_document_id = signed_evidence_event_document_id(evidence_logical_id)
             claim = await self._transaction_read(
@@ -3704,13 +3823,9 @@ class FirestoreAuthorityStore:
                 claim_logical_id = service_claim_logical_id(self._target)
                 claim_document_id = service_claim_document_id(self._target)
                 anchor_logical_id = creation.winner_lineage_anchor_id
-                anchor_document_id = capability_lineage_anchor_document_id(
-                    creation.lineage_anchor
-                )
+                anchor_document_id = capability_lineage_anchor_document_id(creation.lineage_anchor)
                 root_evidence_id = creation.winner_evidence_id
-                root_evidence_document_id = signed_evidence_event_document_id(
-                    root_evidence_id
-                )
+                root_evidence_document_id = signed_evidence_event_document_id(root_evidence_id)
                 decoded_claim = await self._transaction_read(
                     transaction,
                     reference=self._reference(
@@ -3747,11 +3862,7 @@ class FirestoreAuthorityStore:
                     document_id=root_evidence_document_id,
                     model_type=SignedEvidenceEventV1,
                 )
-                if (
-                    decoded_claim is None
-                    or decoded_anchor is None
-                    or decoded_root_evidence is None
-                ):
+                if decoded_claim is None or decoded_anchor is None or decoded_root_evidence is None:
                     raise AuthorityStoreCorruptRecord
                 root_bundle = RootCreationBundle(
                     root=root_record.stored,
@@ -3785,9 +3896,7 @@ class FirestoreAuthorityStore:
                     decoded_head_evidence = decoded_root_evidence
                 else:
                     head_evidence_id = decoded_head.value.evidence_id
-                    head_evidence_document_id = signed_evidence_event_document_id(
-                        head_evidence_id
-                    )
+                    head_evidence_document_id = signed_evidence_event_document_id(head_evidence_id)
                     decoded_head_evidence = await self._transaction_read(
                         transaction,
                         reference=self._reference(
@@ -3856,21 +3965,17 @@ class FirestoreAuthorityStore:
                 document_id=result_document_id,
                 model_type=EpochRevocationResultV1,
             )
-            decoded_result_evidence: (
-                _DecodedDocument[SignedEvidenceEventV1] | None
-            ) = None
+            decoded_result_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
             if decoded_result is not None:
                 result_evidence_id = decoded_result.value.evidence_id
                 if (
                     decoded_head_evidence is not None
-                    and decoded_head_evidence.value.event.evidence_id
-                    == result_evidence_id
+                    and decoded_head_evidence.value.event.evidence_id == result_evidence_id
                 ):
                     decoded_result_evidence = decoded_head_evidence
                 elif (
                     decoded_root_evidence is not None
-                    and decoded_root_evidence.value.event.evidence_id
-                    == result_evidence_id
+                    and decoded_root_evidence.value.event.evidence_id == result_evidence_id
                 ):
                     decoded_result_evidence = decoded_root_evidence
                 else:
@@ -3891,9 +3996,7 @@ class FirestoreAuthorityStore:
                     )
                     if decoded_result_evidence is None:
                         raise AuthorityStoreCorruptRecord
-            audit_document_id = epoch_revocation_audit_document_id(
-                invocation.attempt_id
-            )
+            audit_document_id = epoch_revocation_audit_document_id(invocation.attempt_id)
             decoded_audit = await self._transaction_read(
                 transaction,
                 reference=self._reference(
@@ -3911,14 +4014,10 @@ class FirestoreAuthorityStore:
                 root_bundle=root_bundle,
                 chain_head=None if decoded_head is None else decoded_head.stored,
                 head_evidence=(
-                    None
-                    if decoded_head_evidence is None
-                    else decoded_head_evidence.stored
+                    None if decoded_head_evidence is None else decoded_head_evidence.stored
                 ),
                 request_identity=(
-                    None
-                    if decoded_request_identity is None
-                    else decoded_request_identity.stored
+                    None if decoded_request_identity is None else decoded_request_identity.stored
                 ),
                 idempotency_identity=(
                     None
@@ -3927,13 +4026,9 @@ class FirestoreAuthorityStore:
                 ),
                 result=None if decoded_result is None else decoded_result.stored,
                 result_evidence=(
-                    None
-                    if decoded_result_evidence is None
-                    else decoded_result_evidence.stored
+                    None if decoded_result_evidence is None else decoded_result_evidence.stored
                 ),
-                attempt_audit=(
-                    None if decoded_audit is None else decoded_audit.stored
-                ),
+                attempt_audit=(None if decoded_audit is None else decoded_audit.stored),
             )
 
         await self._run_consistent_read(read)
@@ -3961,9 +4056,7 @@ class FirestoreAuthorityStore:
         authority_document = _prepared_document(
             kind=AuthorityStorageKind.EPOCH_AUTHORITY,
             logical_id=commit.replacement_authority.root_id,
-            document_id=epoch_authority_document_id(
-                commit.replacement_authority.root_id
-            ),
+            document_id=epoch_authority_document_id(commit.replacement_authority.root_id),
             revision=commit.replacement_authority.revision,
             value=commit.replacement_authority,
         )
@@ -4095,9 +4188,7 @@ class FirestoreAuthorityStore:
             if expected_predecessor is None:
                 raise _ExpectedStateMismatch
             predecessor_evidence_id = expected_predecessor.value.event.evidence_id
-            predecessor_document_id = signed_evidence_event_document_id(
-                predecessor_evidence_id
-            )
+            predecessor_document_id = signed_evidence_event_document_id(predecessor_evidence_id)
             current_predecessor = await self._transaction_read(
                 transaction,
                 reference=self._reference(
@@ -4165,17 +4256,10 @@ class FirestoreAuthorityStore:
                 or current_claim.stored != root_bundle.service_claim
                 or current_authority is None
                 or current_authority.stored != root_bundle.authority
-                or (
-                    None if current_head is None else current_head.stored
-                )
-                != expected.chain_head
+                or (None if current_head is None else current_head.stored) != expected.chain_head
                 or current_predecessor is None
                 or current_predecessor.stored != expected_predecessor
-                or (
-                    None
-                    if current_request_identity is None
-                    else current_request_identity.stored
-                )
+                or (None if current_request_identity is None else current_request_identity.stored)
                 != expected.request_identity
                 or (
                     None
@@ -4183,8 +4267,7 @@ class FirestoreAuthorityStore:
                     else current_idempotency_identity.stored
                 )
                 != expected.idempotency_identity
-                or (None if current_result is None else current_result.stored)
-                != expected.result
+                or (None if current_result is None else current_result.stored) != expected.result
                 or (None if current_audit is None else current_audit.stored)
                 != expected.attempt_audit
             ):
@@ -4473,10 +4556,7 @@ class FirestoreAuthorityStore:
                         path = provider_snapshot.reference.path
                     except Exception:
                         raise AuthorityStoreCorruptRecord from None
-                    if (
-                        previous_read_time is not None
-                        and current_read_time < previous_read_time
-                    ):
+                    if previous_read_time is not None and current_read_time < previous_read_time:
                         raise AuthorityStoreCorruptRecord
                     previous_read_time = current_read_time
                     spec = expected.get(path)
@@ -4510,9 +4590,7 @@ class FirestoreAuthorityStore:
             _DecodedDocument[EpochAuthorityRecord] | None,
             decoded[specs[2].reference.path],
         )
-        present = tuple(
-            value for value in (root, service_claim, authority) if value is not None
-        )
+        present = tuple(value for value in (root, service_claim, authority) if value is not None)
         if any(value.value.target != self._target for value in present):
             raise AuthorityStoreCorruptRecord
         if root is None or service_claim is None or authority is None:
@@ -4695,9 +4773,7 @@ class FirestoreAuthorityStore:
                 reference=authority_reference,
                 kind=AuthorityStorageKind.EPOCH_AUTHORITY,
                 logical_id=expected_authority.value.root_id,
-                document_id=epoch_authority_document_id(
-                    expected_authority.value.root_id
-                ),
+                document_id=epoch_authority_document_id(expected_authority.value.root_id),
                 model_type=EpochAuthorityRecord,
             )
             if (
@@ -4713,6 +4789,396 @@ class FirestoreAuthorityStore:
         return ReleasedServiceClaim(
             service_claim=_stored(claim_document),
             authority=expected_authority,
+        )
+
+    async def read_promotion_dispatch(
+        self,
+        command: PromotionCommandV1,
+    ) -> StoredRecord[PromotionDispatchRecordV1] | None:
+        """Read one command's identity ownership and exact dispatch atomically."""
+
+        if type(command) is not PromotionCommandV1:
+            raise TypeError("promotion dispatch read requires an exact command")
+        command_sha256 = promotion_command_sha256(command)
+        dispatch_id = promotion_dispatch_id(command_sha256)
+        request_logical_id = promotion_dispatch_identity_logical_id(
+            PromotionDispatchIdentityKind.REQUEST.value,
+            command.request_id,
+        )
+        request_document_id = promotion_dispatch_identity_document_id(
+            PromotionDispatchIdentityKind.REQUEST.value,
+            command.request_id,
+        )
+        idempotency_logical_id = promotion_dispatch_identity_logical_id(
+            PromotionDispatchIdentityKind.IDEMPOTENCY.value,
+            command.idempotency_key,
+        )
+        idempotency_document_id = promotion_dispatch_identity_document_id(
+            PromotionDispatchIdentityKind.IDEMPOTENCY.value,
+            command.idempotency_key,
+        )
+        dispatch_document_id = promotion_dispatch_document_id(dispatch_id)
+        decoded_request: _DecodedDocument[PromotionDispatchIdentityV1] | None = None
+        decoded_idempotency: _DecodedDocument[PromotionDispatchIdentityV1] | None = None
+        decoded_dispatch: _DecodedDocument[PromotionDispatchRecordV1] | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal decoded_request, decoded_idempotency, decoded_dispatch
+            client = await self._client()
+            decoded_request = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                    request_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                logical_id=request_logical_id,
+                document_id=request_document_id,
+                model_type=PromotionDispatchIdentityV1,
+            )
+            decoded_idempotency = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                    idempotency_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                logical_id=idempotency_logical_id,
+                document_id=idempotency_document_id,
+                model_type=PromotionDispatchIdentityV1,
+            )
+            decoded_dispatch = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH,
+                    dispatch_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH,
+                logical_id=dispatch_id,
+                document_id=dispatch_document_id,
+                model_type=PromotionDispatchRecordV1,
+            )
+
+        await self._run_consistent_read(read)
+        source_sha256 = command.verified_apply_receipt.receipt_sha256
+
+        def matches_command(
+            decoded: _DecodedDocument[PromotionDispatchIdentityV1],
+            kind: PromotionDispatchIdentityKind,
+            value: str,
+        ) -> bool:
+            identity = decoded.value
+            return (
+                identity.identity_kind is kind
+                and identity.identity_value == value
+                and identity.dispatch_id == dispatch_id
+                and identity.command_sha256 == command_sha256
+                and identity.root_id == command.root_id
+                and identity.root_sha256 == command.expected_root_sha256
+                and identity.epoch == command.expected_epoch
+                and identity.source_receipt_sha256 == source_sha256
+            )
+
+        request_conflicts = decoded_request is not None and not matches_command(
+            decoded_request,
+            PromotionDispatchIdentityKind.REQUEST,
+            command.request_id,
+        )
+        idempotency_conflicts = decoded_idempotency is not None and not matches_command(
+            decoded_idempotency,
+            PromotionDispatchIdentityKind.IDEMPOTENCY,
+            command.idempotency_key,
+        )
+        if request_conflicts or idempotency_conflicts:
+            if decoded_dispatch is not None:
+                raise AuthorityStoreCorruptRecord
+            raise AuthorityStoreConflict
+        if decoded_request is None and decoded_idempotency is None and decoded_dispatch is None:
+            return None
+        if decoded_request is None or decoded_idempotency is None or decoded_dispatch is None:
+            raise AuthorityStoreCorruptRecord
+        record = decoded_dispatch.value
+        try:
+            _validate_promotion_record(self._target, command, record)
+            if not _promotion_identity_matches_record(
+                decoded_request.value,
+                record,
+                PromotionDispatchIdentityKind.REQUEST,
+            ) or not _promotion_identity_matches_record(
+                decoded_idempotency.value,
+                record,
+                PromotionDispatchIdentityKind.IDEMPOTENCY,
+            ):
+                raise ValueError("promotion ownership does not match its dispatch")
+        except (TypeError, ValueError):
+            raise AuthorityStoreCorruptRecord from None
+        return decoded_dispatch.stored
+
+    async def prepare_or_adopt_promotion_dispatch(
+        self,
+        command: PromotionCommandV1,
+        prepared: PromotionDispatchRecordV1,
+    ) -> StoredRecord[PromotionDispatchRecordV1]:
+        """Atomically reserve both identities and persist the exact signed task."""
+
+        _validate_promotion_record(self._target, command, prepared)
+        if prepared.state is not PromotionDispatchState.PREPARED:
+            raise ValueError("promotion preparation must be in PREPARED state")
+        request_identity = _promotion_dispatch_identity(
+            prepared,
+            PromotionDispatchIdentityKind.REQUEST,
+        )
+        idempotency_identity = _promotion_dispatch_identity(
+            prepared,
+            PromotionDispatchIdentityKind.IDEMPOTENCY,
+        )
+        request_logical_id = promotion_dispatch_identity_logical_id(
+            request_identity.identity_kind.value,
+            request_identity.identity_value,
+        )
+        idempotency_logical_id = promotion_dispatch_identity_logical_id(
+            idempotency_identity.identity_kind.value,
+            idempotency_identity.identity_value,
+        )
+        request_document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+            logical_id=request_logical_id,
+            document_id=promotion_dispatch_identity_document_id(
+                request_identity.identity_kind.value,
+                request_identity.identity_value,
+            ),
+            revision=0,
+            value=request_identity,
+        )
+        idempotency_document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+            logical_id=idempotency_logical_id,
+            document_id=promotion_dispatch_identity_document_id(
+                idempotency_identity.identity_kind.value,
+                idempotency_identity.identity_value,
+            ),
+            revision=0,
+            value=idempotency_identity,
+        )
+        dispatch_document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH,
+            logical_id=prepared.dispatch_id,
+            document_id=promotion_dispatch_document_id(prepared.dispatch_id),
+            revision=0,
+            value=prepared,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            request_document,
+            idempotency_document,
+            dispatch_document,
+        )
+
+        async def create(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            request_reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                request_document.document_id,
+            )
+            idempotency_reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                idempotency_document.document_id,
+            )
+            dispatch_reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH,
+                dispatch_document.document_id,
+            )
+            existing_request = await self._transaction_read(
+                transaction,
+                reference=request_reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                logical_id=request_logical_id,
+                document_id=request_document.document_id,
+                model_type=PromotionDispatchIdentityV1,
+            )
+            existing_idempotency = await self._transaction_read(
+                transaction,
+                reference=idempotency_reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                logical_id=idempotency_logical_id,
+                document_id=idempotency_document.document_id,
+                model_type=PromotionDispatchIdentityV1,
+            )
+            existing_dispatch = await self._transaction_read(
+                transaction,
+                reference=dispatch_reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH,
+                logical_id=prepared.dispatch_id,
+                document_id=dispatch_document.document_id,
+                model_type=PromotionDispatchRecordV1,
+            )
+            if any(
+                value is not None
+                for value in (
+                    existing_request,
+                    existing_idempotency,
+                    existing_dispatch,
+                )
+            ):
+                raise _ExpectedStateMismatch
+            transaction.create(
+                request_reference,
+                _document_data(request_document.wrapper),
+            )
+            transaction.create(
+                idempotency_reference,
+                _document_data(idempotency_document.wrapper),
+            )
+            transaction.create(
+                dispatch_reference,
+                _document_data(dispatch_document.wrapper),
+            )
+
+        try:
+            await self._run_transaction(documents, create)
+        except AuthorityStoreConflict:
+            adopted = await self.read_promotion_dispatch(command)
+            if adopted is None:
+                raise AuthorityStoreOutcomeUnknown from None
+            return adopted
+        return _stored(dispatch_document)
+
+    async def _compare_and_set_promotion_dispatch(
+        self,
+        expected: StoredRecord[PromotionDispatchRecordV1],
+        replacement: PromotionDispatchRecordV1,
+    ) -> tuple[
+        StoredRecord[PromotionDispatchRecordV1],
+        _TransactionCommitDisposition,
+    ]:
+        """Advance PREPARED to started or started to one immutable terminal state."""
+
+        _validate_promotion_replacement(self._target, expected, replacement)
+        current = expected.value
+        request_identity = _promotion_dispatch_identity(
+            current,
+            PromotionDispatchIdentityKind.REQUEST,
+        )
+        idempotency_identity = _promotion_dispatch_identity(
+            current,
+            PromotionDispatchIdentityKind.IDEMPOTENCY,
+        )
+        request_logical_id = promotion_dispatch_identity_logical_id(
+            request_identity.identity_kind.value,
+            request_identity.identity_value,
+        )
+        idempotency_logical_id = promotion_dispatch_identity_logical_id(
+            idempotency_identity.identity_kind.value,
+            idempotency_identity.identity_value,
+        )
+        document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH,
+            logical_id=replacement.dispatch_id,
+            document_id=promotion_dispatch_document_id(replacement.dispatch_id),
+            revision=expected.revision + 1,
+            value=replacement,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (document,)
+
+        async def update(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            request_document_id = promotion_dispatch_identity_document_id(
+                request_identity.identity_kind.value,
+                request_identity.identity_value,
+            )
+            idempotency_document_id = promotion_dispatch_identity_document_id(
+                idempotency_identity.identity_kind.value,
+                idempotency_identity.identity_value,
+            )
+            decoded_request = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                    request_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                logical_id=request_logical_id,
+                document_id=request_document_id,
+                model_type=PromotionDispatchIdentityV1,
+            )
+            decoded_idempotency = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                    idempotency_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+                logical_id=idempotency_logical_id,
+                document_id=idempotency_document_id,
+                model_type=PromotionDispatchIdentityV1,
+            )
+            if (
+                decoded_request is None
+                or decoded_idempotency is None
+                or decoded_request.value != request_identity
+                or decoded_idempotency.value != idempotency_identity
+            ):
+                raise AuthorityStoreCorruptRecord
+            reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH,
+                document.document_id,
+            )
+            decoded_current = await self._transaction_read(
+                transaction,
+                reference=reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH,
+                logical_id=current.dispatch_id,
+                document_id=document.document_id,
+                model_type=PromotionDispatchRecordV1,
+            )
+            if decoded_current is None or decoded_current.stored != expected:
+                raise _ExpectedStateMismatch
+            transaction.update(reference, _document_data(document.wrapper))
+
+        disposition = await self._run_transaction(documents, update)
+        return _stored(document), disposition
+
+    async def compare_and_set_promotion_dispatch(
+        self,
+        expected: StoredRecord[PromotionDispatchRecordV1],
+        replacement: PromotionDispatchRecordV1,
+    ) -> StoredRecord[PromotionDispatchRecordV1]:
+        """Commit one non-dispatching promotion state transition."""
+
+        if replacement.state is PromotionDispatchState.ENQUEUE_STARTED:
+            raise ValueError("promotion enqueue starts require direct confirmation")
+        stored, _ = await self._compare_and_set_promotion_dispatch(
+            expected,
+            replacement,
+        )
+        return stored
+
+    async def begin_promotion_enqueue(
+        self,
+        expected: StoredRecord[PromotionDispatchRecordV1],
+        replacement: PromotionDispatchRecordV1,
+    ) -> DirectPromotionEnqueueStart:
+        """Issue enqueue authority only for a directly confirmed start CAS."""
+
+        if replacement.state is not PromotionDispatchState.ENQUEUE_STARTED:
+            raise ValueError("promotion enqueue start requires ENQUEUE_STARTED")
+        stored, disposition = await self._compare_and_set_promotion_dispatch(
+            expected,
+            replacement,
+        )
+        if disposition is not _TransactionCommitDisposition.DIRECT_CONFIRMED:
+            raise AuthorityStoreOutcomeUnknown
+        return DirectPromotionEnqueueStart(
+            dispatch=stored,
+            permit=PromotionEnqueuePermit._from_direct_store_start(stored),
         )
 
     async def read_receipt(
@@ -4772,9 +5238,7 @@ class FirestoreAuthorityStore:
             existing = await self.read_receipt(receipt.idempotency_key)
             if existing is None:
                 raise AuthorityStoreOutcomeUnknown from None
-            if _receipt_semantic_binding(existing.value) != _receipt_semantic_binding(
-                receipt
-            ):
+            if _receipt_semantic_binding(existing.value) != _receipt_semantic_binding(receipt):
                 return ReceiptClaimConflict()
             return ReceiptClaimAdopted(existing)
 

@@ -12,6 +12,7 @@ from controlgraph_canary.application.capability_issuance import (
     AuthenticatedIssuancePrincipal,
     CapabilityIssuanceRequest,
     CapabilityIssuer,
+    PromotionCapabilityIssuanceRequest,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
@@ -46,6 +47,9 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
     TaskRequest,
 )
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionCapabilityIssuanceCommandV1,
+)
 
 
 class CanaryExecutionErrorCode(StrEnum):
@@ -59,6 +63,9 @@ class CanaryExecutionErrorCode(StrEnum):
     TRANSPORT_UNAVAILABLE = "CANARY_TRANSPORT_UNAVAILABLE"
     RESPONSE_INVALID = "CANARY_RESPONSE_INVALID"
     DISPATCH_UNAVAILABLE = "CANARY_DISPATCH_UNAVAILABLE"
+    IDENTITY_CONFLICT = "CANARY_IDENTITY_CONFLICT"
+    TRUSTED_STATE_INVALID = "CANARY_TRUSTED_STATE_INVALID"
+    OUTCOME_UNKNOWN = "CANARY_OUTCOME_UNKNOWN"
 
 
 class CanaryExecutionError(RuntimeError):
@@ -105,16 +112,14 @@ class CapabilityIssuanceService:
             or authentication_policy.caller.role is not CallerRole.COORDINATOR
             or (clock is not None and not callable(clock))
         ):
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.CONFIGURATION_INVALID
-            )
+            raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._issuer = issuer
         self._authentication_policy = authentication_policy
         self._clock = clock or _now_utc_second
 
     async def issue(
         self,
-        command: CapabilityIssuanceCommandV1,
+        command: CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV1,
         caller: AuthenticationContext,
     ) -> SignedCapability:
         """Return one signed envelope only to the configured coordinator."""
@@ -125,35 +130,68 @@ class CapabilityIssuanceService:
             role=CallerRole.COORDINATOR,
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.CALLER_DENIED)
-        if type(command) is not CapabilityIssuanceCommandV1:
+        if type(command) not in {
+            CapabilityIssuanceCommandV1,
+            PromotionCapabilityIssuanceCommandV1,
+        }:
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         try:
-            issued = await self._issuer.issue(
-                CapabilityIssuanceRequest(
-                    root_id=command.root_id,
-                    expected_root_sha256=command.expected_root_sha256,
-                    expected_epoch=command.expected_epoch,
-                    request_id=command.request_id,
-                    idempotency_key=command.idempotency_key,
-                ),
-                principal=AuthenticatedIssuancePrincipal(identity=caller.email),
-                now=_require_utc_second(self._clock()),
-            )
+            principal = AuthenticatedIssuancePrincipal(identity=caller.email)
+            now = _require_utc_second(self._clock())
+            if type(command) is CapabilityIssuanceCommandV1:
+                issued = await self._issuer.issue(
+                    CapabilityIssuanceRequest(
+                        root_id=command.root_id,
+                        expected_root_sha256=command.expected_root_sha256,
+                        expected_epoch=command.expected_epoch,
+                        request_id=command.request_id,
+                        idempotency_key=command.idempotency_key,
+                    ),
+                    principal=principal,
+                    now=now,
+                )
+            elif type(command) is PromotionCapabilityIssuanceCommandV1:
+                issued = await self._issuer.issue_promotion(
+                    PromotionCapabilityIssuanceRequest(
+                        root_id=command.root_id,
+                        expected_root_sha256=command.expected_root_sha256,
+                        expected_epoch=command.expected_epoch,
+                        request_id=command.request_id,
+                        idempotency_key=command.idempotency_key,
+                        verified_apply_receipt=command.verified_apply_receipt,
+                    ),
+                    principal=principal,
+                    now=now,
+                )
+            else:
+                raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         except asyncio.CancelledError:
             raise
         except Exception:
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED) from None
         claims = issued.claims
+        expected_action = (
+            CapabilityAction.APPLY_CANARY
+            if type(command) is CapabilityIssuanceCommandV1
+            else CapabilityAction.PROMOTE_CANDIDATE
+        )
+        expected_traffic = (
+            (90, 10) if expected_action is CapabilityAction.APPLY_CANARY else (0, 100)
+        )
         if (
             claims.root_id != command.root_id
             or claims.root_sha256 != command.expected_root_sha256
             or claims.epoch != command.expected_epoch
             or claims.request_id != command.request_id
             or claims.idempotency_key != command.idempotency_key
-            or claims.action is not CapabilityAction.APPLY_CANARY
+            or claims.action is not expected_action
             or claims.concurrency is not None
-            or claims.stable_percent != 90
-            or claims.candidate_percent != 10
+            or claims.stable_percent != expected_traffic[0]
+            or claims.candidate_percent != expected_traffic[1]
+            or (
+                expected_action is CapabilityAction.PROMOTE_CANDIDATE
+                and claims.parent_capability_sha256 is not None
+            )
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
         return issued
@@ -174,9 +212,7 @@ class CoordinatorCapabilityClient:
             or route.service_role is not ServiceRole.ISSUER
             or not isinstance(transport, CanonicalInternalTransport)
         ):
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.CONFIGURATION_INVALID
-            )
+            raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._route = route
         self._transport = transport
 
@@ -199,9 +235,7 @@ class CoordinatorCapabilityClient:
         except asyncio.CancelledError:
             raise
         except Exception:
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.TRANSPORT_UNAVAILABLE
-            ) from None
+            raise CanaryExecutionError(CanaryExecutionErrorCode.TRANSPORT_UNAVAILABLE) from None
         try:
             capability = decode_contract(body, SignedCapability)
         except (ContractError, TypeError, ValueError):
@@ -244,9 +278,7 @@ class CanaryRolloutCoordinator:
             or type(task_dispatcher) is not TaskDispatcher
             or (clock is not None and not callable(clock))
         ):
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.CONFIGURATION_INVALID
-            )
+            raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._target = target
         self._capability_client = capability_client
         self._task_dispatcher = task_dispatcher
@@ -329,9 +361,7 @@ class CanaryRolloutCoordinator:
         except CanaryExecutionError:
             raise
         except Exception:
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE
-            ) from None
+            raise CanaryExecutionError(CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE) from None
 
 
 class ApiCanaryClient:
@@ -355,9 +385,7 @@ class ApiCanaryClient:
             or authentication_policy.project_number != route.project_number
             or not isinstance(transport, CanonicalInternalTransport)
         ):
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.CONFIGURATION_INVALID
-            )
+            raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._route = route
         self._authentication_policy = authentication_policy
         self._transport = transport
@@ -396,9 +424,7 @@ class ApiCanaryClient:
         except asyncio.CancelledError:
             raise
         except Exception:
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.TRANSPORT_UNAVAILABLE
-            ) from None
+            raise CanaryExecutionError(CanaryExecutionErrorCode.TRANSPORT_UNAVAILABLE) from None
         try:
             result = decode_contract(body, CanaryDispatchResultV1)
         except (ContractError, TypeError, ValueError):
@@ -433,9 +459,7 @@ class CoordinatorCanaryRelay:
             or operator_policy.project_number != authentication_policy.project_number
             or not isinstance(coordinator, ApplyCanaryCoordinator)
         ):
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.CONFIGURATION_INVALID
-            )
+            raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._authentication_policy = authentication_policy
         self._operator_policy = operator_policy
         self._coordinator = coordinator
@@ -467,17 +491,13 @@ class CoordinatorCanaryRelay:
         except CanaryExecutionError:
             raise
         except Exception:
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE
-            ) from None
+            raise CanaryExecutionError(CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE) from None
         if not _result_matches_command(
             result,
             invocation.command,
             project_id=self._authentication_policy.project_id,
         ):
-            raise CanaryExecutionError(
-                CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE
-            )
+            raise CanaryExecutionError(CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE)
         return result
 
 

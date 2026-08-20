@@ -46,6 +46,10 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     protected_path,
 )
+from controlgraph_canary.application.promotion_execution import (
+    ApiPromotionClient,
+    CoordinatorPromotionRelay,
+)
 from controlgraph_canary.application.receipt_authority import ReceiptAuthorityService
 from controlgraph_canary.application.revocation import EpochRevocationError
 from controlgraph_canary.application.revocation_relay import (
@@ -91,6 +95,11 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionCapabilityIssuanceCommandV1,
+    PromotionCommandV1,
+    PromotionInvocationV1,
+)
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_RELAY_RESPONSE_V1,
     EpochRevocationCommandV1,
@@ -247,6 +256,8 @@ def create_service_app(
     coordinator_root_creation_relay: CoordinatorRootCreationRelay | None = None,
     api_canary_client: ApiCanaryClient | None = None,
     coordinator_canary_relay: CoordinatorCanaryRelay | None = None,
+    api_promotion_client: ApiPromotionClient | None = None,
+    coordinator_promotion_relay: CoordinatorPromotionRelay | None = None,
     api_epoch_revocation_client: ApiEpochRevocationClient | None = None,
     coordinator_epoch_revocation_relay: CoordinatorEpochRevocationRelay | None = None,
     api_service_claim_release_client: ApiServiceClaimReleaseClient | None = None,
@@ -279,9 +290,7 @@ def create_service_app(
         raise ValueError("a protected task handler requires capability verification")
     if verified_task_handler is not None and not mutation_enabled:
         raise ValueError("a protected task handler requires mutation enablement")
-    if mutation_enabled and (
-        capability_verifier is None or verified_task_handler is None
-    ):
+    if mutation_enabled and (capability_verifier is None or verified_task_handler is None):
         raise ValueError("mutation enablement requires the complete protected task path")
     if (capability_verifier is not None or verified_task_handler is not None) and role not in {
         ServiceRole.EXECUTOR,
@@ -294,21 +303,19 @@ def create_service_app(
         raise ValueError("root preflight is limited to the verifier route")
     if api_root_creation_client is not None and role is not ServiceRole.API:
         raise ValueError("operator root creation is limited to the API route")
-    if (
-        coordinator_root_creation_relay is not None
-        and role is not ServiceRole.COORDINATOR
-    ):
+    if coordinator_root_creation_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("root creation coordination is limited to the coordinator route")
     if api_canary_client is not None and role is not ServiceRole.API:
         raise ValueError("canary dispatch is limited to the API route")
     if coordinator_canary_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("canary coordination is limited to the coordinator route")
+    if api_promotion_client is not None and role is not ServiceRole.API:
+        raise ValueError("promotion dispatch is limited to the API route")
+    if coordinator_promotion_relay is not None and role is not ServiceRole.COORDINATOR:
+        raise ValueError("promotion coordination is limited to the coordinator route")
     if api_epoch_revocation_client is not None and role is not ServiceRole.API:
         raise ValueError("manual revocation is limited to the API route")
-    if (
-        coordinator_epoch_revocation_relay is not None
-        and role is not ServiceRole.COORDINATOR
-    ):
+    if coordinator_epoch_revocation_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("revocation coordination is limited to the coordinator route")
     if api_service_claim_release_client is not None and role is not ServiceRole.API:
         raise ValueError("service-claim release is limited to the API route")
@@ -344,16 +351,12 @@ def create_service_app(
         )
     if capability_issuance_service is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability issuance is limited to the issuer route")
-    if (receipt_authority_service is None) != (
-        receipt_authority_authentication_policy is None
-    ):
+    if (receipt_authority_service is None) != (receipt_authority_authentication_policy is None):
         raise ValueError("receipt authority service and policy must be configured together")
     if receipt_authority_service is not None and (
         role is not ServiceRole.COORDINATOR
-        or type(receipt_authority_authentication_policy)
-        is not RouteAuthenticationPolicy
-        or receipt_authority_authentication_policy.service_role
-        is not ServiceRole.COORDINATOR
+        or type(receipt_authority_authentication_policy) is not RouteAuthenticationPolicy
+        or receipt_authority_authentication_policy.service_role is not ServiceRole.COORDINATOR
         or receipt_authority_authentication_policy.path != RECEIPT_AUTHORITY_PATH
         or receipt_authority_authentication_policy.caller.role is not CallerRole.EXECUTOR
     ):
@@ -450,6 +453,7 @@ def create_service_app(
         if role is ServiceRole.API and (
             api_root_creation_client is not None
             or api_canary_client is not None
+            or api_promotion_client is not None
             or api_epoch_revocation_client is not None
             or api_service_claim_release_client is not None
         ):
@@ -463,11 +467,17 @@ def create_service_app(
                     response_body = canonical_json_bytes(root_result)
                 elif type(command) is ApplyCanaryCommandV1:
                     if api_canary_client is None:
-                        raise CanaryExecutionError(
-                            CanaryExecutionErrorCode.CONFIGURATION_INVALID
-                        )
+                        raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
                     canary_result = await api_canary_client.dispatch(command, context)
                     response_body = canonical_json_bytes(canary_result)
+                elif type(command) is PromotionCommandV1:
+                    if api_promotion_client is None:
+                        raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
+                    promotion_result = await api_promotion_client.dispatch(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(promotion_result)
                 elif type(command) is ServiceClaimReleaseCommandV1:
                     if api_service_claim_release_client is None:
                         raise ServiceClaimReleaseError(
@@ -480,13 +490,9 @@ def create_service_app(
                     response_body = canonical_json_bytes(release_result)
                 else:
                     if type(command) is not EpochRevocationCommandV1:
-                        raise EpochRevocationError(
-                            EpochRevocationFailureCode.COMMAND_DENIED
-                        )
+                        raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
                     if api_epoch_revocation_client is None:
-                        raise EpochRevocationError(
-                            EpochRevocationFailureCode.STORE_UNAVAILABLE
-                        )
+                        raise EpochRevocationError(EpochRevocationFailureCode.STORE_UNAVAILABLE)
                     revocation_result = await api_epoch_revocation_client.revoke(
                         command,
                         context,
@@ -523,6 +529,7 @@ def create_service_app(
         if role is ServiceRole.COORDINATOR and (
             coordinator_root_creation_relay is not None
             or coordinator_canary_relay is not None
+            or coordinator_promotion_relay is not None
             or coordinator_epoch_revocation_relay is not None
             or coordinator_service_claim_release_relay is not None
         ):
@@ -539,14 +546,20 @@ def create_service_app(
                     response_body = canonical_json_bytes(root_result)
                 elif type(invocation) is ApplyCanaryInvocationV1:
                     if coordinator_canary_relay is None:
-                        raise CanaryExecutionError(
-                            CanaryExecutionErrorCode.CONFIGURATION_INVALID
-                        )
+                        raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
                     canary_result = await coordinator_canary_relay.dispatch(
                         invocation,
                         context,
                     )
                     response_body = canonical_json_bytes(canary_result)
+                elif type(invocation) is PromotionInvocationV1:
+                    if coordinator_promotion_relay is None:
+                        raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
+                    promotion_result = await coordinator_promotion_relay.dispatch(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(promotion_result)
                 elif type(invocation) is ServiceClaimReleaseInvocationV1:
                     if coordinator_service_claim_release_relay is None:
                         raise ServiceClaimReleaseError(
@@ -578,19 +591,13 @@ def create_service_app(
                     response_body = canonical_json_bytes(release_outcome)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
-                        raise EpochRevocationError(
-                            EpochRevocationFailureCode.COMMAND_DENIED
-                        )
+                        raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
                     if coordinator_epoch_revocation_relay is None:
-                        raise EpochRevocationError(
-                            EpochRevocationFailureCode.STORE_UNAVAILABLE
-                        )
+                        raise EpochRevocationError(EpochRevocationFailureCode.STORE_UNAVAILABLE)
                     try:
-                        revocation_result = (
-                            await coordinator_epoch_revocation_relay.revoke(
-                                invocation,
-                                context,
-                            )
+                        revocation_result = await coordinator_epoch_revocation_relay.revoke(
+                            invocation,
+                            context,
                         )
                     except EpochRevocationError as error:
                         revocation_outcome = EpochRevocationRelayResponseV1(
@@ -636,7 +643,7 @@ def create_service_app(
         if role is ServiceRole.ISSUER and capability_issuance_service is not None:
             try:
                 body = await _read_contract_body(request)
-                issuance_command = decode_contract(body, CapabilityIssuanceCommandV1)
+                issuance_command = _decode_issuance_command(body)
                 capability = await capability_issuance_service.issue(
                     issuance_command,
                     context,
@@ -792,9 +799,7 @@ def create_service_app(
                 AuthenticationDenialCode.CREDENTIAL_MALFORMED,
                 correlation_id,
             )
-        authorization_header = (
-            authorization_headers[0] if authorization_headers else None
-        )
+        authorization_header = authorization_headers[0] if authorization_headers else None
         try:
             context = authenticator.authenticate(authorization_header, policy)
         except AuthenticationError as error:
@@ -804,10 +809,7 @@ def create_service_app(
                 AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
                 correlation_id,
             )
-        if (
-            type(context) is not AuthenticationContext
-            or context.role is not CallerRole.EXECUTOR
-        ):
+        if type(context) is not AuthenticationContext or context.role is not CallerRole.EXECUTOR:
             return _authentication_denial(
                 AuthenticationDenialCode.CALLER_DENIED,
                 correlation_id,
@@ -939,6 +941,7 @@ def _decode_api_command(
 ) -> (
     RootCreationCommandV1
     | ApplyCanaryCommandV1
+    | PromotionCommandV1
     | ServiceClaimReleaseCommandV1
     | EpochRevocationCommandV1
 ):
@@ -949,6 +952,11 @@ def _decode_api_command(
             raise
     try:
         return decode_contract(body, ApplyCanaryCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, PromotionCommandV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -965,6 +973,7 @@ def _decode_coordinator_invocation(
 ) -> (
     RootCreationInvocationV1
     | ApplyCanaryInvocationV1
+    | PromotionInvocationV1
     | ServiceClaimReleaseInvocationV1
     | EpochRevocationInvocationV1
 ):
@@ -975,6 +984,11 @@ def _decode_coordinator_invocation(
             raise
     try:
         return decode_contract(body, ApplyCanaryInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, PromotionInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -995,6 +1009,17 @@ def _decode_verifier_request(
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
     return decode_contract(body, ServiceClaimClassificationRequestV1)
+
+
+def _decode_issuance_command(
+    body: bytes,
+) -> CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV1:
+    try:
+        return decode_contract(body, CapabilityIssuanceCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, PromotionCapabilityIssuanceCommandV1)
 
 
 def _authentication_denial(
@@ -1117,6 +1142,8 @@ def _canary_execution_denial(code: str, correlation_id: str) -> JSONResponse:
         CanaryExecutionErrorCode.ISSUANCE_DENIED.value,
     }:
         status_code = 403
+    elif code == CanaryExecutionErrorCode.IDENTITY_CONFLICT.value:
+        status_code = 409
     return JSONResponse(
         status_code=status_code,
         content=response.model_dump(mode="json"),

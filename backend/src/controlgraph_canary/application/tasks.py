@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Final, Protocol
 from urllib.parse import urlsplit
 
+from controlgraph_canary.application.promotion_store import PromotionEnqueuePermit
 from controlgraph_canary.contracts.codec import (
     ContractError,
     canonical_json_bytes,
@@ -206,9 +207,47 @@ class TaskDispatcher:
         self._enqueuer = enqueuer
 
     def dispatch(self, request: TaskRequest, *, now: datetime) -> TaskEnqueueResult:
+        if request.intent.action is CapabilityAction.PROMOTE_CANDIDATE:
+            raise TaskAddressingError(
+                "promotion dispatch requires a directly confirmed enqueue permit"
+            )
         evaluation_time = _require_utc_second(now)
-        addressed = self._addressor.seal(request, now=evaluation_time)
+        addressed = self.prepare(request, now=evaluation_time)
         return self._enqueuer.enqueue(addressed, now=evaluation_time)
+
+    def prepare(self, request: TaskRequest, *, now: datetime) -> AddressedTask:
+        """Seal an exact task before durable enqueue ownership begins."""
+
+        return self._addressor.seal(request, now=_require_utc_second(now))
+
+    def dispatch_prepared(
+        self,
+        task: AddressedTask,
+        *,
+        permit: PromotionEnqueuePermit,
+        now: datetime,
+    ) -> TaskEnqueueResult:
+        """Validate and submit one already sealed task exactly once."""
+
+        evaluation_time = _require_utc_second(now)
+        self._addressor.validate_seal(task, now=evaluation_time)
+        try:
+            request = decode_contract(task.body, TaskRequest)
+        except ContractError as error:
+            raise TaskAddressingError("promotion task body is not canonical") from error
+        if (
+            type(permit) is not PromotionEnqueuePermit
+            or request.intent.action is not CapabilityAction.PROMOTE_CANDIDATE
+        ):
+            raise TaskAddressingError("promotion enqueue permit is required")
+        try:
+            permit._take(
+                task_name=task.name,
+                task_sha256=canonical_sha256(request),
+            )
+        except (TypeError, ValueError) as error:
+            raise TaskAddressingError("promotion enqueue permit is invalid") from error
+        return self._enqueuer.enqueue(task, now=evaluation_time)
 
 
 def _route_for_action(action: CapabilityAction) -> TaskRoute:

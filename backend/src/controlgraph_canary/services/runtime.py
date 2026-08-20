@@ -40,6 +40,13 @@ from controlgraph_canary.application.identity import (
     runtime_route_policy,
     runtime_service_name,
 )
+from controlgraph_canary.application.promotion_execution import (
+    ApiPromotionClient,
+    CoordinatorPromotionCapabilityClient,
+    CoordinatorPromotionRelay,
+    PromotionRolloutCoordinator,
+)
+from controlgraph_canary.application.promotion_store import PromotionDispatchStore
 from controlgraph_canary.application.receipt_authority import (
     ReceiptAuthorityClient,
     ReceiptAuthorityService,
@@ -153,6 +160,7 @@ def create_runtime_service_app(
     service_claim_release_clock: Callable[[], datetime] | None = None,
     capability_issuance_clock: Callable[[], datetime] | None = None,
     canary_clock: Callable[[], datetime] | None = None,
+    promotion_clock: Callable[[], datetime] | None = None,
     task_enqueuer: TaskEnqueuer | None = None,
     final_authority_clock: Callable[[], datetime] | None = None,
     receipt_clock: Callable[[], datetime] | None = None,
@@ -188,6 +196,8 @@ def create_runtime_service_app(
     coordinator_service_claim_release_relay = None
     api_canary_client = None
     coordinator_canary_relay = None
+    api_promotion_client = None
+    coordinator_promotion_relay = None
     api_epoch_revocation_client = None
     coordinator_epoch_revocation_relay = None
     capability_issuance_service = None
@@ -346,6 +356,17 @@ def create_runtime_service_app(
             authentication_policy=policy,
             transport=selected_transport,
         )
+        api_promotion_client = ApiPromotionClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+        )
         api_epoch_revocation_client = ApiEpochRevocationClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -405,6 +426,7 @@ def create_runtime_service_app(
                         settings.project_number,
                     ),
                 ),
+                receipt_reader=selected_store,
             ),
             authentication_policy=policy,
             clock=capability_issuance_clock,
@@ -593,9 +615,7 @@ def create_runtime_service_app(
             clock=service_claim_release_clock,
         )
         receipt_authority_service = ReceiptAuthorityService(selected_store)
-        receipt_authority_authentication_policy = _receipt_authority_policy(
-            settings
-        )
+        receipt_authority_authentication_policy = _receipt_authority_policy(settings)
         creator = RolloutRootCreator(
             store=selected_store,
             preflight_client=coordinator_clients.preflight,
@@ -697,12 +717,39 @@ def create_runtime_service_app(
                 clock=canary_clock,
             ),
         )
-    if role not in {
-        ServiceRole.API,
-        ServiceRole.COORDINATOR,
-        ServiceRole.EXECUTOR,
-        ServiceRole.VERIFIER,
-    } and internal_transport is not None:
+        coordinator_promotion_relay = CoordinatorPromotionRelay(
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            coordinator=PromotionRolloutCoordinator(
+                target=target,
+                capability_client=CoordinatorPromotionCapabilityClient(
+                    route=CoordinatorInternalRoute(
+                        project_id=settings.project_id,
+                        project_number=settings.project_number,
+                        caller_role=CallerRole.COORDINATOR,
+                        service_role=ServiceRole.ISSUER,
+                        audience=settings.issuer_url,
+                    ),
+                    transport=selected_transport,
+                ),
+                dispatch_store=cast(PromotionDispatchStore, selected_store),
+                task_dispatcher=TaskDispatcher(
+                    task_addressor,
+                    selected_task_enqueuer,
+                ),
+                clock=promotion_clock,
+            ),
+        )
+    if (
+        role
+        not in {
+            ServiceRole.API,
+            ServiceRole.COORDINATOR,
+            ServiceRole.EXECUTOR,
+            ServiceRole.VERIFIER,
+        }
+        and internal_transport is not None
+    ):
         raise ValueError("internal service transport is role-limited")
     if preflight_clock is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("Cloud Run preflight clocks are verifier-limited")
@@ -712,10 +759,7 @@ def create_runtime_service_app(
         services_client_factory is not None or revisions_client_factory is not None
     ) and role not in {ServiceRole.VERIFIER, ServiceRole.EXECUTOR}:
         raise ValueError("Cloud Run dependencies are verifier/executor-limited")
-    if (
-        readback_services_client_factory is not None
-        and role is not ServiceRole.EXECUTOR
-    ):
+    if readback_services_client_factory is not None and role is not ServiceRole.EXECUTOR:
         raise ValueError("Cloud Run receipt readback is executor-limited")
     if authority_store is not None and role not in {
         ServiceRole.COORDINATOR,
@@ -736,9 +780,9 @@ def create_runtime_service_app(
         raise ValueError("service-claim release clocks are coordinator-limited")
     if capability_issuance_clock is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability-issuance clocks are issuer-limited")
-    if (canary_clock is not None or task_enqueuer is not None) and role is not (
-        ServiceRole.COORDINATOR
-    ):
+    if (
+        canary_clock is not None or promotion_clock is not None or task_enqueuer is not None
+    ) and role is not (ServiceRole.COORDINATOR):
         raise ValueError("canary-dispatch dependencies are coordinator-limited")
     if (
         final_authority_clock is not None
@@ -768,6 +812,8 @@ def create_runtime_service_app(
         coordinator_root_creation_relay=coordinator_root_creation_relay,
         api_canary_client=api_canary_client,
         coordinator_canary_relay=coordinator_canary_relay,
+        api_promotion_client=api_promotion_client,
+        coordinator_promotion_relay=coordinator_promotion_relay,
         api_epoch_revocation_client=api_epoch_revocation_client,
         coordinator_epoch_revocation_relay=coordinator_epoch_revocation_relay,
         api_service_claim_release_client=api_service_claim_release_client,
@@ -776,9 +822,7 @@ def create_runtime_service_app(
         ),
         capability_issuance_service=capability_issuance_service,
         receipt_authority_service=receipt_authority_service,
-        receipt_authority_authentication_policy=(
-            receipt_authority_authentication_policy
-        ),
+        receipt_authority_authentication_policy=(receipt_authority_authentication_policy),
         mutation_enabled=settings.mutations_enabled,
     )
     if coordinator_clients is not None:
@@ -809,12 +853,14 @@ def create_runtime_service_app(
         app.state.controlgraph_canary_client = api_canary_client
     if coordinator_canary_relay is not None:
         app.state.controlgraph_canary_relay = coordinator_canary_relay
+    if api_promotion_client is not None:
+        app.state.controlgraph_promotion_client = api_promotion_client
+    if coordinator_promotion_relay is not None:
+        app.state.controlgraph_promotion_relay = coordinator_promotion_relay
     if api_epoch_revocation_client is not None:
         app.state.controlgraph_epoch_revocation_client = api_epoch_revocation_client
     if coordinator_epoch_revocation_relay is not None:
-        app.state.controlgraph_epoch_revocation_relay = (
-            coordinator_epoch_revocation_relay
-        )
+        app.state.controlgraph_epoch_revocation_relay = coordinator_epoch_revocation_relay
     if capability_issuance_service is not None:
         app.state.controlgraph_capability_issuance = capability_issuance_service
     if receipt_authority_service is not None:
@@ -825,9 +871,7 @@ def create_runtime_service_app(
 
 
 def _service_audience(role: ServiceRole, project_number: str) -> str:
-    return (
-        f"https://{runtime_service_name(role)}-{project_number}.us-central1.run.app"
-    )
+    return f"https://{runtime_service_name(role)}-{project_number}.us-central1.run.app"
 
 
 def _reference_target(settings: ControllerSettings) -> TargetBinding:
