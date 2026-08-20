@@ -90,8 +90,8 @@ from controlgraph_canary.settings import ControllerSettings
 PROJECT = "controlgraph-canary-abc123"
 PROJECT_NUMBER = "123456789012"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v1"
-CANDIDATE = f"{SERVICE}-candidate-v1"
+STABLE = f"{SERVICE}-stable-v2"
+CANDIDATE = f"{SERVICE}-candidate-v2"
 VERIFIER_IDENTITY = f"controlgraph-verifier@{PROJECT}.iam.gserviceaccount.com"
 COORDINATOR_IDENTITY = f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
 SUBJECT = "123456789012345678901"
@@ -627,7 +627,7 @@ def test_coordinator_preflight_client_binds_request_and_converts_trusted_result(
         (_route(ServiceRole.VERIFIER), canonical_json_bytes(request))
     ]
 
-    other = _request(candidate_revision=f"{SERVICE}-candidate-v2")
+    other = _request(candidate_revision=f"{SERVICE}-candidate-v3")
     substituted = _Transport(canonical_json_bytes(_result()))
     with pytest.raises(RootTrustClientError) as failure:
         asyncio.run(

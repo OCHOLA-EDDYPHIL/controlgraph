@@ -92,8 +92,8 @@ from controlgraph_canary.integrations.google.cloud_run import (
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v1"
-CANDIDATE = f"{SERVICE}-candidate-v1"
+STABLE = f"{SERVICE}-stable-v2"
+CANDIDATE = f"{SERVICE}-candidate-v2"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
@@ -1015,14 +1015,14 @@ async def test_receipt_readback_uses_a_fresh_exact_get_and_provider_state() -> N
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            stable_revision=f"{SERVICE}-stable-v2",
+            stable_revision=f"{SERVICE}-stable-v3",
         ),
         replace(
             target_configuration_projection(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            candidate_revision=f"{SERVICE}-candidate-v2",
+            candidate_revision=f"{SERVICE}-candidate-v3",
         ),
         replace(
             target_configuration_projection(
@@ -1625,7 +1625,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-        "91cc2ad3338f51de339b64d9deae36713c0e687f122473743ce4e6612f69947c"
+        "fbfa417a2b022a6f8d64c27ce6debe3c99b9e680c794934f0b57c5a18feb1d26"
     )
 
 
@@ -1653,8 +1653,8 @@ def test_target_configuration_digest_excludes_non_poststate_fields() -> None:
     ("changes", "expected_concurrency"),
     [
         ({"target": _target(project_id="controlgraph-canary-d4e5f6")}, 8),
-        ({"stable_revision": f"{SERVICE}-stable-v2"}, 8),
-        ({"candidate_revision": f"{SERVICE}-candidate-v2"}, 8),
+        ({"stable_revision": f"{SERVICE}-stable-v3"}, 8),
+        ({"candidate_revision": f"{SERVICE}-candidate-v3"}, 8),
         ({"stable_percent": 80, "candidate_percent": 20}, 8),
         ({}, 9),
     ],
@@ -1753,6 +1753,82 @@ async def test_reference_target_reset_uses_one_conditional_traffic_update_and_re
     }
     assert provider_fields == {"name", "traffic", "etag"}
     assert operation.calls == [30.0]
+
+
+@_async_test
+async def test_reference_target_reset_migrates_the_retained_v1_baseline_to_v2() -> None:
+    before = _service(
+        100,
+        0,
+        stable_revision="controlgraph-reference-target-stable-v1",
+        candidate_revision=CANDIDATE,
+        etag="etag-before-migration",
+        generation=8,
+    )
+    del before.traffic[1:]
+    del before.traffic_statuses[1:]
+    after = _service(100, 0, etag="etag-after-migration", generation=9)
+    operation = _FakeOperation(after, name="operations/reference-target-migration-1")
+    services = _ResetServicesClient([before, after], update=operation)
+
+    result = await _resetter(services).reset(_reset_request("etag-before-migration"))
+
+    assert result.outcome is ReferenceTargetResetOutcome.RESET_APPLIED
+    assert result.previous_generation == 8
+    assert result.observed_generation == 9
+    assert len(services.update_calls) == 1
+    request, _, _ = services.update_calls[0]
+    assert [(item.revision, item.percent, item.tag) for item in request.service.traffic] == [
+        (STABLE, 100, "stable"),
+        (CANDIDATE, 0, "candidate"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["wrong-tag", "extra-allocation", "status-mismatch"],
+)
+@_async_test
+async def test_reference_target_reset_rejects_any_other_v1_traffic_shape(
+    case: str,
+) -> None:
+    before = _service(
+        100,
+        0,
+        stable_revision="controlgraph-reference-target-stable-v1",
+        candidate_revision=CANDIDATE,
+        etag="etag-before-migration",
+        generation=8,
+    )
+    del before.traffic[1:]
+    del before.traffic_statuses[1:]
+    if case == "wrong-tag":
+        before.traffic[0].tag = "candidate"
+        before.traffic_statuses[0].tag = "candidate"
+    elif case == "extra-allocation":
+        before.traffic.append(
+            run_v2.TrafficTarget(
+                type_=(
+                    run_v2.TrafficTargetAllocationType
+                    .TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
+                ),
+                revision=CANDIDATE,
+                percent=0,
+                tag="candidate",
+            )
+        )
+    else:
+        before.traffic_statuses[0].revision = STABLE
+    services = _ResetServicesClient(
+        [before],
+        update=AssertionError("invalid retained traffic must not update"),
+    )
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services).reset(_reset_request("etag-before-migration"))
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+    assert services.update_calls == []
 
 
 @_async_test
