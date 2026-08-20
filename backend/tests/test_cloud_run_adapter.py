@@ -1820,6 +1820,100 @@ async def test_reference_target_reset_migrates_the_retained_v1_baseline_to_v3() 
     ]
 
 
+@_async_test
+async def test_reference_target_reset_rewrites_a_stable_only_v3_baseline() -> None:
+    before = _service(
+        100,
+        0,
+        etag="etag-before-reset",
+        generation=8,
+        latest_ready_revision=STABLE,
+    )
+    del before.traffic[1:]
+    del before.traffic_statuses[1:]
+    after = _service(100, 0, etag="etag-after-reset", generation=9)
+    operation = _FakeOperation(after, name="operations/reference-target-reset-1")
+    services = _ResetServicesClient([before, after], update=operation)
+
+    result = await _resetter(services).reset(_reset_request())
+
+    assert result.outcome is ReferenceTargetResetOutcome.RESET_APPLIED
+    assert result.previous_generation == 8
+    assert result.observed_generation == 9
+    assert len(services.update_calls) == 1
+    request, retry, _ = services.update_calls[0]
+    assert retry is None
+    assert [(item.revision, item.percent, item.tag) for item in request.service.traffic] == [
+        (STABLE, 100, "stable"),
+        (CANDIDATE, 0, "candidate"),
+    ]
+
+
+@_async_test
+async def test_reference_target_reset_rewrites_when_candidate_is_not_latest_ready() -> None:
+    before = _service(
+        100,
+        0,
+        etag="etag-before-reset",
+        generation=8,
+        latest_ready_revision=STABLE,
+    )
+    after = _service(100, 0, etag="etag-after-reset", generation=9)
+    operation = _FakeOperation(after, name="operations/reference-target-reset-1")
+    services = _ResetServicesClient([before, after], update=operation)
+
+    result = await _resetter(services).reset(_reset_request())
+
+    assert result.outcome is ReferenceTargetResetOutcome.RESET_APPLIED
+    assert len(services.update_calls) == 1
+
+
+@_async_test
+async def test_reference_target_reset_denies_stable_only_baseline_readback() -> None:
+    before = _service(90, 10, etag="etag-before-reset", generation=8)
+    incomplete = _service(
+        100,
+        0,
+        etag="etag-after-reset",
+        generation=9,
+        latest_ready_revision=CANDIDATE,
+    )
+    del incomplete.traffic[1:]
+    del incomplete.traffic_statuses[1:]
+    operation = _FakeOperation(incomplete, name="operations/reference-target-reset-1")
+    services = _ResetServicesClient([before, incomplete], update=operation)
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services).reset(_reset_request())
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+    assert len(services.update_calls) == 1
+    assert len(services.get_calls) == 2
+    assert operation.calls == [30.0]
+
+
+@_async_test
+async def test_reference_target_reset_denies_non_candidate_latest_ready_readback() -> None:
+    before = _service(90, 10, etag="etag-before-reset", generation=8)
+    incomplete = _service(
+        100,
+        0,
+        etag="etag-after-reset",
+        generation=9,
+        latest_ready_revision=STABLE,
+    )
+    operation = _FakeOperation(incomplete, name="operations/reference-target-reset-1")
+    services = _ResetServicesClient([before, incomplete], update=operation)
+
+    with pytest.raises(ReferenceTargetResetError) as raised:
+        await _resetter(services).reset(_reset_request())
+
+    assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+    assert len(services.update_calls) == 1
+    assert len(services.get_calls) == 2
+    assert operation.calls == [30.0]
+
+
 @pytest.mark.parametrize(
     "case",
     ["wrong-tag", "extra-allocation", "status-mismatch"],
