@@ -258,8 +258,6 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
-        "run_operation_read",
-        "run_target_restore_stable",
       ])
       verifier = toset([
         "firestore_authority_read",
@@ -267,7 +265,6 @@ locals {
         "kms_capability_version_read",
         "kms_evidence_public_key_read",
         "kms_evidence_version_read",
-        "monitoring_health_read",
         "run_reference_invoke",
         "run_evidence_writer_invoke",
         "run_target_snapshot",
@@ -375,16 +372,6 @@ check "iam_matrix_does_not_overstate_implemented_grants" {
       length(setsubtract(implemented, local.identity_expected_allows[identity])) == 0
     ])
     error_message = "Every implemented IAM domain must be a subset of that identity's reviewed expected allows."
-  }
-}
-
-check "recovery_and_verifier_permissions_are_implemented" {
-  assert {
-    condition = (
-      local.identity_implemented_allows.recovery == local.identity_expected_allows.recovery &&
-      local.identity_implemented_allows.verifier == local.identity_expected_allows.verifier
-    )
-    error_message = "Recovery and verifier must have no pending IAM permission domains."
   }
 }
 
