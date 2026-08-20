@@ -21,6 +21,10 @@ from controlgraph_canary.contracts.revocation import (
     EpochRevocationResultV1,
     epoch_revocation_evidence_id,
 )
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.integrations.google.internal_transport import InternalHttpResponse
 
 
@@ -182,7 +186,9 @@ def test_cli_uses_human_identity_token_and_one_shell_free_api_post(
     assert call["timeout"] == 30.0
     headers = call["headers"]
     assert isinstance(headers, dict)
-    assert headers["Authorization"] == "Bearer header.payload.signature"
+    assert "Authorization" not in headers
+    assert headers[CONTROLGRAPH_AUTHORIZATION_HEADER] == "Bearer header.payload.signature"
+    assert headers[SERVERLESS_AUTHORIZATION_HEADER] == "Bearer header.payload.signature"
     command = decode_contract(call["body"], EpochRevocationCommandV1)
     assert command.confirmation == "REVOKE"
     output = capsys.readouterr().out  # type: ignore[attr-defined]
@@ -322,7 +328,9 @@ def test_proof_cli_uses_one_exact_authenticated_api_post(capsys: object) -> None
     assert call["timeout"] == 30.0
     headers = call["headers"]
     assert isinstance(headers, dict)
-    assert headers["Authorization"] == "Bearer header.payload.signature"
+    assert "Authorization" not in headers
+    assert headers[CONTROLGRAPH_AUTHORIZATION_HEADER] == "Bearer header.payload.signature"
+    assert headers[SERVERLESS_AUTHORIZATION_HEADER] == "Bearer header.payload.signature"
     command = decode_contract(call["body"], EpochRevocationProofCommandV1)
     assert command == records.proof_command
     output = capsys.readouterr().out  # type: ignore[attr-defined]

@@ -63,6 +63,10 @@ from controlgraph_canary.contracts.root_creation import (
     RootCreationResultV1,
 )
 from controlgraph_canary.contracts.root_trust import stable_snapshots_match
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.integrations.google.internal_transport import (
     InternalHttpResponse,
     OneShotHttpPoster,
@@ -883,8 +887,9 @@ def _post_operator_command(
             url=f"{origin}/v1/operator/commands",
             headers={
                 "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                CONTROLGRAPH_AUTHORIZATION_HEADER: f"Bearer {token}",
+                SERVERLESS_AUTHORIZATION_HEADER: f"Bearer {token}",
             },
             body=body,
             timeout=_OPERATOR_HTTP_TIMEOUT_SECONDS,

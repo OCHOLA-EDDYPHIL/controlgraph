@@ -29,6 +29,10 @@ from controlgraph_canary.application.root_relay import (
     ApiRootCreationClient,
     CoordinatorRootCreationRelay,
 )
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.http.service import (
     PRODUCT_CONTRACT_VERSION,
     SERVICE_SHELL_VERSION,
@@ -36,6 +40,7 @@ from controlgraph_canary.http.service import (
     create_service_app,
     protected_paths,
 )
+from controlgraph_canary.integrations.google.identity import GoogleIdentityVerifier
 from controlgraph_canary.services.runtime import create_runtime_service_app
 
 ROLE_MODULES = (
@@ -66,6 +71,15 @@ CALLER_ACCOUNT_IDS = {
     CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
     CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
 }
+
+
+def _credential_headers(role: ServiceRole, value: str) -> dict[str, str]:
+    if role is ServiceRole.API:
+        return {
+            CONTROLGRAPH_AUTHORIZATION_HEADER: value,
+            SERVERLESS_AUTHORIZATION_HEADER: value,
+        }
+    return {"Authorization": value}
 
 
 def _caller_email(role: CallerRole) -> str:
@@ -315,7 +329,7 @@ def test_every_protected_route_remains_disabled_without_reading_sensitive_body(
             content=f'{{"capability":"{sensitive_marker}"}}',
             headers={
                 "Content-Type": "application/json",
-                "Authorization": authorization,
+                **_credential_headers(role, authorization),
             },
         )
         assert response.status_code == 503
@@ -485,12 +499,147 @@ def test_api_runtime_verifies_operator_token_against_oauth_client_audience() -> 
     response = client.post(
         protected_paths(ServiceRole.API)[0],
         content=b"{}",
-        headers={"Authorization": "Bearer exact.test.credential"},
+        headers=_credential_headers(
+            ServiceRole.API,
+            "Bearer exact.test.credential",
+        ),
     )
 
     assert response.status_code == 400
     assert response.json()["code"] == "CONTRACT_INVALID"
     assert calls == [("exact.test.credential", oauth_audience)]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("Authorization", "Bearer header.payload.signature")],
+        [(CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature")],
+        [(SERVERLESS_AUTHORIZATION_HEADER, "Bearer header.payload.signature")],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            ("Authorization", "Bearer header.payload.signature"),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+        ],
+        [
+            (CONTROLGRAPH_AUTHORIZATION_HEADER, "Bearer header.payload.signature"),
+            (SERVERLESS_AUTHORIZATION_HEADER, "Bearer other.payload.signature"),
+        ],
+    ],
+)
+def test_operator_route_rejects_incomplete_duplicate_or_ambiguous_envelopes(
+    headers: list[tuple[str, str]],
+) -> None:
+    role = ServiceRole.API
+    policy = runtime_route_policy(role, _environment(role))
+    authenticator = _ExactTestAuthenticator("Bearer header.payload.signature")
+    response = TestClient(
+        create_service_app(
+            role,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    ).post(protected_paths(role)[0], headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "AUTH_CREDENTIAL_MALFORMED"
+    assert authenticator.calls == []
+
+
+def test_operator_envelope_admits_cloud_run_signature_removal() -> None:
+    role = ServiceRole.API
+    policy = runtime_route_policy(role, _environment(role))
+    credential = "Bearer header.payload.signature"
+    authenticator = _ExactTestAuthenticator(credential)
+    response = TestClient(
+        create_service_app(
+            role,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    ).post(
+        protected_paths(role)[0],
+        headers={
+            CONTROLGRAPH_AUTHORIZATION_HEADER: credential,
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                "Bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
+        },
+    )
+
+    assert response.status_code == 503
+    assert authenticator.calls == [(credential, policy)]
+
+
+@pytest.mark.parametrize(
+    "header",
+    [CONTROLGRAPH_AUTHORIZATION_HEADER, SERVERLESS_AUTHORIZATION_HEADER],
+)
+def test_non_operator_routes_reject_operator_transport_headers(header: str) -> None:
+    role = ServiceRole.EXECUTOR
+    policy = runtime_route_policy(role, _environment(role))
+    authenticator = _ExactTestAuthenticator("Bearer header.payload.signature")
+    response = TestClient(
+        create_service_app(
+            role,
+            authenticator=authenticator,
+            authentication_policy=policy,
+        )
+    ).post(
+        protected_paths(role)[0],
+        headers={header: "Bearer header.payload.signature"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "AUTH_CREDENTIAL_MALFORMED"
+    assert authenticator.calls == []
+
+
+def test_cloud_tasks_authorization_fallback_is_signature_verified() -> None:
+    role = ServiceRole.EXECUTOR
+    environment = _environment(role)
+    policy = runtime_route_policy(role, environment)
+    expected_audience = environment["CONTROLGRAPH_AUTH_AUDIENCE"]
+    calls: list[tuple[str, str]] = []
+
+    def verify_token(token: str, audience: str) -> dict[str, object]:
+        calls.append((token, audience))
+        return {
+            "iss": "https://accounts.google.com",
+            "aud": expected_audience,
+            "email": environment["CONTROLGRAPH_AUTH_CALLER_EMAIL"],
+            "email_verified": True,
+            "sub": SUBJECT,
+            "iat": 1_776_236_340,
+            "exp": 1_776_239_400,
+        }
+
+    response = TestClient(
+        create_service_app(
+            role,
+            authenticator=GoogleIdentityVerifier(
+                verify_token,
+                clock=lambda: 1_776_236_400.0,
+            ),
+            authentication_policy=policy,
+        )
+    ).post(
+        protected_paths(role)[0],
+        headers={"Authorization": "Bearer header.payload.signature"},
+    )
+
+    assert response.status_code == 503
+    assert calls == [("header.payload.signature", expected_audience)]
 
 
 def test_unexpected_verifier_failure_is_sanitized_and_fails_closed() -> None:

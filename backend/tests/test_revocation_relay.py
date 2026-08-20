@@ -42,6 +42,10 @@ from controlgraph_canary.contracts.revocation import (
     epoch_revocation_evidence_id,
     epoch_revocation_request_sha256,
 )
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.http.service import create_service_app
 
 OPERATOR = "operator@example.test"
@@ -399,7 +403,10 @@ def test_api_http_route_accepts_the_strict_revocation_command() -> None:
     response = client.post(
         protected_path(ServiceRole.API),
         content=canonical_json_bytes(_command()),
-        headers={"Authorization": "Bearer exact-token"},
+        headers={
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact-token",
+            SERVERLESS_AUTHORIZATION_HEADER: "Bearer exact-token",
+        },
     )
 
     assert response.status_code == 200
@@ -583,7 +590,10 @@ def test_api_and_coordinator_relay_one_exact_proof_on_the_existing_post_path() -
     api_response = api_http.post(
         protected_path(ServiceRole.API),
         content=canonical_json_bytes(records.proof_command),
-        headers={"Authorization": "Bearer exact-token"},
+        headers={
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer exact-token",
+            SERVERLESS_AUTHORIZATION_HEADER: "Bearer exact-token",
+        },
     )
     assert api_response.status_code == 200
     assert decode_contract(api_response.content, EpochRevocationProofV1) == records.proof

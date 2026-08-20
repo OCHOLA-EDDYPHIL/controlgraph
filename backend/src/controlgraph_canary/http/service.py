@@ -141,6 +141,7 @@ from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseInvocationV1,
     ServiceClaimReleaseRelayResponseV1,
 )
+from controlgraph_canary.http.identity_headers import authentication_header
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
@@ -479,14 +480,11 @@ def create_service_app(
                 AuthenticationDenialCode.CONFIGURATION_INVALID,
                 correlation_id,
             )
-        authorization_headers = request.headers.getlist("authorization")
-        if len(authorization_headers) > 1:
-            return _authentication_denial(
-                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
-                correlation_id,
-            )
-        authorization_header = authorization_headers[0] if authorization_headers else None
         try:
+            authorization_header = authentication_header(
+                request.headers,
+                authentication_policy,
+            )
             context = authenticator.authenticate(authorization_header, authentication_policy)
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
@@ -983,14 +981,8 @@ def create_service_app(
                 AuthenticationDenialCode.CONFIGURATION_INVALID,
                 correlation_id,
             )
-        authorization_headers = request.headers.getlist("authorization")
-        if len(authorization_headers) > 1:
-            return _authentication_denial(
-                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
-                correlation_id,
-            )
-        authorization_header = authorization_headers[0] if authorization_headers else None
         try:
+            authorization_header = authentication_header(request.headers, policy)
             context = authenticator.authenticate(authorization_header, policy)
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
@@ -1042,16 +1034,8 @@ def create_service_app(
                 AuthenticationDenialCode.CONFIGURATION_INVALID,
                 correlation_id,
             )
-        authorization_headers = request.headers.getlist("authorization")
-        if len(authorization_headers) > 1:
-            return _authentication_denial(
-                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
-                correlation_id,
-            )
-        authorization_header = (
-            authorization_headers[0] if authorization_headers else None
-        )
         try:
+            authorization_header = authentication_header(request.headers, policy)
             context = authenticator.authenticate(authorization_header, policy)
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)

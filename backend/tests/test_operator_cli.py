@@ -66,6 +66,10 @@ from controlgraph_canary.contracts.root_creation import (
     RootCreationCommandV1,
 )
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
+from controlgraph_canary.http.identity_headers import (
+    CONTROLGRAPH_AUTHORIZATION_HEADER,
+    SERVERLESS_AUTHORIZATION_HEADER,
+)
 from controlgraph_canary.integrations.google.internal_transport import InternalHttpResponse
 
 
@@ -464,6 +468,12 @@ def test_all_operator_commands_use_one_fixed_shell_free_api_post(
         assert call["url"] == f"{origin}/v1/operator/commands"
         assert call["body"] == canonical_json_bytes(command)  # type: ignore[arg-type]
         assert call["timeout"] == 30.0
+        assert call["headers"] == {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            CONTROLGRAPH_AUTHORIZATION_HEADER: "Bearer header.payload.signature",
+            SERVERLESS_AUTHORIZATION_HEADER: "Bearer header.payload.signature",
+        }
         output = capsys.readouterr().out
         assert "header.payload.signature" not in output
         assert output.strip() == canonical_json_bytes(result).decode("utf-8")  # type: ignore[arg-type]
