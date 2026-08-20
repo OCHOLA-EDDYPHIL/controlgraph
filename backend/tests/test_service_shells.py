@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import re
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,10 @@ from controlgraph_canary.application.identity import (
     RouteAuthenticationPolicy,
     runtime_route_policy,
     runtime_service_name,
+)
+from controlgraph_canary.application.revocation_relay import (
+    ApiEpochRevocationClient,
+    CoordinatorEpochRevocationRelay,
 )
 from controlgraph_canary.application.root_relay import (
     ApiRootCreationClient,
@@ -217,10 +222,18 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
             module.app.state.controlgraph_root_creation_client,
             ApiRootCreationClient,
         )
+        assert isinstance(
+            module.app.state.controlgraph_epoch_revocation_client,
+            ApiEpochRevocationClient,
+        )
     if role is ServiceRole.COORDINATOR:
         assert isinstance(
             module.app.state.controlgraph_root_creation_relay,
             CoordinatorRootCreationRelay,
+        )
+        assert isinstance(
+            module.app.state.controlgraph_epoch_revocation_relay,
+            CoordinatorEpochRevocationRelay,
         )
 
     health = client.get("/healthz")
@@ -474,6 +487,21 @@ def test_runtime_rejects_kms_clients_outside_evidence_trust_roles(
             role,
             environment=_environment(role),
             kms_client=object(),
+        )
+
+
+def test_runtime_limits_revocation_injected_dependencies_to_their_roles() -> None:
+    with pytest.raises(ValueError, match="revocation clocks"):
+        create_runtime_service_app(
+            ServiceRole.API,
+            environment=_environment(ServiceRole.API),
+            revocation_clock=lambda: datetime(2026, 8, 20, tzinfo=UTC),
+        )
+    with pytest.raises(ValueError, match="attempt identities"):
+        create_runtime_service_app(
+            ServiceRole.RECOVERY,
+            environment=_environment(ServiceRole.RECOVERY),
+            revocation_attempt_id_factory=lambda: "attempt-id",
         )
 
 

@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI
 
@@ -47,6 +47,12 @@ from controlgraph_canary.application.receipt_execution import (
     ReceiptClassifyingMutationAdapter,
     ReceiptExecutionCoordinator,
 )
+from controlgraph_canary.application.revocation import EpochRevoker
+from controlgraph_canary.application.revocation_relay import (
+    ApiEpochRevocationClient,
+    CoordinatorEpochRevocationRelay,
+)
+from controlgraph_canary.application.revocation_store import EpochRevocationStore
 from controlgraph_canary.application.root_creation import RootCreationConfiguration
 from controlgraph_canary.application.root_creation_service import RolloutRootCreator
 from controlgraph_canary.application.root_relay import (
@@ -129,6 +135,8 @@ def create_runtime_service_app(
     final_authority_clock: Callable[[], datetime] | None = None,
     receipt_clock: Callable[[], datetime] | None = None,
     capability_verification_clock: Callable[[], datetime] | None = None,
+    revocation_clock: Callable[[], datetime] | None = None,
+    revocation_attempt_id_factory: Callable[[], str] | None = None,
 ) -> FastAPI:
     """Compose a fail-closed service from validated startup coordinates."""
 
@@ -152,6 +160,8 @@ def create_runtime_service_app(
     coordinator_root_creation_relay = None
     api_canary_client = None
     coordinator_canary_relay = None
+    api_epoch_revocation_client = None
+    coordinator_epoch_revocation_relay = None
     capability_issuance_service = None
     receipt_authority_service = None
     receipt_authority_authentication_policy = None
@@ -247,6 +257,18 @@ def create_runtime_service_app(
             ),
             authentication_policy=policy,
             transport=selected_transport,
+        )
+        api_epoch_revocation_client = ApiEpochRevocationClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+            attempt_id_factory=revocation_attempt_id_factory,
         )
     elif role is ServiceRole.ISSUER:
         from controlgraph_canary.integrations.google.firestore import (
@@ -507,6 +529,16 @@ def create_runtime_service_app(
             operator_policy=_operator_api_policy(settings),
             creator=creator,
         )
+        coordinator_epoch_revocation_relay = CoordinatorEpochRevocationRelay(
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            revoker=EpochRevoker(
+                store=cast(EpochRevocationStore, selected_store),
+                evidence_client=coordinator_clients.evidence,
+                operator_policy=_operator_api_policy(settings),
+                clock=revocation_clock,
+            ),
+        )
         capability_client = CoordinatorCapabilityClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -571,6 +603,10 @@ def create_runtime_service_app(
         raise ValueError("authority-store dependencies are role-limited")
     if root_creation_clock is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("root-creation clocks are coordinator-limited")
+    if revocation_clock is not None and role is not ServiceRole.COORDINATOR:
+        raise ValueError("revocation clocks are coordinator-limited")
+    if revocation_attempt_id_factory is not None and role is not ServiceRole.API:
+        raise ValueError("revocation attempt identities are API-limited")
     if capability_issuance_clock is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability-issuance clocks are issuer-limited")
     if (canary_clock is not None or task_enqueuer is not None) and role is not (
@@ -596,6 +632,8 @@ def create_runtime_service_app(
         coordinator_root_creation_relay=coordinator_root_creation_relay,
         api_canary_client=api_canary_client,
         coordinator_canary_relay=coordinator_canary_relay,
+        api_epoch_revocation_client=api_epoch_revocation_client,
+        coordinator_epoch_revocation_relay=coordinator_epoch_revocation_relay,
         capability_issuance_service=capability_issuance_service,
         receipt_authority_service=receipt_authority_service,
         receipt_authority_authentication_policy=(
@@ -613,6 +651,12 @@ def create_runtime_service_app(
         app.state.controlgraph_canary_client = api_canary_client
     if coordinator_canary_relay is not None:
         app.state.controlgraph_canary_relay = coordinator_canary_relay
+    if api_epoch_revocation_client is not None:
+        app.state.controlgraph_epoch_revocation_client = api_epoch_revocation_client
+    if coordinator_epoch_revocation_relay is not None:
+        app.state.controlgraph_epoch_revocation_relay = (
+            coordinator_epoch_revocation_relay
+        )
     if capability_issuance_service is not None:
         app.state.controlgraph_capability_issuance = capability_issuance_service
     if receipt_authority_service is not None:
