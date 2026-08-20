@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
+from threading import Lock
 from typing import Protocol, cast
 
 from google.api_core.exceptions import AlreadyExists
@@ -28,16 +29,20 @@ class CloudTasksCreateClient(Protocol):
 class GoogleCloudTasksEnqueuer:
     """Submit one sealed HTTP task without application retries or redirects."""
 
-    def __init__(self, client: CloudTasksCreateClient, addressor: TaskAddressor) -> None:
+    def __init__(
+        self,
+        client: CloudTasksCreateClient | None,
+        addressor: TaskAddressor,
+    ) -> None:
         self._client = client
         self._addressor = addressor
+        self._client_lock = Lock()
 
     @classmethod
     def from_default_credentials(cls, addressor: TaskAddressor) -> GoogleCloudTasksEnqueuer:
         """Construct the runtime client without exposing credential material."""
 
-        client = cast(CloudTasksCreateClient, tasks_v2.CloudTasksClient())
-        return cls(client, addressor)
+        return cls(None, addressor)
 
     def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
         self._addressor.validate_seal(task, now=now)
@@ -60,7 +65,7 @@ class GoogleCloudTasksEnqueuer:
             },
         }
         try:
-            response = self._client.create_task(request=provider_request)
+            response = self._get_client().create_task(request=provider_request)
             response_name = getattr(response, "name", None)
         except AlreadyExists:
             return TaskEnqueueResult(
@@ -81,6 +86,17 @@ class GoogleCloudTasksEnqueuer:
             task_name=task.name,
             disposition=TaskEnqueueDisposition.CREATED,
         )
+
+    def _get_client(self) -> CloudTasksCreateClient:
+        client = self._client
+        if client is not None:
+            return client
+        with self._client_lock:
+            client = self._client
+            if client is None:
+                client = cast(CloudTasksCreateClient, tasks_v2.CloudTasksClient())
+                self._client = client
+        return client
 
 
 __all__ = ["CloudTasksCreateClient", "GoogleCloudTasksEnqueuer"]

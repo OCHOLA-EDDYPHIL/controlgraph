@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Sequence
+from threading import Lock
 from typing import Protocol, cast
 
 from controlgraph_canary.application.identity import ServiceRole
@@ -256,7 +257,8 @@ class GoogleKmsDigestSigner:
         if type(profile) is not SigningProfile:
             raise _error(SigningErrorCode.PROFILE_INVALID, "KMS profile is invalid")
         self._profile = profile
-        self._client = _default_client() if client is None else cast(_KmsClient, client)
+        self._client = None if client is None else cast(_KmsClient, client)
+        self._client_lock = Lock()
 
     @property
     def profile(self) -> SigningProfile:
@@ -265,7 +267,8 @@ class GoogleKmsDigestSigner:
     def sign_digest(self, digest: bytes) -> bytes:
         if type(digest) is not bytes or len(digest) != 32:
             raise _error(SigningErrorCode.DIGEST_MISMATCH, "signing digest must be SHA-256")
-        _load_version(self._client, self._profile, permit_disabled=False)
+        client = self._get_client()
+        _load_version(client, self._profile, permit_disabled=False)
         digest_crc32c = _crc32c(digest)
         request: dict[str, object] = {
             "name": self._profile.key_version,
@@ -273,7 +276,7 @@ class GoogleKmsDigestSigner:
             "digest_crc32c": digest_crc32c,
         }
         try:
-            raw_response = self._client.asymmetric_sign(request)
+            raw_response = client.asymmetric_sign(request)
             response = cast(_SignResponse, raw_response)
             response_name = response.name
             signature = response.signature
@@ -295,6 +298,17 @@ class GoogleKmsDigestSigner:
         if type(signature_crc32c) is not int or signature_crc32c != _crc32c(signature):
             raise _error(SigningErrorCode.CRC_MISMATCH, "KMS signature CRC32C is invalid")
         return signature
+
+    def _get_client(self) -> _KmsClient:
+        client = self._client
+        if client is not None:
+            return client
+        with self._client_lock:
+            client = self._client
+            if client is None:
+                client = _default_client()
+                self._client = client
+        return client
 
 
 class GoogleKmsAsyncDigestSigner:

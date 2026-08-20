@@ -446,6 +446,30 @@ def test_create_task_timeout_is_explicitly_ambiguous_and_not_retried() -> None:
     )
 
 
+def test_default_task_client_is_deferred_and_unavailable_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def unavailable_client() -> object:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("synthetic credentials detail")
+
+    monkeypatch.setattr(tasks_v2, "CloudTasksClient", unavailable_client)
+    addressor = TaskAddressor(delivery_settings())
+    enqueuer = GoogleCloudTasksEnqueuer.from_default_credentials(addressor)
+
+    assert calls == 0
+    result = TaskDispatcher(addressor, enqueuer).dispatch(
+        task_request(),
+        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+    )
+
+    assert calls == 1
+    assert result.disposition is TaskEnqueueDisposition.AMBIGUOUS
+
+
 def test_unexpected_provider_response_is_ambiguous_and_not_retried() -> None:
     client = _UnexpectedResponseClient()
     addressor = TaskAddressor(delivery_settings())

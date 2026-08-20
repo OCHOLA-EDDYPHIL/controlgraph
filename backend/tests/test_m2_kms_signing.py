@@ -820,6 +820,31 @@ def test_kms_signer_sends_and_verifies_crc32c_without_key_selection_inputs() -> 
     assert set(fake.sign_requests[0]) == {"name", "digest", "digest_crc32c"}
 
 
+def test_kms_signer_defers_default_credentials_until_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = SigningProfile.capability(PROJECT_ID, CAPABILITY_V1)
+    calls = 0
+
+    def unavailable_client() -> object:
+        nonlocal calls
+        calls += 1
+        raise SigningError(SigningErrorCode.PROVIDER_FAILURE, "unavailable")
+
+    monkeypatch.setattr(
+        "controlgraph_canary.integrations.google.kms._default_client",
+        unavailable_client,
+    )
+
+    signer = GoogleKmsDigestSigner(profile)
+
+    assert calls == 0
+    with pytest.raises(SigningError) as failure:
+        signer.sign_digest(b"d" * 32)
+    assert failure.value.code is SigningErrorCode.PROVIDER_FAILURE
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("mutate", "code"),
     [
