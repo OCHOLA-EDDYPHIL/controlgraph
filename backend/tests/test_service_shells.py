@@ -99,6 +99,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
                 ),
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
+                "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL": (
+                    f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT": SUBJECT,
             }
         )
     if role is ServiceRole.ISSUER:
@@ -174,6 +178,15 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE": (
                     f"projects/{PROJECT_ID}/regions/us-central1/"
                     "subnetworks/controlgraph"
+                ),
+                "CONTROLGRAPH_EVIDENCE_WRITER_URL": (
+                    "https://controlgraph-evidence-writer-"
+                    f"{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+                "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+                    f"projects/{PROJECT_ID}/locations/us-central1/"
+                    "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
+                    "cryptoKeyVersions/1"
                 ),
             }
         )
@@ -502,6 +515,15 @@ def test_runtime_limits_revocation_injected_dependencies_to_their_roles() -> Non
             ServiceRole.RECOVERY,
             environment=_environment(ServiceRole.RECOVERY),
             revocation_attempt_id_factory=lambda: "attempt-id",
+        )
+
+
+def test_service_claim_release_clock_is_coordinator_limited() -> None:
+    with pytest.raises(ValueError, match="service-claim release clocks"):
+        create_runtime_service_app(
+            ServiceRole.RECOVERY,
+            environment=_environment(ServiceRole.RECOVERY),
+            service_claim_release_clock=lambda: datetime.now(UTC),
         )
 
 

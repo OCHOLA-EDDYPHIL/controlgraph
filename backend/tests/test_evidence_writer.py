@@ -127,6 +127,10 @@ def _runtime_environment() -> dict[str, str]:
         "CONTROLGRAPH_ENVIRONMENT": "nonprod",
         "CONTROLGRAPH_EVIDENCE_KEY_VERSION": KEY_VERSION,
         "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
+        "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL": (
+            f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT": SUBJECT,
     }
 
 
@@ -230,6 +234,23 @@ def test_application_signs_with_exact_detached_signature_bindings() -> None:
     assert signed.payload_sha256 == evidence_payload_sha256(event)
     assert signed.signing_input_sha256 == evidence_signing_input_sha256(event, KEY_VERSION)
     assert backend.calls == [bytes.fromhex(signed.signing_input_sha256)]
+
+
+def test_generic_coordinator_route_cannot_sign_verifier_actor_provenance() -> None:
+    service, backend = _service()
+    event = _event().model_copy(
+        update={
+            "actor": (
+                f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
+            )
+        }
+    )
+
+    with pytest.raises(EvidenceSigningError) as failure:
+        _sign(service, event, _context())
+
+    assert failure.value.code is EvidenceSigningErrorCode.ACTOR_DENIED
+    assert backend.calls == []
 
 
 @pytest.mark.parametrize(
@@ -669,7 +690,12 @@ def test_async_kms_sanitizes_sign_stage_failures_and_propagates_cancellation() -
 
 @pytest.mark.parametrize(
     "missing",
-    ["CONTROLGRAPH_EVIDENCE_KEY_VERSION", "CONTROLGRAPH_SIGNING_ALGORITHM"],
+    [
+        "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+        "CONTROLGRAPH_SIGNING_ALGORITHM",
+        "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL",
+        "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT",
+    ],
 )
 def test_evidence_writer_settings_require_every_signing_binding(missing: str) -> None:
     environment = _runtime_environment()

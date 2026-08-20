@@ -142,7 +142,12 @@ class GoogleOneShotOidcTransport:
             or _PROJECT_ID.fullmatch(project_id) is None
             or "reconcile" in project_id
             or caller_role
-            not in {CallerRole.API, CallerRole.COORDINATOR, CallerRole.EXECUTOR}
+            not in {
+                CallerRole.API,
+                CallerRole.COORDINATOR,
+                CallerRole.EXECUTOR,
+                CallerRole.VERIFIER,
+            }
         ):
             raise InternalTransportError("internal transport configuration is invalid")
         self._project_id = project_id

@@ -19,6 +19,7 @@ from controlgraph_canary.application.candidate_revision import (
     CandidateValidationError,
 )
 from controlgraph_canary.application.identity import (
+    CLASSIFICATION_EVIDENCE_PATH,
     RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     CallerRole,
@@ -163,7 +164,8 @@ class CoordinatorInternalRoute:
             or not self._route_pair_is_valid()
             or (
                 self.override_path is not None
-                and self.override_path != RECEIPT_AUTHORITY_PATH
+                and self.override_path
+                not in {RECEIPT_AUTHORITY_PATH, CLASSIFICATION_EVIDENCE_PATH}
             )
             or (
                 self.override_path == RECEIPT_AUTHORITY_PATH
@@ -174,6 +176,16 @@ class CoordinatorInternalRoute:
                 (self.caller_role, self.service_role)
                 == (CallerRole.EXECUTOR, ServiceRole.COORDINATOR)
                 and self.override_path != RECEIPT_AUTHORITY_PATH
+            )
+            or (
+                self.override_path == CLASSIFICATION_EVIDENCE_PATH
+                and (self.caller_role, self.service_role)
+                != (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER)
+            )
+            or (
+                (self.caller_role, self.service_role)
+                == (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER)
+                and self.override_path != CLASSIFICATION_EVIDENCE_PATH
             )
         ):
             raise ValueError("coordinator internal route coordinates are invalid")
@@ -205,6 +217,7 @@ class CoordinatorInternalRoute:
             (CallerRole.COORDINATOR, ServiceRole.VERIFIER),
             (CallerRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER),
             (CallerRole.EXECUTOR, ServiceRole.COORDINATOR),
+            (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER),
         }
 
     @property
@@ -449,6 +462,12 @@ class CoordinatorEvidenceClient:
         self._transport = transport
         self._signature_verifier = signature_verifier
 
+    @property
+    def evidence_key_version(self) -> str:
+        """Return the exact evidence key version independently verified."""
+
+        return self._evidence_key_version
+
     async def sign(self, event: EvidenceEvent) -> SignedEvidenceEventV1:
         """Return evidence only after exact response and ECDSA verification."""
 
@@ -474,13 +493,25 @@ class CoordinatorEvidenceClient:
             raise RootTrustClientError(RootTrustClientErrorCode.RESPONSE_INVALID) from None
         if signed.event != event or signed.signing_key_version != self._evidence_key_version:
             raise RootTrustClientError(RootTrustClientErrorCode.EVIDENCE_INVALID)
+        await self.verify(signed)
+        return signed
+
+    async def verify(self, signed: SignedEvidenceEventV1) -> None:
+        """Independently verify one stored evidence envelope and exact key."""
+
+        if (
+            type(signed) is not SignedEvidenceEventV1
+            or signed.signing_key_version != self._evidence_key_version
+            or signed.event.target.project_id != self._route.project_id
+            or not _target_is_exact(signed.event.target)
+        ):
+            raise RootTrustClientError(RootTrustClientErrorCode.EVIDENCE_INVALID)
         try:
             await self._signature_verifier.verify(signed)
         except asyncio.CancelledError:
             raise
         except Exception:
             raise RootTrustClientError(RootTrustClientErrorCode.EVIDENCE_INVALID) from None
-        return signed
 
 
 def _candidate_contract(

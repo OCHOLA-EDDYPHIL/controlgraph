@@ -30,6 +30,7 @@ from controlgraph_canary.application.cloud_run import CloudRunTargetConfiguratio
 from controlgraph_canary.application.evidence_signing import EvidenceSigningService
 from controlgraph_canary.application.execution import FinalMutationGate
 from controlgraph_canary.application.identity import (
+    CLASSIFICATION_EVIDENCE_PATH,
     RECEIPT_AUTHORITY_PATH,
     CallerBinding,
     CallerRole,
@@ -66,6 +67,22 @@ from controlgraph_canary.application.root_trust import (
     CoordinatorRootPreflightClient,
     RootPreflightService,
 )
+from controlgraph_canary.application.service_claim_classification import (
+    CoordinatorServiceClaimClassificationClient,
+    ServiceClaimClassificationService,
+)
+from controlgraph_canary.application.service_claim_classification_signing import (
+    ClassificationEvidenceSigningService,
+    VerifierClassificationEvidenceClient,
+)
+from controlgraph_canary.application.service_claim_release import ServiceClaimReleaser
+from controlgraph_canary.application.service_claim_release_relay import (
+    ApiServiceClaimReleaseClient,
+    CoordinatorServiceClaimReleaseRelay,
+)
+from controlgraph_canary.application.service_claim_release_store import (
+    ServiceClaimReleaseStore,
+)
 from controlgraph_canary.application.signing import (
     AsyncPurposeSealedSigner,
     PurposeSealedSigner,
@@ -80,6 +97,9 @@ from controlgraph_canary.application.tasks import (
 from controlgraph_canary.contracts.models import TargetBinding
 from controlgraph_canary.contracts.root_creation import RolloutHealthPolicyV1
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
+from controlgraph_canary.contracts.service_claim_release import (
+    ServiceClaimClassificationRequestV1,
+)
 from controlgraph_canary.http.receipt import create_receipt_task_handler
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.integrations.google.identity import (
@@ -124,11 +144,13 @@ def create_runtime_service_app(
     kms_client: object | None = None,
     internal_transport: CanonicalInternalTransport | None = None,
     preflight_clock: Callable[[], datetime] | None = None,
+    classification_clock: Callable[[], datetime] | None = None,
     services_client_factory: ServicesClientFactory | None = None,
     revisions_client_factory: RevisionsClientFactory | None = None,
     readback_services_client_factory: ReadOnlyServicesClientFactory | None = None,
     authority_store: AuthorityStore | None = None,
     root_creation_clock: Callable[[], datetime] | None = None,
+    service_claim_release_clock: Callable[[], datetime] | None = None,
     capability_issuance_clock: Callable[[], datetime] | None = None,
     canary_clock: Callable[[], datetime] | None = None,
     task_enqueuer: TaskEnqueuer | None = None,
@@ -154,10 +176,16 @@ def create_runtime_service_app(
     policy = runtime_route_policy(role, source)
     authenticator = GoogleIdentityVerifier(verifier=token_verifier, clock=clock)
     evidence_signing_service = None
+    classification_evidence_signing_service = None
+    classification_evidence_authentication_policy = None
     root_preflight_service = None
+    service_claim_classification_service = None
     coordinator_clients = None
     api_root_creation_client = None
     coordinator_root_creation_relay = None
+    service_claim_releaser = None
+    api_service_claim_release_client = None
+    coordinator_service_claim_release_relay = None
     api_canary_client = None
     coordinator_canary_relay = None
     api_epoch_revocation_client = None
@@ -173,12 +201,25 @@ def create_runtime_service_app(
         profile = SigningProfile.evidence(settings.project_id, settings.evidence_key_version)
         if settings.signing_algorithm != profile.algorithm:
             raise ValueError("evidence-writer signing algorithm is invalid")
+        evidence_signer = AsyncPurposeSealedSigner(
+            GoogleKmsAsyncDigestSigner(profile, client=kms_client)
+        )
         evidence_signing_service = EvidenceSigningService(
             project_id=settings.project_id,
             authentication_policy=policy,
-            signer=AsyncPurposeSealedSigner(
-                GoogleKmsAsyncDigestSigner(profile, client=kms_client)
-            ),
+            signer=evidence_signer,
+        )
+        classification_evidence_authentication_policy = (
+            _classification_evidence_policy(settings)
+        )
+        classification_evidence_signing_service = (
+            ClassificationEvidenceSigningService(
+                project_id=settings.project_id,
+                authentication_policy=(
+                    classification_evidence_authentication_policy
+                ),
+                signer=evidence_signer,
+            )
         )
     elif role is ServiceRole.VERIFIER:
         from controlgraph_canary.integrations.google.cloud_run import (
@@ -188,6 +229,8 @@ def create_runtime_service_app(
         if (
             settings.target_network_resource is None
             or settings.target_subnetwork_resource is None
+            or settings.evidence_writer_url is None
+            or settings.evidence_key_version is None
         ):
             raise ValueError("verifier preflight configuration is incomplete")
         target_network_resource = settings.target_network_resource
@@ -224,6 +267,51 @@ def create_runtime_service_app(
             authentication_policy=policy,
             reader_factory=reader_factory,
             clock=preflight_clock,
+        )
+        selected_transport = (
+            internal_transport
+            if internal_transport is not None
+            else GoogleOneShotOidcTransport(
+                project_id=settings.project_id,
+                caller_role=CallerRole.VERIFIER,
+            )
+        )
+
+        def classification_reader_factory(
+            request: ServiceClaimClassificationRequestV1,
+        ) -> CloudRunV2SnapshotReader:
+            return CloudRunV2SnapshotReader(
+                configuration=CloudRunTargetConfiguration(
+                    target=target,
+                    stable_revision=request.stable_revision,
+                    candidate_revision=request.candidate_revision,
+                    stable_concurrency=request.concurrency,
+                    candidate_concurrency=request.concurrency,
+                    network_resource=target_network_resource,
+                    subnetwork_resource=target_subnetwork_resource,
+                ),
+                service_role=ServiceRole.VERIFIER,
+                configured_project_id=settings.project_id,
+                services_client_factory=services_client_factory,
+                revisions_client_factory=revisions_client_factory,
+            )
+
+        service_claim_classification_service = ServiceClaimClassificationService(
+            authentication_policy=policy,
+            reader_factory=classification_reader_factory,
+            evidence_client=VerifierClassificationEvidenceClient(
+                route=CoordinatorInternalRoute(
+                    project_id=settings.project_id,
+                    project_number=settings.project_number,
+                    caller_role=CallerRole.VERIFIER,
+                    service_role=ServiceRole.EVIDENCE_WRITER,
+                    audience=settings.evidence_writer_url,
+                    override_path=CLASSIFICATION_EVIDENCE_PATH,
+                ),
+                evidence_key_version=settings.evidence_key_version,
+                transport=selected_transport,
+            ),
+            clock=classification_clock,
         )
     elif role is ServiceRole.API:
         if settings.coordinator_url is None:
@@ -269,6 +357,17 @@ def create_runtime_service_app(
             authentication_policy=policy,
             transport=selected_transport,
             attempt_id_factory=revocation_attempt_id_factory,
+        )
+        api_service_claim_release_client = ApiServiceClaimReleaseClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
         )
     elif role is ServiceRole.ISSUER:
         from controlgraph_canary.integrations.google.firestore import (
@@ -448,6 +547,12 @@ def create_runtime_service_app(
             service_role=ServiceRole.EVIDENCE_WRITER,
             audience=settings.evidence_writer_url,
         )
+        evidence_signature_verifier = GoogleKmsEvidenceSignatureVerifier(
+            project_id=settings.project_id,
+            service_role=ServiceRole.COORDINATOR,
+            key_version=settings.evidence_key_version,
+            client=kms_client,
+        )
         coordinator_clients = CoordinatorTrustClients(
             preflight=CoordinatorRootPreflightClient(
                 route=verifier_route,
@@ -457,12 +562,7 @@ def create_runtime_service_app(
                 route=evidence_route,
                 evidence_key_version=settings.evidence_key_version,
                 transport=selected_transport,
-                signature_verifier=GoogleKmsEvidenceSignatureVerifier(
-                    project_id=settings.project_id,
-                    service_role=ServiceRole.COORDINATOR,
-                    key_version=settings.evidence_key_version,
-                    client=kms_client,
-                ),
+                signature_verifier=evidence_signature_verifier,
             ),
         )
         target = TargetBinding(
@@ -479,6 +579,18 @@ def create_runtime_service_app(
                 target=target,
                 configured_project_id=settings.project_id,
             )
+        )
+        service_claim_releaser = ServiceClaimReleaser(
+            store=cast(ServiceClaimReleaseStore, selected_store),
+            evidence_client=coordinator_clients.evidence,
+            classification_client=CoordinatorServiceClaimClassificationClient(
+                route=verifier_route,
+                transport=selected_transport,
+                evidence_key_version=settings.evidence_key_version,
+                signature_verifier=evidence_signature_verifier,
+            ),
+            operator_policy=_operator_api_policy(settings),
+            clock=service_claim_release_clock,
         )
         receipt_authority_service = ReceiptAuthorityService(selected_store)
         receipt_authority_authentication_policy = _receipt_authority_policy(
@@ -539,6 +651,13 @@ def create_runtime_service_app(
                 clock=revocation_clock,
             ),
         )
+        coordinator_service_claim_release_relay = (
+            CoordinatorServiceClaimReleaseRelay(
+                authentication_policy=policy,
+                operator_policy=_operator_api_policy(settings),
+                releaser=service_claim_releaser,
+            )
+        )
         capability_client = CoordinatorCapabilityClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -582,10 +701,13 @@ def create_runtime_service_app(
         ServiceRole.API,
         ServiceRole.COORDINATOR,
         ServiceRole.EXECUTOR,
+        ServiceRole.VERIFIER,
     } and internal_transport is not None:
         raise ValueError("internal service transport is role-limited")
     if preflight_clock is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("Cloud Run preflight clocks are verifier-limited")
+    if classification_clock is not None and role is not ServiceRole.VERIFIER:
+        raise ValueError("claim-classification clocks are verifier-limited")
     if (
         services_client_factory is not None or revisions_client_factory is not None
     ) and role not in {ServiceRole.VERIFIER, ServiceRole.EXECUTOR}:
@@ -607,6 +729,11 @@ def create_runtime_service_app(
         raise ValueError("revocation clocks are coordinator-limited")
     if revocation_attempt_id_factory is not None and role is not ServiceRole.API:
         raise ValueError("revocation attempt identities are API-limited")
+    if (
+        service_claim_release_clock is not None
+        and role is not ServiceRole.COORDINATOR
+    ):
+        raise ValueError("service-claim release clocks are coordinator-limited")
     if capability_issuance_clock is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability-issuance clocks are issuer-limited")
     if (canary_clock is not None or task_enqueuer is not None) and role is not (
@@ -627,13 +754,26 @@ def create_runtime_service_app(
         capability_verifier=capability_verifier,
         verified_task_handler=verified_task_handler,
         evidence_signing_service=evidence_signing_service,
+        classification_evidence_signing_service=(
+            classification_evidence_signing_service
+        ),
+        classification_evidence_authentication_policy=(
+            classification_evidence_authentication_policy
+        ),
         root_preflight_service=root_preflight_service,
+        service_claim_classification_service=(
+            service_claim_classification_service
+        ),
         api_root_creation_client=api_root_creation_client,
         coordinator_root_creation_relay=coordinator_root_creation_relay,
         api_canary_client=api_canary_client,
         coordinator_canary_relay=coordinator_canary_relay,
         api_epoch_revocation_client=api_epoch_revocation_client,
         coordinator_epoch_revocation_relay=coordinator_epoch_revocation_relay,
+        api_service_claim_release_client=api_service_claim_release_client,
+        coordinator_service_claim_release_relay=(
+            coordinator_service_claim_release_relay
+        ),
         capability_issuance_service=capability_issuance_service,
         receipt_authority_service=receipt_authority_service,
         receipt_authority_authentication_policy=(
@@ -647,6 +787,24 @@ def create_runtime_service_app(
         app.state.controlgraph_root_creation_client = api_root_creation_client
     if coordinator_root_creation_relay is not None:
         app.state.controlgraph_root_creation_relay = coordinator_root_creation_relay
+    if service_claim_releaser is not None:
+        app.state.controlgraph_service_claim_releaser = service_claim_releaser
+    if api_service_claim_release_client is not None:
+        app.state.controlgraph_service_claim_release_client = (
+            api_service_claim_release_client
+        )
+    if coordinator_service_claim_release_relay is not None:
+        app.state.controlgraph_service_claim_release_relay = (
+            coordinator_service_claim_release_relay
+        )
+    if service_claim_classification_service is not None:
+        app.state.controlgraph_service_claim_classification = (
+            service_claim_classification_service
+        )
+    if classification_evidence_signing_service is not None:
+        app.state.controlgraph_classification_evidence_signing = (
+            classification_evidence_signing_service
+        )
     if api_canary_client is not None:
         app.state.controlgraph_canary_client = api_canary_client
     if coordinator_canary_relay is not None:
@@ -720,6 +878,31 @@ def _receipt_authority_policy(
             role=CallerRole.EXECUTOR,
             email=settings.receipt_authority_caller_identity,
             subject=settings.receipt_authority_caller_subject,
+        ),
+    )
+
+
+def _classification_evidence_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    if (
+        settings.classification_evidence_caller_identity is None
+        or settings.classification_evidence_caller_subject is None
+    ):
+        raise ValueError("classification evidence policy is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.EVIDENCE_WRITER,
+        path=CLASSIFICATION_EVIDENCE_PATH,
+        audience=_service_audience(
+            ServiceRole.EVIDENCE_WRITER,
+            settings.project_number,
+        ),
+        caller=CallerBinding(
+            role=CallerRole.VERIFIER,
+            email=settings.classification_evidence_caller_identity,
+            subject=settings.classification_evidence_caller_subject,
         ),
     )
 

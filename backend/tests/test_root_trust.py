@@ -45,6 +45,7 @@ from controlgraph_canary.application.root_trust import (
     RootTrustClientError,
     RootTrustClientErrorCode,
 )
+from controlgraph_canary.application.service_claim_release import ServiceClaimReleaser
 from controlgraph_canary.application.signing import (
     SigningProfile,
     build_signing_input,
@@ -807,7 +808,7 @@ class _UnusedTaskEnqueuer:
         raise AssertionError("settings composition must not enqueue a task")
 
 
-def test_coordinator_settings_and_runtime_compose_only_exact_trust_clients() -> None:
+def test_coordinator_runtime_composes_a_credential_lazy_exact_release_gate() -> None:
     environment = _coordinator_environment()
     settings = ControllerSettings.from_environment(environment)
     assert settings.verifier_url == VERIFIER_AUDIENCE
@@ -827,6 +828,11 @@ def test_coordinator_settings_and_runtime_compose_only_exact_trust_clients() -> 
         app.state.controlgraph_root_creation_relay,
         CoordinatorRootCreationRelay,
     )
+    releaser = app.state.controlgraph_service_claim_releaser
+    assert isinstance(releaser, ServiceClaimReleaser)
+    assert releaser.target == _target()
+    assert releaser.evidence_key_version == EVIDENCE_KEY_VERSION
+    assert not any("release" in route.path for route in app.routes)
 
     substituted = dict(environment)
     substituted["CONTROLGRAPH_VERIFIER_URL"] = EVIDENCE_AUDIENCE

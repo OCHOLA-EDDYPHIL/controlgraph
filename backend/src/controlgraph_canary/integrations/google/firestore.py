@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Final, Protocol, Self, cast
+from typing import Any, Final, Literal, Protocol, Self, cast
 from uuid import uuid4
 
 from google.api_core import exceptions as api_exceptions
@@ -45,6 +45,11 @@ from controlgraph_canary.application.revocation_store import (
     EpochRevocationState,
     EpochRevocationWriteResult,
 )
+from controlgraph_canary.application.service_claim_release_store import (
+    ServiceClaimFenceWriteResult,
+    ServiceClaimFinalizeWriteResult,
+    ServiceClaimReleaseState,
+)
 from controlgraph_canary.authority.replay import MutationBinding
 from controlgraph_canary.contracts.base import StrictContractModel
 from controlgraph_canary.contracts.codec import (
@@ -54,6 +59,7 @@ from controlgraph_canary.contracts.codec import (
 )
 from controlgraph_canary.contracts.evidence import EvidenceChainHeadV1
 from controlgraph_canary.contracts.models import (
+    CapabilityAction,
     EpochAuthorityRecord,
     EpochChangeCause,
     EvidenceKind,
@@ -78,12 +84,25 @@ from controlgraph_canary.contracts.root_creation import (
     SignedEvidenceEventV1,
     capability_lineage_anchor,
 )
+from controlgraph_canary.contracts.service_claim_release import (
+    ServiceClaimReleaseFenceCommitV1,
+    ServiceClaimReleaseFinalizeCommitV1,
+    ServiceClaimReleaseIdentityKind,
+    ServiceClaimReleaseIdentityV1,
+    ServiceClaimReleaseInvocationV1,
+    ServiceClaimReleaseProgressV1,
+    ServiceClaimReleaseResultV1,
+    service_claim_release_evidence_id,
+    service_claim_release_request_sha256,
+)
 from controlgraph_canary.contracts.storage import (
     AUTHORITY_STORAGE_DOCUMENT_V1,
     AuthorityStorageDocument,
     AuthorityStorageKind,
     ServiceClaimRecord,
     ServiceClaimStatus,
+    ServiceClaimTargetClassification,
+    ServiceClaimTerminalRootState,
     active_service_claim_matches_root,
     active_service_claim_matches_root_v2,
     capability_lineage_anchor_document_id,
@@ -102,6 +121,10 @@ from controlgraph_canary.contracts.storage import (
     service_claim_document_id,
     service_claim_logical_id,
     service_claim_matches_root_v2,
+    service_claim_release_identity_document_id,
+    service_claim_release_identity_logical_id,
+    service_claim_release_progress_document_id,
+    service_claim_release_result_document_id,
     signed_evidence_event_document_id,
 )
 
@@ -785,9 +808,635 @@ def _validate_claim_release(
         or authority.current_epoch != current.release_fence_epoch
         or authority.revision != current.release_fence_authority_revision
         or expected_authority.revision != authority.revision
+        or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+        or authority.changed_by != current.release_fenced_by
+        or authority.request_id != current.release_fence_request_id
+        or authority.evidence_id != current.release_fence_evidence_id
         or authority.changed_at != current.release_fenced_at
     ):
         raise ValueError("service claim replacement is not an exact fenced release")
+
+
+def _terminal_receipt_release_mapping(
+    receipt: ExecutionReceipt,
+    claim: ServiceClaimRecord,
+) -> tuple[
+    ServiceClaimTerminalRootState,
+    ServiceClaimTargetClassification,
+    str,
+]:
+    if receipt.action is CapabilityAction.PROMOTE_CANDIDATE:
+        return (
+            ServiceClaimTerminalRootState.PROMOTED,
+            ServiceClaimTargetClassification.CANDIDATE_PROMOTED,
+            claim.candidate_target_configuration_sha256,
+        )
+    if receipt.action is CapabilityAction.RECOVER_STABLE:
+        return (
+            ServiceClaimTerminalRootState.RECOVERED,
+            ServiceClaimTargetClassification.STABLE_RESTORED,
+            claim.stable_target_configuration_sha256,
+        )
+    raise ValueError("terminal receipt action cannot release a service claim")
+
+
+def _validate_service_claim_fence_commit(
+    configured_target: TargetBinding,
+    expected: ServiceClaimReleaseState,
+    commit: ServiceClaimReleaseFenceCommitV1,
+) -> None:
+    if (
+        type(expected) is not ServiceClaimReleaseState
+        or type(commit) is not ServiceClaimReleaseFenceCommitV1
+        or expected.root_bundle is None
+        or type(expected.root_bundle) is not RootCreationBundle
+        or expected.terminal_receipt is None
+        or type(expected.terminal_receipt) is not StoredRecord
+        or type(expected.terminal_receipt.value) is not ExecutionReceipt
+        or any(
+            value is not None
+            for value in (
+                expected.request_identity,
+                expected.idempotency_identity,
+                expected.progress,
+                expected.result,
+                expected.terminal_evidence,
+                expected.fence_evidence,
+                expected.classification_evidence,
+                expected.release_evidence,
+            )
+        )
+    ):
+        raise ValueError("service claim fence state is not pristine")
+    bundle = expected.root_bundle
+    _validate_read_root_creation_bundle(configured_target, bundle)
+    _validate_claim_fence_authority(
+        configured_target,
+        bundle.service_claim,
+        commit.replacement_claim,
+        bundle.authority,
+        commit.replacement_authority,
+    )
+    previous_head = current_evidence_chain_head(
+        bundle,
+        target=configured_target,
+        stored_head=expected.chain_head,
+        head_evidence=expected.head_evidence,
+    )
+    terminal = commit.terminal_evidence
+    fence = commit.fence_evidence
+    terminal_event = terminal.event
+    fence_event = fence.event
+    progress = commit.progress
+    request_sha256 = service_claim_release_request_sha256(expected.invocation)
+    invocation = expected.invocation
+    command = expected.invocation.command
+    receipt_record = expected.terminal_receipt
+    receipt = receipt_record.value
+    root = bundle.root.value
+    claim = bundle.service_claim.value
+    authority = bundle.authority.value
+    terminal_state, _, target_configuration_sha256 = (
+        _terminal_receipt_release_mapping(receipt, claim)
+    )
+    terminal_subject = commit.terminal_subject
+    terminal_proof = commit.replacement_claim.terminal_root_proof
+    fence_subject = commit.fence_subject
+    replacement_authority = commit.replacement_authority
+    replacement_claim = commit.replacement_claim
+    if terminal_proof is None:
+        raise ValueError("service claim fence lacks terminal proof")
+    if (
+        root.content.target != configured_target
+        or root.root_id != command.root_id
+        or root.root_sha256 != command.expected_root_sha256
+        or claim.target != configured_target
+        or claim.root_id != root.root_id
+        or claim.root_sha256 != root.root_sha256
+        or authority.target != configured_target
+        or authority.root_id != root.root_id
+        or authority.root_sha256 != root.root_sha256
+        or authority.current_epoch != command.expected_epoch
+        or receipt_record.revision < 1
+        or receipt.receipt_id
+        != execution_receipt_logical_id(
+            configured_target,
+            command.terminal_receipt_idempotency_key,
+        )
+        or receipt.idempotency_key != command.terminal_receipt_idempotency_key
+        or receipt.target != configured_target
+        or receipt.root_id != root.root_id
+        or receipt.root_sha256 != root.root_sha256
+        or receipt.outcome is not ReceiptOutcome.VERIFIED
+        or receipt.reason_code is not None
+        or receipt.observed_etag is None
+        or receipt.expected_poststate_sha256 != target_configuration_sha256
+        or receipt.epoch > authority.current_epoch
+        or receipt.updated_at > progress.fenced_at
+        or previous_head.updated_at > progress.fenced_at
+        or replacement_authority.changed_by != invocation.operator_identity
+        or replacement_authority.request_id != command.request_id
+        or replacement_authority.evidence_id != fence_event.evidence_id
+        or replacement_authority.changed_at != progress.fenced_at
+        or replacement_claim.release_fenced_by != invocation.operator_identity
+        or replacement_claim.release_fence_request_id != command.request_id
+        or replacement_claim.release_fence_evidence_id != fence_event.evidence_id
+        or replacement_claim.release_fenced_at != progress.fenced_at
+        or terminal_subject.target != configured_target
+        or terminal_subject.root_id != root.root_id
+        or terminal_subject.root_sha256 != root.root_sha256
+        or terminal_subject.state is not terminal_state
+        or terminal_subject.target_configuration_sha256
+        != target_configuration_sha256
+        or terminal_subject.receipt_id != receipt.receipt_id
+        or terminal_subject.receipt_sha256 != canonical_sha256(receipt)
+        or terminal_subject.receipt_revision != receipt_record.revision
+        or terminal_subject.receipt_epoch != receipt.epoch
+        or terminal_subject.receipt_action is not receipt.action
+        or terminal_subject.receipt_outcome is not ReceiptOutcome.VERIFIED
+        or terminal_subject.evidence_id != terminal_event.evidence_id
+        or terminal_subject.confirmed_by != "controlgraph.coordinator/v1"
+        or terminal_subject.confirmed_at != progress.fenced_at
+        or terminal_proof.target != terminal_subject.target
+        or terminal_proof.root_id != terminal_subject.root_id
+        or terminal_proof.root_sha256 != terminal_subject.root_sha256
+        or terminal_proof.state is not terminal_subject.state
+        or terminal_proof.target_configuration_sha256
+        != terminal_subject.target_configuration_sha256
+        or terminal_proof.evidence_id != terminal_event.evidence_id
+        or terminal_proof.evidence_sha256 != canonical_sha256(terminal)
+        or terminal_proof.confirmed_by != terminal_subject.confirmed_by
+        or terminal_proof.confirmed_at != terminal_subject.confirmed_at
+        or terminal_event.root_id != root.root_id
+        or terminal_event.root_sha256 != root.root_sha256
+        or terminal_event.target != configured_target
+        or terminal_event.epoch != receipt.epoch
+        or terminal_event.actor != "controlgraph.coordinator/v1"
+        or terminal_event.request_id != command.request_id
+        or terminal_event.occurred_at != progress.fenced_at
+        or terminal_event.reason_code is not None
+        or terminal_event.provider_operation is not None
+        or terminal_event.target_configuration_sha256
+        != target_configuration_sha256
+        or fence_subject.target != configured_target
+        or fence_subject.root_id != root.root_id
+        or fence_subject.root_sha256 != root.root_sha256
+        or fence_subject.request_sha256 != request_sha256
+        or fence_subject.request_id != command.request_id
+        or fence_subject.idempotency_key != command.idempotency_key
+        or fence_subject.operator_identity != invocation.operator_identity
+        or fence_subject.operator_subject != invocation.operator_subject
+        or fence_subject.terminal_evidence_id != terminal_event.evidence_id
+        or fence_subject.terminal_evidence_sha256 != canonical_sha256(terminal)
+        or fence_subject.previous_claim_sha256 != canonical_sha256(claim)
+        or fence_subject.replacement_claim_sha256
+        != canonical_sha256(replacement_claim)
+        or fence_subject.previous_authority_sha256 != canonical_sha256(authority)
+        or fence_subject.replacement_authority_sha256
+        != canonical_sha256(replacement_authority)
+        or fence_subject.previous_epoch != authority.current_epoch
+        or fence_subject.new_epoch != replacement_authority.current_epoch
+        or fence_subject.evidence_id != fence_event.evidence_id
+        or fence_subject.fenced_at != progress.fenced_at
+        or fence_event.root_id != root.root_id
+        or fence_event.root_sha256 != root.root_sha256
+        or fence_event.target != configured_target
+        or fence_event.actor != invocation.operator_identity
+        or fence_event.receipt_id is not None
+        or fence_event.occurred_at != progress.fenced_at
+        or fence_event.reason_code is not None
+        or fence_event.provider_operation is not None
+        or fence_event.target_configuration_sha256 is not None
+        or progress.request_sha256 != request_sha256
+        or progress.result_id != f"cgrelease:{request_sha256}"
+        or progress.request_id != command.request_id
+        or progress.idempotency_key != command.idempotency_key
+        or progress.root_id != root.root_id
+        or progress.root_sha256 != root.root_sha256
+        or progress.target != configured_target
+        or progress.terminal_receipt_id != receipt.receipt_id
+        or progress.terminal_receipt_sha256 != canonical_sha256(receipt)
+        or progress.terminal_evidence_sha256 != canonical_sha256(terminal)
+        or progress.fence_evidence_sha256 != canonical_sha256(fence)
+        or progress.terminal_subject != commit.terminal_subject
+        or progress.fence_subject != commit.fence_subject
+        or progress.terminal_evidence_id != terminal_event.evidence_id
+        or progress.fence_evidence_id != fence_event.evidence_id
+        or progress.fenced_epoch != replacement_authority.current_epoch
+        or progress.fenced_authority_revision != replacement_authority.revision
+        or progress.fenced_at != replacement_authority.changed_at
+        or terminal_event.evidence_id
+        != service_claim_release_evidence_id(request_sha256, "terminal")
+        or terminal_event.sequence != previous_head.sequence + 1
+        or terminal_event.previous_event_sha256 != previous_head.evidence_sha256
+        or terminal_event.subject_sha256 != canonical_sha256(commit.terminal_subject)
+        or terminal_event.kind is not EvidenceKind.TARGET_VERIFIED
+        or terminal_event.receipt_id != receipt.receipt_id
+        or fence_event.evidence_id
+        != service_claim_release_evidence_id(request_sha256, "fence")
+        or fence_event.sequence != terminal_event.sequence + 1
+        or fence_event.previous_event_sha256 != canonical_sha256(terminal)
+        or fence_event.subject_sha256 != canonical_sha256(commit.fence_subject)
+        or fence_event.kind is not EvidenceKind.EPOCH_ADVANCED
+        or fence_event.epoch != commit.replacement_authority.current_epoch
+        or fence_event.request_id != command.request_id
+        or commit.chain_head.root_id != fence_event.root_id
+        or commit.chain_head.root_sha256 != fence_event.root_sha256
+        or commit.chain_head.target != fence_event.target
+        or commit.chain_head.sequence != fence_event.sequence
+        or commit.chain_head.evidence_id != fence_event.evidence_id
+        or commit.chain_head.evidence_sha256 != canonical_sha256(fence)
+        or commit.chain_head.kind is not fence_event.kind
+        or commit.chain_head.epoch != fence_event.epoch
+        or commit.chain_head.updated_at != fence_event.occurred_at
+        or terminal.signing_key_version
+        != bundle.root.value.content.evidence_signing_key_version
+        or fence.signing_key_version
+        != bundle.root.value.content.evidence_signing_key_version
+        or commit.request_identity.identity_kind
+        is not ServiceClaimReleaseIdentityKind.REQUEST
+        or commit.request_identity.identity_value != command.request_id
+        or commit.idempotency_identity.identity_kind
+        is not ServiceClaimReleaseIdentityKind.IDEMPOTENCY
+        or commit.idempotency_identity.identity_value != command.idempotency_key
+        or commit.request_identity.request_sha256 != request_sha256
+        or commit.idempotency_identity.request_sha256 != request_sha256
+        or commit.request_identity.result_id != progress.result_id
+        or commit.idempotency_identity.result_id != progress.result_id
+        or commit.request_identity.root_id != root.root_id
+        or commit.idempotency_identity.root_id != root.root_id
+        or commit.request_identity.root_sha256 != root.root_sha256
+        or commit.idempotency_identity.root_sha256 != root.root_sha256
+        or commit.request_identity.claimed_at != progress.fenced_at
+        or commit.idempotency_identity.claimed_at != progress.fenced_at
+    ):
+        raise ValueError("service claim fence commit is not exactly bound")
+
+
+def _validate_service_claim_finalize_commit(
+    configured_target: TargetBinding,
+    expected: ServiceClaimReleaseState,
+    commit: ServiceClaimReleaseFinalizeCommitV1,
+) -> None:
+    if (
+        type(expected) is not ServiceClaimReleaseState
+        or type(commit) is not ServiceClaimReleaseFinalizeCommitV1
+        or expected.root_bundle is None
+        or type(expected.root_bundle) is not RootCreationBundle
+        or expected.terminal_receipt is None
+        or type(expected.terminal_receipt) is not StoredRecord
+        or type(expected.terminal_receipt.value) is not ExecutionReceipt
+        or expected.progress is None
+        or type(expected.progress) is not StoredRecord
+        or type(expected.progress.value) is not ServiceClaimReleaseProgressV1
+        or expected.request_identity is None
+        or type(expected.request_identity) is not StoredRecord
+        or type(expected.request_identity.value) is not ServiceClaimReleaseIdentityV1
+        or expected.idempotency_identity is None
+        or type(expected.idempotency_identity) is not StoredRecord
+        or type(expected.idempotency_identity.value)
+        is not ServiceClaimReleaseIdentityV1
+        or expected.terminal_evidence is None
+        or type(expected.terminal_evidence) is not StoredRecord
+        or type(expected.terminal_evidence.value) is not SignedEvidenceEventV1
+        or expected.fence_evidence is None
+        or type(expected.fence_evidence) is not StoredRecord
+        or type(expected.fence_evidence.value) is not SignedEvidenceEventV1
+        or expected.chain_head is None
+        or type(expected.chain_head) is not StoredRecord
+        or type(expected.chain_head.value) is not EvidenceChainHeadV1
+        or expected.head_evidence is None
+        or type(expected.head_evidence) is not StoredRecord
+        or type(expected.head_evidence.value) is not SignedEvidenceEventV1
+        or expected.result is not None
+        or expected.classification_evidence is not None
+        or expected.release_evidence is not None
+    ):
+        raise ValueError("service claim finalize state is incomplete")
+    bundle = expected.root_bundle
+    _validate_read_root_creation_bundle(configured_target, bundle)
+    _validate_claim_release(
+        configured_target,
+        bundle.service_claim,
+        commit.replacement_claim,
+        bundle.authority,
+    )
+    previous_head = current_evidence_chain_head(
+        bundle,
+        target=configured_target,
+        stored_head=expected.chain_head,
+        head_evidence=expected.head_evidence,
+    )
+    classification = commit.classification_evidence
+    release = commit.release_evidence
+    classification_event = classification.event
+    release_event = release.event
+    result = commit.result
+    progress = expected.progress.value
+    request_sha256 = service_claim_release_request_sha256(expected.invocation)
+    invocation = expected.invocation
+    command = invocation.command
+    root = bundle.root.value
+    claim = bundle.service_claim.value
+    authority = bundle.authority.value
+    terminal_receipt = expected.terminal_receipt.value
+    terminal_evidence = expected.terminal_evidence.value
+    fence_evidence = expected.fence_evidence.value
+    request_identity = expected.request_identity.value
+    idempotency_identity = expected.idempotency_identity.value
+    classification_subject = commit.classification_subject
+    release_subject = commit.release_subject
+    classification_proof = commit.replacement_claim.target_classification_proof
+    terminal_proof = claim.terminal_root_proof
+    expected_reader = (
+        f"controlgraph-verifier@{configured_target.project_id}.iam.gserviceaccount.com"
+    )
+    if classification_proof is None or terminal_proof is None:
+        raise ValueError("service claim release lacks verifier classification proof")
+    terminal_state, expected_classification, target_configuration_sha256 = (
+        _terminal_receipt_release_mapping(terminal_receipt, claim)
+    )
+    if (
+        root.content.target != configured_target
+        or root.root_id != command.root_id
+        or root.root_sha256 != command.expected_root_sha256
+        or claim.target != configured_target
+        or claim.root_id != root.root_id
+        or claim.root_sha256 != root.root_sha256
+        or authority.target != configured_target
+        or authority.root_id != root.root_id
+        or authority.root_sha256 != root.root_sha256
+        or authority.current_epoch != command.expected_epoch + 1
+        or progress.request_sha256 != request_sha256
+        or progress.result_id != f"cgrelease:{request_sha256}"
+        or progress.request_id != command.request_id
+        or progress.idempotency_key != command.idempotency_key
+        or progress.root_id != root.root_id
+        or progress.root_sha256 != root.root_sha256
+        or progress.target != configured_target
+        or progress.terminal_receipt_id != terminal_receipt.receipt_id
+        or progress.terminal_receipt_sha256 != canonical_sha256(terminal_receipt)
+        or progress.terminal_evidence_id
+        != terminal_evidence.event.evidence_id
+        or progress.terminal_evidence_sha256
+        != canonical_sha256(terminal_evidence)
+        or progress.fence_evidence_id != fence_evidence.event.evidence_id
+        or progress.fence_evidence_sha256 != canonical_sha256(fence_evidence)
+        or progress.fenced_epoch != authority.current_epoch
+        or progress.fenced_authority_revision != authority.revision
+        or progress.fenced_at != authority.changed_at
+        or terminal_receipt.receipt_id
+        != execution_receipt_logical_id(
+            configured_target,
+            command.terminal_receipt_idempotency_key,
+        )
+        or terminal_receipt.idempotency_key
+        != command.terminal_receipt_idempotency_key
+        or terminal_receipt.target != configured_target
+        or terminal_receipt.root_id != root.root_id
+        or terminal_receipt.root_sha256 != root.root_sha256
+        or terminal_receipt.outcome is not ReceiptOutcome.VERIFIED
+        or terminal_receipt.reason_code is not None
+        or terminal_receipt.observed_etag is None
+        or terminal_receipt.expected_poststate_sha256
+        != target_configuration_sha256
+        or terminal_receipt.epoch > command.expected_epoch
+        or terminal_state is not terminal_proof.state
+        or terminal_proof.target != configured_target
+        or terminal_proof.root_id != root.root_id
+        or terminal_proof.root_sha256 != root.root_sha256
+        or terminal_proof.target_configuration_sha256
+        != target_configuration_sha256
+        or terminal_proof.evidence_id != progress.terminal_evidence_id
+        or terminal_proof.evidence_sha256 != progress.terminal_evidence_sha256
+        or terminal_proof.confirmed_by != "controlgraph.coordinator/v1"
+        or terminal_proof.confirmed_at != progress.fenced_at
+        or progress.terminal_subject.target != configured_target
+        or progress.terminal_subject.root_id != root.root_id
+        or progress.terminal_subject.root_sha256 != root.root_sha256
+        or progress.terminal_subject.state is not terminal_state
+        or progress.terminal_subject.target_configuration_sha256
+        != target_configuration_sha256
+        or progress.terminal_subject.receipt_id != terminal_receipt.receipt_id
+        or progress.terminal_subject.receipt_sha256
+        != canonical_sha256(terminal_receipt)
+        or progress.terminal_subject.receipt_revision
+        != expected.terminal_receipt.revision
+        or progress.terminal_subject.receipt_epoch != terminal_receipt.epoch
+        or progress.terminal_subject.receipt_action is not terminal_receipt.action
+        or progress.terminal_subject.receipt_outcome is not ReceiptOutcome.VERIFIED
+        or progress.terminal_subject.evidence_id
+        != terminal_evidence.event.evidence_id
+        or progress.terminal_subject.confirmed_by
+        != "controlgraph.coordinator/v1"
+        or progress.terminal_subject.confirmed_at != progress.fenced_at
+        or terminal_evidence.event.root_id != root.root_id
+        or terminal_evidence.event.root_sha256 != root.root_sha256
+        or terminal_evidence.event.target != configured_target
+        or terminal_evidence.event.epoch != terminal_receipt.epoch
+        or terminal_evidence.event.kind is not EvidenceKind.TARGET_VERIFIED
+        or terminal_evidence.event.actor != "controlgraph.coordinator/v1"
+        or terminal_evidence.event.request_id != command.request_id
+        or terminal_evidence.event.receipt_id != terminal_receipt.receipt_id
+        or terminal_evidence.event.occurred_at != progress.fenced_at
+        or terminal_evidence.event.subject_sha256
+        != canonical_sha256(progress.terminal_subject)
+        or terminal_evidence.event.target_configuration_sha256
+        != target_configuration_sha256
+        or terminal_evidence.signing_key_version
+        != root.content.evidence_signing_key_version
+        or progress.fence_subject.target != configured_target
+        or progress.fence_subject.root_id != root.root_id
+        or progress.fence_subject.root_sha256 != root.root_sha256
+        or progress.fence_subject.request_sha256 != request_sha256
+        or progress.fence_subject.request_id != command.request_id
+        or progress.fence_subject.idempotency_key != command.idempotency_key
+        or progress.fence_subject.operator_identity != invocation.operator_identity
+        or progress.fence_subject.operator_subject != invocation.operator_subject
+        or progress.fence_subject.replacement_claim_sha256 != canonical_sha256(claim)
+        or progress.fence_subject.replacement_authority_sha256
+        != canonical_sha256(authority)
+        or progress.fence_subject.new_epoch != authority.current_epoch
+        or progress.fence_subject.evidence_id != fence_evidence.event.evidence_id
+        or progress.fence_subject.fenced_at != progress.fenced_at
+        or fence_evidence.event.root_id != root.root_id
+        or fence_evidence.event.root_sha256 != root.root_sha256
+        or fence_evidence.event.target != configured_target
+        or fence_evidence.event.epoch != authority.current_epoch
+        or fence_evidence.event.kind is not EvidenceKind.EPOCH_ADVANCED
+        or fence_evidence.event.actor != invocation.operator_identity
+        or fence_evidence.event.request_id != command.request_id
+        or fence_evidence.event.receipt_id is not None
+        or fence_evidence.event.occurred_at != progress.fenced_at
+        or fence_evidence.event.subject_sha256
+        != canonical_sha256(progress.fence_subject)
+        or fence_evidence.event.sequence != terminal_evidence.event.sequence + 1
+        or fence_evidence.event.previous_event_sha256
+        != progress.terminal_evidence_sha256
+        or fence_evidence.event.reason_code is not None
+        or fence_evidence.event.provider_operation is not None
+        or fence_evidence.event.target_configuration_sha256 is not None
+        or fence_evidence.signing_key_version
+        != root.content.evidence_signing_key_version
+        or request_identity.identity_kind
+        is not ServiceClaimReleaseIdentityKind.REQUEST
+        or request_identity.identity_value != command.request_id
+        or idempotency_identity.identity_kind
+        is not ServiceClaimReleaseIdentityKind.IDEMPOTENCY
+        or idempotency_identity.identity_value != command.idempotency_key
+        or request_identity.root_id != root.root_id
+        or idempotency_identity.root_id != root.root_id
+        or request_identity.root_sha256 != root.root_sha256
+        or idempotency_identity.root_sha256 != root.root_sha256
+        or request_identity.request_sha256 != request_sha256
+        or idempotency_identity.request_sha256 != request_sha256
+        or request_identity.result_id != progress.result_id
+        or idempotency_identity.result_id != progress.result_id
+        or request_identity.claimed_at != progress.fenced_at
+        or idempotency_identity.claimed_at != progress.fenced_at
+        or expected.progress.revision != 0
+        or expected.request_identity.revision != 0
+        or expected.idempotency_identity.revision != 0
+        or expected.terminal_evidence.revision != 0
+        or expected.fence_evidence.revision != 0
+        or result.request_sha256 != request_sha256
+        or result.result_id != progress.result_id
+        or result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != root.root_id
+        or result.root_sha256 != root.root_sha256
+        or result.target != configured_target
+        or result.operator_identity != invocation.operator_identity
+        or result.operator_subject != invocation.operator_subject
+        or result.terminal_receipt_id != progress.terminal_receipt_id
+        or result.terminal_receipt_sha256 != progress.terminal_receipt_sha256
+        or result.terminal_evidence_id != progress.terminal_evidence_id
+        or result.terminal_evidence_sha256 != progress.terminal_evidence_sha256
+        or result.fence_evidence_id != progress.fence_evidence_id
+        or result.fence_evidence_sha256 != progress.fence_evidence_sha256
+        or result.classification_subject != commit.classification_subject
+        or result.release_subject != commit.release_subject
+        or result.classification_evidence_id != classification_event.evidence_id
+        or result.classification_evidence_sha256 != canonical_sha256(classification)
+        or result.release_evidence_id != release_event.evidence_id
+        or result.release_evidence_sha256 != canonical_sha256(release)
+        or result.fenced_epoch != progress.fenced_epoch
+        or result.fenced_authority_revision
+        != progress.fenced_authority_revision
+        or classification_subject.target != configured_target
+        or classification_subject.root_id != root.root_id
+        or classification_subject.root_sha256 != root.root_sha256
+        or classification_subject.request_sha256 != request_sha256
+        or classification_subject.classification is not expected_classification
+        or classification_subject.fenced_epoch != progress.fenced_epoch
+        or classification_subject.fenced_authority_revision
+        != progress.fenced_authority_revision
+        or classification_subject.target_configuration_sha256
+        != target_configuration_sha256
+        or classification_subject.service_generation
+        <= claim.baseline_service_generation
+        or classification_subject.evidence_id != classification_event.evidence_id
+        or classification_subject.classified_by != expected_reader
+        or classification_subject.classified_at != classification_event.occurred_at
+        or classification_proof.target != configured_target
+        or classification_proof.root_id != root.root_id
+        or classification_proof.root_sha256 != root.root_sha256
+        or classification_proof.classification is not expected_classification
+        or classification_proof.fenced_epoch != progress.fenced_epoch
+        or classification_proof.fenced_authority_revision
+        != progress.fenced_authority_revision
+        or classification_proof.service_generation
+        != classification_subject.service_generation
+        or classification_proof.provider_etag != classification_subject.provider_etag
+        or classification_proof.target_configuration_sha256
+        != target_configuration_sha256
+        or classification_proof.evidence_id != classification_event.evidence_id
+        or classification_proof.evidence_sha256 != canonical_sha256(classification)
+        or classification_proof.classified_by != expected_reader
+        or classification_proof.classified_at != classification_event.occurred_at
+        or classification_event.evidence_id
+        != service_claim_release_evidence_id(request_sha256, "classification")
+        or classification_event.sequence != previous_head.sequence + 1
+        or classification_event.previous_event_sha256
+        != previous_head.evidence_sha256
+        or classification_event.subject_sha256
+        != canonical_sha256(commit.classification_subject)
+        or classification_event.kind is not EvidenceKind.TARGET_VERIFIED
+        or classification_event.root_id != root.root_id
+        or classification_event.root_sha256 != root.root_sha256
+        or classification_event.target != configured_target
+        or classification_event.epoch != progress.fenced_epoch
+        or classification_event.actor != expected_reader
+        or classification_event.request_id != command.request_id
+        or classification_event.receipt_id is not None
+        or classification_event.occurred_at < previous_head.updated_at
+        or classification_event.reason_code is not None
+        or classification_event.provider_operation is not None
+        or classification_event.target_configuration_sha256
+        != target_configuration_sha256
+        or commit.replacement_claim.released_by != "controlgraph.coordinator/v1"
+        or commit.replacement_claim.release_request_id != command.request_id
+        or commit.replacement_claim.target_classification_proof
+        != classification_proof
+        or release_subject.target != configured_target
+        or release_subject.root_id != root.root_id
+        or release_subject.root_sha256 != root.root_sha256
+        or release_subject.request_sha256 != request_sha256
+        or release_subject.request_id != command.request_id
+        or release_subject.idempotency_key != command.idempotency_key
+        or release_subject.operator_identity != invocation.operator_identity
+        or release_subject.operator_subject != invocation.operator_subject
+        or release_subject.classification_evidence_id
+        != classification_event.evidence_id
+        or release_subject.classification_evidence_sha256
+        != canonical_sha256(classification)
+        or release_subject.fenced_claim_sha256 != canonical_sha256(claim)
+        or release_subject.released_claim_sha256
+        != canonical_sha256(commit.replacement_claim)
+        or release_subject.fenced_authority_sha256 != canonical_sha256(authority)
+        or release_subject.fenced_epoch != progress.fenced_epoch
+        or release_subject.fenced_authority_revision
+        != progress.fenced_authority_revision
+        or release_subject.evidence_id != release_event.evidence_id
+        or release_subject.released_at != release_event.occurred_at
+        or release_event.evidence_id
+        != service_claim_release_evidence_id(request_sha256, "release")
+        or release_event.sequence != classification_event.sequence + 1
+        or release_event.previous_event_sha256 != canonical_sha256(classification)
+        or release_event.subject_sha256 != canonical_sha256(commit.release_subject)
+        or release_event.kind is not EvidenceKind.TARGET_VERIFIED
+        or release_event.root_id != root.root_id
+        or release_event.root_sha256 != root.root_sha256
+        or release_event.target != configured_target
+        or release_event.epoch != progress.fenced_epoch
+        or release_event.actor != "controlgraph.coordinator/v1"
+        or release_event.request_id != command.request_id
+        or release_event.receipt_id is not None
+        or release_event.occurred_at < classification_event.occurred_at
+        or release_event.reason_code is not None
+        or release_event.provider_operation is not None
+        or release_event.target_configuration_sha256
+        != target_configuration_sha256
+        or commit.chain_head.root_id != release_event.root_id
+        or commit.chain_head.root_sha256 != release_event.root_sha256
+        or commit.chain_head.target != release_event.target
+        or commit.chain_head.sequence != release_event.sequence
+        or commit.chain_head.evidence_id != release_event.evidence_id
+        or commit.chain_head.evidence_sha256 != canonical_sha256(release)
+        or commit.chain_head.kind is not release_event.kind
+        or commit.chain_head.epoch != release_event.epoch
+        or commit.chain_head.updated_at != release_event.occurred_at
+        or classification.signing_key_version
+        != bundle.root.value.content.evidence_signing_key_version
+        or release.signing_key_version
+        != bundle.root.value.content.evidence_signing_key_version
+        or result.classification_proof
+        != commit.replacement_claim.target_classification_proof
+        or result.release_evidence_id != commit.replacement_claim.release_evidence_id
+        or result.released_at != commit.replacement_claim.released_at
+        or result.released_at != release_event.occurred_at
+    ):
+        raise ValueError("service claim finalize commit is not exactly bound")
 
 
 def _validate_released_takeover(
@@ -1938,6 +2587,1043 @@ class FirestoreAuthorityStore:
         except (TypeError, ValueError):
             raise AuthorityStoreCorruptRecord from None
         return decoded_bundle
+
+    async def read_service_claim_release_state(
+        self,
+        invocation: ServiceClaimReleaseInvocationV1,
+    ) -> ServiceClaimReleaseState:
+        """Read one complete release lifecycle view in a consistent transaction."""
+
+        if type(invocation) is not ServiceClaimReleaseInvocationV1:
+            raise TypeError("service claim release state requires an exact invocation")
+        command = invocation.command
+        request_sha256 = service_claim_release_request_sha256(invocation)
+        result_id = f"cgrelease:{request_sha256}"
+        decoded_state: ServiceClaimReleaseState | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal decoded_state
+            client = await self._client()
+            root_id = command.root_id
+            root_document_id = rollout_root_v2_document_id(root_id)
+            authority_document_id = epoch_authority_document_id(root_id)
+            creation_document_id = root_creation_result_document_id(root_id)
+            decoded_root = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRootV2,
+            )
+            decoded_authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            decoded_creation = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROOT_CREATION_RESULT,
+                    creation_document_id,
+                ),
+                kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
+                logical_id=root_id,
+                document_id=creation_document_id,
+                model_type=RootCreationResultV1,
+            )
+            root_specific = (decoded_root, decoded_authority, decoded_creation)
+            root_bundle: RootCreationBundle | None = None
+            decoded_root_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
+            if any(value is not None for value in root_specific):
+                if any(value is None for value in root_specific):
+                    raise AuthorityStoreCorruptRecord
+                root_record = cast(_DecodedDocument[RolloutRootV2], decoded_root)
+                authority_record = cast(
+                    _DecodedDocument[EpochAuthorityRecord],
+                    decoded_authority,
+                )
+                creation_record = cast(
+                    _DecodedDocument[RootCreationResultV1],
+                    decoded_creation,
+                )
+                creation = creation_record.value
+                claim_logical_id = service_claim_logical_id(self._target)
+                claim_document_id = service_claim_document_id(self._target)
+                anchor_logical_id = creation.winner_lineage_anchor_id
+                anchor_document_id = capability_lineage_anchor_document_id(
+                    creation.lineage_anchor
+                )
+                root_evidence_id = creation.winner_evidence_id
+                root_evidence_document_id = signed_evidence_event_document_id(
+                    root_evidence_id
+                )
+                decoded_claim = await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SERVICE_CLAIM,
+                        claim_document_id,
+                    ),
+                    kind=AuthorityStorageKind.SERVICE_CLAIM,
+                    logical_id=claim_logical_id,
+                    document_id=claim_document_id,
+                    model_type=ServiceClaimRecord,
+                )
+                decoded_anchor = await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+                        anchor_document_id,
+                    ),
+                    kind=AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
+                    logical_id=anchor_logical_id,
+                    document_id=anchor_document_id,
+                    model_type=CapabilityLineageAnchorV1,
+                )
+                decoded_root_evidence = await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        root_evidence_document_id,
+                    ),
+                    kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    logical_id=root_evidence_id,
+                    document_id=root_evidence_document_id,
+                    model_type=SignedEvidenceEventV1,
+                )
+                if (
+                    decoded_claim is None
+                    or decoded_anchor is None
+                    or decoded_root_evidence is None
+                ):
+                    raise AuthorityStoreCorruptRecord
+                root_bundle = RootCreationBundle(
+                    root=root_record.stored,
+                    service_claim=decoded_claim.stored,
+                    authority=authority_record.stored,
+                    lineage_anchor=decoded_anchor.stored,
+                    signed_evidence=decoded_root_evidence.stored,
+                    creation_result=creation_record.stored,
+                )
+
+            head_document_id = evidence_chain_head_document_id(root_id)
+            decoded_head = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                    head_document_id,
+                ),
+                kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                logical_id=root_id,
+                document_id=head_document_id,
+                model_type=EvidenceChainHeadV1,
+            )
+            decoded_head_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
+            if decoded_head is not None:
+                head_evidence_id = decoded_head.value.evidence_id
+                if (
+                    decoded_root_evidence is not None
+                    and decoded_root_evidence.value.event.evidence_id == head_evidence_id
+                ):
+                    decoded_head_evidence = decoded_root_evidence
+                else:
+                    head_evidence_document_id = signed_evidence_event_document_id(
+                        head_evidence_id
+                    )
+                    decoded_head_evidence = await self._transaction_read(
+                        transaction,
+                        reference=self._reference(
+                            client,
+                            AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                            head_evidence_document_id,
+                        ),
+                        kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        logical_id=head_evidence_id,
+                        document_id=head_evidence_document_id,
+                        model_type=SignedEvidenceEventV1,
+                    )
+                    if decoded_head_evidence is None:
+                        raise AuthorityStoreCorruptRecord
+
+            receipt_logical_id = execution_receipt_logical_id(
+                self._target,
+                command.terminal_receipt_idempotency_key,
+            )
+            receipt_document_id = execution_receipt_document_id(
+                self._target,
+                command.terminal_receipt_idempotency_key,
+            )
+            decoded_receipt = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EXECUTION_RECEIPT,
+                    receipt_document_id,
+                ),
+                kind=AuthorityStorageKind.EXECUTION_RECEIPT,
+                logical_id=receipt_logical_id,
+                document_id=receipt_document_id,
+                model_type=ExecutionReceipt,
+            )
+
+            async def release_evidence(
+                stage: Literal["terminal", "fence", "classification", "release"],
+            ) -> _DecodedDocument[SignedEvidenceEventV1] | None:
+                evidence_id = service_claim_release_evidence_id(
+                    request_sha256,
+                    stage,
+                )
+                document_id = signed_evidence_event_document_id(evidence_id)
+                return await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        document_id,
+                    ),
+                    kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    logical_id=evidence_id,
+                    document_id=document_id,
+                    model_type=SignedEvidenceEventV1,
+                )
+
+            decoded_terminal_evidence = await release_evidence("terminal")
+            decoded_fence_evidence = await release_evidence("fence")
+            decoded_classification_evidence = await release_evidence("classification")
+            decoded_release_evidence = await release_evidence("release")
+
+            request_identity_logical_id = service_claim_release_identity_logical_id(
+                ServiceClaimReleaseIdentityKind.REQUEST.value,
+                command.request_id,
+            )
+            request_identity_document_id = service_claim_release_identity_document_id(
+                ServiceClaimReleaseIdentityKind.REQUEST.value,
+                command.request_id,
+            )
+            idempotency_identity_logical_id = (
+                service_claim_release_identity_logical_id(
+                    ServiceClaimReleaseIdentityKind.IDEMPOTENCY.value,
+                    command.idempotency_key,
+                )
+            )
+            idempotency_identity_document_id = (
+                service_claim_release_identity_document_id(
+                    ServiceClaimReleaseIdentityKind.IDEMPOTENCY.value,
+                    command.idempotency_key,
+                )
+            )
+            decoded_request_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+                    request_identity_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+                logical_id=request_identity_logical_id,
+                document_id=request_identity_document_id,
+                model_type=ServiceClaimReleaseIdentityV1,
+            )
+            decoded_idempotency_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+                    idempotency_identity_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+                logical_id=idempotency_identity_logical_id,
+                document_id=idempotency_identity_document_id,
+                model_type=ServiceClaimReleaseIdentityV1,
+            )
+            progress_document_id = service_claim_release_progress_document_id(
+                result_id
+            )
+            decoded_progress = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+                    progress_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+                logical_id=result_id,
+                document_id=progress_document_id,
+                model_type=ServiceClaimReleaseProgressV1,
+            )
+            result_document_id = service_claim_release_result_document_id(result_id)
+            decoded_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                    result_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                logical_id=result_id,
+                document_id=result_document_id,
+                model_type=ServiceClaimReleaseResultV1,
+            )
+            decoded_state = ServiceClaimReleaseState(
+                invocation=invocation,
+                root_bundle=root_bundle,
+                terminal_receipt=(
+                    None if decoded_receipt is None else decoded_receipt.stored
+                ),
+                chain_head=None if decoded_head is None else decoded_head.stored,
+                head_evidence=(
+                    None
+                    if decoded_head_evidence is None
+                    else decoded_head_evidence.stored
+                ),
+                terminal_evidence=(
+                    None
+                    if decoded_terminal_evidence is None
+                    else decoded_terminal_evidence.stored
+                ),
+                fence_evidence=(
+                    None
+                    if decoded_fence_evidence is None
+                    else decoded_fence_evidence.stored
+                ),
+                classification_evidence=(
+                    None
+                    if decoded_classification_evidence is None
+                    else decoded_classification_evidence.stored
+                ),
+                release_evidence=(
+                    None
+                    if decoded_release_evidence is None
+                    else decoded_release_evidence.stored
+                ),
+                request_identity=(
+                    None
+                    if decoded_request_identity is None
+                    else decoded_request_identity.stored
+                ),
+                idempotency_identity=(
+                    None
+                    if decoded_idempotency_identity is None
+                    else decoded_idempotency_identity.stored
+                ),
+                progress=(
+                    None if decoded_progress is None else decoded_progress.stored
+                ),
+                result=None if decoded_result is None else decoded_result.stored,
+            )
+
+        await self._run_consistent_read(read)
+        if decoded_state is None:
+            raise AuthorityStoreUnavailable
+        if decoded_state.root_bundle is not None:
+            try:
+                _validate_read_root_creation_bundle(
+                    self._target,
+                    decoded_state.root_bundle,
+                )
+            except (TypeError, ValueError):
+                raise AuthorityStoreCorruptRecord from None
+        return decoded_state
+
+    async def commit_service_claim_fence(
+        self,
+        expected: ServiceClaimReleaseState,
+        commit: ServiceClaimReleaseFenceCommitV1,
+    ) -> ServiceClaimFenceWriteResult:
+        """Atomically append terminal/fence evidence and fence claim authority."""
+
+        _validate_service_claim_fence_commit(self._target, expected, commit)
+        root_bundle = cast(RootCreationBundle, expected.root_bundle)
+        claim_logical_id = service_claim_logical_id(self._target)
+        claim_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM,
+            logical_id=claim_logical_id,
+            document_id=service_claim_document_id(self._target),
+            revision=root_bundle.service_claim.revision + 1,
+            value=commit.replacement_claim,
+        )
+        authority_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+            logical_id=commit.replacement_authority.root_id,
+            document_id=epoch_authority_document_id(
+                commit.replacement_authority.root_id
+            ),
+            revision=root_bundle.authority.revision + 1,
+            value=commit.replacement_authority,
+        )
+
+        def evidence_document(
+            evidence: SignedEvidenceEventV1,
+        ) -> _PreparedDocument[SignedEvidenceEventV1]:
+            evidence_id = evidence.event.evidence_id
+            return _prepared_document(
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=evidence_id,
+                document_id=signed_evidence_event_document_id(evidence_id),
+                revision=0,
+                value=evidence,
+            )
+
+        terminal_document = evidence_document(commit.terminal_evidence)
+        fence_document = evidence_document(commit.fence_evidence)
+        head_document = _prepared_document(
+            kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+            logical_id=commit.chain_head.root_id,
+            document_id=evidence_chain_head_document_id(commit.chain_head.root_id),
+            revision=commit.chain_head.sequence,
+            value=commit.chain_head,
+        )
+        progress_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+            logical_id=commit.progress.result_id,
+            document_id=service_claim_release_progress_document_id(
+                commit.progress.result_id
+            ),
+            revision=0,
+            value=commit.progress,
+        )
+        request_identity_logical_id = service_claim_release_identity_logical_id(
+            commit.request_identity.identity_kind.value,
+            commit.request_identity.identity_value,
+        )
+        request_identity_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+            logical_id=request_identity_logical_id,
+            document_id=service_claim_release_identity_document_id(
+                commit.request_identity.identity_kind.value,
+                commit.request_identity.identity_value,
+            ),
+            revision=0,
+            value=commit.request_identity,
+        )
+        idempotency_identity_logical_id = service_claim_release_identity_logical_id(
+            commit.idempotency_identity.identity_kind.value,
+            commit.idempotency_identity.identity_value,
+        )
+        idempotency_identity_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+            logical_id=idempotency_identity_logical_id,
+            document_id=service_claim_release_identity_document_id(
+                commit.idempotency_identity.identity_kind.value,
+                commit.idempotency_identity.identity_value,
+            ),
+            revision=0,
+            value=commit.idempotency_identity,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            claim_document,
+            authority_document,
+            terminal_document,
+            fence_document,
+            head_document,
+            progress_document,
+            request_identity_document,
+            idempotency_identity_document,
+        )
+
+        async def write(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            root_id = commit.progress.root_id
+            root_document_id = rollout_root_v2_document_id(root_id)
+            current_root = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRootV2,
+            )
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document.document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document.document_id,
+                model_type=ServiceClaimRecord,
+            )
+            current_authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document.document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            receipt = cast(StoredRecord[ExecutionReceipt], expected.terminal_receipt)
+            receipt_document_id = execution_receipt_document_id(
+                self._target,
+                receipt.value.idempotency_key,
+            )
+            current_receipt = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EXECUTION_RECEIPT,
+                    receipt_document_id,
+                ),
+                kind=AuthorityStorageKind.EXECUTION_RECEIPT,
+                logical_id=execution_receipt_logical_id(
+                    self._target,
+                    receipt.value.idempotency_key,
+                ),
+                document_id=receipt_document_id,
+                model_type=ExecutionReceipt,
+            )
+            current_head = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                    head_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                logical_id=root_id,
+                document_id=head_document.document_id,
+                model_type=EvidenceChainHeadV1,
+            )
+            expected_predecessor = (
+                root_bundle.signed_evidence
+                if expected.chain_head is None
+                else expected.head_evidence
+            )
+            if expected_predecessor is None:
+                raise _ExpectedStateMismatch
+            predecessor_id = expected_predecessor.value.event.evidence_id
+            predecessor_document_id = signed_evidence_event_document_id(
+                predecessor_id
+            )
+            current_predecessor = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    predecessor_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=predecessor_id,
+                document_id=predecessor_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+
+            async def current[ModelT: StrictContractModel](
+                document: _PreparedDocument[ModelT],
+                model: type[ModelT],
+            ) -> _DecodedDocument[ModelT] | None:
+                return await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        document.wrapper.record_kind,
+                        document.document_id,
+                    ),
+                    kind=document.wrapper.record_kind,
+                    logical_id=document.wrapper.logical_id,
+                    document_id=document.document_id,
+                    model_type=model,
+                )
+
+            current_terminal = await current(
+                terminal_document,
+                SignedEvidenceEventV1,
+            )
+            current_fence = await current(fence_document, SignedEvidenceEventV1)
+            current_progress = await current(
+                progress_document,
+                ServiceClaimReleaseProgressV1,
+            )
+            current_request_identity = await current(
+                request_identity_document,
+                ServiceClaimReleaseIdentityV1,
+            )
+            current_idempotency_identity = await current(
+                idempotency_identity_document,
+                ServiceClaimReleaseIdentityV1,
+            )
+            request_sha256 = service_claim_release_request_sha256(
+                expected.invocation
+            )
+
+            async def current_release_evidence(
+                stage: Literal["classification", "release"],
+            ) -> _DecodedDocument[SignedEvidenceEventV1] | None:
+                evidence_id = service_claim_release_evidence_id(
+                    request_sha256,
+                    stage,
+                )
+                document_id = signed_evidence_event_document_id(evidence_id)
+                return await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        document_id,
+                    ),
+                    kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    logical_id=evidence_id,
+                    document_id=document_id,
+                    model_type=SignedEvidenceEventV1,
+                )
+
+            current_classification = await current_release_evidence(
+                "classification"
+            )
+            current_release = await current_release_evidence("release")
+            result_id = commit.progress.result_id
+            result_document_id = service_claim_release_result_document_id(
+                result_id
+            )
+            current_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                    result_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                logical_id=result_id,
+                document_id=result_document_id,
+                model_type=ServiceClaimReleaseResultV1,
+            )
+            if (
+                current_root is None
+                or current_root.stored != root_bundle.root
+                or current_claim is None
+                or current_claim.stored != root_bundle.service_claim
+                or current_authority is None
+                or current_authority.stored != root_bundle.authority
+                or current_receipt is None
+                or current_receipt.stored != receipt
+                or (None if current_head is None else current_head.stored)
+                != expected.chain_head
+                or current_predecessor is None
+                or current_predecessor.stored != expected_predecessor
+                or current_terminal is not None
+                or current_fence is not None
+                or current_progress is not None
+                or current_request_identity is not None
+                or current_idempotency_identity is not None
+                or current_classification is not None
+                or current_release is not None
+                or current_result is not None
+            ):
+                raise _ExpectedStateMismatch
+            transaction.update(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document.document_id,
+                ),
+                _document_data(claim_document.wrapper),
+            )
+            transaction.update(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document.document_id,
+                ),
+                _document_data(authority_document.wrapper),
+            )
+            for evidence_document in (terminal_document, fence_document):
+                transaction.create(
+                    self._reference(
+                        client,
+                        evidence_document.wrapper.record_kind,
+                        evidence_document.document_id,
+                    ),
+                    _document_data(evidence_document.wrapper),
+                )
+            head_reference = self._reference(
+                client,
+                AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                head_document.document_id,
+            )
+            if current_head is None:
+                transaction.create(
+                    head_reference,
+                    _document_data(head_document.wrapper),
+                )
+            else:
+                transaction.update(
+                    head_reference,
+                    _document_data(head_document.wrapper),
+                )
+            for metadata_document in (
+                progress_document,
+                request_identity_document,
+                idempotency_identity_document,
+            ):
+                transaction.create(
+                    self._reference(
+                        client,
+                        metadata_document.wrapper.record_kind,
+                        metadata_document.document_id,
+                    ),
+                    _document_data(metadata_document.wrapper),
+                )
+
+        await self._run_transaction(documents, write)
+        return ServiceClaimFenceWriteResult(
+            service_claim=_stored(claim_document),
+            authority=_stored(authority_document),
+            terminal_evidence=_stored(terminal_document),
+            fence_evidence=_stored(fence_document),
+            chain_head=_stored(head_document),
+            progress=_stored(progress_document),
+            request_identity=_stored(request_identity_document),
+            idempotency_identity=_stored(idempotency_identity_document),
+        )
+
+    async def commit_service_claim_release(
+        self,
+        expected: ServiceClaimReleaseState,
+        commit: ServiceClaimReleaseFinalizeCommitV1,
+    ) -> ServiceClaimFinalizeWriteResult:
+        """Atomically append verifier proof and finalize the fenced claim."""
+
+        _validate_service_claim_finalize_commit(self._target, expected, commit)
+        root_bundle = cast(RootCreationBundle, expected.root_bundle)
+        claim_logical_id = service_claim_logical_id(self._target)
+        claim_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM,
+            logical_id=claim_logical_id,
+            document_id=service_claim_document_id(self._target),
+            revision=root_bundle.service_claim.revision + 1,
+            value=commit.replacement_claim,
+        )
+
+        def evidence_document(
+            evidence: SignedEvidenceEventV1,
+        ) -> _PreparedDocument[SignedEvidenceEventV1]:
+            evidence_id = evidence.event.evidence_id
+            return _prepared_document(
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=evidence_id,
+                document_id=signed_evidence_event_document_id(evidence_id),
+                revision=0,
+                value=evidence,
+            )
+
+        classification_document = evidence_document(commit.classification_evidence)
+        release_document = evidence_document(commit.release_evidence)
+        head_document = _prepared_document(
+            kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+            logical_id=commit.chain_head.root_id,
+            document_id=evidence_chain_head_document_id(commit.chain_head.root_id),
+            revision=commit.chain_head.sequence,
+            value=commit.chain_head,
+        )
+        result_document = _prepared_document(
+            kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+            logical_id=commit.result.result_id,
+            document_id=service_claim_release_result_document_id(
+                commit.result.result_id
+            ),
+            revision=0,
+            value=commit.result,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            claim_document,
+            classification_document,
+            release_document,
+            head_document,
+            result_document,
+        )
+
+        async def write(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            root_id = commit.result.root_id
+            root_document_id = rollout_root_v2_document_id(root_id)
+            current_root = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                    root_document_id,
+                ),
+                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                logical_id=root_id,
+                document_id=root_document_id,
+                model_type=RolloutRootV2,
+            )
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document.document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document.document_id,
+                model_type=ServiceClaimRecord,
+            )
+            authority_document_id = epoch_authority_document_id(root_id)
+            current_authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            receipt = cast(
+                StoredRecord[ExecutionReceipt],
+                expected.terminal_receipt,
+            )
+            receipt_document_id = execution_receipt_document_id(
+                self._target,
+                receipt.value.idempotency_key,
+            )
+            current_receipt = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EXECUTION_RECEIPT,
+                    receipt_document_id,
+                ),
+                kind=AuthorityStorageKind.EXECUTION_RECEIPT,
+                logical_id=execution_receipt_logical_id(
+                    self._target,
+                    receipt.value.idempotency_key,
+                ),
+                document_id=receipt_document_id,
+                model_type=ExecutionReceipt,
+            )
+            terminal_record = cast(
+                StoredRecord[SignedEvidenceEventV1],
+                expected.terminal_evidence,
+            )
+            terminal_document_id = signed_evidence_event_document_id(
+                terminal_record.value.event.evidence_id
+            )
+            current_terminal = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    terminal_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=terminal_record.value.event.evidence_id,
+                document_id=terminal_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+            current_head = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                    head_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                logical_id=root_id,
+                document_id=head_document.document_id,
+                model_type=EvidenceChainHeadV1,
+            )
+            expected_predecessor = expected.head_evidence
+            if expected_predecessor is None:
+                raise _ExpectedStateMismatch
+            predecessor_id = expected_predecessor.value.event.evidence_id
+            predecessor_document_id = signed_evidence_event_document_id(
+                predecessor_id
+            )
+            current_predecessor = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    predecessor_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=predecessor_id,
+                document_id=predecessor_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+            progress = cast(
+                StoredRecord[ServiceClaimReleaseProgressV1],
+                expected.progress,
+            )
+            progress_document_id = service_claim_release_progress_document_id(
+                progress.value.result_id
+            )
+            current_progress = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+                    progress_document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+                logical_id=progress.value.result_id,
+                document_id=progress_document_id,
+                model_type=ServiceClaimReleaseProgressV1,
+            )
+
+            async def identity(
+                stored: StoredRecord[ServiceClaimReleaseIdentityV1] | None,
+            ) -> _DecodedDocument[ServiceClaimReleaseIdentityV1] | None:
+                if stored is None:
+                    raise _ExpectedStateMismatch
+                value = stored.value
+                logical_id = service_claim_release_identity_logical_id(
+                    value.identity_kind.value,
+                    value.identity_value,
+                )
+                document_id = service_claim_release_identity_document_id(
+                    value.identity_kind.value,
+                    value.identity_value,
+                )
+                return await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+                        document_id,
+                    ),
+                    kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+                    logical_id=logical_id,
+                    document_id=document_id,
+                    model_type=ServiceClaimReleaseIdentityV1,
+                )
+
+            current_request_identity = await identity(expected.request_identity)
+            current_idempotency_identity = await identity(
+                expected.idempotency_identity
+            )
+
+            async def evidence(
+                document: _PreparedDocument[SignedEvidenceEventV1],
+            ) -> _DecodedDocument[SignedEvidenceEventV1] | None:
+                return await self._transaction_read(
+                    transaction,
+                    reference=self._reference(
+                        client,
+                        AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        document.document_id,
+                    ),
+                    kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    logical_id=document.wrapper.logical_id,
+                    document_id=document.document_id,
+                    model_type=SignedEvidenceEventV1,
+                )
+
+            current_classification = await evidence(classification_document)
+            current_release = await evidence(release_document)
+            current_result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                    result_document.document_id,
+                ),
+                kind=AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                logical_id=commit.result.result_id,
+                document_id=result_document.document_id,
+                model_type=ServiceClaimReleaseResultV1,
+            )
+            if (
+                current_root is None
+                or current_root.stored != root_bundle.root
+                or current_claim is None
+                or current_claim.stored != root_bundle.service_claim
+                or current_authority is None
+                or current_authority.stored != root_bundle.authority
+                or current_receipt is None
+                or current_receipt.stored != receipt
+                or current_terminal is None
+                or current_terminal.stored != terminal_record
+                or current_head is None
+                or current_head.stored != expected.chain_head
+                or current_predecessor is None
+                or current_predecessor.stored != expected_predecessor
+                or current_progress is None
+                or current_progress.stored != progress
+                or current_request_identity is None
+                or current_request_identity.stored != expected.request_identity
+                or current_idempotency_identity is None
+                or current_idempotency_identity.stored
+                != expected.idempotency_identity
+                or current_classification is not None
+                or current_release is not None
+                or current_result is not None
+            ):
+                raise _ExpectedStateMismatch
+            transaction.update(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM,
+                    claim_document.document_id,
+                ),
+                _document_data(claim_document.wrapper),
+            )
+            for document in (classification_document, release_document):
+                transaction.create(
+                    self._reference(
+                        client,
+                        AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                        document.document_id,
+                    ),
+                    _document_data(document.wrapper),
+                )
+            transaction.update(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.EVIDENCE_CHAIN_HEAD,
+                    head_document.document_id,
+                ),
+                _document_data(head_document.wrapper),
+            )
+            transaction.create(
+                self._reference(
+                    client,
+                    AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+                    result_document.document_id,
+                ),
+                _document_data(result_document.wrapper),
+            )
+
+        await self._run_transaction(documents, write)
+        return ServiceClaimFinalizeWriteResult(
+            service_claim=_stored(claim_document),
+            authority=root_bundle.authority,
+            classification_evidence=_stored(classification_document),
+            release_evidence=_stored(release_document),
+            chain_head=_stored(head_document),
+            result=_stored(result_document),
+        )
+
 
     async def read_epoch_revocation_state(
         self,

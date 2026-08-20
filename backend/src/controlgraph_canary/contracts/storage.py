@@ -177,7 +177,7 @@ class ServiceClaimRecord(StrictContractModel):
     claimed_at: UtcSecond
     release_fence_epoch: PositiveSafeInteger | None
     release_fence_authority_revision: NonNegativeSafeInteger | None
-    release_fenced_by: Literal["controlgraph.operator/v1"] | None
+    release_fenced_by: BoundedText | None
     release_fence_request_id: Identifier | None
     release_fence_evidence_id: Identifier | None
     release_fenced_at: UtcSecond | None
@@ -471,6 +471,9 @@ class AuthorityStorageKind(StrEnum):
     EPOCH_REVOCATION_IDENTITY = "controlgraph-epoch-revocation-identities-v1"
     EPOCH_REVOCATION_RESULT = "controlgraph-epoch-revocation-results-v1"
     EPOCH_REVOCATION_AUDIT = "controlgraph-epoch-revocation-audits-v1"
+    SERVICE_CLAIM_RELEASE_IDENTITY = "controlgraph-service-claim-release-identities-v1"
+    SERVICE_CLAIM_RELEASE_PROGRESS = "controlgraph-service-claim-release-progress-v1"
+    SERVICE_CLAIM_RELEASE_RESULT = "controlgraph-service-claim-release-results-v1"
 
 
 class AuthorityStorageDocument(StrictContractModel):
@@ -486,20 +489,7 @@ class AuthorityStorageDocument(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_payload(self) -> Self:
-        model_type: type[
-            RolloutRoot
-            | RolloutRootV2
-            | ServiceClaimRecord
-            | EpochAuthorityRecord
-            | ExecutionReceipt
-            | CapabilityLineageAnchorV1
-            | SignedEvidenceEventV1
-            | RootCreationResultV1
-            | EvidenceChainHeadV1
-            | EpochRevocationIdentityV1
-            | EpochRevocationResultV1
-            | EpochRevocationAuditV1
-        ]
+        model_type: type[StrictContractModel]
         if self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT:
             model_type = RolloutRoot
         elif self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT_V2:
@@ -522,8 +512,27 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = EpochRevocationIdentityV1
         elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_RESULT:
             model_type = EpochRevocationResultV1
-        else:
+        elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_AUDIT:
             model_type = EpochRevocationAuditV1
+        else:
+            from controlgraph_canary.contracts.service_claim_release import (
+                ServiceClaimReleaseIdentityV1,
+                ServiceClaimReleaseProgressV1,
+                ServiceClaimReleaseResultV1,
+            )
+
+            if (
+                self.record_kind
+                is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY
+            ):
+                model_type = ServiceClaimReleaseIdentityV1
+            elif (
+                self.record_kind
+                is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS
+            ):
+                model_type = ServiceClaimReleaseProgressV1
+            else:
+                model_type = ServiceClaimReleaseResultV1
         try:
             payload = decode_contract(self.canonical_payload, model_type)
         except ContractError as error:
@@ -539,6 +548,9 @@ class AuthorityStorageDocument(StrictContractModel):
             AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
             AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
             AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
         }
         if self.record_kind in immutable_kinds and self.revision != 0:
             raise ValueError("immutable authority record must remain at revision zero")
@@ -593,6 +605,33 @@ class AuthorityStorageDocument(StrictContractModel):
             expected_logical_id = cast(EpochRevocationResultV1, payload).result_id
         elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_AUDIT:
             expected_logical_id = cast(EpochRevocationAuditV1, payload).audit_id
+        elif self.record_kind in {
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+        }:
+            from controlgraph_canary.contracts.service_claim_release import (
+                ServiceClaimReleaseIdentityV1,
+                ServiceClaimReleaseProgressV1,
+                ServiceClaimReleaseResultV1,
+            )
+
+            if self.record_kind is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY:
+                release_identity = cast(ServiceClaimReleaseIdentityV1, payload)
+                expected_logical_id = service_claim_release_identity_logical_id(
+                    release_identity.identity_kind.value,
+                    release_identity.identity_value,
+                )
+            elif self.record_kind is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS:
+                expected_logical_id = cast(
+                    ServiceClaimReleaseProgressV1,
+                    payload,
+                ).result_id
+            else:
+                expected_logical_id = cast(
+                    ServiceClaimReleaseResultV1,
+                    payload,
+                ).result_id
         else:
             expected_logical_id = cast(
                 RolloutRoot | RolloutRootV2 | EpochAuthorityRecord,
@@ -714,6 +753,38 @@ def epoch_revocation_audit_document_id(audit_id: str) -> str:
     return _document_id(AuthorityStorageKind.EPOCH_REVOCATION_AUDIT, audit_id)
 
 
+def service_claim_release_identity_logical_id(kind: str, identity_value: str) -> str:
+    """Return the collision domain for one claim-release request identity."""
+
+    if kind not in {"REQUEST", "IDEMPOTENCY"}:
+        raise ValueError("claim-release identity kind is invalid")
+    return f"{kind}:{_LogicalIdentity(value=identity_value).value}"
+
+
+def service_claim_release_identity_document_id(
+    kind: str,
+    identity_value: str,
+) -> str:
+    """Return the immutable document ID for one release identity claim."""
+
+    return _document_id(
+        AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+        service_claim_release_identity_logical_id(kind, identity_value),
+    )
+
+
+def service_claim_release_progress_document_id(result_id: str) -> str:
+    """Return the immutable document ID for one committed release fence."""
+
+    return _document_id(AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS, result_id)
+
+
+def service_claim_release_result_document_id(result_id: str) -> str:
+    """Return the immutable document ID for one completed claim release."""
+
+    return _document_id(AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT, result_id)
+
+
 def execution_receipt_logical_id(target: TargetBinding, idempotency_key: str) -> str:
     """Return one target-bound claim identity for an idempotency key."""
 
@@ -773,5 +844,9 @@ __all__ = [
     "service_claim_logical_id",
     "service_claim_matches_root",
     "service_claim_matches_root_v2",
+    "service_claim_release_identity_document_id",
+    "service_claim_release_identity_logical_id",
+    "service_claim_release_progress_document_id",
+    "service_claim_release_result_document_id",
     "signed_evidence_event_document_id",
 ]

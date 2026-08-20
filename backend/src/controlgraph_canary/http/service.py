@@ -35,6 +35,7 @@ from controlgraph_canary.application.evidence_signing import (
     EvidenceSigningService,
 )
 from controlgraph_canary.application.identity import (
+    CLASSIFICATION_EVIDENCE_PATH,
     RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     AuthenticationDenialCode,
@@ -62,6 +63,21 @@ from controlgraph_canary.application.root_trust import (
     RootPreflightErrorCode,
     RootPreflightService,
 )
+from controlgraph_canary.application.service_claim_classification import (
+    ServiceClaimClassificationError,
+    ServiceClaimClassificationErrorCode,
+    ServiceClaimClassificationService,
+)
+from controlgraph_canary.application.service_claim_classification_signing import (
+    ClassificationEvidenceSigningService,
+)
+from controlgraph_canary.application.service_claim_release import (
+    ServiceClaimReleaseError,
+)
+from controlgraph_canary.application.service_claim_release_relay import (
+    ApiServiceClaimReleaseClient,
+    CoordinatorServiceClaimReleaseRelay,
+)
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
 from controlgraph_canary.contracts.canary_execution import (
     ApplyCanaryCommandV1,
@@ -85,6 +101,15 @@ from controlgraph_canary.contracts.revocation import (
 from controlgraph_canary.contracts.root_creation import RootCreationCommandV1
 from controlgraph_canary.contracts.root_relay import RootCreationInvocationV1
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
+from controlgraph_canary.contracts.service_claim_release import (
+    SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1,
+    ServiceClaimClassificationRequestV1,
+    ServiceClaimClassificationSigningRequestV1,
+    ServiceClaimReleaseCommandV1,
+    ServiceClaimReleaseFailureCode,
+    ServiceClaimReleaseInvocationV1,
+    ServiceClaimReleaseRelayResponseV1,
+)
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
@@ -187,6 +212,24 @@ class EpochRevocationDenied(BaseModel):
     correlation_id: str
 
 
+class ServiceClaimReleaseDenied(BaseModel):
+    """Payload-free service-claim release failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
+class ServiceClaimClassificationDenied(BaseModel):
+    """Payload-free verifier classification failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -206,6 +249,19 @@ def create_service_app(
     coordinator_canary_relay: CoordinatorCanaryRelay | None = None,
     api_epoch_revocation_client: ApiEpochRevocationClient | None = None,
     coordinator_epoch_revocation_relay: CoordinatorEpochRevocationRelay | None = None,
+    api_service_claim_release_client: ApiServiceClaimReleaseClient | None = None,
+    coordinator_service_claim_release_relay: (
+        CoordinatorServiceClaimReleaseRelay | None
+    ) = None,
+    service_claim_classification_service: (
+        ServiceClaimClassificationService | None
+    ) = None,
+    classification_evidence_signing_service: (
+        ClassificationEvidenceSigningService | None
+    ) = None,
+    classification_evidence_authentication_policy: (
+        RouteAuthenticationPolicy | None
+    ) = None,
     capability_issuance_service: CapabilityIssuanceService | None = None,
     receipt_authority_service: ReceiptAuthorityService | None = None,
     receipt_authority_authentication_policy: RouteAuthenticationPolicy | None = None,
@@ -254,6 +310,38 @@ def create_service_app(
         and role is not ServiceRole.COORDINATOR
     ):
         raise ValueError("revocation coordination is limited to the coordinator route")
+    if api_service_claim_release_client is not None and role is not ServiceRole.API:
+        raise ValueError("service-claim release is limited to the API route")
+    if (
+        coordinator_service_claim_release_relay is not None
+        and role is not ServiceRole.COORDINATOR
+    ):
+        raise ValueError("claim release coordination is limited to the coordinator route")
+    if (
+        service_claim_classification_service is not None
+        and role is not ServiceRole.VERIFIER
+    ):
+        raise ValueError("claim classification is limited to the verifier route")
+    if (classification_evidence_signing_service is None) != (
+        classification_evidence_authentication_policy is None
+    ):
+        raise ValueError(
+            "classification evidence service and policy must be configured together"
+        )
+    if classification_evidence_signing_service is not None and (
+        role is not ServiceRole.EVIDENCE_WRITER
+        or type(classification_evidence_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or classification_evidence_authentication_policy.service_role
+        is not ServiceRole.EVIDENCE_WRITER
+        or classification_evidence_authentication_policy.path
+        != CLASSIFICATION_EVIDENCE_PATH
+        or classification_evidence_authentication_policy.caller.role
+        is not CallerRole.VERIFIER
+    ):
+        raise ValueError(
+            "classification evidence is limited to the verifier-to-writer route"
+        )
     if capability_issuance_service is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability issuance is limited to the issuer route")
     if (receipt_authority_service is None) != (
@@ -363,6 +451,7 @@ def create_service_app(
             api_root_creation_client is not None
             or api_canary_client is not None
             or api_epoch_revocation_client is not None
+            or api_service_claim_release_client is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -379,6 +468,16 @@ def create_service_app(
                         )
                     canary_result = await api_canary_client.dispatch(command, context)
                     response_body = canonical_json_bytes(canary_result)
+                elif type(command) is ServiceClaimReleaseCommandV1:
+                    if api_service_claim_release_client is None:
+                        raise ServiceClaimReleaseError(
+                            ServiceClaimReleaseFailureCode.STORE_UNAVAILABLE
+                        )
+                    release_result = await api_service_claim_release_client.release(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(release_result)
                 else:
                     if type(command) is not EpochRevocationCommandV1:
                         raise EpochRevocationError(
@@ -405,6 +504,11 @@ def create_service_app(
                 return _canary_execution_denial(error.code.value, correlation_id)
             except EpochRevocationError as error:
                 return _epoch_revocation_denial(error.code.value, correlation_id)
+            except ServiceClaimReleaseError as error:
+                return _service_claim_release_denial(
+                    error.code.value,
+                    correlation_id,
+                )
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -420,6 +524,7 @@ def create_service_app(
             coordinator_root_creation_relay is not None
             or coordinator_canary_relay is not None
             or coordinator_epoch_revocation_relay is not None
+            or coordinator_service_claim_release_relay is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -442,6 +547,35 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(canary_result)
+                elif type(invocation) is ServiceClaimReleaseInvocationV1:
+                    if coordinator_service_claim_release_relay is None:
+                        raise ServiceClaimReleaseError(
+                            ServiceClaimReleaseFailureCode.STORE_UNAVAILABLE
+                        )
+                    try:
+                        release_result = (
+                            await coordinator_service_claim_release_relay.release(
+                                invocation,
+                                context,
+                            )
+                        )
+                    except ServiceClaimReleaseError as error:
+                        release_outcome = ServiceClaimReleaseRelayResponseV1(
+                            schema_version=(
+                                SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1
+                            ),
+                            result=None,
+                            failure_code=error.code,
+                        )
+                    else:
+                        release_outcome = ServiceClaimReleaseRelayResponseV1(
+                            schema_version=(
+                                SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1
+                            ),
+                            result=release_result,
+                            failure_code=None,
+                        )
+                    response_body = canonical_json_bytes(release_outcome)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
                         raise EpochRevocationError(
@@ -483,6 +617,11 @@ def create_service_app(
                 return _canary_execution_denial(error.code.value, correlation_id)
             except EpochRevocationError as error:
                 return _epoch_revocation_denial(error.code.value, correlation_id)
+            except ServiceClaimReleaseError as error:
+                return _service_claim_release_denial(
+                    error.code.value,
+                    correlation_id,
+                )
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -550,15 +689,39 @@ def create_service_app(
                 media_type="application/json",
                 headers={"X-ControlGraph-Correlation-Id": correlation_id},
             )
-        if role is ServiceRole.VERIFIER and root_preflight_service is not None:
+        if role is ServiceRole.VERIFIER and (
+            root_preflight_service is not None
+            or service_claim_classification_service is not None
+        ):
             try:
                 body = await _read_contract_body(request)
-                preflight_request = decode_contract(body, RootPreflightRequestV1)
-                preflight_result = await root_preflight_service.preflight(
-                    preflight_request,
-                    context,
-                )
-                response_body = canonical_json_bytes(preflight_result)
+                verifier_request = _decode_verifier_request(body)
+                if type(verifier_request) is RootPreflightRequestV1:
+                    if root_preflight_service is None:
+                        raise RootPreflightError(
+                            RootPreflightErrorCode.CONFIGURATION_INVALID
+                        )
+                    preflight_result = await root_preflight_service.preflight(
+                        verifier_request,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(preflight_result)
+                else:
+                    if (
+                        type(verifier_request)
+                        is not ServiceClaimClassificationRequestV1
+                        or service_claim_classification_service is None
+                    ):
+                        raise ServiceClaimClassificationError(
+                            ServiceClaimClassificationErrorCode.CONFIGURATION_INVALID
+                        )
+                    classification_result = (
+                        await service_claim_classification_service.classify(
+                            verifier_request,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(classification_result)
             except asyncio.CancelledError:
                 raise
             except CapabilityVerificationError:
@@ -567,6 +730,11 @@ def create_service_app(
                 return _root_preflight_denial(error.code.value, correlation_id)
             except RootPreflightError as error:
                 return _root_preflight_denial(error.code.value, correlation_id)
+            except ServiceClaimClassificationError as error:
+                return _service_claim_classification_denial(
+                    error.code.value,
+                    correlation_id,
+                )
             except Exception:
                 return _root_preflight_denial(
                     RootPreflightErrorCode.UNAVAILABLE.value,
@@ -669,12 +837,91 @@ def create_service_app(
             headers={"X-ControlGraph-Correlation-Id": correlation_id},
         )
 
+    async def classification_evidence_work(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        policy = classification_evidence_authentication_policy
+        service = classification_evidence_signing_service
+        if (
+            authenticator is None
+            or type(policy) is not RouteAuthenticationPolicy
+            or type(service) is not ClassificationEvidenceSigningService
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CONFIGURATION_INVALID,
+                correlation_id,
+            )
+        authorization_headers = request.headers.getlist("authorization")
+        if len(authorization_headers) > 1:
+            return _authentication_denial(
+                AuthenticationDenialCode.CREDENTIAL_MALFORMED,
+                correlation_id,
+            )
+        authorization_header = (
+            authorization_headers[0] if authorization_headers else None
+        )
+        try:
+            context = authenticator.authenticate(authorization_header, policy)
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if (
+            type(context) is not AuthenticationContext
+            or context.role is not CallerRole.VERIFIER
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            body = await _read_contract_body(request)
+            signing_request = decode_contract(
+                body,
+                ServiceClaimClassificationSigningRequestV1,
+            )
+            signed = await service.sign(signing_request, context)
+            response_body = canonical_json_bytes(signed)
+        except asyncio.CancelledError:
+            raise
+        except ContractError as error:
+            return _service_claim_classification_denial(
+                error.code.value,
+                correlation_id,
+            )
+        except ServiceClaimClassificationError as error:
+            return _service_claim_classification_denial(
+                error.code.value,
+                correlation_id,
+            )
+        except Exception:
+            return _service_claim_classification_denial(
+                ServiceClaimClassificationErrorCode.UNAVAILABLE.value,
+                correlation_id,
+            )
+        return Response(
+            content=response_body,
+            status_code=200,
+            media_type="application/json",
+            headers={"X-ControlGraph-Correlation-Id": correlation_id},
+        )
+
     for path in protected_paths(role):
         app.add_api_route(path, protected_work, methods=["POST"], include_in_schema=False)
     if receipt_authority_service is not None:
         app.add_api_route(
             RECEIPT_AUTHORITY_PATH,
             receipt_authority_work,
+            methods=["POST"],
+            include_in_schema=False,
+        )
+    if classification_evidence_signing_service is not None:
+        app.add_api_route(
+            CLASSIFICATION_EVIDENCE_PATH,
+            classification_evidence_work,
             methods=["POST"],
             include_in_schema=False,
         )
@@ -689,7 +936,12 @@ def protected_paths(role: ServiceRole) -> tuple[str, ...]:
 
 def _decode_api_command(
     body: bytes,
-) -> RootCreationCommandV1 | ApplyCanaryCommandV1 | EpochRevocationCommandV1:
+) -> (
+    RootCreationCommandV1
+    | ApplyCanaryCommandV1
+    | ServiceClaimReleaseCommandV1
+    | EpochRevocationCommandV1
+):
     try:
         return decode_contract(body, RootCreationCommandV1)
     except ContractError as error:
@@ -700,12 +952,22 @@ def _decode_api_command(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, ServiceClaimReleaseCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, EpochRevocationCommandV1)
 
 
 def _decode_coordinator_invocation(
     body: bytes,
-) -> RootCreationInvocationV1 | ApplyCanaryInvocationV1 | EpochRevocationInvocationV1:
+) -> (
+    RootCreationInvocationV1
+    | ApplyCanaryInvocationV1
+    | ServiceClaimReleaseInvocationV1
+    | EpochRevocationInvocationV1
+):
     try:
         return decode_contract(body, RootCreationInvocationV1)
     except ContractError as error:
@@ -716,7 +978,23 @@ def _decode_coordinator_invocation(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, ServiceClaimReleaseInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, EpochRevocationInvocationV1)
+
+
+def _decode_verifier_request(
+    body: bytes,
+) -> RootPreflightRequestV1 | ServiceClaimClassificationRequestV1:
+    try:
+        return decode_contract(body, RootPreflightRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, ServiceClaimClassificationRequestV1)
 
 
 def _authentication_denial(
@@ -765,6 +1043,7 @@ def _evidence_signing_denial(code: str, correlation_id: str) -> JSONResponse:
     elif code in {
         EvidenceSigningErrorCode.CALLER_DENIED.value,
         EvidenceSigningErrorCode.TARGET_DENIED.value,
+        EvidenceSigningErrorCode.ACTOR_DENIED.value,
     }:
         status_code = 403
     else:
@@ -869,6 +1148,62 @@ def _epoch_revocation_denial(code: str, correlation_id: str) -> JSONResponse:
     )
 
 
+def _service_claim_release_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = ServiceClaimReleaseDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        ServiceClaimReleaseFailureCode.CALLER_DENIED.value,
+        ServiceClaimReleaseFailureCode.COMMAND_DENIED.value,
+    }:
+        status_code = 403
+    elif code in {
+        ServiceClaimReleaseFailureCode.ROOT_NOT_FOUND.value,
+        ServiceClaimReleaseFailureCode.ROOT_MISMATCH.value,
+        ServiceClaimReleaseFailureCode.CLAIM_NOT_ACTIVE.value,
+        ServiceClaimReleaseFailureCode.EPOCH_MISMATCH.value,
+        ServiceClaimReleaseFailureCode.TERMINAL_RECEIPT_INVALID.value,
+        ServiceClaimReleaseFailureCode.IDENTITY_CONFLICT.value,
+        ServiceClaimReleaseFailureCode.CLASSIFICATION_DENIED.value,
+        ServiceClaimReleaseFailureCode.EVIDENCE_DENIED.value,
+    }:
+        status_code = 409
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+def _service_claim_classification_denial(
+    code: str,
+    correlation_id: str,
+) -> JSONResponse:
+    response = ServiceClaimClassificationDenied(
+        code=code,
+        correlation_id=correlation_id,
+    )
+    if code in {
+        ContractErrorCode.INVALID.value,
+        ContractErrorCode.VERSION_UNSUPPORTED.value,
+    }:
+        status_code = 400
+    elif code in {
+        ServiceClaimClassificationErrorCode.CALLER_DENIED.value,
+        ServiceClaimClassificationErrorCode.REQUEST_DENIED.value,
+    }:
+        status_code = 403
+    elif code == ServiceClaimClassificationErrorCode.TARGET_MISMATCH.value:
+        status_code = 409
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
 def _receipt_authority_denial(code: str, correlation_id: str) -> JSONResponse:
     response = CanaryExecutionDenied(code=code, correlation_id=correlation_id)
     return JSONResponse(
@@ -922,6 +1257,8 @@ __all__ = [
     "EvidenceSigningDenied",
     "RootCreationDenied",
     "RootPreflightDenied",
+    "ServiceClaimClassificationDenied",
+    "ServiceClaimReleaseDenied",
     "ServiceHealth",
     "ServiceMetadata",
     "ServiceRole",
