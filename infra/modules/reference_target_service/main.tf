@@ -23,6 +23,10 @@ resource "google_cloud_run_v2_service" "reference" {
   deletion_protection  = true
   labels               = local.labels
 
+  scaling {
+    min_instance_count = 0
+  }
+
   template {
     revision                         = local.active_revision
     service_account                  = var.service_account

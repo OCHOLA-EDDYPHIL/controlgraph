@@ -8,6 +8,10 @@ resource "google_cloud_run_v2_service" "service" {
   deletion_protection  = true
   labels               = var.labels
 
+  scaling {
+    min_instance_count = var.minimum_instances
+  }
+
   template {
     service_account                  = var.service_account
     execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
