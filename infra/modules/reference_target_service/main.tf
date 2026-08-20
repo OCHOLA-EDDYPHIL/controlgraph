@@ -1,7 +1,7 @@
 locals {
   service_name       = "controlgraph-reference-target"
-  stable_revision    = "controlgraph-reference-target-stable-v1"
-  candidate_revision = "controlgraph-reference-target-candidate-v1"
+  stable_revision    = "controlgraph-reference-target-stable-v2"
+  candidate_revision = "controlgraph-reference-target-candidate-v2"
   active_revision    = var.deployment_phase == "stable" ? local.stable_revision : local.candidate_revision
   active_image       = var.deployment_phase == "stable" ? var.stable_image : var.candidate_image
   labels = {
