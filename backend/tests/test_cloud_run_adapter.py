@@ -92,8 +92,8 @@ from controlgraph_canary.integrations.google.cloud_run import (
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v2"
-CANDIDATE = f"{SERVICE}-candidate-v2"
+STABLE = f"{SERVICE}-stable-v3"
+CANDIDATE = f"{SERVICE}-candidate-v3"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
@@ -1046,14 +1046,14 @@ async def test_receipt_readback_uses_a_fresh_exact_get_and_provider_state() -> N
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            stable_revision=f"{SERVICE}-stable-v3",
+            stable_revision=f"{SERVICE}-stable-v4",
         ),
         replace(
             target_configuration_projection(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            candidate_revision=f"{SERVICE}-candidate-v3",
+            candidate_revision=f"{SERVICE}-candidate-v4",
         ),
         replace(
             target_configuration_projection(
@@ -1656,7 +1656,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-        "fbfa417a2b022a6f8d64c27ce6debe3c99b9e680c794934f0b57c5a18feb1d26"
+        "c6cd592b0caa606476704fb2448cda9741d265b05b374b495659f6b550161f11"
     )
 
 
@@ -1684,8 +1684,8 @@ def test_target_configuration_digest_excludes_non_poststate_fields() -> None:
     ("changes", "expected_concurrency"),
     [
         ({"target": _target(project_id="controlgraph-canary-d4e5f6")}, 8),
-        ({"stable_revision": f"{SERVICE}-stable-v3"}, 8),
-        ({"candidate_revision": f"{SERVICE}-candidate-v3"}, 8),
+        ({"stable_revision": f"{SERVICE}-stable-v4"}, 8),
+        ({"candidate_revision": f"{SERVICE}-candidate-v4"}, 8),
         ({"stable_percent": 80, "candidate_percent": 20}, 8),
         ({}, 9),
     ],
@@ -1787,7 +1787,7 @@ async def test_reference_target_reset_uses_one_conditional_traffic_update_and_re
 
 
 @_async_test
-async def test_reference_target_reset_migrates_the_retained_v1_baseline_to_v2() -> None:
+async def test_reference_target_reset_migrates_the_retained_v1_baseline_to_v3() -> None:
     before = _service(
         100,
         0,

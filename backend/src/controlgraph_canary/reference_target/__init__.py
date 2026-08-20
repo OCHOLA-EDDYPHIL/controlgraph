@@ -11,8 +11,8 @@ from pydantic import BaseModel, ConfigDict
 
 REFERENCE_PROBE_VERSION: Final = "controlgraph.reference-probe/v1"
 REFERENCE_SERVICE_NAME: Final = "controlgraph-reference-target"
-STABLE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-stable-v2"
-CANDIDATE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-candidate-v2"
+STABLE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-stable-v3"
+CANDIDATE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-candidate-v3"
 STABLE_MARKER: Final = "controlgraph-stable-v1"
 CANDIDATE_MARKER: Final = "controlgraph-candidate-v1"
 
