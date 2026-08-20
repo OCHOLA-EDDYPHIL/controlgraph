@@ -136,7 +136,7 @@ OpaqueToken = Annotated[
     StringConstraints(
         min_length=1,
         max_length=512,
-        pattern=r"^[A-Za-z0-9._~:/+=-]+$",
+        pattern=r'^(?:[A-Za-z0-9._~:/+=-]+|"[A-Za-z0-9._~:/+=-]+")$',
     ),
 ]
 KeyVersionResource = Annotated[

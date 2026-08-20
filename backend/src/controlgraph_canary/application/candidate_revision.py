@@ -24,7 +24,7 @@ from controlgraph_canary.contracts.models import TargetBinding
 _CONTROLGRAPH_PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _CLOUD_RUN_NAME = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9._~:/+=-]+$")
+_OPAQUE_TOKEN = re.compile(r'^(?:[A-Za-z0-9._~:/+=-]+|"[A-Za-z0-9._~:/+=-]+")$')
 _REFERENCE_SERVICE = "controlgraph-reference-target"
 _CONTROLGRAPH_ENVIRONMENT = "nonprod"
 

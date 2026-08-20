@@ -25,7 +25,7 @@ ROOT_CANDIDATE_ATTESTATION_V1: Final = (
 ROOT_PREFLIGHT_RESULT_V1: Final = "controlgraph.root-preflight-result/v1"
 
 _CONTROLGRAPH_PROJECT = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
-_OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9._~:/+=-]+$")
+_OPAQUE_TOKEN = re.compile(r'^(?:[A-Za-z0-9._~:/+=-]+|"[A-Za-z0-9._~:/+=-]+")$')
 _REFERENCE_SERVICE: Final = "controlgraph-reference-target"
 
 
