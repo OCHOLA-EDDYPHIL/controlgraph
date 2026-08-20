@@ -43,8 +43,8 @@ check "operator_queue_control_is_execution_only" {
   assert {
     condition = (
       google_cloud_tasks_queue_iam_member.operator_execution_controller.project == var.project_id &&
-      google_cloud_tasks_queue_iam_member.operator_execution_controller.location == "us-central1" &&
-      google_cloud_tasks_queue_iam_member.operator_execution_controller.name == "controlgraph-execution" &&
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.location == var.region &&
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.name == google_cloud_tasks_queue.execution.id &&
       google_cloud_tasks_queue_iam_member.operator_execution_controller.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.tasks_controller &&
       google_cloud_tasks_queue_iam_member.operator_execution_controller.member == var.operator_principal
     )

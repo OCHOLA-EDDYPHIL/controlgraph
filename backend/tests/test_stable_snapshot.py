@@ -91,7 +91,7 @@ def _revision_configuration(**changes: object) -> CloudRunRevisionConfiguration:
         "port_name": "http1",
         "container_port": 8080,
         "cpu_limit": "1",
-        "memory_limit": "256Mi",
+        "memory_limit": "512Mi",
         "cpu_idle": True,
         "startup_cpu_boost": False,
         "startup_probe": CloudRunHttpProbe(
@@ -326,7 +326,7 @@ async def test_capture_uses_two_matching_reads_and_ignores_mutable_aliases() -> 
     assert snapshot.service_generation == 7
     assert snapshot.provider_etag == "service-etag-7"
     assert snapshot.configuration_sha256 == (
-        "1bc47ea73f678cdccc22dbab383ba3e7820944ab9b421b42b355c085db444847"
+        "7382be29340b9a7b0703bec0e2f589010ce61c81ccae9735dc41dc2e5ced70fe"
     )
     assert snapshot.stable_revision_configuration_sha256 == (
         cloud_run_revision_configuration_sha256(_revision_configuration())
@@ -374,7 +374,7 @@ async def test_capture_preserves_optional_zero_percent_candidate() -> None:
         TrafficAllocation(revision=CANDIDATE, percent=0),
     )
     assert snapshot.configuration_sha256 != (
-        "1bc47ea73f678cdccc22dbab383ba3e7820944ab9b421b42b355c085db444847"
+        "7382be29340b9a7b0703bec0e2f589010ce61c81ccae9735dc41dc2e5ced70fe"
     )
     assert reader.mutation_calls == 0
 
@@ -707,7 +707,7 @@ def test_configuration_digest_binds_immutable_revision_and_serving_state() -> No
 
     assert STABLE_CONFIGURATION_V1 == "controlgraph.stable-configuration/v1"
     assert STABLE_CONFIGURATION_DOMAIN == b"controlgraph.stable-configuration-sha256/v1\0"
-    assert baseline == "1bc47ea73f678cdccc22dbab383ba3e7820944ab9b421b42b355c085db444847"
+    assert baseline == "7382be29340b9a7b0703bec0e2f589010ce61c81ccae9735dc41dc2e5ced70fe"
     assert all(
         stable_configuration_sha256(changed_service, changed_revision, changed_traffic)
         != baseline
@@ -754,7 +754,7 @@ def test_configuration_digest_binds_immutable_revision_and_serving_state() -> No
             ),
         ),
         _revision_configuration(cpu_limit="2"),
-        _revision_configuration(memory_limit="512Mi"),
+        _revision_configuration(memory_limit="1Gi"),
         _revision_configuration(cpu_idle=False),
         _revision_configuration(startup_cpu_boost=True),
         _revision_configuration(
