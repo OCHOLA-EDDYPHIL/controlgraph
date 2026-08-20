@@ -132,7 +132,7 @@ def _proof_args() -> argparse.Namespace:
     )
 
 
-def test_cli_uses_fixed_gcloud_audience_and_one_shell_free_api_post(
+def test_cli_uses_human_identity_token_and_one_shell_free_api_post(
     capsys: object,
 ) -> None:
     args = _args()
@@ -166,7 +166,6 @@ def test_cli_uses_fixed_gcloud_audience_and_one_shell_free_api_post(
                 "gcloud",
                 "auth",
                 "print-identity-token",
-                f"--audiences={origin}",
             ),
             {
                 "capture_output": True,
@@ -307,7 +306,6 @@ def test_proof_cli_uses_one_exact_authenticated_api_post(capsys: object) -> None
                 "gcloud",
                 "auth",
                 "print-identity-token",
-                f"--audiences={origin}",
             ),
             {
                 "capture_output": True,

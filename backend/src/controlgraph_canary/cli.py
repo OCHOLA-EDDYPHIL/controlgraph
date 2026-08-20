@@ -859,7 +859,6 @@ def _post_operator_command(
                 "gcloud",
                 "auth",
                 "print-identity-token",
-                f"--audiences={origin}",
             ),
             capture_output=True,
             text=True,

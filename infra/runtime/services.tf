@@ -186,11 +186,12 @@ module "api" {
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "api" })
   environment = merge(local.common_environment, local.identity_environment.api, {
-    CONTROLGRAPH_ROLE                   = "api"
-    CONTROLGRAPH_SERVICE_NAME           = local.service_names.api
-    CONTROLGRAPH_CONTROLLER_ID          = "${var.project_id}:${var.region}:api"
-    CONTROLGRAPH_COORDINATOR_URL        = local.service_audiences.coordinator
-    CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
-    CONTROLGRAPH_EVIDENCE_KEY_VERSION   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_ROLE                           = "api"
+    CONTROLGRAPH_SERVICE_NAME                   = local.service_names.api
+    CONTROLGRAPH_CONTROLLER_ID                  = "${var.project_id}:${var.region}:api"
+    CONTROLGRAPH_COORDINATOR_URL                = local.service_audiences.coordinator
+    CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE = var.operator_oauth_client_audience
+    CONTROLGRAPH_CAPABILITY_KEY_VERSION         = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION           = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
   })
 }

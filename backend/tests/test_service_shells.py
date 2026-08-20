@@ -121,8 +121,16 @@ def _environment(role: ServiceRole) -> dict[str, str]:
             }
         )
     if role is ServiceRole.API:
-        environment["CONTROLGRAPH_COORDINATOR_URL"] = (
-            f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+        environment.update(
+            {
+                "CONTROLGRAPH_COORDINATOR_URL": (
+                    f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
+                "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
+                    "32555940559.apps.googleusercontent.com"
+                ),
+            }
         )
     if role is ServiceRole.COORDINATOR:
         environment.update(
@@ -447,6 +455,42 @@ def test_runtime_composition_uses_startup_policy_for_google_verification() -> No
     assert response.status_code == 400
     assert response.json()["code"] == "CONTRACT_INVALID"
     assert calls == [("exact.test.credential", expected_audience)]
+
+
+def test_api_runtime_verifies_operator_token_against_oauth_client_audience() -> None:
+    environment = _environment(ServiceRole.API)
+    oauth_audience = environment["CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"]
+    calls: list[tuple[str, str]] = []
+
+    def verify_token(token: str, audience: str) -> dict[str, object]:
+        calls.append((token, audience))
+        return {
+            "iss": "https://accounts.google.com",
+            "aud": oauth_audience,
+            "email": environment["CONTROLGRAPH_AUTH_CALLER_EMAIL"],
+            "email_verified": True,
+            "sub": SUBJECT,
+            "iat": 1_776_236_340,
+            "exp": 1_776_239_400,
+        }
+
+    client = TestClient(
+        create_runtime_service_app(
+            ServiceRole.API,
+            environment=environment,
+            token_verifier=verify_token,
+            clock=lambda: 1_776_236_400.0,
+        )
+    )
+    response = client.post(
+        protected_paths(ServiceRole.API)[0],
+        content=b"{}",
+        headers={"Authorization": "Bearer exact.test.credential"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "CONTRACT_INVALID"
+    assert calls == [("exact.test.credential", oauth_audience)]
 
 
 def test_unexpected_verifier_failure_is_sanitized_and_fails_closed() -> None:

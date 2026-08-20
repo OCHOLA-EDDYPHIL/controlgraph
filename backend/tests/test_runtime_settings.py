@@ -27,6 +27,30 @@ def _environment() -> dict[str, str]:
     }
 
 
+def _api_environment() -> dict[str, str]:
+    environment = _environment()
+    environment.update(
+        {
+            "CONTROLGRAPH_SERVICE_NAME": "controlgraph-api",
+            "CONTROLGRAPH_CONTROLLER_ID": "controlgraph-canary-abc123:us-central1:api",
+            "CONTROLGRAPH_ROLE": "api",
+            "CONTROLGRAPH_AUTH_AUDIENCE": (
+                "https://controlgraph-api-123456789012.us-central1.run.app"
+            ),
+            "CONTROLGRAPH_AUTH_CALLER_ROLE": "operator",
+            "CONTROLGRAPH_AUTH_CALLER_EMAIL": "operator@example.com",
+            "CONTROLGRAPH_COORDINATOR_URL": (
+                "https://controlgraph-coordinator-123456789012."
+                "us-central1.run.app"
+            ),
+            "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
+                "32555940559.apps.googleusercontent.com"
+            ),
+        }
+    )
+    return environment
+
+
 def test_runtime_settings_bind_role_and_environment() -> None:
     settings = ControllerSettings.from_environment(_environment())
 
@@ -76,6 +100,43 @@ def test_enabled_executor_requires_and_binds_exact_mutation_configuration() -> N
     assert settings.target_subnetwork_resource == environment[
         "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"
     ]
+
+
+def test_api_requires_and_binds_exact_operator_oauth_client_audience() -> None:
+    environment = _api_environment()
+
+    settings = ControllerSettings.from_environment(environment)
+
+    assert settings.operator_oauth_client_audience == environment[
+        "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"
+    ]
+
+
+@pytest.mark.parametrize(
+    "audience",
+    [
+        "",
+        "https://controlgraph-api-123456789012.us-central1.run.app",
+        "client.apps.googleusercontent.com",
+        "32555940559.apps.googleusercontent.com ",
+    ],
+)
+def test_api_rejects_missing_or_malformed_operator_oauth_client_audience(
+    audience: str,
+) -> None:
+    environment = _api_environment()
+    environment["CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"] = audience
+
+    with pytest.raises(ValueError):
+        ControllerSettings.from_environment(environment)
+
+
+def test_api_rejects_absent_operator_oauth_client_audience() -> None:
+    environment = _api_environment()
+    del environment["CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"]
+
+    with pytest.raises(ValueError, match="missing environment variables"):
+        ControllerSettings.from_environment(environment)
 
 
 @pytest.mark.parametrize(

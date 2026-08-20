@@ -55,7 +55,10 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT",
 )
 
-API_ROOT_ENVIRONMENT_KEYS = ("CONTROLGRAPH_COORDINATOR_URL",)
+API_ROOT_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_COORDINATOR_URL",
+    "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE",
+)
 
 ISSUER_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
@@ -80,6 +83,9 @@ RUNTIME_ROLES = frozenset(role.value for role in ServiceRole)
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_GOOGLE_OAUTH_CLIENT_AUDIENCE = re.compile(
+    r"^[0-9]{6,32}(?:-[a-z0-9]{6,128})?\.apps\.googleusercontent\.com$"
+)
 
 
 def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]:
@@ -144,6 +150,7 @@ class ControllerSettings:
     candidate_revision_configuration_sha256: str | None
     operator_identity: str | None
     operator_subject: str | None
+    operator_oauth_client_audience: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
@@ -217,6 +224,7 @@ class ControllerSettings:
         candidate_revision_configuration_sha256: str | None = None
         operator_identity: str | None = None
         operator_subject: str | None = None
+        operator_oauth_client_audience: str | None = None
         executor_mutation_enabled = (
             service_role is ServiceRole.EXECUTOR and mutations_enabled
         )
@@ -227,6 +235,22 @@ class ControllerSettings:
                 ServiceRole.COORDINATOR,
                 project_number,
             )
+        if service_role is ServiceRole.API:
+            raw_operator_oauth_client_audience = source[
+                "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"
+            ]
+            if (
+                raw_operator_oauth_client_audience
+                != raw_operator_oauth_client_audience.strip()
+                or _GOOGLE_OAUTH_CLIENT_AUDIENCE.fullmatch(
+                    raw_operator_oauth_client_audience
+                )
+                is None
+            ):
+                raise ValueError(
+                    "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE is invalid"
+                )
+            operator_oauth_client_audience = raw_operator_oauth_client_audience
         if service_role in {
             ServiceRole.EVIDENCE_WRITER,
             ServiceRole.COORDINATOR,
@@ -410,6 +434,7 @@ class ControllerSettings:
             ),
             operator_identity=operator_identity,
             operator_subject=operator_subject,
+            operator_oauth_client_audience=operator_oauth_client_audience,
         )
 
 
