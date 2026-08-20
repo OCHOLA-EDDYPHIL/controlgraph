@@ -179,7 +179,7 @@ def test_cli_uses_human_identity_token_and_one_shell_free_api_post(
     assert len(poster.calls) == 1
     call = poster.calls[0]
     assert call["url"] == f"{origin}/v1/operator/commands"
-    assert call["timeout"] == 10.0
+    assert call["timeout"] == 30.0
     headers = call["headers"]
     assert isinstance(headers, dict)
     assert headers["Authorization"] == "Bearer header.payload.signature"
@@ -319,7 +319,7 @@ def test_proof_cli_uses_one_exact_authenticated_api_post(capsys: object) -> None
     assert len(poster.calls) == 1
     call = poster.calls[0]
     assert call["url"] == f"{origin}/v1/operator/commands"
-    assert call["timeout"] == 10.0
+    assert call["timeout"] == 30.0
     headers = call["headers"]
     assert isinstance(headers, dict)
     assert headers["Authorization"] == "Bearer header.payload.signature"
