@@ -26,6 +26,8 @@ def test_doctor_requires_the_role_specific_evidence_signing_configuration() -> N
     environment = {key: "configured" for key in REQUIRED_ENVIRONMENT_KEYS}
     environment["CONTROLGRAPH_ROLE"] = "evidence_writer"
     environment["CONTROLGRAPH_EVIDENCE_KEY_VERSION"] = "configured"
+    environment["CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL"] = "configured"
+    environment["CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT"] = "configured"
 
     report = _doctor_report(environment)
 
@@ -37,6 +39,8 @@ def test_doctor_requires_the_role_specific_evidence_signing_configuration() -> N
     assert set(EVIDENCE_WRITER_ENVIRONMENT_KEYS) == {
         "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
         "CONTROLGRAPH_SIGNING_ALGORITHM",
+        "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL",
+        "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT",
     }
 
 

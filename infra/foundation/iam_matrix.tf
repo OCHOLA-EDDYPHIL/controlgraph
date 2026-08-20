@@ -182,6 +182,7 @@ locals {
       "kms_evidence_version_read",
       "monitoring_health_read",
       "run_reference_invoke",
+      "run_evidence_writer_invoke",
       "run_target_snapshot",
     ])
     evidence_writer = toset([
@@ -264,6 +265,7 @@ locals {
         "kms_evidence_public_key_read",
         "kms_evidence_version_read",
         "run_reference_invoke",
+        "run_evidence_writer_invoke",
         "run_target_snapshot",
       ])
       evidence_writer = toset([
@@ -378,6 +380,7 @@ check "verifier_and_evidence_writer_are_separated" {
       !contains(local.identity_expected_allows.verifier, "kms_evidence_sign") &&
       contains(local.identity_expected_allows.verifier, "kms_evidence_public_key_read") &&
       contains(local.identity_expected_allows.verifier, "kms_evidence_version_read") &&
+      contains(local.identity_expected_allows.verifier, "run_evidence_writer_invoke") &&
       !contains(local.identity_expected_allows.coordinator, "kms_evidence_sign") &&
       contains(local.identity_expected_allows.coordinator, "kms_evidence_public_key_read") &&
       contains(local.identity_expected_allows.coordinator, "kms_evidence_version_read") &&

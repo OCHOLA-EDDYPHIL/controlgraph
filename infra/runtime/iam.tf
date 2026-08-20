@@ -87,6 +87,10 @@ locals {
       service = module.evidence_writer.service.name
       member  = "serviceAccount:${local.service_accounts.coordinator}"
     }
+    evidence_writer_verifier = {
+      service = module.evidence_writer.service.name
+      member  = "serviceAccount:${local.service_accounts.verifier}"
+    }
     reference = {
       service = module.reference_target.target.name
       member  = "serviceAccount:${local.service_accounts.verifier}"
@@ -106,14 +110,17 @@ check "runtime_invoker_map_is_closed" {
         "recovery",
         "verifier",
         "evidence_writer",
+        "evidence_writer_verifier",
         "reference",
       ]) &&
       local.run_invokers.coordinator_receipts.service == module.coordinator.service.name &&
       local.run_invokers.coordinator_receipts.member == "serviceAccount:${local.service_accounts.executor}" &&
       local.run_invokers.evidence_writer.service == module.evidence_writer.service.name &&
-      local.run_invokers.evidence_writer.member == "serviceAccount:${local.service_accounts.coordinator}"
+      local.run_invokers.evidence_writer.member == "serviceAccount:${local.service_accounts.coordinator}" &&
+      local.run_invokers.evidence_writer_verifier.service == module.evidence_writer.service.name &&
+      local.run_invokers.evidence_writer_verifier.member == "serviceAccount:${local.service_accounts.verifier}"
     )
-    error_message = "Runtime invocation must remain closed and the evidence writer must admit only the coordinator."
+    error_message = "Runtime invocation must remain closed and evidence-writer callers must remain coordinator and verifier only."
   }
 }
 

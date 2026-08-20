@@ -97,6 +97,7 @@ module "verifier" {
     CONTROLGRAPH_CONTROLLER_ID              = "${var.project_id}:${var.region}:verifier"
     CONTROLGRAPH_CAPABILITY_KEY_VERSION     = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
     CONTROLGRAPH_EVIDENCE_KEY_VERSION       = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_EVIDENCE_WRITER_URL        = local.service_audiences.evidence_writer
     CONTROLGRAPH_TARGET_NETWORK_RESOURCE    = data.terraform_remote_state.foundation.outputs.network.network_id
     CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   })
@@ -119,11 +120,13 @@ module "evidence_writer" {
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "evidence-writer" })
   environment = merge(local.common_environment, local.identity_environment.evidence_writer, {
-    CONTROLGRAPH_ROLE                 = "evidence_writer"
-    CONTROLGRAPH_SERVICE_NAME         = local.service_names.evidence_writer
-    CONTROLGRAPH_CONTROLLER_ID        = "${var.project_id}:${var.region}:evidence_writer"
-    CONTROLGRAPH_EVIDENCE_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
-    CONTROLGRAPH_SIGNING_ALGORITHM    = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.algorithm
+    CONTROLGRAPH_ROLE                                   = "evidence_writer"
+    CONTROLGRAPH_SERVICE_NAME                           = local.service_names.evidence_writer
+    CONTROLGRAPH_CONTROLLER_ID                          = "${var.project_id}:${var.region}:evidence_writer"
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION                   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_SIGNING_ALGORITHM                      = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.algorithm
+    CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL   = local.service_accounts.verifier
+    CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT = tostring(local.service_subjects.verifier)
   })
 }
 

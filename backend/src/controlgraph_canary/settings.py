@@ -32,6 +32,8 @@ REQUIRED_ENVIRONMENT_KEYS = (
 EVIDENCE_WRITER_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
     "CONTROLGRAPH_SIGNING_ALGORITHM",
+    "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL",
+    "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT",
 )
 
 COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
@@ -70,6 +72,8 @@ EXECUTOR_ENVIRONMENT_KEYS = (
 VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_TARGET_NETWORK_RESOURCE",
     "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE",
+    "CONTROLGRAPH_EVIDENCE_WRITER_URL",
+    "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
 )
 
 RUNTIME_ROLES = frozenset(role.value for role in ServiceRole)
@@ -132,6 +136,8 @@ class ControllerSettings:
     recovery_task_caller: str | None
     receipt_authority_caller_identity: str | None
     receipt_authority_caller_subject: str | None
+    classification_evidence_caller_identity: str | None
+    classification_evidence_caller_subject: str | None
     target_network_resource: str | None
     target_subnetwork_resource: str | None
     coordinator_url: str | None
@@ -203,6 +209,8 @@ class ControllerSettings:
         recovery_task_caller: str | None = None
         receipt_authority_caller_identity: str | None = None
         receipt_authority_caller_subject: str | None = None
+        classification_evidence_caller_identity: str | None = None
+        classification_evidence_caller_subject: str | None = None
         target_network_resource: str | None = None
         target_subnetwork_resource: str | None = None
         coordinator_url: str | None = None
@@ -219,7 +227,11 @@ class ControllerSettings:
                 ServiceRole.COORDINATOR,
                 project_number,
             )
-        if service_role in {ServiceRole.EVIDENCE_WRITER, ServiceRole.COORDINATOR}:
+        if service_role in {
+            ServiceRole.EVIDENCE_WRITER,
+            ServiceRole.COORDINATOR,
+            ServiceRole.VERIFIER,
+        }:
             evidence_key_version = source["CONTROLGRAPH_EVIDENCE_KEY_VERSION"].strip()
             expected_key_version = re.compile(
                 rf"^projects/{re.escape(project_id)}/locations/us-central1/"
@@ -317,6 +329,31 @@ class ControllerSettings:
             ].strip()
             if _PROJECT_NUMBER.fullmatch(receipt_authority_caller_subject) is None:
                 raise ValueError("receipt authority caller subject is invalid")
+        if service_role is ServiceRole.EVIDENCE_WRITER:
+            classification_evidence_caller_identity = source[
+                "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL"
+            ].strip()
+            if classification_evidence_caller_identity != (
+                f"controlgraph-verifier@{project_id}.iam.gserviceaccount.com"
+            ):
+                raise ValueError("classification evidence caller identity is invalid")
+            classification_evidence_caller_subject = source[
+                "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT"
+            ].strip()
+            if (
+                _PROJECT_NUMBER.fullmatch(classification_evidence_caller_subject)
+                is None
+            ):
+                raise ValueError("classification evidence caller subject is invalid")
+        if service_role is ServiceRole.VERIFIER:
+            evidence_writer_url = source[
+                "CONTROLGRAPH_EVIDENCE_WRITER_URL"
+            ].strip()
+            _validate_service_url(
+                evidence_writer_url,
+                ServiceRole.EVIDENCE_WRITER,
+                project_number,
+            )
         if service_role is ServiceRole.VERIFIER or executor_mutation_enabled:
             target_network_resource = source[
                 "CONTROLGRAPH_TARGET_NETWORK_RESOURCE"
@@ -359,6 +396,12 @@ class ControllerSettings:
             recovery_task_caller=recovery_task_caller,
             receipt_authority_caller_identity=receipt_authority_caller_identity,
             receipt_authority_caller_subject=receipt_authority_caller_subject,
+            classification_evidence_caller_identity=(
+                classification_evidence_caller_identity
+            ),
+            classification_evidence_caller_subject=(
+                classification_evidence_caller_subject
+            ),
             target_network_resource=target_network_resource,
             target_subnetwork_resource=target_subnetwork_resource,
             coordinator_url=coordinator_url,

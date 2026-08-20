@@ -37,6 +37,7 @@ class EvidenceSigningErrorCode(StrEnum):
     CONFIGURATION_INVALID = "EVIDENCE_SIGNING_CONFIGURATION_INVALID"
     CALLER_DENIED = "EVIDENCE_SIGNING_CALLER_DENIED"
     TARGET_DENIED = "EVIDENCE_SIGNING_TARGET_DENIED"
+    ACTOR_DENIED = "EVIDENCE_SIGNING_ACTOR_DENIED"
     UNAVAILABLE = "EVIDENCE_SIGNING_UNAVAILABLE"
 
 
@@ -124,6 +125,8 @@ class EvidenceSigningService:
             raise EvidenceSigningError(EvidenceSigningErrorCode.CALLER_DENIED)
         if type(event) is not EvidenceEvent or event.target != self._target:
             raise EvidenceSigningError(EvidenceSigningErrorCode.TARGET_DENIED)
+        if event.actor.endswith(".iam.gserviceaccount.com"):
+            raise EvidenceSigningError(EvidenceSigningErrorCode.ACTOR_DENIED)
         try:
             detached = await self._signer.sign(event)
         except asyncio.CancelledError:
