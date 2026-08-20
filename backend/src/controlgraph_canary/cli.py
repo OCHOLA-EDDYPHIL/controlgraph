@@ -7,7 +7,10 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
+from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 
 from controlgraph_canary.application.queue_control import (
@@ -19,10 +22,32 @@ from controlgraph_canary.application.queue_control import (
     ExecutionQueueTarget,
 )
 from controlgraph_canary.authority import EpochFence, EpochMismatchError
+from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
+from controlgraph_canary.contracts.canary_execution import (
+    APPLY_CANARY_COMMAND_V1,
+    ApplyCanaryCommandV1,
+    CanaryDispatchResultV1,
+)
 from controlgraph_canary.contracts.codec import (
     ContractError,
     canonical_json_bytes,
     decode_contract,
+)
+from controlgraph_canary.contracts.models import CapabilityAction
+from controlgraph_canary.contracts.operator_observability import (
+    EXECUTION_RECEIPT_READ_COMMAND_V1,
+    STABLE_SNAPSHOT_CAPTURE_COMMAND_V1,
+    TARGET_TRAFFIC_READ_COMMAND_V1,
+    ExecutionReceiptReadCommandV1,
+    ExecutionReceiptReadResultV1,
+    StableSnapshotCaptureCommandV1,
+    StableSnapshotCaptureResultV1,
+    TargetTrafficReadCommandV1,
+    TargetTrafficReadResultV1,
+)
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionCommandV1,
+    PromotionDispatchResultV1,
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_COMMAND_V1,
@@ -33,6 +58,11 @@ from controlgraph_canary.contracts.revocation import (
     EpochRevocationProofV1,
     epoch_revocation_proof_matches_command,
 )
+from controlgraph_canary.contracts.root_creation import (
+    RootCreationCommandV1,
+    RootCreationResultV1,
+)
+from controlgraph_canary.contracts.root_trust import stable_snapshots_match
 from controlgraph_canary.integrations.google.internal_transport import (
     InternalHttpResponse,
     OneShotHttpPoster,
@@ -44,9 +74,37 @@ _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
 _IDENTITY_TOKEN = re.compile(r"^[A-Za-z0-9._~-]{16,16384}$")
 _HTTP_TIMEOUT_SECONDS = 10.0
 
-type ExecutionQueueControllerFactory = Callable[
-    [ExecutionQueueTarget], ExecutionQueueController
-]
+type OperatorApiCommand = (
+    StableSnapshotCaptureCommandV1
+    | RootCreationCommandV1
+    | ApplyCanaryCommandV1
+    | ExecutionReceiptReadCommandV1
+    | TargetTrafficReadCommandV1
+    | PromotionCommandV1
+    | EpochRevocationCommandV1
+    | EpochRevocationProofCommandV1
+)
+type OperatorApiResult = (
+    StableSnapshotCaptureResultV1
+    | RootCreationResultV1
+    | CanaryDispatchResultV1
+    | ExecutionReceiptReadResultV1
+    | TargetTrafficReadResultV1
+    | PromotionDispatchResultV1
+)
+
+_OPERATOR_API_COMMAND_TYPES = (
+    StableSnapshotCaptureCommandV1,
+    RootCreationCommandV1,
+    ApplyCanaryCommandV1,
+    ExecutionReceiptReadCommandV1,
+    TargetTrafficReadCommandV1,
+    PromotionCommandV1,
+    EpochRevocationCommandV1,
+    EpochRevocationProofCommandV1,
+)
+
+type ExecutionQueueControllerFactory = Callable[[ExecutionQueueTarget], ExecutionQueueController]
 
 
 class GcloudCommandRunner(Protocol):
@@ -62,6 +120,18 @@ class GcloudCommandRunner(Protocol):
         timeout: float,
         shell: bool,
     ) -> subprocess.CompletedProcess[str]: ...
+
+
+class _OperatorApiFailure(StrEnum):
+    AUTH_UNAVAILABLE = "AUTH_UNAVAILABLE"
+    OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
+    API_DENIED = "API_DENIED"
+
+
+class _OperatorApiError(RuntimeError):
+    def __init__(self, failure: _OperatorApiFailure) -> None:
+        self.failure = failure
+        super().__init__(failure.value)
 
 
 def _doctor_report(environment: dict[str, str]) -> dict[str, Any]:
@@ -123,6 +193,64 @@ def _build_parser() -> argparse.ArgumentParser:
     proof_parser.add_argument("--attempt-id", required=True)
     proof_parser.add_argument("--audit-id", required=True)
 
+    snapshot_parser = subparsers.add_parser(
+        "capture-stable-snapshot",
+        help="capture the configured target's stable snapshot through the operator API",
+    )
+    snapshot_parser.add_argument("--project-number", required=True)
+    snapshot_parser.add_argument("--request-id", required=True)
+
+    root_parser = subparsers.add_parser(
+        "create-rollout-root",
+        help="create one rollout root from an exact canonical command",
+    )
+    root_parser.add_argument("--project-number", required=True)
+    root_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical root-creation command path, or '-' for stdin",
+    )
+
+    canary_parser = subparsers.add_parser(
+        "apply-canary",
+        help="dispatch one 90/10 canary through the operator API",
+    )
+    _add_authority_arguments(canary_parser)
+
+    receipt_parser = subparsers.add_parser(
+        "read-execution-receipt",
+        help="read one exact execution receipt through the operator API",
+    )
+    _add_authority_arguments(receipt_parser)
+    receipt_parser.add_argument(
+        "--action",
+        type=CapabilityAction,
+        choices=(
+            CapabilityAction.APPLY_CANARY,
+            CapabilityAction.PROMOTE_CANDIDATE,
+        ),
+        required=True,
+    )
+    receipt_parser.add_argument("--capability-sha256", required=True)
+
+    traffic_parser = subparsers.add_parser(
+        "read-target-traffic",
+        help="read the configured target's exact traffic through the operator API",
+    )
+    traffic_parser.add_argument("--project-number", required=True)
+    traffic_parser.add_argument("--request-id", required=True)
+
+    promotion_parser = subparsers.add_parser(
+        "promote-candidate",
+        help="dispatch one promotion from an exact canonical command",
+    )
+    promotion_parser.add_argument("--project-number", required=True)
+    promotion_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical promotion command path, or '-' for stdin",
+    )
+
     queue_parser = subparsers.add_parser(
         "execution-queue",
         help="inspect, hold, or release the fixed execution queue",
@@ -171,6 +299,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_authority_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project-number", required=True)
+    parser.add_argument("--root-id", required=True)
+    parser.add_argument("--expected-root-sha256", required=True)
+    parser.add_argument("--expected-epoch", type=int, required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--idempotency-key", required=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute a CLI command and return its process status."""
 
@@ -206,6 +343,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "revocation-proof":
         return _run_revocation_proof(args)
 
+    if args.command == "capture-stable-snapshot":
+        return _run_stable_snapshot_capture(args)
+
+    if args.command == "create-rollout-root":
+        return _run_root_creation(args)
+
+    if args.command == "apply-canary":
+        return _run_apply_canary(args)
+
+    if args.command == "read-execution-receipt":
+        return _run_execution_receipt_read(args)
+
+    if args.command == "read-target-traffic":
+        return _run_target_traffic_read(args)
+
+    if args.command == "promote-candidate":
+        return _run_promotion(args)
+
     if args.command == "execution-queue":
         return _run_execution_queue_command(args)
 
@@ -239,7 +394,6 @@ def _run_epoch_revocation(
     """Make exactly one authenticated API request without exposing its credential."""
 
     try:
-        origin = _sealed_api_origin(args.project_number)
         command = EpochRevocationCommandV1(
             schema_version=EPOCH_REVOCATION_COMMAND_V1,
             root_id=args.root_id,
@@ -250,66 +404,19 @@ def _run_epoch_revocation(
             idempotency_key=args.idempotency_key,
             confirmation=args.confirm,
         )
-    except (TypeError, ValueError):
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, TypeError, ValueError):
         _print_cli_error("REVOCATION_COMMAND_INVALID")
         return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("REVOCATION", error)
     try:
-        runner = command_runner or _run_gcloud_command
-        completed = runner(
-            (
-                "gcloud",
-                "auth",
-                "print-identity-token",
-                f"--audiences={origin}",
-            ),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_HTTP_TIMEOUT_SECONDS,
-            shell=False,
-        )
-    except Exception:
-        _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
-        return 3
-    token = completed.stdout.strip() if completed.returncode == 0 else ""
-    if _IDENTITY_TOKEN.fullmatch(token) is None:
-        _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
-        return 3
-    poster = http_poster or UrllibOneShotHttpPoster()
-    try:
-        response = poster.post(
-            url=f"{origin}/v1/operator/commands",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            body=canonical_json_bytes(command),
-            timeout=_HTTP_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        _print_cli_error("REVOCATION_OUTCOME_UNKNOWN")
-        return 4
-    if type(response) is not InternalHttpResponse:
-        _print_cli_error("REVOCATION_OUTCOME_UNKNOWN")
-        return 4
-    if response.status_code != 200:
-        code = (
-            "REVOCATION_OUTCOME_UNKNOWN"
-            if type(response.status_code) is int
-            and 500 <= response.status_code <= 599
-            else "REVOCATION_API_DENIED"
-        )
-        _print_cli_error(code)
-        return 4 if code == "REVOCATION_OUTCOME_UNKNOWN" else 5
-    if response.content_type not in {
-        "application/json",
-        "application/json; charset=utf-8",
-    }:
-        _print_cli_error("REVOCATION_API_DENIED")
-        return 5
-    try:
-        outcome = decode_contract(response.body, EpochRevocationCallOutcomeV1)
+        outcome = decode_contract(response_body, EpochRevocationCallOutcomeV1)
     except ContractError:
         _print_cli_error("REVOCATION_RESPONSE_INVALID")
         return 6
@@ -338,7 +445,6 @@ def _run_revocation_proof(
     """Retrieve one exact proof without direct authority-store or KMS access."""
 
     try:
-        origin = _sealed_api_origin(args.project_number)
         command = EpochRevocationProofCommandV1(
             schema_version=EPOCH_REVOCATION_PROOF_COMMAND_V1,
             root_id=args.root_id,
@@ -355,60 +461,23 @@ def _run_revocation_proof(
             attempt_id=args.attempt_id,
             audit_id=args.audit_id,
         )
-    except (TypeError, ValueError):
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, TypeError, ValueError):
         _print_cli_error("REVOCATION_PROOF_COMMAND_INVALID")
         return 2
+    except _OperatorApiError as error:
+        if error.failure is _OperatorApiFailure.AUTH_UNAVAILABLE:
+            _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
+            return 3
+        _print_cli_error("REVOCATION_PROOF_DENIED")
+        return 5 if error.failure is _OperatorApiFailure.API_DENIED else 4
     try:
-        runner = command_runner or _run_gcloud_command
-        completed = runner(
-            (
-                "gcloud",
-                "auth",
-                "print-identity-token",
-                f"--audiences={origin}",
-            ),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_HTTP_TIMEOUT_SECONDS,
-            shell=False,
-        )
-    except Exception:
-        _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
-        return 3
-    token = completed.stdout.strip() if completed.returncode == 0 else ""
-    if _IDENTITY_TOKEN.fullmatch(token) is None:
-        _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
-        return 3
-    poster = http_poster or UrllibOneShotHttpPoster()
-    try:
-        response = poster.post(
-            url=f"{origin}/v1/operator/commands",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            body=canonical_json_bytes(command),
-            timeout=_HTTP_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        _print_cli_error("REVOCATION_PROOF_DENIED")
-        return 4
-    if type(response) is not InternalHttpResponse:
-        _print_cli_error("REVOCATION_PROOF_DENIED")
-        return 4
-    if response.status_code != 200:
-        _print_cli_error("REVOCATION_PROOF_DENIED")
-        return 5
-    if response.content_type not in {
-        "application/json",
-        "application/json; charset=utf-8",
-    }:
-        _print_cli_error("REVOCATION_PROOF_DENIED")
-        return 5
-    try:
-        proof = decode_contract(response.body, EpochRevocationProofV1)
+        proof = decode_contract(response_body, EpochRevocationProofV1)
     except ContractError:
         _print_cli_error("REVOCATION_PROOF_RESPONSE_INVALID")
         return 6
@@ -416,6 +485,248 @@ def _run_revocation_proof(
         _print_cli_error("REVOCATION_PROOF_RESPONSE_INVALID")
         return 6
     print(canonical_json_bytes(proof).decode("utf-8"))
+    return 0
+
+
+def _run_stable_snapshot_capture(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Capture only the API-configured target's stable snapshot."""
+
+    try:
+        command = StableSnapshotCaptureCommandV1(
+            schema_version=STABLE_SNAPSHOT_CAPTURE_COMMAND_V1,
+            request_id=args.request_id,
+        )
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, TypeError, ValueError):
+        _print_cli_error("SNAPSHOT_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("SNAPSHOT", error)
+    try:
+        result = decode_contract(response_body, StableSnapshotCaptureResultV1)
+    except ContractError:
+        _print_cli_error("SNAPSHOT_RESPONSE_INVALID")
+        return 6
+    if result.request.request_id != command.request_id:
+        _print_cli_error("SNAPSHOT_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_root_creation(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Create one root from a pre-decoded exact root-creation command."""
+
+    try:
+        command = _read_root_creation_command(args.command_file)
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("ROOT_CREATION_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("ROOT_CREATION", error)
+    try:
+        result = decode_contract(response_body, RootCreationResultV1)
+    except ContractError:
+        _print_cli_error("ROOT_CREATION_RESPONSE_INVALID")
+        return 6
+    root_snapshot = result.root.content.stable_snapshot
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or not stable_snapshots_match(
+            root_snapshot,
+            command.expected_stable_snapshot,
+        )
+        or root_snapshot.captured_at < command.expected_stable_snapshot.captured_at
+    ):
+        _print_cli_error("ROOT_CREATION_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_apply_canary(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Dispatch one command bound to exact root authority."""
+
+    try:
+        command = ApplyCanaryCommandV1(
+            schema_version=APPLY_CANARY_COMMAND_V1,
+            root_id=args.root_id,
+            expected_root_sha256=args.expected_root_sha256,
+            expected_epoch=args.expected_epoch,
+            request_id=args.request_id,
+            idempotency_key=args.idempotency_key,
+        )
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, TypeError, ValueError):
+        _print_cli_error("CANARY_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("CANARY", error)
+    try:
+        result = decode_contract(response_body, CanaryDispatchResultV1)
+    except ContractError:
+        _print_cli_error("CANARY_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.epoch != command.expected_epoch
+    ):
+        _print_cli_error("CANARY_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_execution_receipt_read(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Read only the receipt named by its complete dispatch identity."""
+
+    try:
+        command = ExecutionReceiptReadCommandV1(
+            schema_version=EXECUTION_RECEIPT_READ_COMMAND_V1,
+            root_id=args.root_id,
+            expected_root_sha256=args.expected_root_sha256,
+            expected_epoch=args.expected_epoch,
+            action=args.action,
+            request_id=args.request_id,
+            idempotency_key=args.idempotency_key,
+            capability_sha256=args.capability_sha256,
+        )
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, TypeError, ValueError):
+        _print_cli_error("RECEIPT_READ_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("RECEIPT_READ", error)
+    try:
+        result = decode_contract(response_body, ExecutionReceiptReadResultV1)
+    except ContractError:
+        _print_cli_error("RECEIPT_READ_RESPONSE_INVALID")
+        return 6
+    if result.command != command:
+        _print_cli_error("RECEIPT_READ_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_target_traffic_read(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Read only the API-configured target's traffic state."""
+
+    try:
+        command = TargetTrafficReadCommandV1(
+            schema_version=TARGET_TRAFFIC_READ_COMMAND_V1,
+            request_id=args.request_id,
+        )
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, TypeError, ValueError):
+        _print_cli_error("TRAFFIC_READ_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("TRAFFIC_READ", error)
+    try:
+        result = decode_contract(response_body, TargetTrafficReadResultV1)
+    except ContractError:
+        _print_cli_error("TRAFFIC_READ_RESPONSE_INVALID")
+        return 6
+    if result.request.request_id != command.request_id:
+        _print_cli_error("TRAFFIC_READ_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_promotion(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Dispatch one promotion from a pre-decoded exact promotion command."""
+
+    try:
+        command = _read_promotion_command(args.command_file)
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("PROMOTION_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("PROMOTION", error)
+    try:
+        result = decode_contract(response_body, PromotionDispatchResultV1)
+    except ContractError:
+        _print_cli_error("PROMOTION_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.epoch != command.expected_epoch
+        or result.verified_apply_receipt != command.verified_apply_receipt
+    ):
+        _print_cli_error("PROMOTION_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
     return 0
 
 
@@ -505,6 +816,125 @@ def _default_execution_queue_controller(
     )
 
     return GoogleCloudTasksExecutionQueueController.from_default_credentials(target)
+
+
+def _read_root_creation_command(source: str) -> RootCreationCommandV1:
+    return decode_contract(_read_bounded_command_bytes(source), RootCreationCommandV1)
+
+
+def _read_promotion_command(source: str) -> PromotionCommandV1:
+    return decode_contract(_read_bounded_command_bytes(source), PromotionCommandV1)
+
+
+def _read_bounded_command_bytes(source: str) -> bytes:
+    if type(source) is not str or not source:
+        raise ValueError("command source is invalid")
+    if source == "-":
+        payload = sys.stdin.buffer.read(MAX_CONTRACT_BYTES + 1)
+    else:
+        with Path(source).open("rb") as command_file:
+            payload = command_file.read(MAX_CONTRACT_BYTES + 1)
+    if type(payload) is not bytes or not payload or len(payload) > MAX_CONTRACT_BYTES:
+        raise ValueError("command source is outside its byte bounds")
+    return payload
+
+
+def _post_operator_command(
+    project_number: str,
+    command: OperatorApiCommand,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> bytes:
+    """Send one exact admitted command to the sealed operator API route."""
+
+    origin = _sealed_api_origin(project_number)
+    if type(command) not in _OPERATOR_API_COMMAND_TYPES:
+        raise TypeError("operator API command type is not admitted")
+    body = canonical_json_bytes(command)
+    try:
+        runner = command_runner or _run_gcloud_command
+        completed = runner(
+            (
+                "gcloud",
+                "auth",
+                "print-identity-token",
+                f"--audiences={origin}",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+            shell=False,
+        )
+        token = (
+            completed.stdout.strip()
+            if completed.returncode == 0 and type(completed.stdout) is str
+            else ""
+        )
+    except Exception as error:
+        raise _OperatorApiError(_OperatorApiFailure.AUTH_UNAVAILABLE) from error
+    if _IDENTITY_TOKEN.fullmatch(token) is None:
+        raise _OperatorApiError(_OperatorApiFailure.AUTH_UNAVAILABLE)
+
+    try:
+        poster = http_poster or UrllibOneShotHttpPoster()
+        response = poster.post(
+            url=f"{origin}/v1/operator/commands",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            body=body,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        raise _OperatorApiError(_OperatorApiFailure.OUTCOME_UNKNOWN) from error
+    if type(response) is not InternalHttpResponse:
+        raise _OperatorApiError(_OperatorApiFailure.OUTCOME_UNKNOWN)
+    if (
+        type(response.status_code) is not int
+        or not 100 <= response.status_code <= 599
+        or (response.content_type is not None and type(response.content_type) is not str)
+        or type(response.body) is not bytes
+    ):
+        raise _OperatorApiError(_OperatorApiFailure.OUTCOME_UNKNOWN)
+    if response.status_code != 200:
+        if 400 <= response.status_code <= 499:
+            raise _OperatorApiError(_OperatorApiFailure.API_DENIED)
+        raise _OperatorApiError(_OperatorApiFailure.OUTCOME_UNKNOWN)
+    if response.content_type not in {
+        "application/json",
+        "application/json; charset=utf-8",
+    }:
+        raise _OperatorApiError(_OperatorApiFailure.OUTCOME_UNKNOWN)
+    if not response.body or len(response.body) > MAX_CONTRACT_BYTES:
+        raise _OperatorApiError(_OperatorApiFailure.OUTCOME_UNKNOWN)
+    return response.body
+
+
+def _report_operator_api_failure(prefix: str, error: _OperatorApiError) -> int:
+    status = {
+        _OperatorApiFailure.AUTH_UNAVAILABLE: 3,
+        _OperatorApiFailure.OUTCOME_UNKNOWN: 4,
+        _OperatorApiFailure.API_DENIED: 5,
+    }[error.failure]
+    _print_cli_error(f"{prefix}_{error.failure.value}")
+    return status
+
+
+def _print_contract_result(result: OperatorApiResult) -> None:
+    if type(result) not in (
+        StableSnapshotCaptureResultV1,
+        RootCreationResultV1,
+        CanaryDispatchResultV1,
+        ExecutionReceiptReadResultV1,
+        TargetTrafficReadResultV1,
+        PromotionDispatchResultV1,
+    ):
+        raise TypeError("operator API result type is not admitted")
+    print(canonical_json_bytes(result).decode("utf-8"))
 
 
 def _sealed_api_origin(project_number: str) -> str:
