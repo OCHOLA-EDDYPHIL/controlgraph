@@ -65,11 +65,15 @@ from controlgraph_canary.application.receipt_execution import (
     ReceiptExecutionCoordinator,
 )
 from controlgraph_canary.application.revocation import EpochRevoker
+from controlgraph_canary.application.revocation_proof import EpochRevocationProofService
 from controlgraph_canary.application.revocation_relay import (
     ApiEpochRevocationClient,
     CoordinatorEpochRevocationRelay,
 )
-from controlgraph_canary.application.revocation_store import EpochRevocationStore
+from controlgraph_canary.application.revocation_store import (
+    EpochRevocationProofStore,
+    EpochRevocationStore,
+)
 from controlgraph_canary.application.root_creation import RootCreationConfiguration
 from controlgraph_canary.application.root_creation_service import RolloutRootCreator
 from controlgraph_canary.application.root_relay import (
@@ -771,6 +775,11 @@ def create_runtime_service_app(
                 evidence_client=coordinator_clients.evidence,
                 operator_policy=_operator_api_policy(settings),
                 clock=revocation_clock,
+            ),
+            proof_reader=EpochRevocationProofService(
+                store=cast(EpochRevocationProofStore, selected_store),
+                evidence_verifier=coordinator_clients.evidence,
+                operator_policy=_operator_api_policy(settings),
             ),
         )
         coordinator_service_claim_release_relay = (

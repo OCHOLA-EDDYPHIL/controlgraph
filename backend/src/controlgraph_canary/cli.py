@@ -26,8 +26,12 @@ from controlgraph_canary.contracts.codec import (
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_COMMAND_V1,
+    EPOCH_REVOCATION_PROOF_COMMAND_V1,
+    EpochRevocationCallOutcomeV1,
     EpochRevocationCommandV1,
-    EpochRevocationResultV1,
+    EpochRevocationProofCommandV1,
+    EpochRevocationProofV1,
+    epoch_revocation_proof_matches_command,
 )
 from controlgraph_canary.integrations.google.internal_transport import (
     InternalHttpResponse,
@@ -99,6 +103,25 @@ def _build_parser() -> argparse.ArgumentParser:
     revoke_parser.add_argument("--request-id", required=True)
     revoke_parser.add_argument("--idempotency-key", required=True)
     revoke_parser.add_argument("--confirm", required=True, choices=("REVOKE",))
+
+    proof_parser = subparsers.add_parser(
+        "revocation-proof",
+        help="retrieve one exact verified revocation proof through the authenticated API",
+    )
+    proof_parser.add_argument("--project-number", required=True)
+    proof_parser.add_argument("--root-id", required=True)
+    proof_parser.add_argument("--root-sha256", required=True)
+    proof_parser.add_argument("--previous-epoch", type=int, required=True)
+    proof_parser.add_argument("--new-epoch", type=int, required=True)
+    proof_parser.add_argument("--reason", required=True)
+    proof_parser.add_argument("--request-sha256", required=True)
+    proof_parser.add_argument("--request-id", required=True)
+    proof_parser.add_argument("--idempotency-key", required=True)
+    proof_parser.add_argument("--result-id", required=True)
+    proof_parser.add_argument("--evidence-id", required=True)
+    proof_parser.add_argument("--evidence-sha256", required=True)
+    proof_parser.add_argument("--attempt-id", required=True)
+    proof_parser.add_argument("--audit-id", required=True)
 
     queue_parser = subparsers.add_parser(
         "execution-queue",
@@ -179,6 +202,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "revoke-epoch":
         return _run_epoch_revocation(args)
+
+    if args.command == "revocation-proof":
+        return _run_revocation_proof(args)
 
     if args.command == "execution-queue":
         return _run_execution_queue_command(args)
@@ -283,10 +309,11 @@ def _run_epoch_revocation(
         _print_cli_error("REVOCATION_API_DENIED")
         return 5
     try:
-        result = decode_contract(response.body, EpochRevocationResultV1)
+        outcome = decode_contract(response.body, EpochRevocationCallOutcomeV1)
     except ContractError:
         _print_cli_error("REVOCATION_RESPONSE_INVALID")
         return 6
+    result = outcome.result
     if (
         result.request_id != command.request_id
         or result.idempotency_key != command.idempotency_key
@@ -298,7 +325,97 @@ def _run_epoch_revocation(
     ):
         _print_cli_error("REVOCATION_RESPONSE_INVALID")
         return 6
-    print(canonical_json_bytes(result).decode("utf-8"))
+    print(canonical_json_bytes(outcome).decode("utf-8"))
+    return 0
+
+
+def _run_revocation_proof(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Retrieve one exact proof without direct authority-store or KMS access."""
+
+    try:
+        origin = _sealed_api_origin(args.project_number)
+        command = EpochRevocationProofCommandV1(
+            schema_version=EPOCH_REVOCATION_PROOF_COMMAND_V1,
+            root_id=args.root_id,
+            root_sha256=args.root_sha256,
+            previous_epoch=args.previous_epoch,
+            new_epoch=args.new_epoch,
+            reason=args.reason,
+            request_sha256=args.request_sha256,
+            request_id=args.request_id,
+            idempotency_key=args.idempotency_key,
+            result_id=args.result_id,
+            evidence_id=args.evidence_id,
+            evidence_sha256=args.evidence_sha256,
+            attempt_id=args.attempt_id,
+            audit_id=args.audit_id,
+        )
+    except (TypeError, ValueError):
+        _print_cli_error("REVOCATION_PROOF_COMMAND_INVALID")
+        return 2
+    try:
+        runner = command_runner or _run_gcloud_command
+        completed = runner(
+            (
+                "gcloud",
+                "auth",
+                "print-identity-token",
+                f"--audiences={origin}",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except Exception:
+        _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
+        return 3
+    token = completed.stdout.strip() if completed.returncode == 0 else ""
+    if _IDENTITY_TOKEN.fullmatch(token) is None:
+        _print_cli_error("REVOCATION_AUTH_UNAVAILABLE")
+        return 3
+    poster = http_poster or UrllibOneShotHttpPoster()
+    try:
+        response = poster.post(
+            url=f"{origin}/v1/operator/commands",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            body=canonical_json_bytes(command),
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        _print_cli_error("REVOCATION_PROOF_DENIED")
+        return 4
+    if type(response) is not InternalHttpResponse:
+        _print_cli_error("REVOCATION_PROOF_DENIED")
+        return 4
+    if response.status_code != 200:
+        _print_cli_error("REVOCATION_PROOF_DENIED")
+        return 5
+    if response.content_type not in {
+        "application/json",
+        "application/json; charset=utf-8",
+    }:
+        _print_cli_error("REVOCATION_PROOF_DENIED")
+        return 5
+    try:
+        proof = decode_contract(response.body, EpochRevocationProofV1)
+    except ContractError:
+        _print_cli_error("REVOCATION_PROOF_RESPONSE_INVALID")
+        return 6
+    if not epoch_revocation_proof_matches_command(proof, command):
+        _print_cli_error("REVOCATION_PROOF_RESPONSE_INVALID")
+        return 6
+    print(canonical_json_bytes(proof).decode("utf-8"))
     return 0
 
 

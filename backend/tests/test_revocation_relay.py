@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
+from revocation_proof_test_data import make_revocation_proof_records
 from root_v2_test_data import PROJECT, PROJECT_NUMBER, make_root_v2_records
 
 from controlgraph_canary.application.identity import (
@@ -22,14 +23,20 @@ from controlgraph_canary.application.revocation_relay import (
 from controlgraph_canary.application.root_trust import CoordinatorInternalRoute
 from controlgraph_canary.contracts.codec import canonical_json_bytes, decode_contract
 from controlgraph_canary.contracts.revocation import (
+    EPOCH_REVOCATION_CALL_OUTCOME_V1,
     EPOCH_REVOCATION_COMMAND_V1,
     EPOCH_REVOCATION_EVIDENCE_SUBJECT_V1,
+    EPOCH_REVOCATION_PROOF_RELAY_RESPONSE_V1,
     EPOCH_REVOCATION_RELAY_RESPONSE_V1,
     EPOCH_REVOCATION_RESULT_V1,
+    EpochRevocationCallOutcomeV1,
     EpochRevocationCommandV1,
     EpochRevocationEvidenceSubjectV1,
     EpochRevocationFailureCode,
     EpochRevocationInvocationV1,
+    EpochRevocationProofInvocationV1,
+    EpochRevocationProofRelayResponseV1,
+    EpochRevocationProofV1,
     EpochRevocationRelayResponseV1,
     EpochRevocationResultV1,
     epoch_revocation_evidence_id,
@@ -185,7 +192,12 @@ class _Transport:
         return canonical_json_bytes(
             EpochRevocationRelayResponseV1(
                 schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
-                result=_result(invocation),
+                outcome=EpochRevocationCallOutcomeV1(
+                    schema_version=EPOCH_REVOCATION_CALL_OUTCOME_V1,
+                    attempt_id=invocation.attempt_id,
+                    audit_id=invocation.attempt_id,
+                    result=_result(invocation),
+                ),
                 failure_code=None,
             )
         )
@@ -200,6 +212,26 @@ class _OutcomeTransport:
         if self.body is None:
             raise TimeoutError("synthetic response loss")
         return self.body
+
+
+class _ProofTransport:
+    def __init__(self, *, alternate_attempt: str | None = None) -> None:
+        self.alternate_attempt = alternate_attempt
+        self.calls: list[tuple[CoordinatorInternalRoute, EpochRevocationProofInvocationV1]] = []
+
+    async def post(self, route: CoordinatorInternalRoute, body: bytes) -> bytes:
+        invocation = decode_contract(body, EpochRevocationProofInvocationV1)
+        self.calls.append((route, invocation))
+        records = make_revocation_proof_records(
+            attempt_id=self.alternate_attempt or invocation.command.attempt_id
+        )
+        return canonical_json_bytes(
+            EpochRevocationProofRelayResponseV1(
+                schema_version=EPOCH_REVOCATION_PROOF_RELAY_RESPONSE_V1,
+                proof=records.proof,
+                failure_code=None,
+            )
+        )
 
 
 class _TamperedTargetTransport:
@@ -217,7 +249,12 @@ class _TamperedTargetTransport:
         return canonical_json_bytes(
             EpochRevocationRelayResponseV1(
                 schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
-                result=altered,
+                outcome=EpochRevocationCallOutcomeV1(
+                    schema_version=EPOCH_REVOCATION_CALL_OUTCOME_V1,
+                    attempt_id=invocation.attempt_id,
+                    audit_id=invocation.attempt_id,
+                    result=altered,
+                ),
                 failure_code=None,
             )
         )
@@ -248,6 +285,29 @@ class _Revoker:
         self.denials.append((invocation, code))
 
 
+class _ProofReader:
+    async def read(self, invocation: object, *, principal: object) -> object:
+        del invocation, principal
+        raise AssertionError("proof retrieval was not expected")
+
+
+class _ReturningProofReader:
+    def __init__(self, proof: EpochRevocationProofV1) -> None:
+        self.proof = proof
+        self.calls: list[
+            tuple[EpochRevocationProofInvocationV1, AuthenticationContext | None]
+        ] = []
+
+    async def read(
+        self,
+        invocation: EpochRevocationProofInvocationV1,
+        *,
+        principal: AuthenticationContext | None,
+    ) -> EpochRevocationProofV1:
+        self.calls.append((invocation, principal))
+        return self.proof
+
+
 class _Authenticator:
     def __init__(self, principal: AuthenticationContext) -> None:
         self.principal = principal
@@ -272,9 +332,11 @@ def test_api_relay_binds_verified_operator_and_one_unique_attempt() -> None:
             attempt_id_factory=lambda: "cgrevoke-attempt-relay-001",
         )
 
-        result = await client.revoke(_command(), _operator())
+        outcome = await client.revoke(_command(), _operator())
 
-        assert result.new_epoch == 2
+        assert outcome.attempt_id == "cgrevoke-attempt-relay-001"
+        assert outcome.audit_id == outcome.attempt_id
+        assert outcome.result.new_epoch == 2
         assert len(transport.calls) == 1
         route, body = transport.calls[0]
         assert route == _route()
@@ -293,6 +355,7 @@ def test_coordinator_relay_preserves_operator_identity_without_an_api_store() ->
             authentication_policy=_coordinator_policy(),
             operator_policy=_operator_policy(),
             revoker=revoker,
+            proof_reader=_ProofReader(),
         )
         operator = _operator()
         invocation = EpochRevocationInvocationV1(
@@ -307,9 +370,10 @@ def test_coordinator_relay_preserves_operator_identity_without_an_api_store() ->
             operator_expires_at=operator.expires_at,
         )
 
-        result = await relay.revoke(invocation, _api())
+        outcome = await relay.revoke(invocation, _api())
 
-        assert result.new_epoch == 2
+        assert outcome.attempt_id == invocation.attempt_id
+        assert outcome.result.new_epoch == 2
         assert revoker.calls == [(invocation, operator)]
 
     asyncio.run(scenario())
@@ -339,8 +403,8 @@ def test_api_http_route_accepts_the_strict_revocation_command() -> None:
     )
 
     assert response.status_code == 200
-    result = decode_contract(response.content, EpochRevocationResultV1)
-    assert result.new_epoch == 2
+    outcome = decode_contract(response.content, EpochRevocationCallOutcomeV1)
+    assert outcome.result.new_epoch == 2
     assert len(transport.calls) == 1
 
 
@@ -350,6 +414,7 @@ def test_coordinator_http_route_accepts_only_the_bound_invocation() -> None:
         authentication_policy=_coordinator_policy(),
         operator_policy=_operator_policy(),
         revoker=revoker,
+        proof_reader=_ProofReader(),
     )
     operator = _operator()
     invocation = EpochRevocationInvocationV1(
@@ -380,7 +445,7 @@ def test_coordinator_http_route_accepts_only_the_bound_invocation() -> None:
 
     assert response.status_code == 200
     outcome = decode_contract(response.content, EpochRevocationRelayResponseV1)
-    assert outcome.result is not None and outcome.result.new_epoch == 2
+    assert outcome.outcome is not None and outcome.outcome.result.new_epoch == 2
     assert outcome.failure_code is None
     assert revoker.calls == [(invocation, operator)]
 
@@ -394,7 +459,7 @@ def test_api_relay_preserves_sanitized_coordinator_denials() -> None:
                 canonical_json_bytes(
                     EpochRevocationRelayResponseV1(
                         schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
-                        result=None,
+                        outcome=None,
                         failure_code=EpochRevocationFailureCode.EPOCH_MISMATCH,
                     )
                 )
@@ -434,6 +499,7 @@ def test_coordinator_relay_rejects_forged_operator_facts_before_revoker() -> Non
             authentication_policy=_coordinator_policy(),
             operator_policy=_operator_policy(),
             revoker=revoker,
+            proof_reader=_ProofReader(),
         )
         operator = _operator()
         forged = EpochRevocationInvocationV1(
@@ -473,5 +539,99 @@ def test_api_relay_rejects_a_result_for_another_target() -> None:
             await client.revoke(_command(), _operator())
 
         assert captured.value.code is EpochRevocationFailureCode.OUTCOME_UNKNOWN
+
+    asyncio.run(scenario())
+
+
+def test_api_and_coordinator_relay_one_exact_proof_on_the_existing_post_path() -> None:
+    async def api_scenario() -> None:
+        records = make_revocation_proof_records()
+        transport = _ProofTransport()
+        client = ApiEpochRevocationClient(
+            route=_route(),
+            authentication_policy=_operator_policy(),
+            transport=transport,
+        )
+
+        proof = await client.proof(records.proof_command, _operator())
+
+        assert proof == records.proof
+        assert len(transport.calls) == 1
+        route, invocation = transport.calls[0]
+        assert route == _route()
+        assert invocation.command == records.proof_command
+        assert invocation.operator_identity == OPERATOR
+        assert invocation.operator_subject == OPERATOR_SUBJECT
+
+    asyncio.run(api_scenario())
+
+    records = make_revocation_proof_records()
+    transport = _ProofTransport()
+    api_client = ApiEpochRevocationClient(
+        route=_route(),
+        authentication_policy=_operator_policy(),
+        transport=transport,
+    )
+    api_http = TestClient(
+        create_service_app(
+            ServiceRole.API,
+            authenticator=_Authenticator(_operator()),
+            authentication_policy=_operator_policy(),
+            api_epoch_revocation_client=api_client,
+        )
+    )
+    api_response = api_http.post(
+        protected_path(ServiceRole.API),
+        content=canonical_json_bytes(records.proof_command),
+        headers={"Authorization": "Bearer exact-token"},
+    )
+    assert api_response.status_code == 200
+    assert decode_contract(api_response.content, EpochRevocationProofV1) == records.proof
+
+    reader = _ReturningProofReader(records.proof)
+    coordinator_relay = CoordinatorEpochRevocationRelay(
+        authentication_policy=_coordinator_policy(),
+        operator_policy=_operator_policy(),
+        revoker=_Revoker(),
+        proof_reader=reader,
+    )
+    coordinator_http = TestClient(
+        create_service_app(
+            ServiceRole.COORDINATOR,
+            authenticator=_Authenticator(_api()),
+            authentication_policy=_coordinator_policy(),
+            coordinator_epoch_revocation_relay=coordinator_relay,
+        )
+    )
+    coordinator_response = coordinator_http.post(
+        protected_path(ServiceRole.COORDINATOR),
+        content=canonical_json_bytes(records.proof_invocation),
+        headers={"Authorization": "Bearer exact-token"},
+    )
+    assert coordinator_response.status_code == 200
+    proof_outcome = decode_contract(
+        coordinator_response.content,
+        EpochRevocationProofRelayResponseV1,
+    )
+    assert proof_outcome.proof == records.proof
+    assert proof_outcome.failure_code is None
+    assert reader.calls == [(records.proof_invocation, _operator())]
+
+
+def test_proof_response_substitution_collapses_to_the_closed_denial() -> None:
+    async def scenario() -> None:
+        records = make_revocation_proof_records()
+        client = ApiEpochRevocationClient(
+            route=_route(),
+            authentication_policy=_operator_policy(),
+            transport=_ProofTransport(
+                alternate_attempt="cgrevoke-attempt-proof-substitution"
+            ),
+        )
+
+        with pytest.raises(EpochRevocationError) as captured:
+            await client.proof(records.proof_command, _operator())
+
+        assert captured.value.code is EpochRevocationFailureCode.PROOF_DENIED
 
     asyncio.run(scenario())

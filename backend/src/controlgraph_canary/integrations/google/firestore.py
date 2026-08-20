@@ -46,6 +46,7 @@ from controlgraph_canary.application.promotion_store import (
     PromotionEnqueuePermit,
 )
 from controlgraph_canary.application.revocation_store import (
+    EpochRevocationProofState,
     EpochRevocationState,
     EpochRevocationWriteResult,
 )
@@ -88,6 +89,7 @@ from controlgraph_canary.contracts.revocation import (
     EpochRevocationIdentityKind,
     EpochRevocationIdentityV1,
     EpochRevocationInvocationV1,
+    EpochRevocationProofCommandV1,
     EpochRevocationResultV1,
     epoch_revocation_request_sha256,
 )
@@ -3743,6 +3745,87 @@ class FirestoreAuthorityStore:
             result=_stored(result_document),
         )
 
+
+    async def read_epoch_revocation_proof(
+        self,
+        command: EpochRevocationProofCommandV1,
+    ) -> EpochRevocationProofState | None:
+        """Read one authority, evidence, result, and audit by exact document keys."""
+
+        if type(command) is not EpochRevocationProofCommandV1:
+            raise TypeError("epoch revocation proof requires an exact command")
+        decoded_state: EpochRevocationProofState | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal decoded_state
+            client = await self._client()
+            authority_document_id = epoch_authority_document_id(command.root_id)
+            result_document_id = epoch_revocation_result_document_id(command.result_id)
+            evidence_document_id = signed_evidence_event_document_id(command.evidence_id)
+            audit_document_id = epoch_revocation_audit_document_id(command.audit_id)
+            authority = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_AUTHORITY,
+                    authority_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=command.root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            signed_evidence = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    evidence_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=command.evidence_id,
+                document_id=evidence_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+            result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                    result_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                logical_id=command.result_id,
+                document_id=result_document_id,
+                model_type=EpochRevocationResultV1,
+            )
+            audit = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                    audit_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
+                logical_id=command.audit_id,
+                document_id=audit_document_id,
+                model_type=EpochRevocationAuditV1,
+            )
+            if any(value is None for value in (authority, signed_evidence, result, audit)):
+                return
+            decoded_state = EpochRevocationProofState(
+                command=command,
+                authority=cast(_DecodedDocument[EpochAuthorityRecord], authority).stored,
+                signed_evidence=cast(
+                    _DecodedDocument[SignedEvidenceEventV1],
+                    signed_evidence,
+                ).stored,
+                result=cast(_DecodedDocument[EpochRevocationResultV1], result).stored,
+                audit=cast(_DecodedDocument[EpochRevocationAuditV1], audit).stored,
+            )
+
+        await self._run_consistent_read(read)
+        return decoded_state
 
     async def read_epoch_revocation_state(
         self,

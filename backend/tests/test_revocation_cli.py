@@ -4,16 +4,20 @@ import argparse
 import inspect
 import subprocess
 
+from revocation_proof_test_data import make_revocation_proof_records
 from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
 
 import controlgraph_canary.cli as cli_module
-from controlgraph_canary.cli import _run_epoch_revocation
+from controlgraph_canary.cli import _run_epoch_revocation, _run_revocation_proof
 from controlgraph_canary.contracts.codec import canonical_json_bytes, decode_contract
 from controlgraph_canary.contracts.revocation import (
+    EPOCH_REVOCATION_CALL_OUTCOME_V1,
     EPOCH_REVOCATION_EVIDENCE_SUBJECT_V1,
     EPOCH_REVOCATION_RESULT_V1,
+    EpochRevocationCallOutcomeV1,
     EpochRevocationCommandV1,
     EpochRevocationEvidenceSubjectV1,
+    EpochRevocationProofCommandV1,
     EpochRevocationResultV1,
     epoch_revocation_evidence_id,
 )
@@ -108,17 +112,43 @@ def _result(args: argparse.Namespace) -> EpochRevocationResultV1:
     )
 
 
+def _proof_args() -> argparse.Namespace:
+    command = make_revocation_proof_records().proof_command
+    return argparse.Namespace(
+        project_number=PROJECT_NUMBER,
+        root_id=command.root_id,
+        root_sha256=command.root_sha256,
+        previous_epoch=command.previous_epoch,
+        new_epoch=command.new_epoch,
+        reason=command.reason,
+        request_sha256=command.request_sha256,
+        request_id=command.request_id,
+        idempotency_key=command.idempotency_key,
+        result_id=command.result_id,
+        evidence_id=command.evidence_id,
+        evidence_sha256=command.evidence_sha256,
+        attempt_id=command.attempt_id,
+        audit_id=command.audit_id,
+    )
+
+
 def test_cli_uses_fixed_gcloud_audience_and_one_shell_free_api_post(
     capsys: object,
 ) -> None:
     args = _args()
     result = _result(args)
+    outcome = EpochRevocationCallOutcomeV1(
+        schema_version=EPOCH_REVOCATION_CALL_OUTCOME_V1,
+        attempt_id="cgrevoke-attempt-cli-001",
+        audit_id="cgrevoke-attempt-cli-001",
+        result=result,
+    )
     runner = _Runner()
     poster = _Poster(
         InternalHttpResponse(
             status_code=200,
             content_type="application/json",
-            body=canonical_json_bytes(result),
+            body=canonical_json_bytes(outcome),
         )
     )
 
@@ -158,7 +188,7 @@ def test_cli_uses_fixed_gcloud_audience_and_one_shell_free_api_post(
     assert command.confirmation == "REVOKE"
     output = capsys.readouterr().out  # type: ignore[attr-defined]
     assert "header.payload.signature" not in output
-    assert output.strip() == canonical_json_bytes(result).decode("utf-8")
+    assert output.strip() == canonical_json_bytes(outcome).decode("utf-8")
 
 
 def test_cli_rejects_unsealed_project_coordinates_without_auth_or_http() -> None:
@@ -193,11 +223,17 @@ def test_cli_rejects_a_response_not_bound_to_the_exact_reason(
             ),
         }
     )
+    outcome = EpochRevocationCallOutcomeV1(
+        schema_version=EPOCH_REVOCATION_CALL_OUTCOME_V1,
+        attempt_id="cgrevoke-attempt-cli-altered",
+        audit_id="cgrevoke-attempt-cli-altered",
+        result=altered,
+    )
     poster = _Poster(
         InternalHttpResponse(
             status_code=200,
             content_type="application/json",
-            body=canonical_json_bytes(altered),
+            body=canonical_json_bytes(outcome),
         )
     )
 
@@ -244,3 +280,102 @@ def test_cli_keeps_post_response_loss_and_server_failure_ambiguous(
             capsys.readouterr().out.strip()
             == '{"code": "REVOCATION_OUTCOME_UNKNOWN"}'
         )
+
+
+def test_proof_cli_uses_one_exact_authenticated_api_post(capsys: object) -> None:
+    records = make_revocation_proof_records()
+    runner = _Runner()
+    poster = _Poster(
+        InternalHttpResponse(
+            status_code=200,
+            content_type="application/json",
+            body=canonical_json_bytes(records.proof),
+        )
+    )
+
+    status = _run_revocation_proof(
+        _proof_args(),
+        command_runner=runner,
+        http_poster=poster,
+    )
+
+    assert status == 0
+    origin = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
+    assert runner.calls == [
+        (
+            (
+                "gcloud",
+                "auth",
+                "print-identity-token",
+                f"--audiences={origin}",
+            ),
+            {
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 10.0,
+                "shell": False,
+            },
+        )
+    ]
+    assert len(poster.calls) == 1
+    call = poster.calls[0]
+    assert call["url"] == f"{origin}/v1/operator/commands"
+    assert call["timeout"] == 10.0
+    headers = call["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Authorization"] == "Bearer header.payload.signature"
+    command = decode_contract(call["body"], EpochRevocationProofCommandV1)
+    assert command == records.proof_command
+    output = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "header.payload.signature" not in output
+    assert output.strip() == canonical_json_bytes(records.proof).decode("utf-8")
+
+
+def test_proof_cli_collapses_api_denial_without_echoing_payload(
+    capsys: object,
+) -> None:
+    poster = _Poster(
+        InternalHttpResponse(
+            status_code=403,
+            content_type="application/json",
+            body=b'{"provider_diagnostic":"must-not-escape"}',
+        )
+    )
+
+    status = _run_revocation_proof(
+        _proof_args(),
+        command_runner=_Runner(),
+        http_poster=poster,
+    )
+
+    assert status == 5
+    assert (  # type: ignore[attr-defined]
+        capsys.readouterr().out.strip()
+        == '{"code": "REVOCATION_PROOF_DENIED"}'
+    )
+
+
+def test_proof_cli_rejects_a_substituted_attempt(capsys: object) -> None:
+    substituted = make_revocation_proof_records(
+        attempt_id="cgrevoke-attempt-proof-substituted"
+    )
+    poster = _Poster(
+        InternalHttpResponse(
+            status_code=200,
+            content_type="application/json",
+            body=canonical_json_bytes(substituted.proof),
+        )
+    )
+
+    status = _run_revocation_proof(
+        _proof_args(),
+        command_runner=_Runner(),
+        http_poster=poster,
+    )
+
+    assert status == 6
+    assert (  # type: ignore[attr-defined]
+        capsys.readouterr().out.strip()
+        == '{"code": "REVOCATION_PROOF_RESPONSE_INVALID"}'
+    )
