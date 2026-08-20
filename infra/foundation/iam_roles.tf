@@ -126,6 +126,17 @@ check "run_executor_roles_are_minimal" {
   }
 }
 
+check "tasks_controller_is_queue_control_only" {
+  assert {
+    condition = toset(local.custom_iam_roles.tasks_controller.permissions) == toset([
+      "cloudtasks.queues.get",
+      "cloudtasks.queues.pause",
+      "cloudtasks.queues.resume",
+    ])
+    error_message = "The task controller role must contain only queue inspect, pause, and resume permissions."
+  }
+}
+
 output "custom_iam_role_names" {
   description = "Least-privilege ControlGraph custom-role names keyed by purpose."
   value       = { for purpose, role in google_project_iam_custom_role.controlgraph : purpose => role.name }

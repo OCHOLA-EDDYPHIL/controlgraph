@@ -7,9 +7,17 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
+from controlgraph_canary.application.queue_control import (
+    EXECUTION_QUEUE_ID,
+    EXECUTION_QUEUE_REGION,
+    ExecutionQueueController,
+    ExecutionQueueObservation,
+    ExecutionQueueState,
+    ExecutionQueueTarget,
+)
 from controlgraph_canary.authority import EpochFence, EpochMismatchError
 from controlgraph_canary.contracts.codec import (
     ContractError,
@@ -32,9 +40,13 @@ _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
 _IDENTITY_TOKEN = re.compile(r"^[A-Za-z0-9._~-]{16,16384}$")
 _HTTP_TIMEOUT_SECONDS = 10.0
 
+type ExecutionQueueControllerFactory = Callable[
+    [ExecutionQueueTarget], ExecutionQueueController
+]
 
-class IdentityTokenCommandRunner(Protocol):
-    """Run one fixed shell-free identity-token command."""
+
+class GcloudCommandRunner(Protocol):
+    """Run one fixed shell-free gcloud command."""
 
     def __call__(
         self,
@@ -88,6 +100,37 @@ def _build_parser() -> argparse.ArgumentParser:
     revoke_parser.add_argument("--idempotency-key", required=True)
     revoke_parser.add_argument("--confirm", required=True, choices=("REVOKE",))
 
+    queue_parser = subparsers.add_parser(
+        "execution-queue",
+        help="inspect, hold, or release the fixed execution queue",
+    )
+    queue_subparsers = queue_parser.add_subparsers(dest="queue_action", required=True)
+    describe_queue_parser = queue_subparsers.add_parser(
+        "describe",
+        help="read the fixed execution queue state",
+    )
+    describe_queue_parser.add_argument("--project-id", required=True)
+    hold_queue_parser = queue_subparsers.add_parser(
+        "hold",
+        help="pause dispatch from the fixed execution queue",
+    )
+    hold_queue_parser.add_argument("--project-id", required=True)
+    hold_queue_parser.add_argument(
+        "--confirm",
+        required=True,
+        choices=("HOLD_EXECUTION_QUEUE",),
+    )
+    release_queue_parser = queue_subparsers.add_parser(
+        "release",
+        help="resume dispatch from the fixed execution queue",
+    )
+    release_queue_parser.add_argument("--project-id", required=True)
+    release_queue_parser.add_argument(
+        "--confirm",
+        required=True,
+        choices=("RELEASE_EXECUTION_QUEUE",),
+    )
+
     serve_parser = subparsers.add_parser("serve", help="serve the read-only HTTP surface")
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
@@ -137,6 +180,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "revoke-epoch":
         return _run_epoch_revocation(args)
 
+    if args.command == "execution-queue":
+        return _run_execution_queue_command(args)
+
     if args.command == "serve":
         import uvicorn
 
@@ -161,7 +207,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run_epoch_revocation(
     args: argparse.Namespace,
     *,
-    command_runner: IdentityTokenCommandRunner | None = None,
+    command_runner: GcloudCommandRunner | None = None,
     http_poster: OneShotHttpPoster | None = None,
 ) -> int:
     """Make exactly one authenticated API request without exposing its credential."""
@@ -182,7 +228,7 @@ def _run_epoch_revocation(
         _print_cli_error("REVOCATION_COMMAND_INVALID")
         return 2
     try:
-        runner = command_runner or _run_identity_token_command
+        runner = command_runner or _run_gcloud_command
         completed = runner(
             (
                 "gcloud",
@@ -256,13 +302,101 @@ def _run_epoch_revocation(
     return 0
 
 
+def _run_execution_queue_command(
+    args: argparse.Namespace,
+    *,
+    controller_factory: ExecutionQueueControllerFactory | None = None,
+) -> int:
+    """Inspect or control only the fixed execution queue with one provider RPC."""
+
+    action = getattr(args, "queue_action", None)
+    project_id = getattr(args, "project_id", None)
+    confirmation = getattr(args, "confirm", None)
+    if type(action) is not str or type(project_id) is not str:
+        _print_cli_error("QUEUE_CONTROL_COMMAND_INVALID")
+        return 2
+    try:
+        target = ExecutionQueueTarget(project_id=project_id)
+    except (TypeError, ValueError):
+        _print_cli_error("QUEUE_CONTROL_COMMAND_INVALID")
+        return 2
+    if not _valid_queue_confirmation(action, confirmation):
+        _print_cli_error("QUEUE_CONTROL_COMMAND_INVALID")
+        return 2
+
+    try:
+        factory = controller_factory or _default_execution_queue_controller
+        controller = factory(target)
+        if action == "describe":
+            observation = controller.describe()
+        elif action == "hold":
+            observation = controller.hold()
+        else:
+            observation = controller.release()
+    except Exception:
+        code = (
+            "QUEUE_CONTROL_PROVIDER_UNAVAILABLE"
+            if action == "describe"
+            else "QUEUE_CONTROL_OUTCOME_UNKNOWN"
+        )
+        _print_cli_error(code)
+        return 3 if action == "describe" else 4
+
+    expected_state = {
+        "hold": ExecutionQueueState.PAUSED,
+        "release": ExecutionQueueState.RUNNING,
+    }.get(action)
+    if (
+        type(observation) is not ExecutionQueueObservation
+        or observation.resource_name != target.resource_name
+        or type(observation.state) is not ExecutionQueueState
+        or (expected_state is not None and observation.state is not expected_state)
+    ):
+        code = (
+            "QUEUE_CONTROL_RESPONSE_INVALID"
+            if action == "describe"
+            else "QUEUE_CONTROL_OUTCOME_UNKNOWN"
+        )
+        _print_cli_error(code)
+        return 5 if action == "describe" else 4
+    output = {
+        "action": action,
+        "location": EXECUTION_QUEUE_REGION,
+        "project_id": target.project_id,
+        "queue_id": EXECUTION_QUEUE_ID,
+        "state": observation.state.value,
+    }
+    print(json.dumps(output, sort_keys=True))
+    return 0
+
+
+def _valid_queue_confirmation(action: object, confirmation: object) -> bool:
+    if action == "describe":
+        return confirmation is None
+    if action == "hold":
+        return confirmation == "HOLD_EXECUTION_QUEUE"
+    if action == "release":
+        return confirmation == "RELEASE_EXECUTION_QUEUE"
+    return False
+
+
+def _default_execution_queue_controller(
+    target: ExecutionQueueTarget,
+) -> ExecutionQueueController:
+    from controlgraph_canary.integrations.google.queue_control import (
+        GoogleCloudTasksExecutionQueueController,
+    )
+
+    return GoogleCloudTasksExecutionQueueController.from_default_credentials(target)
+
+
 def _sealed_api_origin(project_number: str) -> str:
     if type(project_number) is not str or _PROJECT_NUMBER.fullmatch(project_number) is None:
         raise ValueError("project number is invalid")
     return f"https://controlgraph-api-{project_number}.us-central1.run.app"
 
 
-def _run_identity_token_command(
+def _run_gcloud_command(
     argv: Sequence[str],
     *,
     capture_output: bool,
