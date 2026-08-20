@@ -679,6 +679,27 @@ class CloudRunV2SnapshotReader:
         except (TypeError, ValueError):
             raise CloudRunReadError(CloudRunReadErrorCode.CORRUPT_RESPONSE) from None
 
+    async def read_target(self) -> CloudRunTargetState:
+        """Read the fixed service and both configured revisions without listing."""
+
+        service, stable, candidate = await asyncio.gather(
+            self.read_service(),
+            self.read_revision(self._configuration.stable_revision),
+            self.read_revision(self._configuration.candidate_revision),
+        )
+        if (
+            stable.revision != self._configuration.stable_revision
+            or stable.concurrency != self._configuration.stable_concurrency
+            or candidate.revision != self._configuration.candidate_revision
+            or candidate.concurrency != self._configuration.candidate_concurrency
+        ):
+            raise CloudRunReadError(CloudRunReadErrorCode.CORRUPT_RESPONSE)
+        return CloudRunTargetState(
+            service=service,
+            stable_revision=stable,
+            candidate_revision=candidate,
+        )
+
     async def _services_client(self) -> _ServicesClientPort:
         if self._services is not None:
             return self._services

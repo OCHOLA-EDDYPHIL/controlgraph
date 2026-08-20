@@ -40,6 +40,15 @@ from controlgraph_canary.application.identity import (
     runtime_route_policy,
     runtime_service_name,
 )
+from controlgraph_canary.application.operator_observability import (
+    ApiOperatorObservationClient,
+    CoordinatorOperatorObservationRelay,
+    CoordinatorStableSnapshotClient,
+    CoordinatorTargetTrafficClient,
+    ExecutionReceiptObservationStore,
+    StableSnapshotCaptureService,
+    TargetTrafficObservationService,
+)
 from controlgraph_canary.application.promotion_execution import (
     ApiPromotionClient,
     CoordinatorPromotionCapabilityClient,
@@ -102,6 +111,11 @@ from controlgraph_canary.application.tasks import (
     TaskEnqueuer,
 )
 from controlgraph_canary.contracts.models import TargetBinding
+from controlgraph_canary.contracts.operator_observability import (
+    STABLE_SNAPSHOT_CAPTURE_REQUEST_V1,
+    StableSnapshotCaptureRequestV1,
+    TargetTrafficReadRequestV1,
+)
 from controlgraph_canary.contracts.root_creation import RolloutHealthPolicyV1
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 from controlgraph_canary.contracts.service_claim_release import (
@@ -187,10 +201,14 @@ def create_runtime_service_app(
     classification_evidence_signing_service = None
     classification_evidence_authentication_policy = None
     root_preflight_service = None
+    stable_snapshot_capture_service = None
+    target_traffic_observation_service = None
     service_claim_classification_service = None
     coordinator_clients = None
     api_root_creation_client = None
     coordinator_root_creation_relay = None
+    api_operator_observation_client = None
+    coordinator_operator_observation_relay = None
     service_claim_releaser = None
     api_service_claim_release_client = None
     coordinator_service_claim_release_relay = None
@@ -278,6 +296,61 @@ def create_runtime_service_app(
             reader_factory=reader_factory,
             clock=preflight_clock,
         )
+
+        def capture_reader_factory(
+            request: StableSnapshotCaptureRequestV1,
+        ) -> CloudRunV2SnapshotReader:
+            if request.target != target:
+                raise ValueError("snapshot capture target is not configured")
+            return CloudRunV2SnapshotReader(
+                configuration=CloudRunTargetConfiguration(
+                    target=target,
+                    stable_revision="controlgraph-reference-target-stable-v1",
+                    candidate_revision="controlgraph-reference-target-candidate-v1",
+                    stable_concurrency=8,
+                    candidate_concurrency=8,
+                    network_resource=target_network_resource,
+                    subnetwork_resource=target_subnetwork_resource,
+                ),
+                service_role=ServiceRole.VERIFIER,
+                configured_project_id=settings.project_id,
+                services_client_factory=services_client_factory,
+                revisions_client_factory=revisions_client_factory,
+            )
+
+        stable_snapshot_capture_service = StableSnapshotCaptureService(
+            target=target,
+            authentication_policy=policy,
+            reader_factory=capture_reader_factory,
+            clock=preflight_clock,
+        )
+
+        def traffic_reader_factory(
+            request: TargetTrafficReadRequestV1,
+        ) -> CloudRunV2SnapshotReader:
+            if (
+                request.target != target
+                or request.stable_revision
+                != "controlgraph-reference-target-stable-v1"
+                or request.candidate_revision
+                != "controlgraph-reference-target-candidate-v1"
+                or request.concurrency != 8
+            ):
+                raise ValueError("target traffic request is not configured")
+            return capture_reader_factory(
+                StableSnapshotCaptureRequestV1(
+                    schema_version=STABLE_SNAPSHOT_CAPTURE_REQUEST_V1,
+                    request_id=request.request_id,
+                    target=request.target,
+                )
+            )
+
+        target_traffic_observation_service = TargetTrafficObservationService(
+            target=target,
+            authentication_policy=policy,
+            reader_factory=traffic_reader_factory,
+            clock=preflight_clock,
+        )
         selected_transport = (
             internal_transport
             if internal_transport is not None
@@ -335,6 +408,17 @@ def create_runtime_service_app(
             )
         )
         api_root_creation_client = ApiRootCreationClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+        )
+        api_operator_observation_client = ApiOperatorObservationClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
                 project_number=settings.project_number,
@@ -602,6 +686,24 @@ def create_runtime_service_app(
                 configured_project_id=settings.project_id,
             )
         )
+        coordinator_operator_observation_relay = CoordinatorOperatorObservationRelay(
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            snapshot_client=CoordinatorStableSnapshotClient(
+                target=target,
+                route=verifier_route,
+                transport=selected_transport,
+            ),
+            traffic_client=CoordinatorTargetTrafficClient(
+                target=target,
+                stable_revision="controlgraph-reference-target-stable-v1",
+                candidate_revision="controlgraph-reference-target-candidate-v1",
+                concurrency=8,
+                route=verifier_route,
+                transport=selected_transport,
+            ),
+            receipt_store=cast(ExecutionReceiptObservationStore, selected_store),
+        )
         service_claim_releaser = ServiceClaimReleaser(
             store=cast(ServiceClaimReleaseStore, selected_store),
             evidence_client=coordinator_clients.evidence,
@@ -805,11 +907,17 @@ def create_runtime_service_app(
             classification_evidence_authentication_policy
         ),
         root_preflight_service=root_preflight_service,
+        stable_snapshot_capture_service=stable_snapshot_capture_service,
+        target_traffic_observation_service=target_traffic_observation_service,
         service_claim_classification_service=(
             service_claim_classification_service
         ),
         api_root_creation_client=api_root_creation_client,
         coordinator_root_creation_relay=coordinator_root_creation_relay,
+        api_operator_observation_client=api_operator_observation_client,
+        coordinator_operator_observation_relay=(
+            coordinator_operator_observation_relay
+        ),
         api_canary_client=api_canary_client,
         coordinator_canary_relay=coordinator_canary_relay,
         api_promotion_client=api_promotion_client,
@@ -831,6 +939,20 @@ def create_runtime_service_app(
         app.state.controlgraph_root_creation_client = api_root_creation_client
     if coordinator_root_creation_relay is not None:
         app.state.controlgraph_root_creation_relay = coordinator_root_creation_relay
+    if stable_snapshot_capture_service is not None:
+        app.state.controlgraph_stable_snapshot_capture = stable_snapshot_capture_service
+    if target_traffic_observation_service is not None:
+        app.state.controlgraph_target_traffic_observation = (
+            target_traffic_observation_service
+        )
+    if api_operator_observation_client is not None:
+        app.state.controlgraph_operator_observation_client = (
+            api_operator_observation_client
+        )
+    if coordinator_operator_observation_relay is not None:
+        app.state.controlgraph_operator_observation_relay = (
+            coordinator_operator_observation_relay
+        )
     if service_claim_releaser is not None:
         app.state.controlgraph_service_claim_releaser = service_claim_releaser
     if api_service_claim_release_client is not None:
