@@ -118,7 +118,7 @@ locals {
     }
     tasks_queue_control = {
       api      = "cloudtasks.googleapis.com"
-      boundary = "one explicitly bound ControlGraph queue"
+      boundary = "the fixed execution queue only"
     }
     tasks_recovery_enqueue = {
       api      = "cloudtasks.googleapis.com"
@@ -209,6 +209,7 @@ locals {
     ])
     operator = toset([
       "run_api_invoke",
+      "tasks_queue_control",
     ])
     cloud_tasks_service_agent = toset([
       "task_oidc_token_mint",
@@ -291,6 +292,7 @@ locals {
       ])
       operator = toset([
         "run_api_invoke",
+        "tasks_queue_control",
       ])
       cloud_tasks_service_agent = toset([
         "task_oidc_token_mint",
@@ -391,6 +393,19 @@ check "verifier_and_evidence_writer_are_separated" {
       local.identity_implemented_allows.evidence_writer == local.identity_expected_allows.evidence_writer
     )
     error_message = "Verification, authority writes, and evidence signing must remain separate."
+  }
+}
+
+check "operator_permissions_are_bounded" {
+  assert {
+    condition = (
+      local.identity_expected_allows.operator == toset([
+        "run_api_invoke",
+        "tasks_queue_control",
+      ]) &&
+      local.identity_implemented_allows.operator == local.identity_expected_allows.operator
+    )
+    error_message = "The operator may invoke the API and control only the fixed execution queue."
   }
 }
 

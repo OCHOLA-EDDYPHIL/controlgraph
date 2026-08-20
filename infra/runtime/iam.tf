@@ -31,6 +31,27 @@ resource "google_cloud_tasks_queue_iam_member" "coordinator_enqueuer" {
   member   = "serviceAccount:${local.service_accounts.coordinator}"
 }
 
+resource "google_cloud_tasks_queue_iam_member" "operator_execution_controller" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_tasks_queue.execution.name
+  role     = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.tasks_controller
+  member   = var.operator_principal
+}
+
+check "operator_queue_control_is_execution_only" {
+  assert {
+    condition = (
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.project == var.project_id &&
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.location == "us-central1" &&
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.name == "controlgraph-execution" &&
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.role == data.terraform_remote_state.foundation.outputs.custom_iam_role_names.tasks_controller &&
+      google_cloud_tasks_queue_iam_member.operator_execution_controller.member == var.operator_principal
+    )
+    error_message = "Operator queue control must remain bound only to controlgraph-execution in us-central1."
+  }
+}
+
 resource "google_service_account_iam_member" "coordinator_task_caller_actor" {
   for_each = toset([
     "execution_task_caller",
