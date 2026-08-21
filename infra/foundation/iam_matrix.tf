@@ -82,7 +82,7 @@ locals {
     }
     run_operation_read = {
       api      = "run.googleapis.com"
-      boundary = "read-only operation status in us-central1 within the dedicated project"
+      boundary = "read-only Cloud Run operation status within the dedicated ControlGraph project"
     }
     run_recovery_invoke = {
       api      = "run.googleapis.com"
