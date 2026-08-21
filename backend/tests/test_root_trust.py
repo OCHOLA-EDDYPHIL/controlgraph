@@ -694,6 +694,7 @@ def test_one_shot_oidc_transport_uses_exact_audience_url_and_never_retries() -> 
         caller_role=CallerRole.COORDINATOR,
         token_provider=tokens,
         http_poster=poster,
+        timeout_seconds=30.0,
     )
 
     assert asyncio.run(transport.post(route, b"{}")) == b"{}"
@@ -703,6 +704,7 @@ def test_one_shot_oidc_transport_uses_exact_audience_url_and_never_retries() -> 
     headers = poster.calls[0]["headers"]
     assert isinstance(headers, dict)
     assert headers["Authorization"] == "Bearer synthetic.oidc.token"
+    assert poster.calls[0]["timeout"] == 30.0
 
     poster.status = 307
     with pytest.raises(InternalTransportError):

@@ -97,7 +97,9 @@ from controlgraph_canary.settings import ControllerSettings, required_environmen
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
 _IDENTITY_TOKEN = re.compile(r"^[A-Za-z0-9._~-]{16,16384}$")
 _IDENTITY_TOKEN_COMMAND_TIMEOUT_SECONDS = 10.0
-_OPERATOR_HTTP_TIMEOUT_SECONDS = 30.0
+# The API may wait on the complete internal authorization chain. Match the
+# bounded Cloud Run request deadline so callers can observe its response.
+_OPERATOR_HTTP_TIMEOUT_SECONDS = 60.0
 
 type OperatorApiCommand = (
     StableSnapshotCaptureCommandV1

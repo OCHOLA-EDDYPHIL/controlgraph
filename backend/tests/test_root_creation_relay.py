@@ -476,6 +476,7 @@ def test_one_shot_transport_supports_only_exact_api_to_coordinator_route() -> No
         caller_role=CallerRole.API,
         token_provider=tokens,
         http_poster=poster,
+        timeout_seconds=45.0,
     )
 
     assert asyncio.run(transport.post(_route(), b"{}")) == b"{}"
@@ -486,6 +487,7 @@ def test_one_shot_transport_supports_only_exact_api_to_coordinator_route() -> No
     )
     headers = cast(dict[str, str], poster.calls[0]["headers"])
     assert headers["Authorization"] == "Bearer synthetic.oidc.token"
+    assert poster.calls[0]["timeout"] == 45.0
 
     poster.status = 307
     with pytest.raises(InternalTransportError):
@@ -501,6 +503,16 @@ def test_one_shot_transport_supports_only_exact_api_to_coordinator_route() -> No
             audience=(
                 f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
             ),
+        )
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.0, 45.1, float("inf"), float("nan")])
+def test_one_shot_transport_rejects_unbounded_timeout(timeout_seconds: float) -> None:
+    with pytest.raises(InternalTransportError):
+        GoogleOneShotOidcTransport(
+            project_id=PROJECT,
+            caller_role=CallerRole.API,
+            timeout_seconds=timeout_seconds,
         )
 
 
