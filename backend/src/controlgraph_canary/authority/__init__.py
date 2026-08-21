@@ -16,6 +16,15 @@ from controlgraph_canary.authority.epoch import (
     compare_and_advance,
     initial_authority,
 )
+from controlgraph_canary.authority.health import (
+    HealthDecisionKind,
+    HealthEvaluationResult,
+    HealthEvaluationState,
+    HealthPolicy,
+    HealthReason,
+    HealthWindowSample,
+    evaluate_health,
+)
 from controlgraph_canary.authority.policy import (
     MAX_LINEAGE_DEPTH,
     AttenuationFailure,
@@ -93,6 +102,12 @@ __all__ = [
     "EpochMismatchError",
     "EpochTransition",
     "FactStatus",
+    "HealthDecisionKind",
+    "HealthEvaluationResult",
+    "HealthEvaluationState",
+    "HealthPolicy",
+    "HealthReason",
+    "HealthWindowSample",
     "IntegerBounds",
     "LineageFailure",
     "LineageResult",
@@ -125,6 +140,7 @@ __all__ = [
     "decide_replay",
     "decide_transport_failure",
     "deny_before_dispatch",
+    "evaluate_health",
     "initial_authority",
     "mutation_identity",
     "receipt_claim_identity",
