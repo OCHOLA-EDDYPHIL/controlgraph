@@ -116,8 +116,6 @@ jobs:
       - name: Push and emit immutable references
         id: publish
         shell: bash
-        env:
-          CONTROLGRAPH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
           set -euo pipefail
           registry="${CONTROLGRAPH_REGION}-docker.pkg.dev/${CONTROLGRAPH_PROJECT_ID}/${CONTROLGRAPH_ARTIFACT_REPOSITORY}"
@@ -135,23 +133,20 @@ jobs:
             output_name="${image_output##*:}"
             tagged_image="${registry}/${image_name}:${image_tag}"
             docker push "$tagged_image"
-            manifest_url="https://${CONTROLGRAPH_REGION}-docker.pkg.dev/v2/${CONTROLGRAPH_PROJECT_ID}/${CONTROLGRAPH_ARTIFACT_REPOSITORY}/${image_name}/manifests/${image_tag}"
-            digest="$(
-              curl \
-                --fail \
-                --silent \
-                --show-error \
-                --head \
-                --config - \
-                "$manifest_url" <<CURL_CONFIG \
-                | awk "tolower(\$1) == \"docker-content-digest:\" { gsub(\"\\\\r\", \"\", \$2); digest = \$2 } END { print digest }"
-          header = "Authorization: Bearer ${CONTROLGRAPH_ACCESS_TOKEN}"
-          header = "Accept: application/vnd.oci.image.manifest.v1+json"
-          header = "Accept: application/vnd.docker.distribution.manifest.v2+json"
-          CURL_CONFIG
-            )"
+            mapfile -t matching_references < <(
+              docker image inspect \
+                --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                "$tagged_image" \
+                | while IFS= read -r reference; do
+                    if [[ "$reference" == "${registry}/${image_name}@sha256:"* ]]; then
+                      printf '%s\n' "$reference"
+                    fi
+                  done
+            )
+            [[ "${#matching_references[@]}" -eq 1 ]]
+            immutable_reference="${matching_references[0]}"
+            digest="${immutable_reference##*@}"
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            immutable_reference="${registry}/${image_name}@${digest}"
             [[ "$immutable_reference" == "${registry}/"*"@sha256:"* ]]
             printf '%s=%s\n' "$output_name" "$immutable_reference" >> "$GITHUB_OUTPUT"
             digests+=("$digest")
