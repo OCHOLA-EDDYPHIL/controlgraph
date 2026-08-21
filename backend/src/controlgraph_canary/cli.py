@@ -63,6 +63,11 @@ from controlgraph_canary.contracts.root_creation import (
     RootCreationResultV1,
 )
 from controlgraph_canary.contracts.root_trust import stable_snapshots_match
+from controlgraph_canary.contracts.service_claim_release import (
+    ServiceClaimReleaseCommandV1,
+    ServiceClaimReleaseResultV1,
+)
+from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.http.identity_headers import (
     CONTROLGRAPH_AUTHORIZATION_HEADER,
     SERVERLESS_AUTHORIZATION_HEADER,
@@ -88,6 +93,7 @@ type OperatorApiCommand = (
     | PromotionCommandV1
     | EpochRevocationCommandV1
     | EpochRevocationProofCommandV1
+    | ServiceClaimReleaseCommandV1
 )
 type OperatorApiResult = (
     StableSnapshotCaptureResultV1
@@ -96,6 +102,7 @@ type OperatorApiResult = (
     | ExecutionReceiptReadResultV1
     | TargetTrafficReadResultV1
     | PromotionDispatchResultV1
+    | ServiceClaimReleaseResultV1
 )
 
 _OPERATOR_API_COMMAND_TYPES = (
@@ -107,6 +114,7 @@ _OPERATOR_API_COMMAND_TYPES = (
     PromotionCommandV1,
     EpochRevocationCommandV1,
     EpochRevocationProofCommandV1,
+    ServiceClaimReleaseCommandV1,
 )
 
 type ExecutionQueueControllerFactory = Callable[[ExecutionQueueTarget], ExecutionQueueController]
@@ -256,6 +264,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonical promotion command path, or '-' for stdin",
     )
 
+    release_claim_parser = subparsers.add_parser(
+        "release-service-claim",
+        help="release one terminal rollout's service claim through the authenticated API",
+    )
+    release_claim_parser.add_argument("--project-number", required=True)
+    release_claim_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical service-claim release command path, or '-' for stdin",
+    )
+
     queue_parser = subparsers.add_parser(
         "execution-queue",
         help="inspect, hold, or release the fixed execution queue",
@@ -365,6 +384,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "promote-candidate":
         return _run_promotion(args)
+
+    if args.command == "release-service-claim":
+        return _run_service_claim_release(args)
 
     if args.command == "execution-queue":
         return _run_execution_queue_command(args)
@@ -735,6 +757,51 @@ def _run_promotion(
     return 0
 
 
+def _run_service_claim_release(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Release one terminal rollout claim through the sealed operator API."""
+
+    try:
+        command = _read_service_claim_release_command(args.command_file)
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("SERVICE_CLAIM_RELEASE_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("SERVICE_CLAIM_RELEASE", error)
+    try:
+        result = decode_contract(response_body, ServiceClaimReleaseResultV1)
+    except ContractError:
+        _print_cli_error("SERVICE_CLAIM_RELEASE_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.fenced_epoch != command.expected_epoch + 1
+        or result.fenced_authority_revision != command.expected_epoch
+        or result.terminal_receipt_id
+        != execution_receipt_logical_id(
+            result.target,
+            command.terminal_receipt_idempotency_key,
+        )
+    ):
+        _print_cli_error("SERVICE_CLAIM_RELEASE_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
 def _run_execution_queue_command(
     args: argparse.Namespace,
     *,
@@ -829,6 +896,13 @@ def _read_root_creation_command(source: str) -> RootCreationCommandV1:
 
 def _read_promotion_command(source: str) -> PromotionCommandV1:
     return decode_contract(_read_bounded_command_bytes(source), PromotionCommandV1)
+
+
+def _read_service_claim_release_command(source: str) -> ServiceClaimReleaseCommandV1:
+    return decode_contract(
+        _read_bounded_command_bytes(source),
+        ServiceClaimReleaseCommandV1,
+    )
 
 
 def _read_bounded_command_bytes(source: str) -> bytes:
@@ -937,6 +1011,7 @@ def _print_contract_result(result: OperatorApiResult) -> None:
         ExecutionReceiptReadResultV1,
         TargetTrafficReadResultV1,
         PromotionDispatchResultV1,
+        ServiceClaimReleaseResultV1,
     ):
         raise TypeError("operator API result type is not admitted")
     print(canonical_json_bytes(result).decode("utf-8"))
