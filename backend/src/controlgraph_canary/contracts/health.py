@@ -18,6 +18,7 @@ from controlgraph_canary.contracts.base import (
     Sha256Digest,
     StrictContractModel,
     UtcSecond,
+    validate_utc_second,
 )
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import TargetBinding
@@ -39,8 +40,10 @@ _MAXIMUM_OBSERVATION_DELAY_SECONDS: Final = 300
 _MAXIMUM_WINDOWS: Final = 10
 _BASIS_POINTS: Final = 10_000
 _SAMPLE_SET_DIGEST_DOMAIN: Final = b"controlgraph.monitoring-sample-set/v1\0"
+_QUERY_ID_DOMAIN: Final = b"controlgraph.monitoring-query-id/v1\0"
 _BINARY64_HEX: Final = re.compile(r"^[0-9a-f]{16}$")
 _SHA256_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
+_CLOUD_RUN_NAME: Final = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _MAX_SAFE_INTEGER: Final = 2**53 - 1
 
 
@@ -55,8 +58,7 @@ def monitoring_sample_set_sha256(sample_sha256s: tuple[str, ...]) -> str | None:
     if type(sample_sha256s) is not tuple or len(sample_sha256s) > 64:
         raise ValueError("sample digest sequence must be an exact tuple of at most 64 values")
     if any(
-        type(sample_sha256) is not str
-        or _SHA256_HEX.fullmatch(sample_sha256) is None
+        type(sample_sha256) is not str or _SHA256_HEX.fullmatch(sample_sha256) is None
         for sample_sha256 in sample_sha256s
     ):
         raise ValueError("sample digest sequence contains an invalid SHA-256 digest")
@@ -105,6 +107,128 @@ def binary64_milliseconds_to_microseconds(provider_double_bits: str) -> int:
     if microseconds > _MAX_SAFE_INTEGER:
         raise ValueError("canonical latency exceeds the safe integer range")
     return microseconds
+
+
+def derive_monitoring_metric_queries(
+    policy: RolloutHealthPolicyV2,
+    *,
+    target: TargetBinding,
+    root_id: str,
+    root_sha256: str,
+    epoch: int,
+    candidate_revision: str,
+    window_started_at: str,
+    window_ended_at: str,
+) -> tuple[MonitoringMetricQueryV1, MonitoringMetricQueryV1]:
+    """Derive the two closed Monitoring queries for one bound health window."""
+
+    if type(policy) is not RolloutHealthPolicyV2:
+        raise TypeError("an exact rollout health policy is required")
+    if type(target) is not TargetBinding:
+        raise TypeError("an exact target binding is required")
+    if (
+        type(root_id) is not str
+        or type(root_sha256) is not str
+        or _SHA256_HEX.fullmatch(root_sha256) is None
+        or root_id != f"cgroot:{root_sha256}"
+        or type(epoch) is not int
+        or not 1 <= epoch <= _MAX_SAFE_INTEGER
+        or type(candidate_revision) is not str
+        or _CLOUD_RUN_NAME.fullmatch(candidate_revision) is None
+        or type(window_started_at) is not str
+        or type(window_ended_at) is not str
+    ):
+        raise ValueError("monitoring query scope is invalid")
+    try:
+        validate_utc_second(window_started_at)
+        validate_utc_second(window_ended_at)
+    except (TypeError, ValueError):
+        raise ValueError("monitoring query window is invalid") from None
+    if _seconds_between(window_started_at, window_ended_at) != _WINDOW_SECONDS:
+        raise ValueError("monitoring query window is invalid")
+    if not _is_utc_minute(window_started_at) or not _is_utc_minute(window_ended_at):
+        raise ValueError("monitoring query window must align to UTC minutes")
+    if not candidate_revision.startswith(f"{target.service_name}-"):
+        raise ValueError("monitoring candidate revision is outside the target service")
+    validated_policy = RolloutHealthPolicyV2.model_validate(policy)
+    policy_sha256 = canonical_sha256(validated_policy)
+    query_values: list[MonitoringMetricQueryV1] = []
+    for query_kind in MonitoringQueryKind:
+        is_latency = query_kind is MonitoringQueryKind.REQUEST_LATENCY_DISTRIBUTION
+        metric_type = (
+            validated_policy.latency_metric_type
+            if is_latency
+            else validated_policy.request_count_metric_type
+        )
+        query_values.append(
+            MonitoringMetricQueryV1(
+                schema_version=MONITORING_METRIC_QUERY_V1,
+                query_id=monitoring_query_id(
+                    policy_sha256=policy_sha256,
+                    target=target,
+                    root_sha256=root_sha256,
+                    epoch=epoch,
+                    candidate_revision=candidate_revision,
+                    window_started_at=window_started_at,
+                    window_ended_at=window_ended_at,
+                    query_kind=query_kind,
+                ),
+                query_kind=query_kind,
+                policy_sha256=policy_sha256,
+                target=target,
+                root_id=root_id,
+                root_sha256=root_sha256,
+                epoch=epoch,
+                candidate_revision=candidate_revision,
+                configuration_name=target.service_name,
+                window_started_at=window_started_at,
+                window_ended_at=window_ended_at,
+                window_semantics=validated_policy.window_semantics,
+                provider_interval_semantics=validated_policy.provider_interval_semantics,
+                metric_type=metric_type,
+                monitored_resource_type=validated_policy.monitored_resource_type,
+                unit=(
+                    validated_policy.latency_unit if is_latency else validated_policy.request_unit
+                ),
+                metric_kind="DELTA",
+                value_type="DISTRIBUTION" if is_latency else "INT64",
+                alignment_period_seconds=validated_policy.alignment_period_seconds,
+                primary_per_series_aligner=(
+                    validated_policy.latency_primary_per_series_aligner
+                    if is_latency
+                    else validated_policy.request_per_series_aligner
+                ),
+                primary_cross_series_reducer=(
+                    validated_policy.latency_primary_cross_series_reducer
+                    if is_latency
+                    else validated_policy.request_cross_series_reducer
+                ),
+                secondary_per_series_aligner=(
+                    validated_policy.latency_secondary_per_series_aligner if is_latency else None
+                ),
+                secondary_cross_series_reducer=(
+                    validated_policy.latency_secondary_cross_series_reducer if is_latency else None
+                ),
+                secondary_output_metric_kind=(
+                    validated_policy.latency_secondary_output_metric_kind if is_latency else None
+                ),
+                secondary_output_value_type=(
+                    validated_policy.latency_secondary_output_value_type if is_latency else None
+                ),
+                group_by_fields=(() if is_latency else (validated_policy.request_group_by_field,)),
+                page_size=validated_policy.page_size,
+                view=validated_policy.view,
+                order_by=validated_policy.order_by,
+                metric_filter=_metric_filter_values(
+                    metric_type=metric_type,
+                    target=target,
+                    configuration_name=target.service_name,
+                    candidate_revision=candidate_revision,
+                    route_filter=validated_policy.route_filter,
+                ),
+            )
+        )
+    return query_values[0], query_values[1]
 
 
 class HealthSignal(StrEnum):
@@ -260,9 +384,7 @@ class RolloutHealthPolicyV2(StrictContractModel):
     identical_duplicate_action: Literal["DEDUPLICATE_BY_SAMPLE_SHA256"]
     conflicting_duplicate_action: Literal["INSUFFICIENT_EVIDENCE"]
     sample_set_digest_domain: Literal["controlgraph.monitoring-sample-set/v1"]
-    sample_set_digest_algorithm: Literal[
-        "SHA256_DOMAIN_NUL_UINT16_COUNT_ORDERED_32_BYTE_DIGESTS"
-    ]
+    sample_set_digest_algorithm: Literal["SHA256_DOMAIN_NUL_UINT16_COUNT_ORDERED_32_BYTE_DIGESTS"]
     out_of_order_action: Literal["INSUFFICIENT_EVIDENCE"]
     boundary_sample_action: Literal["INCLUDE_START_EXCLUDE_END"]
 
@@ -310,6 +432,8 @@ class MonitoringMetricQueryV1(StrictContractModel):
         _validate_root_binding(self.root_id, self.root_sha256)
         if _seconds_between(self.window_started_at, self.window_ended_at) != _WINDOW_SECONDS:
             raise ValueError("monitoring query must cover one exact 60-second window")
+        if not _is_utc_minute(self.window_started_at) or not _is_utc_minute(self.window_ended_at):
+            raise ValueError("monitoring query window must align to UTC minutes")
         expected = _query_semantics(self.query_kind)
         actual = (
             self.metric_type,
@@ -329,6 +453,20 @@ class MonitoringMetricQueryV1(StrictContractModel):
             raise ValueError("monitoring metric filter is not the exact target-bound filter")
         if self.configuration_name != self.target.service_name:
             raise ValueError("monitoring configuration name must match the target service")
+        if not self.candidate_revision.startswith(f"{self.target.service_name}-"):
+            raise ValueError("monitoring candidate revision is outside the target service")
+        expected_query_id = monitoring_query_id(
+            policy_sha256=self.policy_sha256,
+            target=self.target,
+            root_sha256=self.root_sha256,
+            epoch=self.epoch,
+            candidate_revision=self.candidate_revision,
+            window_started_at=self.window_started_at,
+            window_ended_at=self.window_ended_at,
+            query_kind=self.query_kind,
+        )
+        if self.query_id != expected_query_id:
+            raise ValueError("monitoring query id does not match its canonical scope")
         return self
 
 
@@ -420,6 +558,7 @@ class MonitoringWindowObservationV1(StrictContractModel):
     query_sha256s: Annotated[tuple[Sha256Digest, ...], Field(min_length=2, max_length=2)]
     samples: Annotated[tuple[MonitoringSampleV1, ...], Field(max_length=64)]
     sample_sha256s: Annotated[tuple[Sha256Digest, ...], Field(max_length=64)]
+    source_sample_sha256s: Annotated[tuple[Sha256Digest, ...], Field(max_length=64)]
     completeness: MonitoringObservationCompleteness
     timing: MonitoringObservationTiming
     missing_signals: Annotated[tuple[HealthSignal, ...], Field(max_length=4)]
@@ -497,8 +636,16 @@ class MonitoringWindowObservationV1(StrictContractModel):
             raise ValueError("health observation sample digests do not match its samples")
         if len(set(self.sample_sha256s)) != len(self.sample_sha256s):
             raise ValueError("health observation sample digests must be unique")
-        if self.conflicting_duplicate and self.duplicate_count == 0:
-            raise ValueError("conflicting duplicate requires a duplicate observation")
+        if self.source_sample_sha256s != tuple(sorted(self.source_sample_sha256s)):
+            raise ValueError("health observation source sample digests are not canonical")
+        selected_sample_digests = set(self.sample_sha256s)
+        source_sample_digests = set(self.source_sample_sha256s)
+        if not selected_sample_digests.issubset(source_sample_digests):
+            raise ValueError("health observation source samples omit a selected sample")
+        if self.duplicate_count != len(self.source_sample_sha256s) - len(self.sample_sha256s):
+            raise ValueError("health observation duplicate count does not match its sources")
+        if self.conflicting_duplicate != (source_sample_digests != selected_sample_digests):
+            raise ValueError("health observation conflict classification is incorrect")
         self._validate_samples_and_aggregates()
         return self
 
@@ -637,9 +784,7 @@ class HealthEvaluationStateV1(StrictContractModel):
     consecutive_unhealthy_windows: Annotated[int, Field(ge=0, le=10)]
     evaluated_windows: Annotated[int, Field(ge=0, le=10)]
     last_observation_sha256: Sha256Digest | None
-    consumed_sample_set_sha256s: Annotated[
-        tuple[Sha256Digest, ...], Field(max_length=10)
-    ]
+    consumed_sample_set_sha256s: Annotated[tuple[Sha256Digest, ...], Field(max_length=10)]
     prior_decision_sha256: Sha256Digest | None
 
     @model_validator(mode="after")
@@ -647,9 +792,7 @@ class HealthEvaluationStateV1(StrictContractModel):
         _validate_root_binding(self.root_id, self.root_sha256)
         if self.consecutive_healthy_windows and self.consecutive_unhealthy_windows:
             raise ValueError("healthy and unhealthy streaks cannot both be active")
-        if len(set(self.consumed_sample_set_sha256s)) != len(
-            self.consumed_sample_set_sha256s
-        ):
+        if len(set(self.consumed_sample_set_sha256s)) != len(self.consumed_sample_set_sha256s):
             raise ValueError("consumed sample-set digests must be unique")
         if len(self.consumed_sample_set_sha256s) > self.evaluated_windows:
             raise ValueError("consumed sample-set digests cannot exceed evaluated windows")
@@ -860,8 +1003,7 @@ class HealthDecisionV1(StrictContractModel):
                     consumed
                     or (
                         sample_set_sha256 is not None
-                        and sample_set_sha256
-                        in self.next_state.consumed_sample_set_sha256s
+                        and sample_set_sha256 in self.next_state.consumed_sample_set_sha256s
                     )
                 ):
                     raise ValueError(
@@ -989,11 +1131,13 @@ def _seconds_between(start: str, end: str) -> int:
     )
 
 
+def _is_utc_minute(value: str) -> bool:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").second == 0
+
+
 def _add_seconds(value: str, seconds: int) -> str:
     try:
-        result = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") + timedelta(
-            seconds=seconds
-        )
+        result = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") + timedelta(seconds=seconds)
     except OverflowError as exc:
         raise ValueError("health timestamp exceeds the UTC calendar range") from exc
     return result.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1040,18 +1184,68 @@ def _query_semantics(
     )
 
 
-def _metric_filter(query: MonitoringMetricQueryV1) -> str:
+def _metric_filter_values(
+    *,
+    metric_type: str,
+    target: TargetBinding,
+    configuration_name: str,
+    candidate_revision: str,
+    route_filter: str,
+) -> str:
     clauses = [
-        f'metric.type="{query.metric_type}"',
+        f'metric.type="{metric_type}"',
         f'resource.type="{_RESOURCE_TYPE}"',
-        f'resource.labels.project_id="{query.target.project_id}"',
-        f'resource.labels.location="{query.target.region}"',
-        f'resource.labels.service_name="{query.target.service_name}"',
-        f'resource.labels.configuration_name="{query.configuration_name}"',
-        f'resource.labels.revision_name="{query.candidate_revision}"',
-        'metric.labels.route=""',
+        f'resource.labels.project_id="{target.project_id}"',
+        f'resource.labels.location="{target.region}"',
+        f'resource.labels.service_name="{target.service_name}"',
+        f'resource.labels.configuration_name="{configuration_name}"',
+        f'resource.labels.revision_name="{candidate_revision}"',
+        f'metric.labels.route="{route_filter}"',
     ]
     return " AND ".join(clauses)
+
+
+def _metric_filter(query: MonitoringMetricQueryV1) -> str:
+    return _metric_filter_values(
+        metric_type=query.metric_type,
+        target=query.target,
+        configuration_name=query.configuration_name,
+        candidate_revision=query.candidate_revision,
+        route_filter="",
+    )
+
+
+def monitoring_query_id(
+    *,
+    policy_sha256: str,
+    target: TargetBinding,
+    root_sha256: str,
+    epoch: int,
+    candidate_revision: str,
+    window_started_at: str,
+    window_ended_at: str,
+    query_kind: MonitoringQueryKind,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(_QUERY_ID_DOMAIN)
+    components = (
+        policy_sha256,
+        target.project_id,
+        target.region,
+        target.environment,
+        target.service_name,
+        root_sha256,
+        str(epoch),
+        candidate_revision,
+        window_started_at,
+        window_ended_at,
+        query_kind.value,
+    )
+    for component in components:
+        encoded = component.encode("utf-8")
+        digest.update(len(encoded).to_bytes(2, "big"))
+        digest.update(encoded)
+    return f"cgmonq:{digest.hexdigest()}"
 
 
 def _observation_timing(window_ended_at: str, observed_at: str) -> MonitoringObservationTiming:
@@ -1086,5 +1280,7 @@ __all__ = [
     "MonitoringWindowObservationV1",
     "RolloutHealthPolicyV2",
     "binary64_milliseconds_to_microseconds",
+    "derive_monitoring_metric_queries",
+    "monitoring_query_id",
     "monitoring_sample_set_sha256",
 ]

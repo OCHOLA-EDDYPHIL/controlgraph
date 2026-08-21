@@ -28,6 +28,14 @@ locals {
         "cloudkms.cryptoKeyVersions.get",
       ]
     }
+    monitoring_health_reader = {
+      role_id     = "controlgraph.monitoringHealthReader"
+      title       = "ControlGraph Monitoring health reader"
+      description = "List only the target-bound Cloud Monitoring time series used for health evaluation."
+      permissions = [
+        "monitoring.timeSeries.list",
+      ]
+    }
     tasks_enqueuer = {
       role_id     = "controlgraph.tasksEnqueuer"
       title       = "ControlGraph task enqueuer"
@@ -108,6 +116,18 @@ check "run_snapshot_reader_is_get_only" {
       "run.services.get",
     ])
     error_message = "The snapshot reader role must contain only exact Cloud Run get permissions."
+  }
+}
+
+check "monitoring_health_reader_is_time_series_list_only" {
+  assert {
+    condition = (
+      local.custom_iam_roles.monitoring_health_reader.role_id == "controlgraph.monitoringHealthReader" &&
+      toset(local.custom_iam_roles.monitoring_health_reader.permissions) == toset([
+        "monitoring.timeSeries.list",
+      ])
+    )
+    error_message = "The Monitoring health reader role must contain only time-series list permission."
   }
 }
 

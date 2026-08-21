@@ -30,6 +30,7 @@ from controlgraph_canary.contracts import (
     canonical_json_bytes,
     canonical_sha256,
     decode_contract,
+    monitoring_query_id,
     monitoring_sample_set_sha256,
 )
 
@@ -111,9 +112,7 @@ def _policy(**changes: object) -> RolloutHealthPolicyV2:
         "identical_duplicate_action": "DEDUPLICATE_BY_SAMPLE_SHA256",
         "conflicting_duplicate_action": "INSUFFICIENT_EVIDENCE",
         "sample_set_digest_domain": "controlgraph.monitoring-sample-set/v1",
-        "sample_set_digest_algorithm": (
-            "SHA256_DOMAIN_NUL_UINT16_COUNT_ORDERED_32_BYTE_DIGESTS"
-        ),
+        "sample_set_digest_algorithm": ("SHA256_DOMAIN_NUL_UINT16_COUNT_ORDERED_32_BYTE_DIGESTS"),
         "out_of_order_action": "INSUFFICIENT_EVIDENCE",
         "boundary_sample_action": "INCLUDE_START_EXCLUDE_END",
     }
@@ -148,7 +147,7 @@ def _query(query_kind: MonitoringQueryKind, **changes: object) -> MonitoringMetr
     )
     values: dict[str, object] = {
         "schema_version": "controlgraph.monitoring-metric-query/v1",
-        "query_id": f"query-{query_kind.value.lower().replace('_', '-')}",
+        "query_id": "pending",
         "query_kind": query_kind,
         "policy_sha256": _policy_sha256(),
         "target": _target(),
@@ -180,6 +179,17 @@ def _query(query_kind: MonitoringQueryKind, **changes: object) -> MonitoringMetr
         "metric_filter": _filter(metric_type),
     }
     values.update(changes)
+    if "query_id" not in changes:
+        values["query_id"] = monitoring_query_id(
+            policy_sha256=cast(str, values["policy_sha256"]),
+            target=cast(TargetBinding, values["target"]),
+            root_sha256=cast(str, values["root_sha256"]),
+            epoch=cast(int, values["epoch"]),
+            candidate_revision=cast(str, values["candidate_revision"]),
+            window_started_at=cast(str, values["window_started_at"]),
+            window_ended_at=cast(str, values["window_ended_at"]),
+            query_kind=cast(MonitoringQueryKind, values["query_kind"]),
+        )
     return MonitoringMetricQueryV1.model_validate(values)
 
 
@@ -205,9 +215,7 @@ def _sample(
         "response_code_class": None if is_latency else response_code_class,
         "provider_value_type": "DOUBLE" if is_latency else "INT64",
         "provider_double_bits": (
-            struct.pack(">d", (latency_microseconds or 0) / 1_000).hex()
-            if is_latency
-            else None
+            struct.pack(">d", (latency_microseconds or 0) / 1_000).hex() if is_latency else None
         ),
         "unit": "us" if is_latency else "1",
         "int64_value": None if is_latency else int64_value,
@@ -270,6 +278,7 @@ def _observation(**changes: object) -> MonitoringWindowObservationV1:
         "query_sha256s": tuple(canonical_sha256(query) for query in queries),
         "samples": samples,
         "sample_sha256s": tuple(canonical_sha256(sample) for sample in samples),
+        "source_sample_sha256s": tuple(sorted(canonical_sha256(sample) for sample in samples)),
         "completeness": MonitoringObservationCompleteness.COMPLETE,
         "timing": MonitoringObservationTiming.READY,
         "missing_signals": (),
@@ -287,6 +296,12 @@ def _observation(**changes: object) -> MonitoringWindowObservationV1:
     if "samples" in changes and "sample_sha256s" not in changes:
         changed_samples = cast(tuple[MonitoringSampleV1, ...], changes["samples"])
         values["sample_sha256s"] = tuple(canonical_sha256(sample) for sample in changed_samples)
+    if "source_sample_sha256s" not in changes and (
+        "samples" in changes or "sample_sha256s" in changes
+    ):
+        values["source_sample_sha256s"] = tuple(
+            sorted(cast(tuple[str, ...], values["sample_sha256s"]))
+        )
     return MonitoringWindowObservationV1.model_validate(values)
 
 
@@ -334,9 +349,7 @@ def _state(*, evaluated: bool = False, **changes: object) -> HealthEvaluationSta
         "evaluated_windows": 1 if evaluated else 0,
         "last_observation_sha256": canonical_sha256(_observation()) if evaluated else None,
         "consumed_sample_set_sha256s": (
-            (monitoring_sample_set_sha256(_observation().sample_sha256s),)
-            if evaluated
-            else ()
+            (monitoring_sample_set_sha256(_observation().sample_sha256s),) if evaluated else ()
         ),
         "prior_decision_sha256": None,
     }
@@ -347,14 +360,10 @@ def _state(*, evaluated: bool = False, **changes: object) -> HealthEvaluationSta
             f"2026-08-21T12:{evaluated_windows:02d}:00Z" if evaluated_windows else None
         )
         values["last_observation_sha256"] = (
-            canonical_sha256(_window_observation(evaluated_windows))
-            if evaluated_windows
-            else None
+            canonical_sha256(_window_observation(evaluated_windows)) if evaluated_windows else None
         )
         sample_set_sha256 = (
-            monitoring_sample_set_sha256(
-                _window_observation(evaluated_windows).sample_sha256s
-            )
+            monitoring_sample_set_sha256(_window_observation(evaluated_windows).sample_sha256s)
             if evaluated_windows
             else None
         )
@@ -368,8 +377,7 @@ def _decision(**changes: object) -> HealthDecisionV1:
     next_state = changes.get("next_state")
     observation = (
         _window_observation(next_state.evaluated_windows)
-        if isinstance(next_state, HealthEvaluationStateV1)
-        and next_state.evaluated_windows > 0
+        if isinstance(next_state, HealthEvaluationStateV1) and next_state.evaluated_windows > 0
         else _observation()
     )
     values: dict[str, object] = {
@@ -472,6 +480,14 @@ def test_monitoring_query_rejects_changed_window_signal_or_filter(
         _query(MonitoringQueryKind.REQUEST_COUNT_BY_RESPONSE_CODE_CLASS, **changes)
 
 
+def test_monitoring_query_rejects_a_caller_asserted_query_id() -> None:
+    with pytest.raises(ValidationError, match="query id does not match"):
+        _query(
+            MonitoringQueryKind.REQUEST_COUNT_BY_RESPONSE_CODE_CLASS,
+            query_id="cgmonq:" + "f" * 64,
+        )
+
+
 def test_monitoring_samples_have_strict_query_specific_shapes() -> None:
     request_query, latency_query = _queries()
     request_sample = _sample(
@@ -522,10 +538,7 @@ def test_binary64_latency_conversion_has_frozen_boundary_vectors(
     provider_double_bits: str,
     expected_microseconds: int,
 ) -> None:
-    assert (
-        binary64_milliseconds_to_microseconds(provider_double_bits)
-        == expected_microseconds
-    )
+    assert binary64_milliseconds_to_microseconds(provider_double_bits) == expected_microseconds
 
 
 @pytest.mark.parametrize("provider_double_bits", ["fff0000000000000", "7ff0000000000000"])
@@ -579,6 +592,39 @@ def test_observation_recomputes_sample_digests_and_aggregates() -> None:
         _observation(request_count=999)
     with pytest.raises(ValidationError, match="latency aggregate"):
         _observation(latency_distribution=_distribution(p95_latency_ms=401))
+
+
+def test_observation_binds_every_retrieved_source_sample_digest() -> None:
+    observation = _observation()
+    selected = observation.sample_sha256s
+    identical_sources = tuple(sorted((*selected, selected[0])))
+    conflict_sources = tuple(sorted((*selected, "f" * 64)))
+
+    identical = _observation(
+        source_sample_sha256s=identical_sources,
+        duplicate_count=1,
+    )
+    conflict = _observation(
+        source_sample_sha256s=conflict_sources,
+        duplicate_count=1,
+        conflicting_duplicate=True,
+    )
+
+    assert identical.source_sample_sha256s.count(selected[0]) == 2
+    assert conflict.conflicting_duplicate is True
+    assert canonical_sha256(identical) != canonical_sha256(conflict)
+
+    with pytest.raises(ValidationError, match="not canonical"):
+        _observation(source_sample_sha256s=tuple(reversed(identical_sources)))
+    with pytest.raises(ValidationError, match="omit a selected sample"):
+        _observation(source_sample_sha256s=tuple(sorted(selected[:-1])))
+    with pytest.raises(ValidationError, match="duplicate count"):
+        _observation(duplicate_count=1)
+    with pytest.raises(ValidationError, match="conflict classification"):
+        _observation(
+            source_sample_sha256s=conflict_sources,
+            duplicate_count=1,
+        )
 
 
 def test_observation_requires_canonical_complete_request_samples() -> None:
@@ -647,7 +693,18 @@ def test_observation_rejects_sample_outside_its_exact_query() -> None:
             MonitoringObservationTiming.LATE,
         ),
         (
-            {"duplicate_count": 1, "conflicting_duplicate": True},
+            {
+                "source_sample_sha256s": tuple(
+                    sorted(
+                        (
+                            *(canonical_sha256(sample) for sample in _samples()),
+                            "f" * 64,
+                        )
+                    )
+                ),
+                "duplicate_count": 1,
+                "conflicting_duplicate": True,
+            },
             MonitoringObservationCompleteness.COMPLETE,
             MonitoringObservationTiming.READY,
         ),
@@ -737,9 +794,11 @@ def test_decision_cites_exact_inputs_and_canonical_integer_aggregates() -> None:
     with pytest.raises(ValidationError, match="availability aggregate"):
         _decision(availability_basis_points=9_949)
     with pytest.raises(ValidationError, match="outside its exact scope"):
-        _decision(next_state=_state(evaluated=True, target=_target().model_copy(
-            update={"environment": "other"}
-        )))
+        _decision(
+            next_state=_state(
+                evaluated=True, target=_target().model_copy(update={"environment": "other"})
+            )
+        )
     with pytest.raises(ValidationError, match="root binding"):
         _decision(root_id="cgroot:" + "2" * 64)
 

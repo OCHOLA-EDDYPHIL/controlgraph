@@ -7,7 +7,7 @@ ControlGraph Canary is licensed under Apache-2.0. The project depends on or uses
 | FastAPI | Python HTTP API | MIT |
 | Pydantic | API response models | MIT |
 | Uvicorn | ASGI server | BSD-3-Clause |
-| Google Cloud Firestore, KMS, and Tasks Python clients | Hosted authority storage, asymmetric signing, and addressed delivery adapters | Apache-2.0 |
+| Google Cloud Firestore, KMS, Monitoring, and Tasks Python clients | Hosted authority storage, asymmetric signing, read-only health collection, and addressed delivery adapters | Apache-2.0 |
 | Google Auth | Application Default Credentials and Google workload authentication | Apache-2.0 |
 | google-crc32c | Cloud KMS request and response integrity checks | Apache-2.0 |
 | cryptography | Local P-256 public-key and signature verification | Apache-2.0 OR BSD-3-Clause |
