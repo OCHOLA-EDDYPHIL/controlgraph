@@ -12,7 +12,7 @@ concurrency:
 jobs:
   publish-images:
     name: Publish immutable images
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, controlgraph]
     timeout-minutes: 30
     environment: controlgraph-image-builder
     permissions:
