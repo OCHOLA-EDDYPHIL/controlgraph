@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
+from test_service_claim_release import _released_store
 
 import controlgraph_canary.cli as cli_module
 from controlgraph_canary.cli import (
@@ -17,6 +18,7 @@ from controlgraph_canary.cli import (
     _run_execution_receipt_read,
     _run_promotion,
     _run_root_creation,
+    _run_service_claim_release,
     _run_stable_snapshot_capture,
     _run_target_traffic_read,
 )
@@ -64,6 +66,9 @@ from controlgraph_canary.contracts.promotion_execution import (
 from controlgraph_canary.contracts.root_creation import (
     ROOT_CREATION_COMMAND_V1,
     RootCreationCommandV1,
+)
+from controlgraph_canary.contracts.service_claim_release import (
+    ServiceClaimReleaseCommandV1,
 )
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.http.identity_headers import (
@@ -271,6 +276,11 @@ def _success_fixtures(tmp_path: Path) -> list[tuple[Any, argparse.Namespace, obj
         expires_at="2026-08-19T12:12:00Z",
     )
 
+    release_invocation, _release_store, release_result = _released_store()
+    release_command = release_invocation.command
+    release_file = tmp_path / "service-claim-release-command.json"
+    release_file.write_bytes(canonical_json_bytes(release_command))
+
     return [
         (
             _run_stable_snapshot_capture,
@@ -323,6 +333,15 @@ def _success_fixtures(tmp_path: Path) -> list[tuple[Any, argparse.Namespace, obj
             ),
             promotion_command,
             promotion_result,
+        ),
+        (
+            _run_service_claim_release,
+            argparse.Namespace(
+                project_number=PROJECT_NUMBER,
+                command_file=str(release_file),
+            ),
+            release_command,
+            release_result,
         ),
     ]
 
@@ -403,6 +422,17 @@ def test_parser_exposes_only_named_operator_commands_and_typed_fields() -> None:
     )
     assert parsed.action is CapabilityAction.APPLY_CANARY
 
+    release = parser.parse_args(
+        [
+            "release-service-claim",
+            "--project-number",
+            PROJECT_NUMBER,
+            "--command-file",
+            "release.json",
+        ]
+    )
+    assert release.command_file == "release.json"
+
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -427,6 +457,34 @@ def test_parser_exposes_only_named_operator_commands_and_typed_fields() -> None:
                 "other-service",
             ]
         )
+
+
+def test_main_routes_service_claim_release_to_the_typed_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[argparse.Namespace] = []
+
+    def run(args: argparse.Namespace) -> int:
+        observed.append(args)
+        return 17
+
+    monkeypatch.setattr(cli_module, "_run_service_claim_release", run)
+
+    assert (
+        cli_module.main(
+            [
+                "release-service-claim",
+                "--project-number",
+                PROJECT_NUMBER,
+                "--command-file",
+                "release.json",
+            ]
+        )
+        == 17
+    )
+    assert len(observed) == 1
+    assert observed[0].project_number == PROJECT_NUMBER
+    assert observed[0].command_file == "release.json"
 
 
 def test_all_operator_commands_use_one_fixed_shell_free_api_post(
@@ -486,10 +544,13 @@ def test_complex_commands_decode_exact_type_before_token_acquisition(
     fixtures = _success_fixtures(tmp_path)
     root_command = fixtures[1][2]
     promotion_command = fixtures[5][2]
+    release_command = fixtures[6][2]
     root_file = tmp_path / "root-substitution.json"
     promotion_file = tmp_path / "promotion-substitution.json"
+    release_file = tmp_path / "release-substitution.json"
     root_file.write_bytes(canonical_json_bytes(promotion_command))  # type: ignore[arg-type]
     promotion_file.write_bytes(canonical_json_bytes(root_command))  # type: ignore[arg-type]
+    release_file.write_bytes(canonical_json_bytes(promotion_command))  # type: ignore[arg-type]
 
     for run, args, code in (
         (
@@ -508,6 +569,14 @@ def test_complex_commands_decode_exact_type_before_token_acquisition(
             ),
             "PROMOTION_COMMAND_INVALID",
         ),
+        (
+            _run_service_claim_release,
+            argparse.Namespace(
+                project_number=PROJECT_NUMBER,
+                command_file=str(release_file),
+            ),
+            "SERVICE_CLAIM_RELEASE_COMMAND_INVALID",
+        ),
     ):
         runner = _Runner()
         poster = _Poster(InternalHttpResponse(status_code=500, content_type=None, body=b""))
@@ -515,6 +584,8 @@ def test_complex_commands_decode_exact_type_before_token_acquisition(
         assert runner.calls == []
         assert poster.calls == []
         assert capsys.readouterr().out.strip() == f'{{"code": "{code}"}}'
+
+    assert type(release_command) is ServiceClaimReleaseCommandV1
 
 
 def test_canonical_stdin_is_decoded_before_root_creation_auth(
@@ -558,6 +629,147 @@ def test_noncanonical_complex_command_is_rejected_before_auth(
     )
     assert runner.calls == []
     assert poster.calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        b'{"schema_version":"controlgraph.service-claim-release-command/v1"}',
+        b"[]",
+    ],
+)
+def test_invalid_service_claim_release_is_rejected_before_auth(
+    payload: bytes,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command_file = tmp_path / "invalid-release-command.json"
+    command_file.write_bytes(payload)
+    runner = _Runner()
+    poster = _Poster(InternalHttpResponse(status_code=500, content_type=None, body=b""))
+
+    assert (
+        _run_service_claim_release(
+            argparse.Namespace(
+                project_number=PROJECT_NUMBER,
+                command_file=str(command_file),
+            ),
+            command_runner=runner,
+            http_poster=poster,
+        )
+        == 2
+    )
+    assert runner.calls == []
+    assert poster.calls == []
+    assert (
+        capsys.readouterr().out.strip()
+        == '{"code": "SERVICE_CLAIM_RELEASE_COMMAND_INVALID"}'
+    )
+
+
+def test_noncanonical_service_claim_release_is_rejected_before_auth(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run, _args, command, _result = _success_fixtures(tmp_path)[6]
+    command_file = tmp_path / "noncanonical-release-command.json"
+    command_file.write_bytes(canonical_json_bytes(command) + b"\n")  # type: ignore[arg-type]
+    runner = _Runner()
+    poster = _Poster(InternalHttpResponse(status_code=500, content_type=None, body=b""))
+
+    assert (
+        _run_service_claim_release(
+            argparse.Namespace(
+                project_number=PROJECT_NUMBER,
+                command_file=str(command_file),
+            ),
+            command_runner=runner,
+            http_poster=poster,
+        )
+        == 2
+    )
+    assert runner.calls == []
+    assert poster.calls == []
+    assert (
+        capsys.readouterr().out.strip()
+        == '{"code": "SERVICE_CLAIM_RELEASE_COMMAND_INVALID"}'
+    )
+
+
+@pytest.mark.parametrize(
+    ("update", "filename"),
+    [
+        ({"request_id": "other-release-request"}, "request-mismatch.json"),
+        (
+            {"terminal_receipt_idempotency_key": "other-terminal-receipt"},
+            "terminal-mismatch.json",
+        ),
+    ],
+)
+def test_service_claim_release_result_must_match_the_exact_command(
+    update: dict[str, str],
+    filename: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run, _args, command, result = _success_fixtures(tmp_path)[6]
+    assert type(command) is ServiceClaimReleaseCommandV1
+    mismatched_command = command.model_copy(update=update)
+    command_file = tmp_path / filename
+    command_file.write_bytes(canonical_json_bytes(mismatched_command))
+    poster = _Poster(
+        InternalHttpResponse(
+            status_code=200,
+            content_type="application/json",
+            body=canonical_json_bytes(result),  # type: ignore[arg-type]
+        )
+    )
+
+    assert (
+        _run_service_claim_release(
+            argparse.Namespace(
+                project_number=PROJECT_NUMBER,
+                command_file=str(command_file),
+            ),
+            command_runner=_Runner(),
+            http_poster=poster,
+        )
+        == 6
+    )
+    assert len(poster.calls) == 1
+    assert (
+        capsys.readouterr().out.strip()
+        == '{"code": "SERVICE_CLAIM_RELEASE_RESPONSE_INVALID"}'
+    )
+
+
+def test_service_claim_release_rejects_another_valid_result_contract(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixtures = _success_fixtures(tmp_path)
+    run, args, _command, _result = fixtures[6]
+    promotion_result = fixtures[5][3]
+
+    assert (
+        run(
+            args,
+            command_runner=_Runner(),
+            http_poster=_Poster(
+                InternalHttpResponse(
+                    status_code=200,
+                    content_type="application/json",
+                    body=canonical_json_bytes(promotion_result),  # type: ignore[arg-type]
+                )
+            ),
+        )
+        == 6
+    )
+    assert (
+        capsys.readouterr().out.strip()
+        == '{"code": "SERVICE_CLAIM_RELEASE_RESPONSE_INVALID"}'
+    )
 
 
 def test_every_result_is_bound_to_the_exact_command(
