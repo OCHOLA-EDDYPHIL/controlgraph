@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from controlgraph_canary.application.authority_store import StoredRecord
 from controlgraph_canary.application.cloud_run import (
     rollout_root_v2_target_configuration_sha256,
+    rollout_root_v3_target_configuration_sha256,
 )
 from controlgraph_canary.authority.policy import (
     CanaryAction,
@@ -27,6 +28,7 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
+    RolloutRootV3,
     RootActionGrantV1,
     capability_lineage_anchor,
 )
@@ -42,7 +44,7 @@ class RootAuthorityBundle(Protocol):
     """Atomic persisted records needed by authority-bearing application paths."""
 
     @property
-    def root(self) -> StoredRecord[RolloutRootV2]: ...
+    def root(self) -> StoredRecord[RolloutRootV2 | RolloutRootV3]: ...
 
     @property
     def service_claim(self) -> StoredRecord[ServiceClaimRecord]: ...
@@ -71,7 +73,7 @@ class RootAuthorityBundleReader(Protocol):
 class TrustedRootAuthority:
     """Validated values and revisions from one atomic authority read."""
 
-    root: RolloutRootV2
+    root: RolloutRootV2 | RolloutRootV3
     service_claim: ServiceClaimRecord
     authority: EpochAuthorityRecord
     lineage_anchor: CapabilityLineageAnchorV1
@@ -108,7 +110,7 @@ def inspect_root_authority_bundle(
     anchor = anchor_record.value
     if (
         type(target) is not TargetBinding
-        or type(root) is not RolloutRootV2
+        or type(root) not in (RolloutRootV2, RolloutRootV3)
         or type(claim) is not ServiceClaimRecord
         or type(authority) is not EpochAuthorityRecord
         or type(anchor) is not CapabilityLineageAnchorV1
@@ -117,7 +119,7 @@ def inspect_root_authority_bundle(
     try:
         content_sha256 = canonical_sha256(root.content)
         expected_anchor = capability_lineage_anchor(root)
-        claim_matches = service_claim_matches_root_v2(claim, root)
+        claim_matches = service_claim_matches_content_addressed_root(claim, root)
     except Exception:
         return None
     if (
@@ -148,28 +150,44 @@ def inspect_root_authority_bundle(
     )
 
 
-def service_claim_matches_root_v2(
+def service_claim_matches_content_addressed_root(
     claim: ServiceClaimRecord,
-    root: RolloutRootV2,
+    root: RolloutRootV2 | RolloutRootV3,
 ) -> bool:
     """Return whether a service claim binds every root-derived target field."""
 
-    if type(claim) is not ServiceClaimRecord or type(root) is not RolloutRootV2:
+    if type(claim) is not ServiceClaimRecord or type(root) not in (
+        RolloutRootV2,
+        RolloutRootV3,
+    ):
         return False
     content = root.content
     snapshot = content.stable_snapshot
     plan = content.rollout_plan
     try:
-        stable_target_sha256 = rollout_root_v2_target_configuration_sha256(
-            root,
-            stable_percent=100,
-            candidate_percent=0,
-        )
-        candidate_target_sha256 = rollout_root_v2_target_configuration_sha256(
-            root,
-            stable_percent=0,
-            candidate_percent=100,
-        )
+        if type(root) is RolloutRootV2:
+            stable_target_sha256 = rollout_root_v2_target_configuration_sha256(
+                root,
+                stable_percent=100,
+                candidate_percent=0,
+            )
+            candidate_target_sha256 = rollout_root_v2_target_configuration_sha256(
+                root,
+                stable_percent=0,
+                candidate_percent=100,
+            )
+        else:
+            root_v3 = cast(RolloutRootV3, root)
+            stable_target_sha256 = rollout_root_v3_target_configuration_sha256(
+                root_v3,
+                stable_percent=100,
+                candidate_percent=0,
+            )
+            candidate_target_sha256 = rollout_root_v3_target_configuration_sha256(
+                root_v3,
+                stable_percent=0,
+                candidate_percent=100,
+            )
     except (TypeError, ValueError):
         return False
     return (
@@ -194,13 +212,37 @@ def service_claim_matches_root_v2(
     )
 
 
-def root_action_grant(
+def service_claim_matches_root_v2(
+    claim: ServiceClaimRecord,
     root: RolloutRootV2,
+) -> bool:
+    """Return whether a service claim binds one exact historical V2 root."""
+
+    return type(root) is RolloutRootV2 and service_claim_matches_content_addressed_root(
+        claim,
+        root,
+    )
+
+
+def service_claim_matches_root_v3(
+    claim: ServiceClaimRecord,
+    root: RolloutRootV3,
+) -> bool:
+    """Return whether a service claim binds one exact current V3 root."""
+
+    return type(root) is RolloutRootV3 and service_claim_matches_content_addressed_root(
+        claim,
+        root,
+    )
+
+
+def root_action_grant(
+    root: RolloutRootV2 | RolloutRootV3,
     action: CapabilityAction,
 ) -> RootActionGrantV1:
     """Select the exact closed action grant committed into a rollout root."""
 
-    if type(root) is not RolloutRootV2 or type(action) is not CapabilityAction:
+    if type(root) not in (RolloutRootV2, RolloutRootV3) or type(action) is not CapabilityAction:
         raise TypeError("an exact rollout root and capability action are required")
     bounds = root.content.authority_bounds
     return {
@@ -212,14 +254,14 @@ def root_action_grant(
 
 def capability_claims_match_root_authority(
     claims: CapabilityClaims,
-    root: RolloutRootV2,
+    root: RolloutRootV2 | RolloutRootV3,
     anchor: CapabilityLineageAnchorV1,
 ) -> bool:
     """Check one capability against only persisted root and anchor authority."""
 
     if (
         type(claims) is not CapabilityClaims
-        or type(root) is not RolloutRootV2
+        or type(root) not in (RolloutRootV2, RolloutRootV3)
         or type(anchor) is not CapabilityLineageAnchorV1
         or anchor != capability_lineage_anchor(root)
     ):
@@ -271,11 +313,14 @@ def capability_claims_match_root_authority(
 
 def capability_scope_from_claims(
     claims: CapabilityClaims,
-    root: RolloutRootV2,
+    root: RolloutRootV2 | RolloutRootV3,
 ) -> CapabilityScope:
     """Project a capability scope using root-fixed concurrency."""
 
-    if type(claims) is not CapabilityClaims or type(root) is not RolloutRootV2:
+    if type(claims) is not CapabilityClaims or type(root) not in (
+        RolloutRootV2,
+        RolloutRootV3,
+    ):
         raise TypeError("an exact capability and rollout root are required")
     concurrency = claims.concurrency or root.content.authority_bounds.concurrency
     return CapabilityScope(
@@ -306,7 +351,7 @@ def capability_scope_from_claims(
 
 
 def operator_lineage_anchor(
-    root: RolloutRootV2,
+    root: RolloutRootV2 | RolloutRootV3,
     anchor: CapabilityLineageAnchorV1,
     first_claims: CapabilityClaims,
 ) -> OperatorRootAnchor:
@@ -380,5 +425,7 @@ __all__ = [
     "inspect_root_authority_bundle",
     "operator_lineage_anchor",
     "root_action_grant",
+    "service_claim_matches_content_addressed_root",
     "service_claim_matches_root_v2",
+    "service_claim_matches_root_v3",
 ]

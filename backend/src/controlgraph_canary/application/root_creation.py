@@ -16,6 +16,7 @@ from controlgraph_canary.application.cloud_run import (
     target_configuration_projection_sha256,
 )
 from controlgraph_canary.contracts.codec import canonical_sha256
+from controlgraph_canary.contracts.health import RolloutHealthPolicyV2
 from controlgraph_canary.contracts.models import (
     EPOCH_AUTHORITY_V1,
     EVIDENCE_EVENT_V1,
@@ -29,24 +30,23 @@ from controlgraph_canary.contracts.models import (
 )
 from controlgraph_canary.contracts.root_creation import (
     ROLLOUT_PLAN_V1,
-    ROLLOUT_ROOT_CONTENT_V2,
+    ROLLOUT_ROOT_CONTENT_V3,
     ROOT_ACTION_GRANT_V1,
     ROOT_AUTHORITY_BOUNDS_V1,
     ROOT_CREATION_EVIDENCE_SUBJECT_V1,
-    ROOT_CREATION_RESULT_V1,
+    ROOT_CREATION_RESULT_V2,
     CapabilityLineageAnchorV1,
-    RolloutHealthPolicyV1,
     RolloutPlanV1,
-    RolloutRootContentV2,
-    RolloutRootV2,
+    RolloutRootContentV3,
+    RolloutRootV3,
     RootActionGrantV1,
     RootAuthorityBoundsV1,
     RootCreationCommandV1,
     RootCreationEvidenceSubjectV1,
-    RootCreationResultV1,
+    RootCreationResultV2,
     SignedEvidenceEventV1,
     capability_lineage_anchor,
-    create_rollout_root,
+    create_rollout_root_v3,
     root_creation_request_sha256,
 )
 from controlgraph_canary.contracts.storage import (
@@ -79,7 +79,7 @@ class RootCreationConfiguration:
     candidate_revision: str
     candidate_revision_configuration_sha256: str
     concurrency: int
-    health_policy: RolloutHealthPolicyV1
+    health_policy: RolloutHealthPolicyV2
     capability_signing_key_version: str
     evidence_signing_key_version: str
     issuer_identity: str
@@ -92,7 +92,7 @@ class RootCreationConfiguration:
     operator_subject: str
 
     def __post_init__(self) -> None:
-        if type(self.health_policy) is not RolloutHealthPolicyV1:
+        if type(self.health_policy) is not RolloutHealthPolicyV2:
             raise TypeError("root creation requires an exact health policy")
         CandidateRevisionValidationConfiguration(
             target=self.target,
@@ -144,7 +144,7 @@ class UnsignedRootCreation:
     command: RootCreationCommandV1
     created_at: str
     request_sha256: str
-    root: RolloutRootV2
+    root: RolloutRootV3
     service_claim: ServiceClaimRecord
     initial_authority: EpochAuthorityRecord
     lineage_anchor: CapabilityLineageAnchorV1
@@ -156,12 +156,12 @@ class UnsignedRootCreation:
 class RootCreationArtifacts:
     """Exact records committed atomically for one root-creation winner."""
 
-    root: RolloutRootV2
+    root: RolloutRootV3
     service_claim: ServiceClaimRecord
     initial_authority: EpochAuthorityRecord
     lineage_anchor: CapabilityLineageAnchorV1
     signed_evidence: SignedEvidenceEventV1
-    creation_result: RootCreationResultV1
+    creation_result: RootCreationResultV2
 
 
 def build_unsigned_root_creation(
@@ -217,8 +217,8 @@ def build_unsigned_root_creation(
         maximum_recovery_attempts=1,
         initial_epoch=1,
     )
-    content = RolloutRootContentV2(
-        schema_version=ROLLOUT_ROOT_CONTENT_V2,
+    content = RolloutRootContentV3(
+        schema_version=ROLLOUT_ROOT_CONTENT_V3,
         target=configuration.target,
         stable_snapshot=stable_snapshot,
         health_policy=configuration.health_policy,
@@ -229,7 +229,7 @@ def build_unsigned_root_creation(
         approved_by_subject=operator_subject,
         approved_at=created_at,
     )
-    root = create_rollout_root(content)
+    root = create_rollout_root_v3(content)
     request_sha256 = root_creation_request_sha256(
         root=root,
         request_id=command.request_id,
@@ -330,8 +330,8 @@ def complete_root_creation(
     evidence_sha256 = canonical_sha256(signed_evidence)
     command = unsigned.command
     root = unsigned.root
-    result = RootCreationResultV1(
-        schema_version=ROOT_CREATION_RESULT_V1,
+    result = RootCreationResultV2(
+        schema_version=ROOT_CREATION_RESULT_V2,
         outcome="CREATED",
         request_id=command.request_id,
         idempotency_key=command.idempotency_key,
@@ -444,7 +444,7 @@ def _action_grant(
 
 
 def _service_claim(
-    root: RolloutRootV2,
+    root: RolloutRootV3,
     *,
     request_id: str,
     evidence_id: str,

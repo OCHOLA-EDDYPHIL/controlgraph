@@ -135,6 +135,11 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     "keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
                     "cryptoKeyVersions/1"
                 ),
+                "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+                    f"projects/{PROJECT_ID}/locations/us-central1/"
+                    "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
+                    "cryptoKeyVersions/1"
+                ),
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
             }
         )
@@ -772,6 +777,7 @@ def test_service_app_rejects_a_policy_for_another_role() -> None:
             ServiceRole.EVIDENCE_WRITER,
             ServiceRole.ISSUER,
             ServiceRole.EXECUTOR,
+            ServiceRole.VERIFIER,
         }
     ),
 )

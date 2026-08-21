@@ -10,6 +10,9 @@ from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from controlgraph_canary.application.authority_store import AuthorityStoreError
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_v3_target_configuration_sha256,
+)
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     RouteAuthenticationPolicy,
@@ -52,13 +55,21 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
     TaskRequest,
 )
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionAuthorizationV1,
+    PromotionTaskRequestV2,
+    promotion_capability_id,
+)
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
+    RolloutRootV3,
 )
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _GOOGLE_ISSUERS = frozenset({"accounts.google.com", "https://accounts.google.com"})
+
+type ProtectedMutationRequest = TaskRequest | PromotionTaskRequestV2
 
 
 class CapabilityVerificationError(Exception):
@@ -153,8 +164,8 @@ class CapabilityVerifierConfiguration:
 class VerifiedMutation:
     """Immutable task authority proven before any receipt or provider side effect."""
 
-    request: TaskRequest
-    root: RolloutRootV2
+    request: ProtectedMutationRequest
+    root: RolloutRootV2 | RolloutRootV3
     lineage_anchor: CapabilityLineageAnchorV1
     caller: AuthenticationContext
     capability_sha256: str
@@ -203,17 +214,12 @@ class CapabilityVerifier:
 
         if type(payload) is not bytes:
             raise _deny(ReasonCode.CONTRACT_INVALID)
-        try:
-            request = decode_contract(payload, TaskRequest)
-        except ContractError as error:
-            code = (
-                ReasonCode.CONTRACT_VERSION_UNSUPPORTED
-                if error.code is ContractErrorCode.VERSION_UNSUPPORTED
-                else ReasonCode.CONTRACT_INVALID
-            )
-            raise _deny(code) from None
-        except (TypeError, ValueError):
-            raise _deny(ReasonCode.CONTRACT_INVALID) from None
+        request = _decode_protected_request(payload)
+        if (
+            type(request) is TaskRequest
+            and request.intent.action is CapabilityAction.PROMOTE_CANDIDATE
+        ):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
 
         now = _require_utc_second(self._clock())
         now_second = int(now.timestamp())
@@ -223,6 +229,8 @@ class CapabilityVerifier:
         self._validate_time(request, now_second)
         self._validate_route_and_identity(request)
         root_state = await self._read_root_boundary(request.intent.root_id)
+        if root_state.authority.current_epoch != request.intent.epoch:
+            raise _deny(ReasonCode.EPOCH_MISMATCH)
         root = root_state.root
         anchor = root_state.lineage_anchor
         self._validate_root_bindings(request, root, anchor, now_second)
@@ -259,7 +267,7 @@ class CapabilityVerifier:
         ):
             raise _deny(ReasonCode.CALLER_UNAUTHORIZED)
 
-    def _precheck_target(self, request: TaskRequest) -> None:
+    def _precheck_target(self, request: ProtectedMutationRequest) -> None:
         """Reject configured-target substitutions before any trust-material lookup."""
 
         target = self._configuration.target
@@ -300,7 +308,11 @@ class CapabilityVerifier:
         except (TypeError, ValueError):
             raise _deny(ReasonCode.SIGNATURE_INVALID) from None
 
-    def _validate_time(self, request: TaskRequest, now_second: int) -> None:
+    def _validate_time(
+        self,
+        request: ProtectedMutationRequest,
+        now_second: int,
+    ) -> None:
         claims = request.capability.claims
         not_before = _parse_utc_second(claims.not_before)
         expires_at = _parse_utc_second(claims.expires_at)
@@ -310,8 +322,16 @@ class CapabilityVerifier:
             raise _deny(ReasonCode.CAPABILITY_NOT_YET_VALID)
         if now_second >= expires_at or now_second >= task_expires_at:
             raise _deny(ReasonCode.CAPABILITY_EXPIRED)
+        if (
+            type(request) is PromotionTaskRequestV2
+            and now_second >= _parse_utc_second(request.intent.proof_valid_until)
+        ):
+            raise _deny(ReasonCode.CAPABILITY_EXPIRED)
 
-    def _validate_route_and_identity(self, request: TaskRequest) -> None:
+    def _validate_route_and_identity(
+        self,
+        request: ProtectedMutationRequest,
+    ) -> None:
         claims = request.capability.claims
         configuration = self._configuration
         if (
@@ -345,8 +365,8 @@ class CapabilityVerifier:
 
     def _validate_root_bindings(
         self,
-        request: TaskRequest,
-        root: RolloutRootV2,
+        request: ProtectedMutationRequest,
+        root: RolloutRootV2 | RolloutRootV3,
         anchor: CapabilityLineageAnchorV1,
         now_second: int,
     ) -> None:
@@ -392,6 +412,102 @@ class CapabilityVerifier:
             raise _deny(ReasonCode.LINEAGE_INVALID)
         if _parse_utc_second(claims.issued_at) < _parse_utc_second(content.approved_at):
             raise _deny(ReasonCode.LINEAGE_INVALID)
+        if type(request) is PromotionTaskRequestV2:
+            self._validate_promotion_authorization(request, root, now_second)
+
+    def _validate_promotion_authorization(
+        self,
+        request: PromotionTaskRequestV2,
+        root: RolloutRootV2 | RolloutRootV3,
+        now_second: int,
+    ) -> None:
+        """Bind one compact issuer-approved promotion to the exact current V3 root."""
+
+        if type(root) is not RolloutRootV3:
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
+        intent = request.intent
+        authorization = intent.authorization
+        claims = request.capability.claims
+        content = root.content
+        plan = content.rollout_plan
+        bounds = content.authority_bounds
+        try:
+            expected_capability_id = promotion_capability_id(authorization)
+            expected_prestate_sha256 = rollout_root_v3_target_configuration_sha256(
+                root,
+                stable_percent=90,
+                candidate_percent=10,
+            )
+            desired_poststate_sha256 = rollout_root_v3_target_configuration_sha256(
+                root,
+                stable_percent=0,
+                candidate_percent=100,
+            )
+        except (TypeError, ValueError):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH) from None
+        if (
+            type(authorization) is not PromotionAuthorizationV1
+            or authorization.root_schema_version != root.schema_version
+            or authorization.root_id != root.root_id
+            or authorization.root_sha256 != root.root_sha256
+            or authorization.target != content.target
+            or authorization.epoch != claims.epoch
+            or authorization.request_id != claims.request_id
+            or authorization.request_id != intent.request_id
+            or authorization.idempotency_key != claims.idempotency_key
+            or authorization.idempotency_key != intent.idempotency_key
+            or authorization.scheduled_at != request.scheduled_at
+            or authorization.scheduled_at != claims.not_before
+            or authorization.plan_sha256 != canonical_sha256(plan)
+            or authorization.policy_schema_version != content.health_policy.schema_version
+            or authorization.policy_sha256 != canonical_sha256(content.health_policy)
+            or authorization.stable_snapshot_sha256
+            != canonical_sha256(content.stable_snapshot)
+            or authorization.stable_revision != plan.stable_revision
+            or authorization.stable_revision_configuration_sha256
+            != plan.stable_revision_configuration_sha256
+            or authorization.candidate_revision != plan.candidate_revision
+            or authorization.candidate_revision_configuration_sha256
+            != plan.candidate_revision_configuration_sha256
+            or authorization.concurrency != plan.concurrency
+            or authorization.evidence_signing_key_version
+            != content.evidence_signing_key_version
+            or authorization.capability_signing_key_version
+            != bounds.capability_signing_key_version
+            or authorization.issuer_identity != bounds.issuer_identity
+            or authorization.executor_identity != bounds.executor_identity
+            or authorization.executor_audience != bounds.executor_audience
+            or authorization.expected_prestate_sha256 != expected_prestate_sha256
+            or authorization.desired_poststate_sha256 != desired_poststate_sha256
+            or authorization.expected_stable_percent != 90
+            or authorization.expected_candidate_percent != 10
+            or authorization.stable_percent != 0
+            or authorization.candidate_percent != 100
+            or authorization.provider_etag != claims.provider_etag
+            or authorization.provider_etag != intent.provider_etag
+            or authorization.capability_id != expected_capability_id
+            or intent.capability_id != expected_capability_id
+            or claims.capability_id != expected_capability_id
+            or intent.promotion_authorization_sha256
+            != canonical_sha256(authorization)
+            or intent.expected_prestate_sha256
+            != authorization.expected_prestate_sha256
+            or intent.terminal_health_decision_sha256
+            != authorization.terminal_health_decision_sha256
+            or intent.health_chain_sha256
+            != authorization.health_chain_locator.health_chain_sha256
+            or intent.desired_poststate_sha256
+            != authorization.desired_poststate_sha256
+            or intent.proof_valid_until != authorization.proof_valid_until
+            or claims.issuer != authorization.issuer_identity
+            or claims.subject != authorization.executor_identity
+            or claims.audience != authorization.executor_audience
+            or claims.signing_key_version
+            != authorization.capability_signing_key_version
+            or request.expires_at > authorization.proof_valid_until
+            or now_second >= _parse_utc_second(authorization.proof_valid_until)
+        ):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
 
     async def _read_ancestors(
         self,
@@ -420,7 +536,7 @@ class CapabilityVerifier:
     def _validate_lineage(
         self,
         lineage: tuple[SignedCapability, ...],
-        root: RolloutRootV2,
+        root: RolloutRootV2 | RolloutRootV3,
         anchor_record: CapabilityLineageAnchorV1,
         now_second: int,
     ) -> int:
@@ -497,6 +613,28 @@ class CapabilityVerifier:
         ):
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
 
+
+def _decode_protected_request(payload: bytes) -> ProtectedMutationRequest:
+    try:
+        return decode_contract(payload, PromotionTaskRequestV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise _deny(ReasonCode.CONTRACT_INVALID) from None
+    except (TypeError, ValueError):
+        raise _deny(ReasonCode.CONTRACT_INVALID) from None
+    try:
+        return decode_contract(payload, TaskRequest)
+    except ContractError as error:
+        code = (
+            ReasonCode.CONTRACT_VERSION_UNSUPPORTED
+            if error.code is ContractErrorCode.VERSION_UNSUPPORTED
+            else ReasonCode.CONTRACT_INVALID
+        )
+        raise _deny(code) from None
+    except (TypeError, ValueError):
+        raise _deny(ReasonCode.CONTRACT_INVALID) from None
+
+
 def _validate_claim_time(claims: CapabilityClaims, now_second: int) -> None:
     if now_second < _parse_utc_second(claims.not_before):
         raise _deny(ReasonCode.CAPABILITY_NOT_YET_VALID)
@@ -545,5 +683,6 @@ __all__ = [
     "CapabilityVerificationError",
     "CapabilityVerifier",
     "CapabilityVerifierConfiguration",
+    "ProtectedMutationRequest",
     "VerifiedMutation",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -9,8 +10,9 @@ import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from fastapi.testclient import TestClient
+from health_execution_test_data import make_observation, make_signed_proof
 from pydantic import ValidationError
-from root_v2_test_data import PROJECT, PROJECT_NUMBER, RootV2Records, make_root_v2_records
+from root_v2_test_data import PROJECT, PROJECT_NUMBER, RootV3Records, make_root_v3_records
 from test_m2_firestore_authority_store import _FakeClient, _FakeTransactionRunner
 
 from controlgraph_canary.application.authority_store import (
@@ -33,18 +35,23 @@ from controlgraph_canary.application.capability_issuance import (
     CapabilityIssuanceErrorCode,
     CapabilityIssuer,
     CapabilityIssuerConfiguration,
-    PromotionCapabilityIssuanceRequest,
+    PromotionCapabilityIssuanceRequestV2,
 )
 from controlgraph_canary.application.capability_verification import (
     CapabilityVerifier,
     CapabilityVerifierConfiguration,
 )
 from controlgraph_canary.application.cloud_run import (
-    rollout_root_v2_target_configuration_sha256,
+    rollout_root_v3_target_configuration_sha256,
 )
 from controlgraph_canary.application.execution import (
     FinalMutationGate,
     MutationPermit,
+)
+from controlgraph_canary.application.health_evaluation import (
+    derive_next_health_evaluation_state,
+    evaluate_health_observation,
+    initial_health_evaluation_state,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
@@ -59,8 +66,9 @@ from controlgraph_canary.application.promotion_execution import (
     CoordinatorPromotionCapabilityClient,
     CoordinatorPromotionRelay,
     PromotionRolloutCoordinator,
+    StoredPromotionAuthorizationResolver,
 )
-from controlgraph_canary.application.promotion_store import DirectPromotionEnqueueStart
+from controlgraph_canary.application.promotion_store import DirectPromotionEnqueueStartV2
 from controlgraph_canary.application.receipt_execution import (
     ReceiptExecutionCoordinator,
     ReceiptExecutionStored,
@@ -101,26 +109,38 @@ from controlgraph_canary.contracts.codec import (
     decode_contract,
     encode_base64url,
 )
+from controlgraph_canary.contracts.health_execution import (
+    SignedHealthDecisionChainV1,
+    SignedHealthDecisionProofV1,
+    create_health_decision_proof,
+    create_post_apply_health_anchor,
+    create_signed_health_decision_chain,
+)
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EvidenceEvent,
     ExecutionReceipt,
+    MutationIntent,
     ReasonCode,
     ReceiptOutcome,
-    TaskRequest,
 )
 from controlgraph_canary.contracts.promotion_execution import (
-    PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V1,
-    PROMOTION_COMMAND_V1,
+    PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V2,
+    PROMOTION_COMMAND_V2,
     VERIFIED_APPLY_RECEIPT_LOCATOR_V1,
-    PromotionCapabilityIssuanceCommandV1,
-    PromotionCommandV1,
-    PromotionDispatchRecordV1,
+    PromotionAuthorizationV1,
+    PromotionCapabilityIssuanceCommandV2,
+    PromotionCommandV2,
+    PromotionDispatchRecordV2,
     PromotionDispatchState,
-    PromotionInvocationV1,
+    PromotionInvocationV2,
+    PromotionMutationIntentV2,
+    PromotionTaskRequestV2,
     VerifiedApplyReceiptLocatorV1,
-    promotion_command_sha256,
-    promotion_dispatch_id,
+    create_promotion_authorization,
+    create_promotion_health_chain_locator,
+    promotion_command_v2_sha256,
+    promotion_dispatch_v2_id,
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_COMMAND_V1,
@@ -137,7 +157,7 @@ from controlgraph_canary.contracts.root_creation import (
 from controlgraph_canary.contracts.storage import (
     AuthorityStorageKind,
     execution_receipt_logical_id,
-    promotion_dispatch_document_id,
+    promotion_dispatch_v2_document_id,
 )
 from controlgraph_canary.http.identity_headers import (
     CONTROLGRAPH_AUTHORIZATION_HEADER,
@@ -146,9 +166,9 @@ from controlgraph_canary.http.identity_headers import (
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.integrations.google.firestore import FirestoreAuthorityStore
 
-ISSUE_TIME = datetime(2026, 8, 19, 12, 4, tzinfo=UTC)
-REVOKE_TIME = datetime(2026, 8, 19, 12, 5, tzinfo=UTC)
-EXECUTE_TIME = datetime(2026, 8, 19, 12, 6, tzinfo=UTC)
+ISSUE_TIME = datetime(2026, 8, 19, 12, 9, tzinfo=UTC)
+REVOKE_TIME = datetime(2026, 8, 19, 12, 9, 10, tzinfo=UTC)
+EXECUTE_TIME = datetime(2026, 8, 19, 12, 9, 20, tzinfo=UTC)
 OPERATOR = "operator@example.test"
 OPERATOR_SUBJECT = "123456789012345678901"
 API_AUDIENCE = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
@@ -157,6 +177,15 @@ CAPABILITY_KEY_VERSION = (
     f"projects/{PROJECT}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
 )
+
+_HEALTH_CHAINS: dict[str, SignedHealthDecisionChainV1] = {}
+_HEALTH_CHAINS_BY_RECEIPT: dict[str, SignedHealthDecisionChainV1] = {}
+
+
+@pytest.fixture(autouse=True)
+def _collect_integration_objects() -> object:
+    yield
+    gc.collect()
 
 
 class _P256SigningBackend:
@@ -201,6 +230,26 @@ class _EvidenceClient:
         )
 
 
+class _AcceptHealthVerifier:
+    async def verify(self, signed_proof: SignedHealthDecisionProofV1) -> None:
+        if type(signed_proof) is not SignedHealthDecisionProofV1:
+            raise ValueError("health proof is not exact")
+
+
+class _HealthReader:
+    def __init__(self, records: RootV3Records) -> None:
+        self.target = records.root.content.target
+
+    async def read_promotion_health_chain(
+        self,
+        locator: object,
+    ) -> SignedHealthDecisionChainV1 | None:
+        digest = getattr(locator, "health_chain_sha256", None)
+        if type(digest) is not str:
+            return None
+        return _HEALTH_CHAINS.get(digest)
+
+
 class _DirectPromotionCapabilityClient:
     def __init__(
         self,
@@ -209,14 +258,18 @@ class _DirectPromotionCapabilityClient:
     ) -> None:
         self._service = service
         self._context = context
-        self.calls: list[PromotionCommandV1] = []
+        self.calls: list[PromotionCommandV2] = []
         self.after_issue: Callable[[], None] | None = None
 
-    async def issue(self, command: PromotionCommandV1) -> object:
+    async def issue(
+        self,
+        command: PromotionCommandV2,
+        authorization: PromotionAuthorizationV1,
+    ) -> object:
         self.calls.append(command)
         issued = await self._service.issue(
-            PromotionCapabilityIssuanceCommandV1(
-                schema_version=PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V1,
+            PromotionCapabilityIssuanceCommandV2(
+                schema_version=PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V2,
                 root_id=command.root_id,
                 expected_root_sha256=command.expected_root_sha256,
                 expected_epoch=command.expected_epoch,
@@ -224,6 +277,7 @@ class _DirectPromotionCapabilityClient:
                 idempotency_key=command.idempotency_key,
                 scheduled_at=command.scheduled_at,
                 verified_apply_receipt=command.verified_apply_receipt,
+                authorization=authorization,
             ),
             self._context,
         )
@@ -264,10 +318,24 @@ class _AmbiguousEnqueuer(_HoldingEnqueuer):
 
 
 class _NoMutationAdapter:
-    def __init__(self, records: RootV2Records) -> None:
+    def __init__(self, records: RootV3Records) -> None:
         self.target = records.root.content.target
         self.service_role = ServiceRole.EXECUTOR
         self.calls: list[MutationPermit] = []
+        self._prepared_intent: MutationIntent | PromotionMutationIntentV2 | None = None
+
+    @property
+    def intent(self) -> MutationIntent | PromotionMutationIntentV2:
+        if self._prepared_intent is None:
+            raise RuntimeError("mutation adapter has not been prepared")
+        return self._prepared_intent
+
+    async def prepare(
+        self,
+        intent: MutationIntent | PromotionMutationIntentV2,
+    ) -> _NoMutationAdapter:
+        self._prepared_intent = intent
+        return self
 
     async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
         self.calls.append(permit)
@@ -279,7 +347,7 @@ class _NoMutationAdapter:
 
 
 class _NoReadback:
-    def __init__(self, records: RootV2Records) -> None:
+    def __init__(self, records: RootV3Records) -> None:
         self.target = records.root.content.target
         self.calls = 0
 
@@ -292,7 +360,7 @@ class _NoReadback:
 class _ReceiptReader:
     def __init__(
         self,
-        records: RootV2Records,
+        records: RootV3Records,
         stored: StoredRecord[ExecutionReceipt] | None,
     ) -> None:
         self.target = records.root.content.target
@@ -310,7 +378,7 @@ class _ReceiptReader:
 class _SequencedReceiptReader:
     def __init__(
         self,
-        records: RootV2Records,
+        records: RootV3Records,
         reads: list[StoredRecord[ExecutionReceipt] | BaseException],
     ) -> None:
         self.target = records.root.content.target
@@ -372,13 +440,13 @@ class _NeverPromotionCoordinator:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def dispatch(self, command: PromotionCommandV1) -> object:
+    async def dispatch(self, command: PromotionCommandV2) -> object:
         del command
         self.calls += 1
         raise AssertionError("malformed invocation must not reach promotion coordinator")
 
 
-def _target_key(records: RootV2Records) -> MutationTargetKey:
+def _target_key(records: RootV3Records) -> MutationTargetKey:
     target = records.root.content.target
     return MutationTargetKey(
         project_id=target.project_id,
@@ -389,7 +457,7 @@ def _target_key(records: RootV2Records) -> MutationTargetKey:
 
 
 def _source_binding(
-    records: RootV2Records,
+    records: RootV3Records,
     *,
     source_idempotency_key: str,
     suffix: str,
@@ -407,7 +475,7 @@ def _source_binding(
         plan_sha256=canonical_sha256(root.content.rollout_plan),
         capability_sha256=("a" if suffix == "001" else "b") * 64,
         payload_sha256=("c" if suffix == "001" else "d") * 64,
-        expected_poststate_sha256=rollout_root_v2_target_configuration_sha256(
+        expected_poststate_sha256=rollout_root_v3_target_configuration_sha256(
             root,
             stable_percent=90,
             candidate_percent=10,
@@ -417,7 +485,7 @@ def _source_binding(
 
 async def _write_verified_apply_receipt(
     store: FirestoreAuthorityStore,
-    records: RootV2Records,
+    records: RootV3Records,
     *,
     source_idempotency_key: str = "intent-apply-001",
     suffix: str = "001",
@@ -496,23 +564,93 @@ def _locator(receipt: ExecutionReceipt) -> VerifiedApplyReceiptLocatorV1:
     )
 
 
+def _healthy_chain(
+    records: RootV3Records,
+    receipt: ExecutionReceipt,
+) -> SignedHealthDecisionChainV1:
+    anchor = create_post_apply_health_anchor(
+        root=records.root,
+        apply_receipt=receipt,
+    )
+    state = initial_health_evaluation_state(
+        policy=anchor.policy,
+        target=anchor.target,
+        root_id=anchor.root_id,
+        root_sha256=anchor.root_sha256,
+        epoch=anchor.epoch,
+        candidate_revision=anchor.candidate_revision,
+        observation_started_at=anchor.observation_started_at,
+    )
+    first_observation = make_observation(anchor, window_index=1)
+    first_decision = evaluate_health_observation(
+        policy=anchor.policy,
+        prior_state=state,
+        observation=first_observation,
+        evaluated_at=first_observation.observed_at,
+    )
+    first_proof = create_health_decision_proof(
+        anchor=anchor,
+        sequence=1,
+        previous_signed_proof_sha256=None,
+        prior_state=state,
+        observation=first_observation,
+        decision=first_decision,
+    )
+    first_signed = make_signed_proof(first_proof, anchor, marker=b"promotion-first")
+    second_state = derive_next_health_evaluation_state(
+        policy=anchor.policy,
+        predecessor_decision=first_decision,
+    )
+    second_observation = make_observation(anchor, window_index=2)
+    second_decision = evaluate_health_observation(
+        policy=anchor.policy,
+        prior_state=second_state,
+        predecessor_decision=first_decision,
+        observation=second_observation,
+        evaluated_at=second_observation.observed_at,
+    )
+    second_proof = create_health_decision_proof(
+        anchor=anchor,
+        sequence=2,
+        previous_signed_proof_sha256=canonical_sha256(first_signed),
+        prior_state=second_state,
+        observation=second_observation,
+        decision=second_decision,
+    )
+    second_signed = make_signed_proof(second_proof, anchor, marker=b"promotion-second")
+    return create_signed_health_decision_chain(
+        anchor=anchor,
+        signed_proofs=(first_signed, second_signed),
+    )
+
+
 def _promotion_command(
-    records: RootV2Records,
+    records: RootV3Records,
     receipt: ExecutionReceipt,
     **changes: object,
-) -> PromotionCommandV1:
+) -> PromotionCommandV2:
+    receipt_sha256 = canonical_sha256(receipt)
+    chain = _HEALTH_CHAINS_BY_RECEIPT.get(receipt_sha256)
+    if chain is None:
+        chain = _healthy_chain(records, receipt)
+        _HEALTH_CHAINS_BY_RECEIPT[receipt_sha256] = chain
+    locator = create_promotion_health_chain_locator(chain)
+    _HEALTH_CHAINS[locator.health_chain_sha256] = chain
+    proof = chain.healthy_promotion_proof
+    assert proof is not None
     values: dict[str, object] = {
-        "schema_version": PROMOTION_COMMAND_V1,
+        "schema_version": PROMOTION_COMMAND_V2,
         "root_id": records.root.root_id,
         "expected_root_sha256": records.root.root_sha256,
         "expected_epoch": 1,
         "request_id": "request-promote-001",
         "idempotency_key": "intent-promote-001",
-        "scheduled_at": "2026-08-19T12:06:00Z",
+        "scheduled_at": proof.issued_at,
         "verified_apply_receipt": _locator(receipt),
+        "health_chain_locator": locator,
     }
     values.update(changes)
-    return PromotionCommandV1.model_validate(values)
+    return PromotionCommandV2.model_validate(values)
 
 
 def _coordinator_context() -> AuthenticationContext:
@@ -586,7 +724,7 @@ def _operator_context() -> AuthenticationContext:
     )
 
 
-def _executor_policy(records: RootV2Records) -> RouteAuthenticationPolicy:
+def _executor_policy(records: RootV3Records) -> RouteAuthenticationPolicy:
     return RouteAuthenticationPolicy(
         project_id=PROJECT,
         project_number=PROJECT_NUMBER,
@@ -601,7 +739,7 @@ def _executor_policy(records: RootV2Records) -> RouteAuthenticationPolicy:
     )
 
 
-def _task_caller(records: RootV2Records) -> AuthenticationContext:
+def _task_caller(records: RootV3Records) -> AuthenticationContext:
     policy = _executor_policy(records)
     now = int(EXECUTE_TIME.timestamp())
     return AuthenticationContext(
@@ -661,7 +799,7 @@ def _trust_verifier(
 
 async def _created_store() -> tuple[
     FirestoreAuthorityStore,
-    RootV2Records,
+    RootV3Records,
 ]:
     store, records, _, _ = await _created_store_components()
     return store, records
@@ -669,11 +807,11 @@ async def _created_store() -> tuple[
 
 async def _created_store_components() -> tuple[
     FirestoreAuthorityStore,
-    RootV2Records,
+    RootV3Records,
     _FakeClient,
     _FakeTransactionRunner,
 ]:
-    records = make_root_v2_records()
+    records = make_root_v3_records()
     client = _FakeClient()
     runner = _FakeTransactionRunner()
     store = FirestoreAuthorityStore.for_test(
@@ -695,7 +833,7 @@ async def _created_store_components() -> tuple[
 
 def _issuer(
     store: FirestoreAuthorityStore,
-    records: RootV2Records,
+    records: RootV3Records,
     private_key: ec.EllipticCurvePrivateKey,
     *,
     receipt_reader: object | None = None,
@@ -713,13 +851,15 @@ def _issuer(
             lifetime_seconds=300,
         ),
         receipt_reader=receipt_reader or store,  # type: ignore[arg-type]
+        promotion_health_chain_reader=_HealthReader(records),
+        health_signature_verifier=_AcceptHealthVerifier(),
     )
 
 
 def _rollout_coordinator(
     store: FirestoreAuthorityStore,
     issuer: CapabilityIssuer,
-    records: RootV2Records,
+    records: RootV3Records,
     enqueuer: _HoldingEnqueuer,
     *,
     clock: Callable[[], datetime] = lambda: ISSUE_TIME,
@@ -735,6 +875,12 @@ def _rollout_coordinator(
         client_capture.append(client)
     return PromotionRolloutCoordinator(
         target=records.root.content.target,
+        authorization_resolver=StoredPromotionAuthorizationResolver(
+            target=records.root.content.target,
+            root_reader=store,
+            health_chain_reader=_HealthReader(records),
+            health_signature_verifier=_AcceptHealthVerifier(),
+        ),
         capability_client=cast(object, client),  # type: ignore[arg-type]
         dispatch_store=store,
         task_dispatcher=TaskDispatcher(
@@ -745,8 +891,16 @@ def _rollout_coordinator(
     )
 
 
-def _promotion_request(command: PromotionCommandV1) -> PromotionCapabilityIssuanceRequest:
-    return PromotionCapabilityIssuanceRequest(
+def _promotion_request(command: PromotionCommandV2) -> PromotionCapabilityIssuanceRequestV2:
+    chain = _HEALTH_CHAINS[command.health_chain_locator.health_chain_sha256]
+    authorization = create_promotion_authorization(
+        root=make_root_v3_records().root,
+        signed_health_chain=chain,
+        request_id=command.request_id,
+        idempotency_key=command.idempotency_key,
+        scheduled_at=command.scheduled_at,
+    )
+    return PromotionCapabilityIssuanceRequestV2(
         root_id=command.root_id,
         expected_root_sha256=command.expected_root_sha256,
         expected_epoch=command.expected_epoch,
@@ -754,42 +908,17 @@ def _promotion_request(command: PromotionCommandV1) -> PromotionCapabilityIssuan
         idempotency_key=command.idempotency_key,
         scheduled_at=command.scheduled_at,
         verified_apply_receipt=command.verified_apply_receipt,
+        authorization=authorization,
     )
 
 
 def test_promotion_command_binds_only_authority_and_exact_verified_receipt() -> None:
     async def scenario() -> None:
-        _, records = await _created_store()
-        receipt = ExecutionReceipt.model_validate(
-            {
-                "schema_version": "controlgraph.execution-receipt/v1",
-                "receipt_id": "a" * 64,
-                "request_id": "request-apply-001",
-                "idempotency_key": "intent-apply-001",
-                "capability_sha256": "b" * 64,
-                "mutation_sha256": "c" * 64,
-                "plan_sha256": "d" * 64,
-                "expected_poststate_sha256": "e" * 64,
-                "target": records.root.content.target,
-                "root_id": records.root.root_id,
-                "root_sha256": records.root.root_sha256,
-                "epoch": 1,
-                "action": CapabilityAction.APPLY_CANARY,
-                "provider_etag": "stable-etag-7",
-                "dispatch_not_after": "2026-08-19T12:10:00Z",
-                "outcome": ReceiptOutcome.VERIFIED,
-                "reason_code": None,
-                "provider_operation": "operations/apply-001",
-                "observed_etag": "etag-canary-8",
-                "observed_authority_epoch": 1,
-                "created_at": "2026-08-19T12:02:00Z",
-                "updated_at": "2026-08-19T12:03:00Z",
-                "evidence_ids": (),
-            }
-        )
-        command = _promotion_command(records, receipt)
+        store, records = await _created_store()
+        receipt = await _write_verified_apply_receipt(store, records)
+        command = _promotion_command(records, receipt.value)
 
-        assert tuple(PromotionCommandV1.model_fields) == (
+        assert tuple(PromotionCommandV2.model_fields) == (
             "schema_version",
             "root_id",
             "expected_root_sha256",
@@ -798,20 +927,21 @@ def test_promotion_command_binds_only_authority_and_exact_verified_receipt() -> 
             "idempotency_key",
             "scheduled_at",
             "verified_apply_receipt",
+            "health_chain_locator",
         )
         assert (
             decode_contract(
                 canonical_json_bytes(command),
-                PromotionCommandV1,
+                PromotionCommandV2,
             )
             == command
         )
         missing_schedule = command.model_dump(mode="python")
         del missing_schedule["scheduled_at"]
         with pytest.raises(ValidationError):
-            PromotionCommandV1.model_validate(missing_schedule)
+            PromotionCommandV2.model_validate(missing_schedule)
         with pytest.raises(ValidationError):
-            PromotionCommandV1.model_validate(
+            PromotionCommandV2.model_validate(
                 {
                     **command.model_dump(mode="python"),
                     "scheduled_at": "2026-08-19T12:06:00.000Z",
@@ -824,7 +954,10 @@ def test_promotion_command_binds_only_authority_and_exact_verified_receipt() -> 
             {"provider_etag": "caller-selected-etag"},
         ):
             with pytest.raises(ValidationError):
-                PromotionCommandV1.model_validate({**command.model_dump(mode="python"), **injected})
+                PromotionCommandV2.model_validate({
+                    **command.model_dump(mode="python"),
+                    **injected,
+                })
 
     asyncio.run(scenario())
 
@@ -857,7 +990,7 @@ def test_issuer_derives_root_scoped_promotion_from_verified_canary_receipt() -> 
         assert claims.request_id == command.request_id
         assert claims.idempotency_key == command.idempotency_key
         assert claims.not_before == command.scheduled_at
-        assert claims.expires_at == "2026-08-19T12:09:00Z"
+        assert claims.expires_at == "2026-08-19T12:11:00Z"
         assert claims.parent_capability_sha256 is None
         assert claims.plan_sha256 == canonical_sha256(records.root.content.rollout_plan)
         assert claims.stable_revision == records.root.content.rollout_plan.stable_revision
@@ -875,7 +1008,7 @@ def test_promotion_schedule_binds_capability_identity_and_exact_margin_boundary(
         first_command = _promotion_command(records, source.value)
         boundary_schedule = (
             ISSUE_TIME
-            + timedelta(seconds=300 - MIN_PROMOTION_EXECUTION_MARGIN_SECONDS)
+            + timedelta(seconds=120 - MIN_PROMOTION_EXECUTION_MARGIN_SECONDS)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         boundary_command = first_command.model_copy(
             update={"scheduled_at": boundary_schedule}
@@ -898,21 +1031,22 @@ def test_promotion_schedule_binds_capability_identity_and_exact_margin_boundary(
         assert MIN_PROMOTION_EXECUTION_MARGIN_SECONDS == 30
         assert first.claims.not_before == first_command.scheduled_at
         assert boundary.claims.not_before == boundary_schedule
-        assert boundary.claims.expires_at == "2026-08-19T12:09:00Z"
+        assert boundary.claims.expires_at == "2026-08-19T12:11:00Z"
         assert first.claims.capability_id != boundary.claims.capability_id
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
-    "scheduled_at",
+    ("scheduled_at", "issue_time"),
     [
-        "2026-08-19T12:03:59Z",
-        "2026-08-19T12:08:31Z",
+        ("2026-08-19T12:09:00Z", ISSUE_TIME + timedelta(seconds=1)),
+        ("2026-08-19T12:10:31Z", ISSUE_TIME),
     ],
 )
 def test_issuer_rejects_past_or_insufficient_margin_promotion_schedule(
     scheduled_at: str,
+    issue_time: datetime,
 ) -> None:
     async def scenario() -> None:
         store, records = await _created_store()
@@ -936,7 +1070,7 @@ def test_issuer_rejects_past_or_insufficient_margin_promotion_schedule(
                         f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
                     )
                 ),
-                now=ISSUE_TIME,
+                now=issue_time,
             )
 
         assert denied.value.code is CapabilityIssuanceErrorCode.VALIDITY_EXHAUSTED
@@ -955,7 +1089,7 @@ def test_internal_client_rejects_signed_schedule_substitution() -> None:
         )
         command = _promotion_command(records, source.value)
         substituted = command.model_copy(
-            update={"scheduled_at": "2026-08-19T12:07:00Z"}
+            update={"scheduled_at": "2026-08-19T12:10:00Z"}
         )
         capability = await issuer.issue_promotion(
             _promotion_request(substituted),
@@ -979,13 +1113,13 @@ def test_internal_client_rejects_signed_schedule_substitution() -> None:
         )
 
         with pytest.raises(CanaryExecutionError) as denied:
-            await client.issue(command)
+            await client.issue(command, _promotion_request(command).authorization)
 
         assert denied.value.code is CanaryExecutionErrorCode.RESPONSE_INVALID
         assert len(transport.calls) == 1
         issuance = decode_contract(
             transport.calls[0][1],
-            PromotionCapabilityIssuanceCommandV1,
+            PromotionCapabilityIssuanceCommandV2,
         )
         assert issuance.scheduled_at == command.scheduled_at
 
@@ -1085,16 +1219,13 @@ def test_issuer_rejects_forged_or_incoherent_source_receipts(alter: str) -> None
             private_key,
             receipt_reader=reader,
         )
-        command = PromotionCommandV1(
-            **{
-                **_promotion_command(records, receipt).model_dump(mode="python"),
-                "verified_apply_receipt": locator,
-            }
-        )
+        command = _promotion_command(records, receipt)
+        request = _promotion_request(command)
+        object.__setattr__(request, "verified_apply_receipt", locator)
 
         with pytest.raises(CapabilityIssuanceError) as denied:
             await issuer.issue_promotion(
-                _promotion_request(command),
+                request,
                 principal=AuthenticatedIssuancePrincipal(
                     identity=(f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com")
                 ),
@@ -1214,11 +1345,11 @@ def test_cross_instance_exact_replay_adopts_original_result_without_reissuing() 
         assert len(first_clients) == len(replay_clients) == 1
         assert first_clients[0].calls == [command]
         assert replay_clients[0].calls == []
-        first_request = decode_contract(enqueuer.attempts[0].body, TaskRequest)
+        first_request = decode_contract(enqueuer.attempts[0].body, PromotionTaskRequestV2)
         assert first_request.capability.claims.capability_id == first.capability_id
         assert first_request.capability.claims.not_before == command.scheduled_at
         assert first_request.scheduled_at == command.scheduled_at
-        assert enqueuer.attempts[0].scheduled_for == EXECUTE_TIME
+        assert enqueuer.attempts[0].scheduled_for == ISSUE_TIME
 
     asyncio.run(scenario())
 
@@ -1239,7 +1370,7 @@ def test_changed_schedule_under_same_identities_conflicts_without_reissue() -> N
         )
         first_command = _promotion_command(records, source.value)
         conflicting_command = first_command.model_copy(
-            update={"scheduled_at": "2026-08-19T12:07:00Z"}
+            update={"scheduled_at": "2026-08-19T12:10:00Z"}
         )
 
         first = await coordinator.dispatch(first_command)
@@ -1247,7 +1378,7 @@ def test_changed_schedule_under_same_identities_conflicts_without_reissue() -> N
             await coordinator.dispatch(conflicting_command)
 
         assert first.scheduled_at == first_command.scheduled_at
-        assert promotion_command_sha256(first_command) != promotion_command_sha256(
+        assert promotion_command_v2_sha256(first_command) != promotion_command_v2_sha256(
             conflicting_command
         )
         assert conflicting.value.code is CanaryExecutionErrorCode.IDENTITY_CONFLICT
@@ -1296,7 +1427,7 @@ def test_api_client_rejects_dispatch_result_schedule_substitution() -> None:
 
         assert denied.value.code is CanaryExecutionErrorCode.RESPONSE_INVALID
         assert len(transport.calls) == 1
-        invocation = decode_contract(transport.calls[0][1], PromotionInvocationV1)
+        invocation = decode_contract(transport.calls[0][1], PromotionInvocationV2)
         assert invocation.command.scheduled_at == command.scheduled_at
 
     asyncio.run(scenario())
@@ -1331,7 +1462,10 @@ def test_changed_source_under_same_promotion_idempotency_cannot_enqueue_twice() 
         assert conflicting.value.code is CanaryExecutionErrorCode.IDENTITY_CONFLICT
         assert len(enqueuer.tasks) == 1
         assert len(enqueuer.attempts) == 1
-        held = decode_contract(next(iter(enqueuer.tasks.values())).body, TaskRequest)
+        held = decode_contract(
+            next(iter(enqueuer.tasks.values())).body,
+            PromotionTaskRequestV2,
+        )
         assert held.capability.claims.provider_etag == first_source.value.observed_etag
 
     asyncio.run(scenario())
@@ -1457,7 +1591,7 @@ def test_ambiguous_prepare_commit_is_adopted_without_a_second_task() -> None:
         clients[0].after_issue = lambda: setattr(runner, "mode", "commit-then-timeout")
 
         prepared = await coordinator._prepare(command)
-        readback = await store.read_promotion_dispatch(command)
+        readback = await store.read_promotion_dispatch_v2(command)
 
         assert prepared == readback
         assert prepared.value.state is PromotionDispatchState.PREPARED
@@ -1483,32 +1617,32 @@ def test_same_second_start_cas_yields_one_one_use_enqueue_permit() -> None:
         )
         command = _promotion_command(records, source.value)
         prepared = await coordinator._prepare(command)
-        started = PromotionDispatchRecordV1.model_validate(
+        started = PromotionDispatchRecordV2.model_validate(
             {
                 **prepared.value.model_dump(mode="python"),
                 "state": PromotionDispatchState.ENQUEUE_STARTED,
-                "enqueue_started_at": "2026-08-19T12:04:00Z",
+                "enqueue_started_at": "2026-08-19T12:09:00Z",
             }
         )
 
         contenders = await asyncio.gather(
-            store.begin_promotion_enqueue(prepared, started),
-            store.begin_promotion_enqueue(prepared, started),
+            store.begin_promotion_enqueue_v2(prepared, started),
+            store.begin_promotion_enqueue_v2(prepared, started),
             return_exceptions=True,
         )
 
-        direct = [value for value in contenders if type(value) is DirectPromotionEnqueueStart]
+        direct = [value for value in contenders if type(value) is DirectPromotionEnqueueStartV2]
         conflicts = [value for value in contenders if type(value) is AuthorityStoreConflict]
         assert len(direct) == len(conflicts) == 1
         dispatcher = TaskDispatcher(TaskAddressor(_delivery_settings()), enqueuer)
         addressed = dispatcher.prepare(prepared.value.task, now=ISSUE_TIME)
-        dispatched = dispatcher.dispatch_prepared(
+        dispatched = dispatcher.dispatch_prepared_v2(
             addressed,
             permit=direct[0].permit,
             now=ISSUE_TIME,
         )
         with pytest.raises(TaskAddressingError):
-            dispatcher.dispatch_prepared(
+            dispatcher.dispatch_prepared_v2(
                 addressed,
                 permit=direct[0].permit,
                 now=ISSUE_TIME,
@@ -1533,22 +1667,22 @@ def test_start_commit_response_loss_never_grants_enqueue_authority() -> None:
         )
         command = _promotion_command(records, source.value)
         prepared = await coordinator._prepare(command)
-        started = PromotionDispatchRecordV1.model_validate(
+        started = PromotionDispatchRecordV2.model_validate(
             {
                 **prepared.value.model_dump(mode="python"),
                 "state": PromotionDispatchState.ENQUEUE_STARTED,
-                "enqueue_started_at": "2026-08-19T12:04:00Z",
+                "enqueue_started_at": "2026-08-19T12:09:00Z",
             }
         )
         runner.mode = "commit-then-timeout"
 
         with pytest.raises(AuthorityStoreOutcomeUnknown):
-            await store.begin_promotion_enqueue(prepared, started)
+            await store.begin_promotion_enqueue_v2(prepared, started)
         with pytest.raises(CanaryExecutionError) as replay:
             await coordinator.dispatch(command)
 
         assert replay.value.code is CanaryExecutionErrorCode.OUTCOME_UNKNOWN
-        assert (await store.read_promotion_dispatch(command)) == StoredRecord(started, 1)
+        assert (await store.read_promotion_dispatch_v2(command)) == StoredRecord(started, 1)
         assert enqueuer.attempts == []
 
     asyncio.run(scenario())
@@ -1571,7 +1705,7 @@ def test_legacy_dispatch_cannot_bypass_promotion_enqueue_permit() -> None:
         dispatcher = TaskDispatcher(TaskAddressor(_delivery_settings()), enqueuer)
 
         with pytest.raises(TaskAddressingError):
-            dispatcher.dispatch(prepared.value.task, now=ISSUE_TIME)
+            dispatcher.dispatch(prepared.value.task, now=ISSUE_TIME)  # type: ignore[arg-type]
 
         assert enqueuer.attempts == []
 
@@ -1601,7 +1735,7 @@ def test_dispatch_record_rejects_non_deterministic_task_identity(corruption: str
         }
 
         with pytest.raises(ValidationError):
-            PromotionDispatchRecordV1.model_validate(
+            PromotionDispatchRecordV2.model_validate(
                 {
                     **prepared.value.model_dump(mode="python"),
                     corruption: changed[corruption],
@@ -1630,7 +1764,7 @@ def test_task_contract_rejects_promotion_schedule_substitution() -> None:
         )
 
         with pytest.raises(ValidationError):
-            TaskRequest.model_validate(
+            PromotionTaskRequestV2.model_validate(
                 {
                     **prepared.value.task.model_dump(mode="python"),
                     "scheduled_at": "2026-08-19T12:06:01Z",
@@ -1687,14 +1821,14 @@ def test_started_without_terminal_result_is_outcome_unknown_without_retry() -> N
         )
         command = _promotion_command(records, source.value)
         prepared = await coordinator._prepare(command)
-        started = PromotionDispatchRecordV1.model_validate(
+        started = PromotionDispatchRecordV2.model_validate(
             {
                 **prepared.value.model_dump(mode="python"),
                 "state": PromotionDispatchState.ENQUEUE_STARTED,
-                "enqueue_started_at": "2026-08-19T12:04:00Z",
+                "enqueue_started_at": "2026-08-19T12:09:00Z",
             }
         )
-        await store.begin_promotion_enqueue(prepared, started)
+        await store.begin_promotion_enqueue_v2(prepared, started)
 
         with pytest.raises(CanaryExecutionError) as denied:
             await coordinator.dispatch(command)
@@ -1722,9 +1856,11 @@ def test_missing_or_corrupt_prepared_record_after_ownership_fails_closed(
         )
         command = _promotion_command(records, source.value)
         await coordinator._prepare(command)
-        command_sha256 = promotion_command_sha256(command)
-        document_id = promotion_dispatch_document_id(promotion_dispatch_id(command_sha256))
-        path = f"{AuthorityStorageKind.PROMOTION_DISPATCH.value}/{document_id}"
+        command_sha256 = promotion_command_v2_sha256(command)
+        document_id = promotion_dispatch_v2_document_id(
+            promotion_dispatch_v2_id(command_sha256)
+        )
+        path = f"{AuthorityStorageKind.PROMOTION_DISPATCH_V2.value}/{document_id}"
         if damage == "missing":
             del client.documents[path]
         else:
@@ -1757,6 +1893,19 @@ def test_revoked_held_promotion_passes_signature_then_fails_final_fresh_epoch() 
         assert dispatched.enqueue_disposition == TaskEnqueueDisposition.CREATED.value
         assert len(enqueuer.tasks) == 1
         held = next(iter(enqueuer.tasks.values()))
+
+        verifier = CapabilityVerifier(
+            root_reader=store,
+            trust_verifier=_trust_verifier(private_key),
+            configuration=CapabilityVerifierConfiguration(
+                target=records.root.content.target,
+                route_policy=_executor_policy(records),
+            ),
+            clock=lambda: REVOKE_TIME,
+        )
+        verified = await verifier.verify(held.body, _task_caller(records))
+        assert verified.request.intent.action is CapabilityAction.PROMOTE_CANDIDATE
+        assert verified.request.intent.epoch == 1
 
         evidence = _EvidenceClient(records.root.content.evidence_signing_key_version)
         revoker = EpochRevoker(
@@ -1791,19 +1940,6 @@ def test_revoked_held_promotion_passes_signature_then_fails_final_fresh_epoch() 
         assert revoked.new_epoch == 2
         assert len(evidence.calls) == 1
 
-        verifier = CapabilityVerifier(
-            root_reader=store,
-            trust_verifier=_trust_verifier(private_key),
-            configuration=CapabilityVerifierConfiguration(
-                target=records.root.content.target,
-                route_policy=_executor_policy(records),
-            ),
-            clock=lambda: EXECUTE_TIME,
-        )
-        verified = await verifier.verify(held.body, _task_caller(records))
-        assert verified.request.intent.action is CapabilityAction.PROMOTE_CANDIDATE
-        assert verified.request.intent.epoch == 1
-
         adapter = _NoMutationAdapter(records)
         readback = _NoReadback(records)
         execution = ReceiptExecutionCoordinator(
@@ -1811,6 +1947,8 @@ def test_revoked_held_promotion_passes_signature_then_fails_final_fresh_epoch() 
             final_gate=FinalMutationGate(
                 authority_reader=store,
                 adapter=adapter,
+                route_policy=_executor_policy(records),
+                source_receipt_reader=store,
                 clock=lambda: EXECUTE_TIME,
             ),
             readback=readback,
@@ -1862,7 +2000,7 @@ def test_malformed_promotion_command_stops_at_api_decoder() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["code"] == "CONTRACT_INVALID"
+    assert response.json()["code"] == "CONTRACT_VERSION_UNSUPPORTED"
     assert transport.calls == 0
 
 
@@ -1887,7 +2025,7 @@ def test_malformed_promotion_invocation_stops_at_coordinator_decoder() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["code"] == "CONTRACT_INVALID"
+    assert response.json()["code"] == "CONTRACT_VERSION_UNSUPPORTED"
     assert coordinator.calls == 0
 
 
@@ -1913,4 +2051,4 @@ def test_malformed_promotion_issuance_stops_at_issuer_decoder() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["code"] == "CONTRACT_INVALID"
+    assert response.json()["code"] == "CONTRACT_VERSION_UNSUPPORTED"

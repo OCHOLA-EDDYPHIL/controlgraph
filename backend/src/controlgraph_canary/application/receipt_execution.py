@@ -22,6 +22,7 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunMutationReason,
     CloudRunMutationResult,
     TargetConfigurationProjection,
+    rollout_root_v3_target_configuration_sha256,
     target_configuration_projection,
     target_configuration_sha256,
 )
@@ -31,6 +32,7 @@ from controlgraph_canary.application.execution import (
     FinalMutationGate,
     FinalMutationResult,
     MutationPermit,
+    PreparedTargetMutation,
     TargetBoundMutationAdapter,
 )
 from controlgraph_canary.application.identity import ServiceRole
@@ -43,10 +45,16 @@ from controlgraph_canary.authority.replay import (
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import (
     ExecutionReceipt,
+    MutationIntent,
     ReasonCode,
     ReceiptOutcome,
     TargetBinding,
 )
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionMutationIntentV2,
+    PromotionTaskRequestV2,
+)
+from controlgraph_canary.contracts.root_creation import RolloutRootV3
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 
 RECEIPT_ORPHAN_GRACE_SECONDS: Final = 60
@@ -133,8 +141,37 @@ def map_cloud_run_mutation_result(
     )
 
 
+class _ReceiptClassifyingPreparedMutation:
+    """Map one already-prepared Cloud Run call without adding a pre-call await."""
+
+    def __init__(
+        self,
+        delegate: PreparedTargetMutation[CloudRunMutationResult],
+    ) -> None:
+        self._delegate = delegate
+        self._target = delegate.target
+        self._service_role = delegate.service_role
+        self._intent = delegate.intent
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    @property
+    def service_role(self) -> ServiceRole:
+        return self._service_role
+
+    @property
+    def intent(self) -> MutationIntent | PromotionMutationIntentV2:
+        return self._intent
+
+    async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
+        result = await self._delegate.mutate(permit)
+        return map_cloud_run_mutation_result(result)
+
+
 class ReceiptClassifyingMutationAdapter:
-    """Preserve target and role while mapping one Cloud Run adapter result."""
+    """Prepare a Cloud Run call and preserve its target, role, and classification."""
 
     def __init__(
         self,
@@ -159,9 +196,12 @@ class ReceiptClassifyingMutationAdapter:
     def service_role(self) -> ServiceRole:
         return self._service_role
 
-    async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
-        result = await self._delegate.mutate(permit)
-        return map_cloud_run_mutation_result(result)
+    async def prepare(
+        self,
+        intent: MutationIntent | PromotionMutationIntentV2,
+    ) -> PreparedTargetMutation[ReceiptMutationResult]:
+        prepared = await self._delegate.prepare(intent)
+        return _ReceiptClassifyingPreparedMutation(prepared)
 
 
 @dataclass(frozen=True, slots=True)
@@ -643,10 +683,40 @@ class ReceiptExecutionCoordinator:
 def _expected_target_state(verified: VerifiedMutation) -> TargetConfigurationProjection:
     intent = verified.request.intent
     root = verified.root
-    return target_configuration_projection(
+    if type(verified.request) is PromotionTaskRequestV2:
+        if type(intent) is not PromotionMutationIntentV2 or type(root) is not RolloutRootV3:
+            raise TypeError("V2 promotion receipt execution requires an exact V3 root")
+        expected_prestate_sha256 = rollout_root_v3_target_configuration_sha256(
+            root,
+            stable_percent=90,
+            candidate_percent=10,
+        )
+        desired_poststate_sha256 = rollout_root_v3_target_configuration_sha256(
+            root,
+            stable_percent=0,
+            candidate_percent=100,
+        )
+        if (
+            intent.expected_prestate_sha256 != expected_prestate_sha256
+            or intent.desired_poststate_sha256 != desired_poststate_sha256
+        ):
+            raise ValueError("V2 promotion receipt state is outside the V3 root")
+    elif type(intent) is PromotionMutationIntentV2:
+        raise TypeError("V2 promotion intent requires the exact V2 task request")
+    projected = target_configuration_projection(
         intent,
         expected_concurrency=root.content.authority_bounds.concurrency,
     )
+    if (
+        type(intent) is PromotionMutationIntentV2
+        and target_configuration_sha256(
+            intent,
+            expected_concurrency=projected.concurrency,
+        )
+        != intent.desired_poststate_sha256
+    ):
+        raise ValueError("V2 promotion receipt poststate is not authorized")
+    return projected
 
 
 def _mutation_binding(

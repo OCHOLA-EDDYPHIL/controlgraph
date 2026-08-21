@@ -5,6 +5,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
+from threading import Event, Thread
 from typing import Any, cast
 
 import pytest
@@ -38,13 +39,17 @@ from controlgraph_canary.application.cloud_run import (
 )
 from controlgraph_canary.application.execution import (
     DefinitiveFreshClaimLeaseFactory,
+    FinalAuthorityDenial,
     FinalMutationGate,
     FinalMutationResult,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
+    CallerBinding,
     CallerRole,
+    RouteAuthenticationPolicy,
     ServiceRole,
+    protected_path,
 )
 from controlgraph_canary.application.receipt_execution import (
     ReceiptMutationResult,
@@ -73,6 +78,7 @@ from controlgraph_canary.contracts.codec import (
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
+    EpochChangeCause,
     ExecutionReceipt,
     MutationIntent,
     ReasonCode,
@@ -91,6 +97,8 @@ from controlgraph_canary.integrations.google.cloud_run import (
 )
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
+PROJECT_NUMBER = "123456789012"
+SUBJECT = "123456789012345678901"
 SERVICE = "controlgraph-reference-target"
 STABLE = f"{SERVICE}-stable-v3"
 CANDIDATE = f"{SERVICE}-candidate-v3"
@@ -103,6 +111,33 @@ KEY_VERSION = (
     f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
 )
+
+
+def _route_policy(role: ServiceRole) -> RouteAuthenticationPolicy:
+    caller_role = (
+        CallerRole.RECOVERY_TASK_CALLER
+        if role is ServiceRole.RECOVERY
+        else CallerRole.EXECUTION_TASK_CALLER
+    )
+    account = (
+        "cg-recovery-task-caller"
+        if role is ServiceRole.RECOVERY
+        else "cg-execution-task-caller"
+    )
+    return RouteAuthenticationPolicy(
+        project_id=PROJECT_ID,
+        project_number=PROJECT_NUMBER,
+        service_role=role,
+        path=protected_path(role),
+        audience=(
+            f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        caller=CallerBinding(
+            role=caller_role,
+            email=f"{account}@{PROJECT_ID}.iam.gserviceaccount.com",
+            subject=SUBJECT,
+        ),
+    )
 NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
 REFERENCE_IMAGE = (
     f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-images/reference-target"
@@ -290,12 +325,16 @@ def _verified(
     )
     caller = AuthenticationContext(
         role=caller_role,
-        email=f"caller@{PROJECT_ID}.iam.gserviceaccount.com",
+        email=(
+            f"cg-recovery-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+            if role is ServiceRole.RECOVERY
+            else f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+        ),
         subject="123456789012345678901",
         issuer="https://accounts.google.com",
         audience=audience,
-        issued_at=1,
-        expires_at=2,
+        issued_at=int(datetime(2026, 8, 19, 12, 0, tzinfo=UTC).timestamp()),
+        expires_at=int(datetime(2026, 8, 19, 13, 0, tzinfo=UTC).timestamp()),
     )
     return VerifiedMutation(
         request=request,
@@ -394,6 +433,23 @@ def _snapshot(root: RolloutRootV2) -> RootBundle:
         claim=claim,
         authority=authority,
     )
+
+
+def _revoked_snapshot(root: RolloutRootV2) -> RootBundle:
+    snapshot = _snapshot(root)
+    authority = snapshot.authority.value.model_copy(
+        update={
+            "current_epoch": 2,
+            "previous_epoch": 1,
+            "revision": 1,
+            "cause": EpochChangeCause.OPERATOR_REVOCATION,
+            "changed_by": "operator@example.test",
+            "request_id": "request-revoke-during-client-init",
+            "evidence_id": "evidence-revoke-during-client-init",
+            "changed_at": "2026-08-19T12:02:30Z",
+        }
+    )
+    return replace(snapshot, authority=StoredRecord(authority, 1))
 
 
 class _Reader:
@@ -813,6 +869,7 @@ async def _execute(
     result = await FinalMutationGate(
         authority_reader=_Reader(verified.root),
         adapter=adapter,
+        route_policy=_route_policy(adapter.service_role),
         clock=lambda: NOW,
     ).execute(lease, verified)
     assert type(result) is FinalMutationResult
@@ -1614,7 +1671,13 @@ def test_adapter_exposes_no_general_cloud_run_mutation_surface() -> None:
         for name in dir(adapter)
         if not name.startswith("_") and callable(getattr(adapter, name))
     }
-    assert public_callables == {"mutate", "read_revision", "read_service", "read_target"}
+    assert public_callables == {
+        "mutate",
+        "prepare",
+        "read_revision",
+        "read_service",
+        "read_target",
+    }
     assert not hasattr(adapter, "deploy")
     assert not hasattr(adapter, "update_service")
     assert not hasattr(adapter, "delete_revision")
@@ -1628,6 +1691,55 @@ async def test_adapter_rejects_any_input_other_than_a_final_gate_permit() -> Non
     with pytest.raises(TypeError, match="one-use permit"):
         await adapter.mutate(_verified().request.intent)  # type: ignore[arg-type]
 
+    assert services.update_calls == []
+
+
+@_async_test
+async def test_client_initialization_completes_before_final_epoch_read() -> None:
+    services = _FakeServicesClient()
+    initialization_started = Event()
+    release_initialization = Event()
+
+    def client_factory() -> _FakeServicesClient:
+        initialization_started.set()
+        if not release_initialization.wait(2):
+            raise RuntimeError("synthetic client initialization timeout")
+        return services
+
+    adapter = CloudRunV2Adapter(
+        configuration=_configuration(),
+        service_role=ServiceRole.EXECUTOR,
+        configured_project_id=PROJECT_ID,
+        services_client_factory=client_factory,
+    )
+    verified = _verified()
+    reader = _Reader(verified.root)
+
+    def revoke_before_release() -> None:
+        assert initialization_started.wait(2)
+        reader.snapshot = _revoked_snapshot(verified.root)
+        release_initialization.set()
+
+    revoker = Thread(target=revoke_before_release)
+    revoker.start()
+    try:
+        proof = DirectReceiptCreate._from_direct_store_create(
+            _claimed(verified),
+            _binding(verified),
+        )
+        result = await FinalMutationGate(
+            authority_reader=reader,
+            adapter=adapter,
+            route_policy=_route_policy(ServiceRole.EXECUTOR),
+            clock=lambda: NOW,
+        ).execute(DefinitiveFreshClaimLeaseFactory.mint(proof), verified)
+    finally:
+        release_initialization.set()
+        revoker.join(timeout=2)
+
+    assert isinstance(result, FinalAuthorityDenial)
+    assert result.reason_code is ReasonCode.EPOCH_MISMATCH
+    assert result.observed_authority_epoch == 2
     assert services.update_calls == []
 
 

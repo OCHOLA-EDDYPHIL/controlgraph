@@ -552,6 +552,10 @@ class _RuntimeStore(_Store):
     prepare_or_adopt_promotion_dispatch = _unreachable
     compare_and_set_promotion_dispatch = _unreachable
     begin_promotion_enqueue = _unreachable
+    read_promotion_dispatch_v2 = _unreachable
+    prepare_or_adopt_promotion_dispatch_v2 = _unreachable
+    compare_and_set_promotion_dispatch_v2 = _unreachable
+    begin_promotion_enqueue_v2 = _unreachable
 
 
 class _NeverTaskEnqueuer:

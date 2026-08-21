@@ -15,6 +15,10 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     encode_base64url,
 )
+from controlgraph_canary.contracts.health import (
+    RolloutHealthPolicyV2,
+    create_rollout_health_policy_v2,
+)
 from controlgraph_canary.contracts.models import (
     StableSnapshot,
     TargetBinding,
@@ -23,7 +27,7 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.root_creation import (
     ROOT_CREATION_COMMAND_V1,
     SIGNED_EVIDENCE_EVENT_V1,
-    RolloutHealthPolicyV1,
+    RolloutRootV3,
     RootCreationCommandV1,
     SignedEvidenceEventV1,
     evidence_payload_sha256,
@@ -57,23 +61,8 @@ def _target() -> TargetBinding:
     )
 
 
-def _policy() -> RolloutHealthPolicyV1:
-    return RolloutHealthPolicyV1(
-        schema_version="controlgraph.rollout-health-policy/v1",
-        input_schema_version="controlgraph.health-input/v1",
-        evaluation_window_seconds=60,
-        minimum_request_count=100,
-        maximum_error_rate_basis_points=100,
-        maximum_p95_latency_ms=500,
-        minimum_probe_count=10,
-        minimum_probe_success_basis_points=9_900,
-        healthy_consecutive_windows=2,
-        unhealthy_consecutive_windows=2,
-        window_semantics="HALF_OPEN_START_INCLUSIVE_END_EXCLUSIVE",
-        incomplete_data_action="INDETERMINATE_NO_MUTATION",
-        late_data_action="INDETERMINATE_NO_MUTATION",
-        duplicate_data_action="REJECT",
-    )
+def _policy() -> RolloutHealthPolicyV2:
+    return create_rollout_health_policy_v2()
 
 
 def _configuration() -> RootCreationConfiguration:
@@ -189,6 +178,8 @@ def test_builds_one_complete_content_addressed_root_bundle() -> None:
 
     root = artifacts.root
     plan = root.content.rollout_plan
+    assert type(root) is RolloutRootV3
+    assert type(root.content.health_policy) is RolloutHealthPolicyV2
     assert root.root_sha256 == canonical_sha256(root.content)
     assert root.root_id == f"cgroot:{root.root_sha256}"
     assert plan.stable_revision == STABLE

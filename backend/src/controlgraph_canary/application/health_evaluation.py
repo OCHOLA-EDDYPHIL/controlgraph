@@ -246,10 +246,70 @@ def _decision_id(decision: HealthDecisionV1) -> str:
     return f"cghealth:{digest}"
 
 
+def derive_next_health_evaluation_state(
+    *,
+    policy: RolloutHealthPolicyV2,
+    predecessor_decision: HealthDecisionV1,
+) -> HealthEvaluationStateV1:
+    """Derive the only state that may follow an exact canonical decision."""
+
+    if type(policy) is not RolloutHealthPolicyV2:
+        raise TypeError("policy must be an exact RolloutHealthPolicyV2")
+    if type(predecessor_decision) is not HealthDecisionV1:
+        raise TypeError("predecessor_decision must be an exact HealthDecisionV1")
+    validated_policy = RolloutHealthPolicyV2.model_validate(policy)
+    validated_predecessor = HealthDecisionV1.model_validate(predecessor_decision)
+    policy_sha256 = canonical_sha256(validated_policy)
+    if (
+        validated_predecessor.policy_schema_version != validated_policy.schema_version
+        or validated_predecessor.policy_sha256 != policy_sha256
+    ):
+        raise ValueError("predecessor decision does not match the supplied policy")
+    if validated_predecessor.decision_id != _decision_id(validated_predecessor):
+        raise ValueError("predecessor decision id is not canonical")
+    if validated_predecessor.next_evaluation_at is None:
+        raise ValueError("terminal health decision cannot be used as a predecessor")
+
+    next_state_value = validated_predecessor.next_state.model_dump(mode="python")
+    next_state_value["prior_decision_sha256"] = canonical_sha256(validated_predecessor)
+    return HealthEvaluationStateV1.model_validate(next_state_value)
+
+
+def _validate_predecessor_state(
+    *,
+    policy: RolloutHealthPolicyV2,
+    prior_state: HealthEvaluationStateV1,
+    predecessor_decision: HealthDecisionV1 | None,
+) -> None:
+    if predecessor_decision is None:
+        expected_state = initial_health_evaluation_state(
+            policy=policy,
+            target=prior_state.target,
+            root_id=prior_state.root_id,
+            root_sha256=prior_state.root_sha256,
+            epoch=prior_state.epoch,
+            candidate_revision=prior_state.candidate_revision,
+            observation_started_at=prior_state.observation_started_at,
+        )
+        if prior_state != expected_state:
+            raise ValueError(
+                "predecessor decision is required for a non-initial health state"
+            )
+        return
+
+    expected_state = derive_next_health_evaluation_state(
+        policy=policy,
+        predecessor_decision=predecessor_decision,
+    )
+    if prior_state != expected_state:
+        raise ValueError("health state does not match its exact predecessor decision")
+
+
 def evaluate_health_observation(
     *,
     policy: RolloutHealthPolicyV2,
     prior_state: HealthEvaluationStateV1,
+    predecessor_decision: HealthDecisionV1 | None = None,
     observation: MonitoringWindowObservationV1 | None,
     evaluated_at: str,
 ) -> HealthDecisionV1:
@@ -263,6 +323,11 @@ def evaluate_health_observation(
         raise TypeError("observation must be an exact MonitoringWindowObservationV1")
 
     authority_policy = _authority_policy(policy, prior_state)
+    _validate_predecessor_state(
+        policy=policy,
+        prior_state=prior_state,
+        predecessor_decision=predecessor_decision,
+    )
     authority_state = _authority_state(prior_state)
     samples = (() if observation is None else (_authority_sample(observation),))
     result = evaluate_health(
@@ -318,6 +383,7 @@ def evaluate_health_observation(
 
 
 __all__ = [
+    "derive_next_health_evaluation_state",
     "evaluate_health_observation",
     "initial_health_evaluation_state",
 ]

@@ -33,6 +33,11 @@ from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
     decode_contract,
 )
+from controlgraph_canary.contracts.health_pipeline import (
+    HealthEvaluationCommandV1,
+    HealthEvaluationResultV1,
+    health_evaluation_command_sha256,
+)
 from controlgraph_canary.contracts.models import CapabilityAction
 from controlgraph_canary.contracts.operator_observability import (
     EXECUTION_RECEIPT_READ_COMMAND_V1,
@@ -46,8 +51,8 @@ from controlgraph_canary.contracts.operator_observability import (
     TargetTrafficReadResultV1,
 )
 from controlgraph_canary.contracts.promotion_execution import (
-    PromotionCommandV1,
-    PromotionDispatchResultV1,
+    PromotionCommandV2,
+    PromotionDispatchResultV2,
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_COMMAND_V1,
@@ -61,6 +66,8 @@ from controlgraph_canary.contracts.revocation import (
 from controlgraph_canary.contracts.root_creation import (
     RootCreationCommandV1,
     RootCreationResultV1,
+    RootCreationResultV2,
+    decode_root_creation_result,
 )
 from controlgraph_canary.contracts.root_trust import stable_snapshots_match
 from controlgraph_canary.contracts.service_claim_release import (
@@ -90,7 +97,8 @@ type OperatorApiCommand = (
     | ApplyCanaryCommandV1
     | ExecutionReceiptReadCommandV1
     | TargetTrafficReadCommandV1
-    | PromotionCommandV1
+    | HealthEvaluationCommandV1
+    | PromotionCommandV2
     | EpochRevocationCommandV1
     | EpochRevocationProofCommandV1
     | ServiceClaimReleaseCommandV1
@@ -98,10 +106,12 @@ type OperatorApiCommand = (
 type OperatorApiResult = (
     StableSnapshotCaptureResultV1
     | RootCreationResultV1
+    | RootCreationResultV2
     | CanaryDispatchResultV1
     | ExecutionReceiptReadResultV1
     | TargetTrafficReadResultV1
-    | PromotionDispatchResultV1
+    | HealthEvaluationResultV1
+    | PromotionDispatchResultV2
     | ServiceClaimReleaseResultV1
 )
 
@@ -111,7 +121,8 @@ _OPERATOR_API_COMMAND_TYPES = (
     ApplyCanaryCommandV1,
     ExecutionReceiptReadCommandV1,
     TargetTrafficReadCommandV1,
-    PromotionCommandV1,
+    HealthEvaluationCommandV1,
+    PromotionCommandV2,
     EpochRevocationCommandV1,
     EpochRevocationProofCommandV1,
     ServiceClaimReleaseCommandV1,
@@ -264,6 +275,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonical promotion command path, or '-' for stdin",
     )
 
+    health_parser = subparsers.add_parser(
+        "evaluate-health",
+        help="evaluate one exact post-apply health window through the operator API",
+    )
+    health_parser.add_argument("--project-number", required=True)
+    health_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical health-evaluation command path, or '-' for stdin",
+    )
+
     release_claim_parser = subparsers.add_parser(
         "release-service-claim",
         help="release one terminal rollout's service claim through the authenticated API",
@@ -384,6 +406,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "promote-candidate":
         return _run_promotion(args)
+
+    if args.command == "evaluate-health":
+        return _run_health_evaluation(args)
 
     if args.command == "release-service-claim":
         return _run_service_claim_release(args)
@@ -573,7 +598,7 @@ def _run_root_creation(
     except _OperatorApiError as error:
         return _report_operator_api_failure("ROOT_CREATION", error)
     try:
-        result = decode_contract(response_body, RootCreationResultV1)
+        result = decode_root_creation_result(response_body)
     except ContractError:
         _print_cli_error("ROOT_CREATION_RESPONSE_INVALID")
         return 6
@@ -739,7 +764,7 @@ def _run_promotion(
     except _OperatorApiError as error:
         return _report_operator_api_failure("PROMOTION", error)
     try:
-        result = decode_contract(response_body, PromotionDispatchResultV1)
+        result = decode_contract(response_body, PromotionDispatchResultV2)
     except ContractError:
         _print_cli_error("PROMOTION_RESPONSE_INVALID")
         return 6
@@ -753,6 +778,51 @@ def _run_promotion(
         or result.verified_apply_receipt != command.verified_apply_receipt
     ):
         _print_cli_error("PROMOTION_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_health_evaluation(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Evaluate one root-, receipt-, and predecessor-bound health window."""
+
+    try:
+        command = _read_health_evaluation_command(args.command_file)
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("HEALTH_EVALUATION_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("HEALTH_EVALUATION", error)
+    try:
+        result = decode_contract(response_body, HealthEvaluationResultV1)
+    except ContractError:
+        _print_cli_error("HEALTH_EVALUATION_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.command_sha256 != health_evaluation_command_sha256(command)
+        or result.target != command.target
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.epoch != command.expected_epoch
+        or result.verified_apply_receipt != command.verified_apply_receipt
+        or result.expected_sequence != command.expected_sequence
+        or result.expected_chain_head_sha256
+        != command.expected_chain_head_sha256
+    ):
+        _print_cli_error("HEALTH_EVALUATION_RESPONSE_INVALID")
         return 6
     _print_contract_result(result)
     return 0
@@ -895,8 +965,15 @@ def _read_root_creation_command(source: str) -> RootCreationCommandV1:
     return decode_contract(_read_bounded_command_bytes(source), RootCreationCommandV1)
 
 
-def _read_promotion_command(source: str) -> PromotionCommandV1:
-    return decode_contract(_read_bounded_command_bytes(source), PromotionCommandV1)
+def _read_promotion_command(source: str) -> PromotionCommandV2:
+    return decode_contract(_read_bounded_command_bytes(source), PromotionCommandV2)
+
+
+def _read_health_evaluation_command(source: str) -> HealthEvaluationCommandV1:
+    return decode_contract(
+        _read_bounded_command_bytes(source),
+        HealthEvaluationCommandV1,
+    )
 
 
 def _read_service_claim_release_command(source: str) -> ServiceClaimReleaseCommandV1:
@@ -1008,10 +1085,12 @@ def _print_contract_result(result: OperatorApiResult) -> None:
     if type(result) not in (
         StableSnapshotCaptureResultV1,
         RootCreationResultV1,
+        RootCreationResultV2,
         CanaryDispatchResultV1,
         ExecutionReceiptReadResultV1,
         TargetTrafficReadResultV1,
-        PromotionDispatchResultV1,
+        HealthEvaluationResultV1,
+        PromotionDispatchResultV2,
         ServiceClaimReleaseResultV1,
     ):
         raise TypeError("operator API result type is not admitted")

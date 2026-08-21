@@ -31,8 +31,11 @@ from controlgraph_canary.application.execution import (
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
+    CallerBinding,
     CallerRole,
+    RouteAuthenticationPolicy,
     ServiceRole,
+    protected_path,
 )
 from controlgraph_canary.authority.replay import (
     MutationAction,
@@ -78,6 +81,35 @@ KEY_VERSION = (
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
 )
 NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
+PROJECT_NUMBER = "123456789012"
+SUBJECT = "123456789012345678901"
+
+
+def _route_policy(role: ServiceRole) -> RouteAuthenticationPolicy:
+    caller_role = (
+        CallerRole.RECOVERY_TASK_CALLER
+        if role is ServiceRole.RECOVERY
+        else CallerRole.EXECUTION_TASK_CALLER
+    )
+    account = (
+        "cg-recovery-task-caller"
+        if role is ServiceRole.RECOVERY
+        else "cg-execution-task-caller"
+    )
+    return RouteAuthenticationPolicy(
+        project_id=PROJECT_ID,
+        project_number=PROJECT_NUMBER,
+        service_role=role,
+        path=protected_path(role),
+        audience=(
+            f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        caller=CallerBinding(
+            role=caller_role,
+            email=f"{account}@{PROJECT_ID}.iam.gserviceaccount.com",
+            subject=SUBJECT,
+        ),
+    )
 
 
 def _target() -> TargetBinding:
@@ -110,13 +142,15 @@ def _verified(
     *,
     action: CapabilityAction = CapabilityAction.APPLY_CANARY,
     epoch: int = 1,
+    route_role: ServiceRole | None = None,
 ) -> VerifiedMutation:
     root = _root()
-    role = (
+    action_role = (
         ServiceRole.RECOVERY
         if action is CapabilityAction.RECOVER_STABLE
         else ServiceRole.EXECUTOR
     )
+    role = route_role or action_role
     stable_percent, candidate_percent, concurrency = _action_shape(action)
     audience = f"https://controlgraph-{role.value}-123456789012.us-central1.run.app"
     claims = CapabilityClaims(
@@ -186,12 +220,16 @@ def _verified(
     )
     caller = AuthenticationContext(
         role=caller_role,
-        email=f"caller@{PROJECT_ID}.iam.gserviceaccount.com",
+        email=(
+            f"cg-recovery-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+            if role is ServiceRole.RECOVERY
+            else f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+        ),
         subject="123456789012345678901",
         issuer="https://accounts.google.com",
         audience=audience,
-        issued_at=1,
-        expires_at=2,
+        issued_at=int(datetime(2026, 8, 19, 12, 0, tzinfo=UTC).timestamp()),
+        expires_at=int(datetime(2026, 8, 19, 13, 0, tzinfo=UTC).timestamp()),
     )
     return VerifiedMutation(
         request=request,
@@ -429,6 +467,16 @@ class _Adapter:
         self.error = error
         self.calls: list[MutationPermit] = []
         self.intents: list[MutationIntent] = []
+        self._prepared_intent: MutationIntent | None = None
+
+    @property
+    def intent(self) -> MutationIntent:
+        assert self._prepared_intent is not None
+        return self._prepared_intent
+
+    async def prepare(self, intent: MutationIntent) -> _Adapter:
+        self._prepared_intent = intent
+        return self
 
     async def mutate(self, permit: MutationPermit) -> str:
         if self.events is not None:
@@ -472,6 +520,7 @@ def test_exact_executor_and_recovery_actions_dispatch_once(
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         )
 
@@ -494,6 +543,7 @@ def test_exact_executor_and_recovery_actions_dispatch_once(
     [
         (ServiceRole.EXECUTOR, CapabilityAction.RECOVER_STABLE),
         (ServiceRole.RECOVERY, CapabilityAction.APPLY_CANARY),
+        (ServiceRole.RECOVERY, CapabilityAction.PROMOTE_CANDIDATE),
     ],
 )
 def test_cross_role_action_is_denied_without_adapter_call(
@@ -501,11 +551,12 @@ def test_cross_role_action_is_denied_without_adapter_call(
     action: CapabilityAction,
 ) -> None:
     async def scenario() -> None:
-        verified = _verified(action=action)
+        verified = _verified(action=action, route_role=role)
         adapter = _Adapter(role)
         result = await FinalMutationGate(
             authority_reader=_Reader(_snapshot()),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -530,6 +581,7 @@ def test_stale_and_future_epoch_are_denied_without_adapter_call(
         result = await FinalMutationGate(
             authority_reader=_Reader(_snapshot(epoch=authority_epoch)),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -548,6 +600,7 @@ def test_released_claim_is_denied_without_adapter_call() -> None:
         result = await FinalMutationGate(
             authority_reader=_Reader(_snapshot(epoch=2, released=True)),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -582,6 +635,7 @@ def test_released_claim_requires_the_exact_atomic_revocation_authority(
         result = await FinalMutationGate(
             authority_reader=_Reader(snapshot),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -612,6 +666,7 @@ def test_missing_error_and_corrupt_reads_fail_closed_without_adapter_call(
         result = await FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -635,6 +690,7 @@ def test_final_snapshot_revision_corruption_is_denied_without_adapter_call() -> 
         result = await FinalMutationGate(
             authority_reader=_Reader(corrupt),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -659,6 +715,7 @@ def test_active_claim_at_noninitial_revision_is_denied_without_adapter_call() ->
         result = await FinalMutationGate(
             authority_reader=_Reader(corrupt),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -686,6 +743,7 @@ def test_canonically_wrapped_tampered_claim_projection_is_denied() -> None:
         result = await FinalMutationGate(
             authority_reader=_Reader(tampered),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -721,6 +779,7 @@ def test_final_gate_requires_the_exact_persisted_lineage_anchor(
         result = await FinalMutationGate(
             authority_reader=_Reader(final_snapshot),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified_input), verified_input)
 
@@ -741,6 +800,7 @@ def test_revocation_while_final_read_is_paused_prevents_dispatch() -> None:
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         )
 
@@ -765,6 +825,7 @@ def test_receipt_dispatch_lease_is_exactly_one_use_sequentially() -> None:
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         )
         lease = _lease(verified)
@@ -789,6 +850,7 @@ def test_receipt_dispatch_lease_is_exactly_one_use_concurrently() -> None:
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         )
         lease = _lease(verified)
@@ -857,6 +919,7 @@ def test_adapter_exception_leaves_dispatch_lease_irrevocably_closed() -> None:
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         )
         lease = _lease(verified)
@@ -881,6 +944,7 @@ def test_adapter_cancellation_leaves_dispatch_lease_irrevocably_closed() -> None
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         )
         lease = _lease(verified)
@@ -910,6 +974,7 @@ def test_receipt_binding_mismatch_consumes_lease_before_authority_read() -> None
         result = await FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(other), verified)
 
@@ -928,6 +993,7 @@ def test_final_snapshot_is_followed_by_adapter_mutation_as_the_next_await() -> N
         result = await FinalMutationGate(
             authority_reader=_Reader(_snapshot(), events=events),
             adapter=_Adapter(ServiceRole.EXECUTOR, events=events),
+            route_policy=_route_policy(ServiceRole.EXECUTOR),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -940,11 +1006,48 @@ def test_final_snapshot_is_followed_by_adapter_mutation_as_the_next_await() -> N
         (node for node in ast.walk(tree) if isinstance(node, ast.Await)),
         key=lambda node: node.lineno,
     )
-    assert len(awaits) == 2
+    assert len(awaits) == 4
     assert [awaited.value.func.attr for awaited in awaits] == [  # type: ignore[union-attr]
+        "prepare",
+        "_revalidate_promotion_source_receipt",
         "read_root_creation_bundle",
         "mutate",
     ]
+
+
+@pytest.mark.parametrize(
+    "caller_update",
+    [
+        {"subject": "999999999999999999999"},
+        {
+            "issued_at": int(datetime(2026, 8, 19, 11, 0, tzinfo=UTC).timestamp()),
+            "expires_at": int(datetime(2026, 8, 19, 13, 0, tzinfo=UTC).timestamp()),
+        },
+    ],
+)
+def test_final_gate_rechecks_exact_caller_subject_and_token_lifetime(
+    caller_update: dict[str, object],
+) -> None:
+    async def scenario() -> None:
+        original = _verified()
+        verified = replace(
+            original,
+            caller=replace(original.caller, **caller_update),
+        )
+        adapter = _Adapter(ServiceRole.EXECUTOR)
+
+        result = await FinalMutationGate(
+            authority_reader=_Reader(_snapshot()),
+            adapter=adapter,
+            route_policy=_route_policy(ServiceRole.EXECUTOR),
+            clock=lambda: NOW,
+        ).execute(_lease(verified), verified)
+
+        assert isinstance(result, FinalAuthorityDenial)
+        assert result.reason_code is ReasonCode.CALLER_UNAUTHORIZED
+        assert adapter.calls == []
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -998,6 +1101,7 @@ def test_capability_and_task_time_are_rechecked_after_final_snapshot(
         result = await FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: now,
         ).execute(_lease(verified), verified)
 
@@ -1018,6 +1122,7 @@ def test_invalid_local_clock_fails_closed_after_final_snapshot() -> None:
         result = await FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: datetime(2026, 8, 19, 12, 3),
         ).execute(_lease(verified), verified)
 
@@ -1043,6 +1148,7 @@ def test_capability_lineage_must_not_predate_current_authority() -> None:
         result = await FinalMutationGate(
             authority_reader=_Reader(_snapshot()),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 
@@ -1072,6 +1178,7 @@ def test_authority_epoch_must_equal_persistence_revision_plus_one() -> None:
         result = await FinalMutationGate(
             authority_reader=_Reader(incoherent),
             adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 

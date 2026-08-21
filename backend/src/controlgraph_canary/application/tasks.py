@@ -9,14 +9,19 @@ from enum import StrEnum
 from typing import Final, Protocol
 from urllib.parse import urlsplit
 
-from controlgraph_canary.application.promotion_store import PromotionEnqueuePermit
+from controlgraph_canary.application.promotion_store import (
+    PromotionEnqueuePermit,
+    PromotionEnqueuePermitV2,
+)
 from controlgraph_canary.contracts.codec import (
     ContractError,
+    ContractErrorCode,
     canonical_json_bytes,
     canonical_sha256,
     decode_contract,
 )
 from controlgraph_canary.contracts.models import CapabilityAction, TaskRequest
+from controlgraph_canary.contracts.promotion_execution import PromotionTaskRequestV2
 
 TASK_REGION: Final = "us-central1"
 EXECUTION_QUEUE_ID: Final = "controlgraph-execution"
@@ -33,6 +38,8 @@ TASK_DISPATCH_DEADLINE_SECONDS: Final = 30
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
+
+type AddressableTaskRequest = TaskRequest | PromotionTaskRequestV2
 
 
 class TaskRoute(StrEnum):
@@ -126,7 +133,7 @@ class TaskAddressor:
     def __init__(self, settings: TaskDeliverySettings) -> None:
         self._settings = settings
 
-    def seal(self, request: TaskRequest, *, now: datetime) -> AddressedTask:
+    def seal(self, request: AddressableTaskRequest, *, now: datetime) -> AddressedTask:
         """Validate bounds and derive every provider coordinate from configuration."""
 
         evaluation_time = _require_utc_second(now)
@@ -176,7 +183,7 @@ class TaskAddressor:
         """Rebuild a task at dispatch time and require an exact sealed match."""
 
         try:
-            request = decode_contract(task.body, TaskRequest)
+            request = _decode_addressed_task(task.body)
         except ContractError as error:
             raise TaskAddressingError("addressed task body is not canonical") from error
         expected = self.seal(request, now=now)
@@ -215,7 +222,7 @@ class TaskDispatcher:
         addressed = self.prepare(request, now=evaluation_time)
         return self._enqueuer.enqueue(addressed, now=evaluation_time)
 
-    def prepare(self, request: TaskRequest, *, now: datetime) -> AddressedTask:
+    def prepare(self, request: AddressableTaskRequest, *, now: datetime) -> AddressedTask:
         """Seal an exact task before durable enqueue ownership begins."""
 
         return self._addressor.seal(request, now=_require_utc_second(now))
@@ -249,6 +256,35 @@ class TaskDispatcher:
             raise TaskAddressingError("promotion enqueue permit is invalid") from error
         return self._enqueuer.enqueue(task, now=evaluation_time)
 
+    def dispatch_prepared_v2(
+        self,
+        task: AddressedTask,
+        *,
+        permit: PromotionEnqueuePermitV2,
+        now: datetime,
+    ) -> TaskEnqueueResult:
+        """Submit one exactly sealed V2 promotion task with direct store authority."""
+
+        evaluation_time = _require_utc_second(now)
+        self._addressor.validate_seal(task, now=evaluation_time)
+        try:
+            request = decode_contract(task.body, PromotionTaskRequestV2)
+        except ContractError as error:
+            raise TaskAddressingError("V2 promotion task body is not canonical") from error
+        if (
+            type(permit) is not PromotionEnqueuePermitV2
+            or request.intent.action is not CapabilityAction.PROMOTE_CANDIDATE
+        ):
+            raise TaskAddressingError("V2 promotion enqueue permit is required")
+        try:
+            permit._take(
+                task_name=task.name,
+                task_sha256=canonical_sha256(request),
+            )
+        except (TypeError, ValueError) as error:
+            raise TaskAddressingError("V2 promotion enqueue permit is invalid") from error
+        return self._enqueuer.enqueue(task, now=evaluation_time)
+
 
 def _route_for_action(action: CapabilityAction) -> TaskRoute:
     if action is CapabilityAction.RECOVER_STABLE:
@@ -258,8 +294,17 @@ def _route_for_action(action: CapabilityAction) -> TaskRoute:
     raise TaskAddressingError("task action has no configured route")
 
 
-def _deterministic_task_id(request: TaskRequest) -> str:
+def _deterministic_task_id(request: AddressableTaskRequest) -> str:
     return f"cg-{canonical_sha256(request)}"
+
+
+def _decode_addressed_task(body: bytes) -> AddressableTaskRequest:
+    try:
+        return decode_contract(body, PromotionTaskRequestV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, TaskRequest)
 
 
 def _validate_service_origin(value: str, service_name: str) -> None:
@@ -321,6 +366,7 @@ __all__ = [
     "RECOVERY_TASK_CALLER_ACCOUNT_ID",
     "TASK_DISPATCH_DEADLINE_SECONDS",
     "TASK_REGION",
+    "AddressableTaskRequest",
     "AddressedTask",
     "TaskAddressingError",
     "TaskAddressor",

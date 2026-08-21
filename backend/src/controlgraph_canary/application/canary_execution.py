@@ -12,7 +12,7 @@ from controlgraph_canary.application.capability_issuance import (
     AuthenticatedIssuancePrincipal,
     CapabilityIssuanceRequest,
     CapabilityIssuer,
-    PromotionCapabilityIssuanceRequest,
+    PromotionCapabilityIssuanceRequestV2,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
@@ -48,7 +48,7 @@ from controlgraph_canary.contracts.models import (
     TaskRequest,
 )
 from controlgraph_canary.contracts.promotion_execution import (
-    PromotionCapabilityIssuanceCommandV1,
+    PromotionCapabilityIssuanceCommandV2,
 )
 
 
@@ -119,7 +119,7 @@ class CapabilityIssuanceService:
 
     async def issue(
         self,
-        command: CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV1,
+        command: CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV2,
         caller: AuthenticationContext,
     ) -> SignedCapability:
         """Return one signed envelope only to the configured coordinator."""
@@ -132,7 +132,7 @@ class CapabilityIssuanceService:
             raise CanaryExecutionError(CanaryExecutionErrorCode.CALLER_DENIED)
         if type(command) not in {
             CapabilityIssuanceCommandV1,
-            PromotionCapabilityIssuanceCommandV1,
+            PromotionCapabilityIssuanceCommandV2,
         }:
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         try:
@@ -150,9 +150,9 @@ class CapabilityIssuanceService:
                     principal=principal,
                     now=now,
                 )
-            elif type(command) is PromotionCapabilityIssuanceCommandV1:
+            elif type(command) is PromotionCapabilityIssuanceCommandV2:
                 issued = await self._issuer.issue_promotion(
-                    PromotionCapabilityIssuanceRequest(
+                    PromotionCapabilityIssuanceRequestV2(
                         root_id=command.root_id,
                         expected_root_sha256=command.expected_root_sha256,
                         expected_epoch=command.expected_epoch,
@@ -160,6 +160,7 @@ class CapabilityIssuanceService:
                         idempotency_key=command.idempotency_key,
                         scheduled_at=command.scheduled_at,
                         verified_apply_receipt=command.verified_apply_receipt,
+                        authorization=command.authorization,
                     ),
                     principal=principal,
                     now=now,
@@ -190,7 +191,7 @@ class CapabilityIssuanceService:
             or claims.stable_percent != expected_traffic[0]
             or claims.candidate_percent != expected_traffic[1]
             or (
-                type(command) is PromotionCapabilityIssuanceCommandV1
+                type(command) is PromotionCapabilityIssuanceCommandV2
                 and (
                     claims.parent_capability_sha256 is not None
                     or claims.not_before != command.scheduled_at

@@ -22,6 +22,7 @@ IDENTITY_ENVIRONMENT_KEYS = (
 )
 RECEIPT_AUTHORITY_PATH = "/v1/internal/authority/receipts"
 CLASSIFICATION_EVIDENCE_PATH = "/v1/internal/evidence/classifications/sign"
+HEALTH_ATTESTATION_PATH = "/v1/internal/evidence/health/attest"
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
@@ -119,9 +120,14 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EVIDENCE_WRITER
             and self.path == CLASSIFICATION_EVIDENCE_PATH
         )
+        health_attestation_route = (
+            self.service_role is ServiceRole.EVIDENCE_WRITER
+            and self.path == HEALTH_ATTESTATION_PATH
+        )
         if (
             not receipt_authority_route
             and not classification_evidence_route
+            and not health_attestation_route
             and self.path != protected_path(self.service_role)
         ):
             raise ValueError("protected path does not match the service role")
@@ -137,7 +143,7 @@ class RouteAuthenticationPolicy:
             if receipt_authority_route
             else (
                 CallerRole.VERIFIER
-                if classification_evidence_route
+                if classification_evidence_route or health_attestation_route
                 else expected_route_caller_role(self.service_role)
             )
         )
@@ -400,6 +406,7 @@ def _validate_audience(value: str, service_role: ServiceRole) -> None:
 
 __all__ = [
     "CLASSIFICATION_EVIDENCE_PATH",
+    "HEALTH_ATTESTATION_PATH",
     "IDENTITY_ENVIRONMENT_KEYS",
     "RECEIPT_AUTHORITY_PATH",
     "AuthenticationContext",

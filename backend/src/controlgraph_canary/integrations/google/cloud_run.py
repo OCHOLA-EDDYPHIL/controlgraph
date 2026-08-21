@@ -30,6 +30,7 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunTrafficStatus,
     CloudRunVpcEgress,
     TargetConfigurationProjection,
+    target_configuration_projection_sha256,
 )
 from controlgraph_canary.application.execution import MutationPermit
 from controlgraph_canary.application.identity import ServiceRole
@@ -46,6 +47,9 @@ from controlgraph_canary.application.reference_target_reset import (
     ReferenceTargetResetResult,
 )
 from controlgraph_canary.contracts.models import CapabilityAction, MutationIntent, TargetBinding
+from controlgraph_canary.contracts.promotion_execution import PromotionMutationIntentV2
+
+type CloudRunMutationIntent = MutationIntent | PromotionMutationIntentV2
 
 CLOUD_RUN_REGION: Final = "us-central1"
 CLOUD_RUN_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
@@ -155,6 +159,138 @@ def _default_read_only_operations_client_factory() -> _ReadOnlyOperationsClientP
 
 def _default_revisions_client_factory() -> _RevisionsClientPort:
     return cast(_RevisionsClientPort, run_v2.RevisionsAsyncClient())
+
+
+class _PreparedCloudRunV2Mutation:
+    """One complete request whose first suspension is the provider update call."""
+
+    __slots__ = (
+        "_adapter",
+        "_client",
+        "_expected_concurrency",
+        "_intent",
+        "_rejection",
+        "_request",
+        "_requested",
+    )
+
+    def __init__(
+        self,
+        *,
+        adapter: CloudRunV2Adapter,
+        intent: CloudRunMutationIntent,
+        requested: tuple[CloudRunTrafficAllocation, ...],
+        expected_concurrency: int,
+        rejection: CloudRunMutationReason | None,
+        client: _ServicesClientPort | None,
+        request: run_v2.UpdateServiceRequest | None,
+    ) -> None:
+        self._adapter = adapter
+        self._intent = intent
+        self._requested = requested
+        self._expected_concurrency = expected_concurrency
+        self._rejection = rejection
+        self._client = client
+        self._request = request
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._adapter.target
+
+    @property
+    def service_role(self) -> ServiceRole:
+        return self._adapter.service_role
+
+    @property
+    def intent(self) -> CloudRunMutationIntent:
+        return self._intent
+
+    async def mutate(self, permit: MutationPermit) -> CloudRunMutationResult:
+        """Consume a permit and issue the already-built provider request immediately."""
+
+        if type(permit) is not MutationPermit:
+            raise TypeError("Cloud Run mutation requires an exact one-use permit")
+        intent = permit.intent
+        if intent != self._intent:
+            return _failed_safe(
+                self._requested,
+                self._expected_concurrency,
+                CloudRunMutationReason.DECLARATION_MISMATCH,
+            )
+        if self._rejection is not None:
+            return _failed_safe(
+                self._requested,
+                self._expected_concurrency,
+                self._rejection,
+            )
+        client = self._client
+        request = self._request
+        if client is None or request is None:
+            return _failed_safe(
+                self._requested,
+                self._expected_concurrency,
+                CloudRunMutationReason.PROVIDER_REJECTED,
+            )
+        try:
+            async with asyncio.timeout(_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS):
+                operation = await client.update_service(
+                    request,
+                    retry=None,
+                    timeout=_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS,
+                )
+        except _KNOWN_PRECONDITION_FAILURES:
+            return _failed_safe(
+                self._requested,
+                self._expected_concurrency,
+                CloudRunMutationReason.PRECONDITION_FAILED,
+            )
+        except _KNOWN_SAFE_REJECTIONS:
+            return _failed_safe(
+                self._requested,
+                self._expected_concurrency,
+                CloudRunMutationReason.PROVIDER_REJECTED,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _ambiguous(
+                self._requested,
+                self._expected_concurrency,
+                operation_name=None,
+            )
+        operation_name = _operation_name(operation)
+        if operation_name is None:
+            return _ambiguous(
+                self._requested,
+                self._expected_concurrency,
+                operation_name=None,
+            )
+        try:
+            async with asyncio.timeout(CLOUD_RUN_OPERATION_TIMEOUT_SECONDS):
+                response = await operation.result(timeout=CLOUD_RUN_OPERATION_TIMEOUT_SECONDS)
+            service = self._adapter._decode_service(response)
+            if service.traffic != self._requested:
+                return _ambiguous(
+                    self._requested,
+                    self._expected_concurrency,
+                    operation_name=operation_name,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _ambiguous(
+                self._requested,
+                self._expected_concurrency,
+                operation_name=operation_name,
+            )
+        return CloudRunMutationResult(
+            outcome=CloudRunMutationOutcome.APPLIED,
+            requested_traffic=self._requested,
+            expected_concurrency=self._expected_concurrency,
+            operation_name=operation_name,
+            service=service,
+            reason=None,
+        )
 
 
 class CloudRunV2Adapter:
@@ -286,81 +422,46 @@ class CloudRunV2Adapter:
         )
 
     async def mutate(self, permit: MutationPermit) -> CloudRunMutationResult:
-        """Consume one final-gate permit and make one conditional traffic request."""
+        """Reject use outside the final gate's prepare-then-dispatch path."""
 
         if type(permit) is not MutationPermit:
             raise TypeError("Cloud Run mutation requires an exact one-use permit")
-        intent = permit.intent
+        raise TypeError("Cloud Run mutation requires a prepared final-gate call")
+
+    async def prepare(
+        self,
+        intent: CloudRunMutationIntent,
+    ) -> _PreparedCloudRunV2Mutation:
+        """Initialize the client and build the exact request before epoch fencing."""
+
+        if type(intent) not in (MutationIntent, PromotionMutationIntentV2):
+            raise TypeError("Cloud Run mutation intent must be exact")
         requested, expected_concurrency, rejection = self._admit_intent(intent)
         if rejection is not None:
-            return _failed_safe(requested, expected_concurrency, rejection)
+            return _PreparedCloudRunV2Mutation(
+                adapter=self,
+                intent=intent,
+                requested=requested,
+                expected_concurrency=expected_concurrency,
+                rejection=rejection,
+                client=None,
+                request=None,
+            )
         request = self._update_request(intent, requested)
-        try:
-            client = await self._services_client()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _failed_safe(
-                requested,
-                expected_concurrency,
-                CloudRunMutationReason.PROVIDER_REJECTED,
-            )
-        try:
-            async with asyncio.timeout(_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS):
-                operation = await client.update_service(
-                    request,
-                    retry=None,
-                    timeout=_CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS,
-                )
-        except _KNOWN_PRECONDITION_FAILURES:
-            return _failed_safe(
-                requested,
-                expected_concurrency,
-                CloudRunMutationReason.PRECONDITION_FAILED,
-            )
-        except _KNOWN_SAFE_REJECTIONS:
-            return _failed_safe(
-                requested,
-                expected_concurrency,
-                CloudRunMutationReason.PROVIDER_REJECTED,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _ambiguous(requested, expected_concurrency, operation_name=None)
-        operation_name = _operation_name(operation)
-        if operation_name is None:
-            return _ambiguous(requested, expected_concurrency, operation_name=None)
-        try:
-            async with asyncio.timeout(CLOUD_RUN_OPERATION_TIMEOUT_SECONDS):
-                response = await operation.result(timeout=CLOUD_RUN_OPERATION_TIMEOUT_SECONDS)
-            service = self._decode_service(response)
-            if service.traffic != requested:
-                return _ambiguous(
-                    requested,
-                    expected_concurrency,
-                    operation_name=operation_name,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _ambiguous(
-                requested,
-                expected_concurrency,
-                operation_name=operation_name,
-            )
-        return CloudRunMutationResult(
-            outcome=CloudRunMutationOutcome.APPLIED,
-            requested_traffic=requested,
+        client = await self._services_client()
+        return _PreparedCloudRunV2Mutation(
+            adapter=self,
+            intent=intent,
+            requested=requested,
             expected_concurrency=expected_concurrency,
-            operation_name=operation_name,
-            service=service,
-            reason=None,
+            rejection=None,
+            client=client,
+            request=request,
         )
 
     def _admit_intent(
         self,
-        intent: MutationIntent,
+        intent: CloudRunMutationIntent,
     ) -> tuple[
         tuple[CloudRunTrafficAllocation, ...],
         int,
@@ -380,6 +481,7 @@ class CloudRunV2Adapter:
             ),
         )
         expected_concurrency = configuration.stable_concurrency
+        exact_intent_type = type(intent) in (MutationIntent, PromotionMutationIntentV2)
         exact_target = (
             intent.target == configuration.target
             and intent.stable_revision == configuration.stable_revision
@@ -397,7 +499,36 @@ class CloudRunV2Adapter:
             if intent.action is CapabilityAction.RECOVER_STABLE
             else intent.concurrency is None
         )
-        if not exact_target or not role_admits or not concurrency_is_exact:
+        promotion_v2_is_exact = True
+        if type(intent) is PromotionMutationIntentV2:
+            expected_poststate_sha256 = target_configuration_projection_sha256(
+                TargetConfigurationProjection(
+                    target=configuration.target,
+                    stable_revision=configuration.stable_revision,
+                    candidate_revision=configuration.candidate_revision,
+                    stable_percent=0,
+                    candidate_percent=100,
+                    concurrency=expected_concurrency,
+                )
+            )
+            promotion_v2_is_exact = (
+                self._service_role is ServiceRole.EXECUTOR
+                and intent.action is CapabilityAction.PROMOTE_CANDIDATE
+                and intent.stable_percent == 0
+                and intent.candidate_percent == 100
+                and intent.concurrency is None
+                and intent.desired_poststate_sha256 == expected_poststate_sha256
+                and intent.authorization.desired_poststate_sha256
+                == expected_poststate_sha256
+                and intent.provider_etag == intent.authorization.provider_etag
+            )
+        if (
+            not exact_intent_type
+            or not exact_target
+            or not role_admits
+            or not concurrency_is_exact
+            or not promotion_v2_is_exact
+        ):
             return (
                 requested,
                 expected_concurrency,
@@ -407,7 +538,7 @@ class CloudRunV2Adapter:
 
     def _update_request(
         self,
-        intent: MutationIntent,
+        intent: CloudRunMutationIntent,
         traffic: tuple[CloudRunTrafficAllocation, ...],
     ) -> run_v2.UpdateServiceRequest:
         service = run_v2.Service(

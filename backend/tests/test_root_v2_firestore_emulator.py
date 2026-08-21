@@ -5,7 +5,7 @@ import os
 from uuid import uuid4
 
 import pytest
-from root_v2_test_data import RootV2Records, make_root_v2_records
+from root_v2_test_data import RootV3Records, make_root_v3_records
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 
 async def _create(
     store: FirestoreAuthorityStore,
-    records: RootV2Records,
+    records: RootV3Records,
 ) -> RootCreationWriteResult:
     return await store.create_or_adopt_root_creation_bundle(
         records.root,
@@ -33,11 +33,11 @@ async def _create(
     )
 
 
-def test_emulator_root_v2_bundle_has_one_claim_winner_and_exact_replay() -> None:
+def test_emulator_root_v3_bundle_has_one_claim_winner_and_exact_replay() -> None:
     async def scenario() -> None:
         project_id = f"controlgraph-canary-{uuid4().hex[:10]}"
-        first = make_root_v2_records(project_id=project_id, variant=1)
-        second = make_root_v2_records(project_id=project_id, variant=2)
+        first = make_root_v3_records(project_id=project_id, variant=1)
+        second = make_root_v3_records(project_id=project_id, variant=2)
         first_store = FirestoreAuthorityStore.for_emulator(
             target=first.root.content.target,
             configured_project_id=project_id,

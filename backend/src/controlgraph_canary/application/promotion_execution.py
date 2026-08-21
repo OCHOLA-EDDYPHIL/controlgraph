@@ -18,13 +18,24 @@ from controlgraph_canary.application.canary_execution import (
     CanaryExecutionError,
     CanaryExecutionErrorCode,
 )
+from controlgraph_canary.application.health_orchestration import (
+    HealthAttestationVerifier,
+    verify_healthy_promotion_chain,
+)
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     CallerRole,
     RouteAuthenticationPolicy,
     ServiceRole,
 )
-from controlgraph_canary.application.promotion_store import PromotionDispatchStore
+from controlgraph_canary.application.promotion_store import (
+    PromotionDispatchStoreV2,
+    PromotionHealthChainReader,
+)
+from controlgraph_canary.application.root_authority import (
+    RootAuthorityBundleReader,
+    inspect_root_authority_bundle,
+)
 from controlgraph_canary.application.root_trust import (
     CanonicalInternalTransport,
     CoordinatorInternalRoute,
@@ -42,32 +53,56 @@ from controlgraph_canary.contracts.codec import (
 )
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
-    MutationIntent,
     SignedCapability,
     TargetBinding,
-    TaskRequest,
 )
 from controlgraph_canary.contracts.promotion_execution import (
-    PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V1,
-    PROMOTION_DISPATCH_RECORD_V1,
-    PROMOTION_DISPATCH_RESULT_V1,
-    PROMOTION_INVOCATION_V1,
-    PromotionCapabilityIssuanceCommandV1,
-    PromotionCommandV1,
-    PromotionDispatchRecordV1,
-    PromotionDispatchResultV1,
+    PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V2,
+    PROMOTION_DISPATCH_RECORD_V2,
+    PROMOTION_DISPATCH_RESULT_V2,
+    PROMOTION_INVOCATION_V2,
+    PROMOTION_MUTATION_INTENT_V2,
+    PROMOTION_TASK_REQUEST_V2,
+    PromotionAuthorizationV1,
+    PromotionCapabilityIssuanceCommandV2,
+    PromotionCommandV2,
+    PromotionDispatchRecordV2,
+    PromotionDispatchResultV2,
     PromotionDispatchState,
-    PromotionInvocationV1,
-    promotion_command_sha256,
-    promotion_dispatch_id,
+    PromotionInvocationV2,
+    PromotionMutationIntentV2,
+    PromotionTaskRequestV2,
+    create_promotion_authorization,
+    create_promotion_health_chain_locator,
+    promotion_capability_id,
+    promotion_command_v2_sha256,
+    promotion_dispatch_v2_id,
 )
+from controlgraph_canary.contracts.root_creation import RolloutRootV3
+from controlgraph_canary.contracts.storage import ServiceClaimStatus
 
 
 @runtime_checkable
 class PromotionCapabilityClient(Protocol):
     """Issue only a receipt-derived root capability for candidate promotion."""
 
-    async def issue(self, command: PromotionCommandV1) -> SignedCapability: ...
+    async def issue(
+        self,
+        command: PromotionCommandV2,
+        authorization: PromotionAuthorizationV1,
+    ) -> SignedCapability: ...
+
+
+@runtime_checkable
+class PromotionAuthorizationResolver(Protocol):
+    """Resolve verifier-owned health and root state into one compact authorization."""
+
+    async def resolve(
+        self,
+        command: PromotionCommandV2,
+        *,
+        now: datetime,
+    ) -> PromotionAuthorizationV1: ...
 
 
 @runtime_checkable
@@ -76,8 +111,8 @@ class PromotionCoordinator(Protocol):
 
     async def dispatch(
         self,
-        command: PromotionCommandV1,
-    ) -> PromotionDispatchResultV1: ...
+        command: PromotionCommandV2,
+    ) -> PromotionDispatchResultV2: ...
 
 
 class CoordinatorPromotionCapabilityClient:
@@ -99,11 +134,19 @@ class CoordinatorPromotionCapabilityClient:
         self._route = route
         self._transport = transport
 
-    async def issue(self, command: PromotionCommandV1) -> SignedCapability:
-        if type(command) is not PromotionCommandV1:
+    async def issue(
+        self,
+        command: PromotionCommandV2,
+        authorization: PromotionAuthorizationV1,
+    ) -> SignedCapability:
+        if (
+            type(command) is not PromotionCommandV2
+            or type(authorization) is not PromotionAuthorizationV1
+            or authorization.health_chain_locator != command.health_chain_locator
+        ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
-        issuance = PromotionCapabilityIssuanceCommandV1(
-            schema_version=PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V1,
+        issuance = PromotionCapabilityIssuanceCommandV2(
+            schema_version=PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V2,
             root_id=command.root_id,
             expected_root_sha256=command.expected_root_sha256,
             expected_epoch=command.expected_epoch,
@@ -111,6 +154,7 @@ class CoordinatorPromotionCapabilityClient:
             idempotency_key=command.idempotency_key,
             scheduled_at=command.scheduled_at,
             verified_apply_receipt=command.verified_apply_receipt,
+            authorization=authorization,
         )
         try:
             body = await self._transport.post(
@@ -128,10 +172,101 @@ class CoordinatorPromotionCapabilityClient:
         if not _capability_matches_command(
             capability,
             command,
+            authorization=authorization,
             project_id=self._route.project_id,
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.RESPONSE_INVALID)
         return capability
+
+
+class StoredPromotionAuthorizationResolver:
+    """Derive authorization only from coherent root state and a signed durable chain."""
+
+    def __init__(
+        self,
+        *,
+        target: TargetBinding,
+        root_reader: RootAuthorityBundleReader,
+        health_chain_reader: PromotionHealthChainReader,
+        health_signature_verifier: HealthAttestationVerifier,
+    ) -> None:
+        if (
+            type(target) is not TargetBinding
+            or not isinstance(root_reader, RootAuthorityBundleReader)
+            or root_reader.target != target
+            or not isinstance(health_chain_reader, PromotionHealthChainReader)
+            or health_chain_reader.target != target
+            or not isinstance(health_signature_verifier, HealthAttestationVerifier)
+        ):
+            raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
+        self._target = target
+        self._root_reader = root_reader
+        self._health_chain_reader = health_chain_reader
+        self._health_signature_verifier = health_signature_verifier
+
+    async def resolve(
+        self,
+        command: PromotionCommandV2,
+        *,
+        now: datetime,
+    ) -> PromotionAuthorizationV1:
+        if type(command) is not PromotionCommandV2:
+            raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
+        evaluation_time = _require_utc_second(now)
+        try:
+            bundle = await self._root_reader.read_root_creation_bundle(command.root_id)
+            trusted = inspect_root_authority_bundle(bundle, target=self._target)
+            chain = await self._health_chain_reader.read_promotion_health_chain(
+                command.health_chain_locator
+            )
+        except asyncio.CancelledError:
+            raise
+        except (AuthorityStoreCorruptRecord, ContractError, TypeError, ValueError):
+            raise CanaryExecutionError(
+                CanaryExecutionErrorCode.TRUSTED_STATE_INVALID
+            ) from None
+        except Exception:
+            raise CanaryExecutionError(
+                CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE
+            ) from None
+        if (
+            trusted is None
+            or type(trusted.root) is not RolloutRootV3
+            or trusted.root.root_id != command.root_id
+            or trusted.root.root_sha256 != command.expected_root_sha256
+            or trusted.authority.current_epoch != command.expected_epoch
+            or trusted.service_claim.status is not ServiceClaimStatus.ACTIVE
+            or chain is None
+        ):
+            raise CanaryExecutionError(CanaryExecutionErrorCode.TRUSTED_STATE_INVALID)
+        try:
+            compact = await verify_healthy_promotion_chain(
+                chain=chain,
+                signature_verifier=self._health_signature_verifier,
+                now=evaluation_time,
+            )
+            authorization = create_promotion_authorization(
+                root=trusted.root,
+                signed_health_chain=chain,
+                request_id=command.request_id,
+                idempotency_key=command.idempotency_key,
+                scheduled_at=command.scheduled_at,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CanaryExecutionError(
+                CanaryExecutionErrorCode.TRUSTED_STATE_INVALID
+            ) from None
+        if (
+            compact != authorization.healthy_promotion_proof
+            or create_promotion_health_chain_locator(chain)
+            != command.health_chain_locator
+            or authorization.verified_apply_receipt
+            != command.verified_apply_receipt
+        ):
+            raise CanaryExecutionError(CanaryExecutionErrorCode.TRUSTED_STATE_INVALID)
+        return authorization
 
 
 class PromotionRolloutCoordinator:
@@ -141,8 +276,9 @@ class PromotionRolloutCoordinator:
         self,
         *,
         target: TargetBinding,
+        authorization_resolver: PromotionAuthorizationResolver,
         capability_client: PromotionCapabilityClient,
-        dispatch_store: PromotionDispatchStore,
+        dispatch_store: PromotionDispatchStoreV2,
         task_dispatcher: TaskDispatcher,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -152,8 +288,9 @@ class PromotionRolloutCoordinator:
             or target.environment != "nonprod"
             or target.service_name != "controlgraph-reference-target"
             or "reconcile" in target.project_id.lower()
+            or not isinstance(authorization_resolver, PromotionAuthorizationResolver)
             or not isinstance(capability_client, PromotionCapabilityClient)
-            or not isinstance(dispatch_store, PromotionDispatchStore)
+            or not isinstance(dispatch_store, PromotionDispatchStoreV2)
             or type(dispatch_store.target) is not TargetBinding
             or dispatch_store.target != target
             or type(task_dispatcher) is not TaskDispatcher
@@ -161,6 +298,7 @@ class PromotionRolloutCoordinator:
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._target = target
+        self._authorization_resolver = authorization_resolver
         self._capability_client = capability_client
         self._dispatch_store = dispatch_store
         self._task_dispatcher = task_dispatcher
@@ -168,9 +306,9 @@ class PromotionRolloutCoordinator:
 
     async def dispatch(
         self,
-        command: PromotionCommandV1,
-    ) -> PromotionDispatchResultV1:
-        if type(command) is not PromotionCommandV1:
+        command: PromotionCommandV2,
+    ) -> PromotionDispatchResultV2:
+        if type(command) is not PromotionCommandV2:
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         existing = await self._read_dispatch(command)
         if existing is not None:
@@ -196,7 +334,7 @@ class PromotionRolloutCoordinator:
             raise CanaryExecutionError(CanaryExecutionErrorCode.TRUSTED_STATE_INVALID) from None
 
         try:
-            started_value = PromotionDispatchRecordV1.model_validate(
+            started_value = PromotionDispatchRecordV2.model_validate(
                 {
                     **prepared.value.model_dump(mode="python"),
                     "state": PromotionDispatchState.ENQUEUE_STARTED,
@@ -208,7 +346,7 @@ class PromotionRolloutCoordinator:
                 CanaryExecutionErrorCode.TRUSTED_STATE_INVALID
             ) from None
         try:
-            direct_start = await self._dispatch_store.begin_promotion_enqueue(
+            direct_start = await self._dispatch_store.begin_promotion_enqueue_v2(
                 prepared,
                 started_value,
             )
@@ -235,7 +373,7 @@ class PromotionRolloutCoordinator:
             raise CanaryExecutionError(CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE) from None
 
         try:
-            dispatched = self._task_dispatcher.dispatch_prepared(
+            dispatched = self._task_dispatcher.dispatch_prepared_v2(
                 addressed,
                 permit=direct_start.permit,
                 now=dispatch_time,
@@ -256,7 +394,7 @@ class PromotionRolloutCoordinator:
             )
         try:
             result = _dispatch_result(started.value, dispatched)
-            terminal_value = PromotionDispatchRecordV1.model_validate(
+            terminal_value = PromotionDispatchRecordV2.model_validate(
                 {
                     **started.value.model_dump(mode="python"),
                     "state": PromotionDispatchState(dispatched.disposition.value),
@@ -267,7 +405,7 @@ class PromotionRolloutCoordinator:
         except Exception:
             raise CanaryExecutionError(CanaryExecutionErrorCode.OUTCOME_UNKNOWN) from None
         try:
-            terminal = await self._dispatch_store.compare_and_set_promotion_dispatch(
+            terminal = await self._dispatch_store.compare_and_set_promotion_dispatch_v2(
                 started,
                 terminal_value,
             )
@@ -292,13 +430,19 @@ class PromotionRolloutCoordinator:
 
     async def _prepare(
         self,
-        command: PromotionCommandV1,
-    ) -> StoredRecord[PromotionDispatchRecordV1]:
-        capability = await self._capability_client.issue(command)
+        command: PromotionCommandV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2]:
+        prepared_time = _require_utc_second(self._clock())
+        authorization = await self._authorization_resolver.resolve(
+            command,
+            now=prepared_time,
+        )
+        capability = await self._capability_client.issue(command, authorization)
         if (
             not _capability_matches_command(
                 capability,
                 command,
+                authorization=authorization,
                 project_id=self._target.project_id,
             )
             or capability.claims.target != self._target
@@ -306,25 +450,37 @@ class PromotionRolloutCoordinator:
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
         claims = capability.claims
         try:
-            intent = MutationIntent(
-                schema_version="controlgraph.mutation-intent/v1",
-                request_id=claims.request_id,
-                idempotency_key=claims.idempotency_key,
-                target=claims.target,
-                root_id=claims.root_id,
-                root_sha256=claims.root_sha256,
-                epoch=claims.epoch,
-                action=claims.action,
-                stable_revision=claims.stable_revision,
-                candidate_revision=claims.candidate_revision,
-                stable_percent=claims.stable_percent,
-                candidate_percent=claims.candidate_percent,
-                concurrency=claims.concurrency,
-                plan_sha256=claims.plan_sha256,
-                provider_etag=claims.provider_etag,
+            intent = PromotionMutationIntentV2(
+                schema_version=PROMOTION_MUTATION_INTENT_V2,
+                request_id=authorization.request_id,
+                idempotency_key=authorization.idempotency_key,
+                target=authorization.target,
+                root_id=authorization.root_id,
+                root_sha256=authorization.root_sha256,
+                epoch=authorization.epoch,
+                action=CapabilityAction.PROMOTE_CANDIDATE,
+                stable_revision=authorization.stable_revision,
+                candidate_revision=authorization.candidate_revision,
+                stable_percent=authorization.stable_percent,
+                candidate_percent=authorization.candidate_percent,
+                concurrency=None,
+                plan_sha256=authorization.plan_sha256,
+                provider_etag=authorization.provider_etag,
+                capability_id=promotion_capability_id(authorization),
+                promotion_authorization_sha256=canonical_sha256(authorization),
+                expected_prestate_sha256=authorization.expected_prestate_sha256,
+                terminal_health_decision_sha256=(
+                    authorization.terminal_health_decision_sha256
+                ),
+                health_chain_sha256=(
+                    authorization.health_chain_locator.health_chain_sha256
+                ),
+                desired_poststate_sha256=authorization.desired_poststate_sha256,
+                proof_valid_until=authorization.proof_valid_until,
+                authorization=authorization,
             )
-            request = TaskRequest(
-                schema_version="controlgraph.task-request/v1",
+            request = PromotionTaskRequestV2(
+                schema_version=PROMOTION_TASK_REQUEST_V2,
                 task_id=f"task-{capability.claims_sha256}",
                 queue_region="us-central1",
                 handler_audience=claims.audience,
@@ -333,22 +489,25 @@ class PromotionRolloutCoordinator:
                 capability=capability,
                 intent=intent,
             )
-            prepared_time = _require_utc_second(self._clock())
             addressed = self._task_dispatcher.prepare(request, now=prepared_time)
-            command_sha256 = promotion_command_sha256(command)
-            prepared_value = PromotionDispatchRecordV1(
-                schema_version=PROMOTION_DISPATCH_RECORD_V1,
-                dispatch_id=promotion_dispatch_id(command_sha256),
+            command_sha256 = promotion_command_v2_sha256(command)
+            prepared_value = PromotionDispatchRecordV2(
+                schema_version=PROMOTION_DISPATCH_RECORD_V2,
+                dispatch_id=promotion_dispatch_v2_id(command_sha256),
                 command_sha256=command_sha256,
-                request_id=command.request_id,
-                idempotency_key=command.idempotency_key,
-                target=self._target,
-                root_id=command.root_id,
-                root_sha256=command.expected_root_sha256,
-                epoch=command.expected_epoch,
-                scheduled_at=command.scheduled_at,
-                verified_apply_receipt=command.verified_apply_receipt,
-                source_receipt_sha256=(command.verified_apply_receipt.receipt_sha256),
+                promotion_authorization_sha256=canonical_sha256(authorization),
+                capability_id=promotion_capability_id(authorization),
+                request_id=authorization.request_id,
+                idempotency_key=authorization.idempotency_key,
+                target=authorization.target,
+                root_id=authorization.root_id,
+                root_sha256=authorization.root_sha256,
+                epoch=authorization.epoch,
+                scheduled_at=authorization.scheduled_at,
+                source_receipt_sha256=authorization.source_receipt_sha256,
+                health_chain_sha256=(
+                    authorization.health_chain_locator.health_chain_sha256
+                ),
                 task_sha256=canonical_sha256(request),
                 task_name=addressed.name,
                 task=request,
@@ -365,7 +524,7 @@ class PromotionRolloutCoordinator:
         except Exception:
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED) from None
         try:
-            return await self._dispatch_store.prepare_or_adopt_promotion_dispatch(
+            return await self._dispatch_store.prepare_or_adopt_promotion_dispatch_v2(
                 command,
                 prepared_value,
             )
@@ -384,10 +543,10 @@ class PromotionRolloutCoordinator:
 
     async def _read_dispatch(
         self,
-        command: PromotionCommandV1,
-    ) -> StoredRecord[PromotionDispatchRecordV1] | None:
+        command: PromotionCommandV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2] | None:
         try:
-            return await self._dispatch_store.read_promotion_dispatch(command)
+            return await self._dispatch_store.read_promotion_dispatch_v2(command)
         except asyncio.CancelledError:
             raise
         except AuthorityStoreConflict:
@@ -403,8 +562,8 @@ class PromotionRolloutCoordinator:
 
     async def _require_owned_dispatch(
         self,
-        command: PromotionCommandV1,
-    ) -> StoredRecord[PromotionDispatchRecordV1]:
+        command: PromotionCommandV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2]:
         current = await self._read_dispatch(command)
         if current is None:
             raise CanaryExecutionError(CanaryExecutionErrorCode.TRUSTED_STATE_INVALID)
@@ -412,8 +571,8 @@ class PromotionRolloutCoordinator:
 
     async def _read_after_transition(
         self,
-        command: PromotionCommandV1,
-    ) -> StoredRecord[PromotionDispatchRecordV1]:
+        command: PromotionCommandV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2]:
         try:
             return await self._require_owned_dispatch(command)
         except CanaryExecutionError as error:
@@ -428,9 +587,9 @@ class PromotionRolloutCoordinator:
 
     def _adopt_existing(
         self,
-        stored: StoredRecord[PromotionDispatchRecordV1],
-        command: PromotionCommandV1,
-    ) -> PromotionDispatchResultV1 | None:
+        stored: StoredRecord[PromotionDispatchRecordV2],
+        command: PromotionCommandV2,
+    ) -> PromotionDispatchResultV2 | None:
         expected_revisions = {
             PromotionDispatchState.PREPARED: 0,
             PromotionDispatchState.ENQUEUE_STARTED: 1,
@@ -440,10 +599,10 @@ class PromotionRolloutCoordinator:
         }
         if (
             type(stored) is not StoredRecord
-            or type(stored.value) is not PromotionDispatchRecordV1
+            or type(stored.value) is not PromotionDispatchRecordV2
             or stored.value.target != self._target
             or stored.revision != expected_revisions.get(stored.value.state)
-            or stored.value.command_sha256 != promotion_command_sha256(command)
+            or stored.value.command_sha256 != promotion_command_v2_sha256(command)
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.TRUSTED_STATE_INVALID)
         if stored.value.state is PromotionDispatchState.PREPARED:
@@ -457,7 +616,7 @@ class PromotionRolloutCoordinator:
             project_id=self._target.project_id,
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.TRUSTED_STATE_INVALID)
-        return cast(PromotionDispatchResultV1, result)
+        return cast(PromotionDispatchResultV2, result)
 
 
 class ApiPromotionClient:
@@ -488,10 +647,10 @@ class ApiPromotionClient:
 
     async def dispatch(
         self,
-        command: PromotionCommandV1,
+        command: PromotionCommandV2,
         principal: AuthenticationContext,
-    ) -> PromotionDispatchResultV1:
-        if type(command) is not PromotionCommandV1:
+    ) -> PromotionDispatchResultV2:
+        if type(command) is not PromotionCommandV2:
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         if not _context_matches_policy(
             principal,
@@ -499,8 +658,8 @@ class ApiPromotionClient:
             role=CallerRole.OPERATOR,
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.OPERATOR_DENIED)
-        invocation = PromotionInvocationV1(
-            schema_version=PROMOTION_INVOCATION_V1,
+        invocation = PromotionInvocationV2(
+            schema_version=PROMOTION_INVOCATION_V2,
             command=command,
             operator_identity=principal.email,
             operator_subject=principal.subject,
@@ -522,7 +681,7 @@ class ApiPromotionClient:
         except Exception:
             raise CanaryExecutionError(CanaryExecutionErrorCode.TRANSPORT_UNAVAILABLE) from None
         try:
-            result = decode_contract(body, PromotionDispatchResultV1)
+            result = decode_contract(body, PromotionDispatchResultV2)
         except (ContractError, TypeError, ValueError):
             raise CanaryExecutionError(CanaryExecutionErrorCode.RESPONSE_INVALID) from None
         if not _result_matches_command(
@@ -562,16 +721,16 @@ class CoordinatorPromotionRelay:
 
     async def dispatch(
         self,
-        invocation: PromotionInvocationV1,
+        invocation: PromotionInvocationV2,
         caller: AuthenticationContext,
-    ) -> PromotionDispatchResultV1:
+    ) -> PromotionDispatchResultV2:
         if not _context_matches_policy(
             caller,
             self._authentication_policy,
             role=CallerRole.API,
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.CALLER_DENIED)
-        if type(invocation) is not PromotionInvocationV1:
+        if type(invocation) is not PromotionInvocationV2:
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         expected_operator = self._operator_policy.caller
         if (
@@ -598,13 +757,14 @@ class CoordinatorPromotionRelay:
 
 
 def _dispatch_result(
-    record: PromotionDispatchRecordV1,
+    record: PromotionDispatchRecordV2,
     dispatched: TaskEnqueueResult,
-) -> PromotionDispatchResultV1:
+) -> PromotionDispatchResultV2:
     task = record.task
     claims = task.capability.claims
-    return PromotionDispatchResultV1(
-        schema_version=PROMOTION_DISPATCH_RESULT_V1,
+    authorization = task.intent.authorization
+    return PromotionDispatchResultV2(
+        schema_version=PROMOTION_DISPATCH_RESULT_V2,
         request_id=claims.request_id,
         idempotency_key=claims.idempotency_key,
         target=claims.target,
@@ -616,7 +776,20 @@ def _dispatch_result(
         stable_percent=0,
         candidate_percent=100,
         provider_etag=claims.provider_etag,
-        verified_apply_receipt=record.verified_apply_receipt,
+        verified_apply_receipt=authorization.verified_apply_receipt,
+        source_receipt_sha256=authorization.source_receipt_sha256,
+        expected_prestate_sha256=authorization.expected_prestate_sha256,
+        terminal_health_decision_sha256=(
+            authorization.terminal_health_decision_sha256
+        ),
+        health_chain_sha256=authorization.health_chain_locator.health_chain_sha256,
+        health_chain_locator=authorization.health_chain_locator,
+        healthy_promotion_proof_sha256=(
+            authorization.healthy_promotion_proof_sha256
+        ),
+        desired_poststate_sha256=authorization.desired_poststate_sha256,
+        proof_valid_until=authorization.proof_valid_until,
+        promotion_authorization_sha256=canonical_sha256(authorization),
         capability_id=claims.capability_id,
         capability_sha256=canonical_sha256(task.capability),
         task_id=task.task_id,
@@ -629,37 +802,65 @@ def _dispatch_result(
 
 def _capability_matches_command(
     capability: object,
-    command: PromotionCommandV1,
+    command: PromotionCommandV2,
     *,
+    authorization: PromotionAuthorizationV1,
     project_id: str,
 ) -> bool:
-    if type(capability) is not SignedCapability:
+    if (
+        type(capability) is not SignedCapability
+        or type(authorization) is not PromotionAuthorizationV1
+    ):
         return False
     claims = capability.claims
     return (
         claims.target.project_id == project_id
-        and claims.root_id == command.root_id
-        and claims.root_sha256 == command.expected_root_sha256
-        and claims.epoch == command.expected_epoch
-        and claims.request_id == command.request_id
-        and claims.idempotency_key == command.idempotency_key
-        and claims.not_before == command.scheduled_at
+        and authorization.root_id == command.root_id
+        and authorization.root_sha256 == command.expected_root_sha256
+        and authorization.epoch == command.expected_epoch
+        and authorization.request_id == command.request_id
+        and authorization.idempotency_key == command.idempotency_key
+        and authorization.scheduled_at == command.scheduled_at
+        and authorization.verified_apply_receipt == command.verified_apply_receipt
+        and authorization.health_chain_locator == command.health_chain_locator
+        and claims.capability_id == promotion_capability_id(authorization)
+        and claims.issuer == authorization.issuer_identity
+        and claims.subject == authorization.executor_identity
+        and claims.audience == authorization.executor_audience
+        and claims.signing_key_version
+        == authorization.capability_signing_key_version
+        and claims.target == authorization.target
+        and claims.root_id == authorization.root_id
+        and claims.root_sha256 == authorization.root_sha256
+        and claims.epoch == authorization.epoch
+        and claims.request_id == authorization.request_id
+        and claims.idempotency_key == authorization.idempotency_key
+        and claims.not_before == authorization.scheduled_at
+        and authorization.healthy_promotion_proof.issued_at
+        <= claims.issued_at
+        <= claims.not_before
+        < claims.expires_at
+        <= authorization.proof_valid_until
         and claims.action is CapabilityAction.PROMOTE_CANDIDATE
         and claims.concurrency is None
-        and claims.stable_percent == 0
-        and claims.candidate_percent == 100
+        and claims.stable_revision == authorization.stable_revision
+        and claims.candidate_revision == authorization.candidate_revision
+        and claims.stable_percent == authorization.stable_percent
+        and claims.candidate_percent == authorization.candidate_percent
+        and claims.plan_sha256 == authorization.plan_sha256
+        and claims.provider_etag == authorization.provider_etag
         and claims.parent_capability_sha256 is None
     )
 
 
 def _result_matches_command(
     result: object,
-    command: PromotionCommandV1,
+    command: PromotionCommandV2,
     *,
     project_id: str,
 ) -> bool:
     return (
-        type(result) is PromotionDispatchResultV1
+        type(result) is PromotionDispatchResultV2
         and result.request_id == command.request_id
         and result.idempotency_key == command.idempotency_key
         and result.root_id == command.root_id
@@ -670,6 +871,12 @@ def _result_matches_command(
         and result.stable_percent == 0
         and result.candidate_percent == 100
         and result.verified_apply_receipt == command.verified_apply_receipt
+        and result.source_receipt_sha256
+        == command.verified_apply_receipt.receipt_sha256
+        and result.health_chain_sha256
+        == command.health_chain_locator.health_chain_sha256
+        and result.health_chain_locator == command.health_chain_locator
+        and result.scheduled_at < result.expires_at <= result.proof_valid_until
     )
 
 
@@ -717,7 +924,9 @@ __all__ = [
     "ApiPromotionClient",
     "CoordinatorPromotionCapabilityClient",
     "CoordinatorPromotionRelay",
+    "PromotionAuthorizationResolver",
     "PromotionCapabilityClient",
     "PromotionCoordinator",
     "PromotionRolloutCoordinator",
+    "StoredPromotionAuthorizationResolver",
 ]

@@ -411,11 +411,10 @@ def _verify(
     ("role", "action"),
     [
         (ServiceRole.EXECUTOR, CapabilityAction.APPLY_CANARY),
-        (ServiceRole.EXECUTOR, CapabilityAction.PROMOTE_CANDIDATE),
         (ServiceRole.RECOVERY, CapabilityAction.RECOVER_STABLE),
     ],
 )
-def test_verifies_closed_signed_actions_for_both_protected_routes(
+def test_verifies_legacy_apply_and_recovery_for_both_protected_routes(
     role: ServiceRole,
     action: CapabilityAction,
 ) -> None:
@@ -445,6 +444,31 @@ def test_verifies_closed_signed_actions_for_both_protected_routes(
     )
     assert root_reader.reads == [_root().root_id]
     assert root_reader.receipt_claims == 0
+
+
+def test_legacy_promotion_task_is_rejected_before_trusted_reads() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    root_reader = _RootReader()
+    request = _task(
+        _signed(
+            _claims(
+                ServiceRole.EXECUTOR,
+                action=CapabilityAction.PROMOTE_CANDIDATE,
+                provider_etag="etag-canary-8",
+            ),
+            private_key,
+        )
+    )
+
+    with pytest.raises(CapabilityVerificationError) as denied:
+        _verify(
+            _verifier(ServiceRole.EXECUTOR, private_key, root_reader),
+            canonical_json_bytes(request),
+            _caller(ServiceRole.EXECUTOR),
+        )
+
+    assert denied.value.code is ReasonCode.CLAIM_BINDING_MISMATCH
+    assert root_reader.reads == []
 
 
 def test_verifier_configuration_has_no_action_key_or_resource_selector() -> None:
@@ -820,6 +844,16 @@ class _JoinedCloudRunAdapter:
         self.calls: list[MutationIntent] = []
         self._state = _initial_target_state()
         self._lock = Lock()
+        self._prepared_intent: MutationIntent | None = None
+
+    @property
+    def intent(self) -> MutationIntent:
+        assert self._prepared_intent is not None
+        return self._prepared_intent
+
+    async def prepare(self, intent: MutationIntent) -> _JoinedCloudRunAdapter:
+        self._prepared_intent = intent
+        return self
 
     @property
     def state(self) -> TargetConfigurationProjection:
@@ -904,6 +938,7 @@ class _JoinedConformancePath:
             final_gate=FinalMutationGate(
                 authority_reader=self.final_reader,
                 adapter=classifying_adapter,
+                route_policy=_policy(role),
                 clock=lambda: NOW,
             ),
             readback=_JoinedReadback(self.cloud_run_adapter, self.events),

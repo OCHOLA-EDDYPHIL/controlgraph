@@ -8,15 +8,18 @@ from test_health_contracts import (
     _query,
     _samples,
     _target,
+    _window_observation,
 )
 
 from controlgraph_canary.application.health_evaluation import (
+    derive_next_health_evaluation_state,
     evaluate_health_observation,
     initial_health_evaluation_state,
 )
 from controlgraph_canary.contracts import (
     ContractError,
     HealthDecisionStatus,
+    HealthEvaluationStateV1,
     HealthReasonCode,
     MonitoringObservationTiming,
     MonitoringQueryKind,
@@ -62,6 +65,13 @@ def _second_observation():  # type: ignore[no-untyped-def]
     )
 
 
+def _next_state(decision):  # type: ignore[no-untyped-def]
+    return derive_next_health_evaluation_state(
+        policy=_policy(),
+        predecessor_decision=decision,
+    )
+
+
 def test_initial_state_recomputes_the_canonical_policy_digest() -> None:
     policy = _policy()
 
@@ -91,7 +101,8 @@ def test_canonical_observations_produce_a_terminal_healthy_streak() -> None:
     )
     second = evaluate_health_observation(
         policy=policy,
-        prior_state=first.next_state,
+        prior_state=_next_state(first),
+        predecessor_decision=first,
         observation=_second_observation(),
         evaluated_at="2026-08-21T12:05:00Z",
     )
@@ -124,20 +135,22 @@ def test_cross_call_observation_replay_preserves_the_healthy_streak() -> None:
 
     replayed = evaluate_health_observation(
         policy=policy,
-        prior_state=first.next_state,
+        prior_state=_next_state(first),
+        predecessor_decision=first,
         observation=recollected,
         evaluated_at="2026-08-21T12:04:01Z",
     )
     terminal = evaluate_health_observation(
         policy=policy,
-        prior_state=replayed.next_state,
+        prior_state=_next_state(replayed),
+        predecessor_decision=replayed,
         observation=_second_observation(),
         evaluated_at="2026-08-21T12:05:00Z",
     )
 
     assert replayed.status is HealthDecisionStatus.WAIT
     assert replayed.reason_codes == (HealthReasonCode.WINDOW_DUPLICATE,)
-    assert replayed.next_state == first.next_state
+    assert replayed.next_state == _next_state(first)
     assert canonical_sha256(recollected) != canonical_sha256(observation)
     assert replayed.next_evaluation_at == "2026-08-21T12:05:00Z"
     assert terminal.status is HealthDecisionStatus.HEALTHY
@@ -163,7 +176,8 @@ def test_conflict_metadata_takes_precedence_over_adapter_replay_deduplication() 
 
     replayed = evaluate_health_observation(
         policy=policy,
-        prior_state=first.next_state,
+        prior_state=_next_state(first),
+        predecessor_decision=first,
         observation=conflict,
         evaluated_at="2026-08-21T12:04:01Z",
     )
@@ -280,6 +294,22 @@ def test_early_observation_waits_without_advancing_state() -> None:
     assert decision.next_state == initial
     assert decision.next_evaluation_at == "2026-08-21T12:04:00Z"
 
+    linked_state = _next_state(decision)
+    resumed = evaluate_health_observation(
+        policy=_policy(),
+        prior_state=linked_state,
+        predecessor_decision=decision,
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+
+    assert linked_state.evaluated_windows == 0
+    assert linked_state.prior_decision_sha256 == canonical_sha256(decision)
+    assert resumed.reason_codes == (
+        HealthReasonCode.HEALTHY_THRESHOLDS_MET,
+        HealthReasonCode.HEALTHY_STREAK_PENDING,
+    )
+
 
 def test_invalid_canonical_scope_is_rejected_before_it_can_claim_health() -> None:
     mismatched = _observation().model_copy(update={"root_id": "cgroot:" + "9" * 64})
@@ -303,18 +333,189 @@ def test_terminal_state_cannot_be_reused() -> None:
     )
     terminal = evaluate_health_observation(
         policy=policy,
-        prior_state=first.next_state,
+        prior_state=_next_state(first),
+        predecessor_decision=first,
         observation=_second_observation(),
         evaluated_at="2026-08-21T12:05:00Z",
     )
 
-    reused = evaluate_health_observation(
+    with pytest.raises(ValueError, match="terminal health decision"):
+        derive_next_health_evaluation_state(
+            policy=policy,
+            predecessor_decision=terminal,
+        )
+
+
+def test_non_initial_state_requires_its_exact_canonical_predecessor() -> None:
+    policy = _policy()
+    first = evaluate_health_observation(
         policy=policy,
-        prior_state=terminal.next_state,
-        observation=None,
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    linked_state = _next_state(first)
+
+    assert linked_state.prior_decision_sha256 == canonical_sha256(first)
+    with pytest.raises(ValueError, match="predecessor decision is required"):
+        evaluate_health_observation(
+            policy=policy,
+            prior_state=linked_state,
+            observation=_second_observation(),
+            evaluated_at="2026-08-21T12:05:00Z",
+        )
+
+
+def test_forged_streak_state_cannot_be_advanced() -> None:
+    policy = _policy()
+    first = evaluate_health_observation(
+        policy=policy,
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    forged_values = _next_state(first).model_dump(mode="python")
+    forged_values["consecutive_healthy_windows"] = 0
+    forged_state = HealthEvaluationStateV1.model_validate(forged_values)
+
+    with pytest.raises(ValueError, match="exact predecessor decision"):
+        evaluate_health_observation(
+            policy=policy,
+            prior_state=forged_state,
+            predecessor_decision=first,
+            observation=_second_observation(),
+            evaluated_at="2026-08-21T12:05:00Z",
+        )
+
+
+def test_predecessor_replay_is_idempotent_and_cannot_extend_the_streak() -> None:
+    policy = _policy()
+    first = evaluate_health_observation(
+        policy=policy,
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    linked_state = _next_state(first)
+    inputs = {
+        "policy": policy,
+        "prior_state": linked_state,
+        "predecessor_decision": first,
+        "observation": _second_observation(),
+        "evaluated_at": "2026-08-21T12:05:00Z",
+    }
+
+    first_replay = evaluate_health_observation(**inputs)
+    second_replay = evaluate_health_observation(**inputs)
+
+    assert first_replay == second_replay
+    assert canonical_sha256(first_replay) == canonical_sha256(second_replay)
+    assert first_replay.next_state.consecutive_healthy_windows == 2
+
+
+def test_noncanonical_predecessor_decision_id_is_rejected() -> None:
+    first = evaluate_health_observation(
+        policy=_policy(),
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    forged_predecessor = first.model_copy(update={"decision_id": "forged-decision"})
+
+    with pytest.raises(ValueError, match="decision id is not canonical"):
+        derive_next_health_evaluation_state(
+            policy=_policy(),
+            predecessor_decision=forged_predecessor,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("epoch", 2),
+        ("candidate_revision", "controlgraph-reference-target-forged"),
+        ("target", _target().model_copy(update={"environment": "other"})),
+        ("root_id", "cgroot:" + "2" * 64),
+    ),
+)
+def test_predecessor_rejects_scope_forgery(field: str, value: object) -> None:
+    policy = _policy()
+    first = evaluate_health_observation(
+        policy=policy,
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    state_values = _next_state(first).model_dump(mode="python")
+    state_values[field] = value
+    if field == "root_id":
+        state_values["root_sha256"] = "2" * 64
+    forged_state = HealthEvaluationStateV1.model_validate(state_values)
+
+    with pytest.raises(ValueError, match="exact predecessor decision"):
+        evaluate_health_observation(
+            policy=policy,
+            prior_state=forged_state,
+            predecessor_decision=first,
+            observation=_second_observation(),
+            evaluated_at="2026-08-21T12:05:00Z",
+        )
+
+
+def test_branch_state_cannot_be_paired_with_another_predecessor() -> None:
+    policy = _policy()
+    first = evaluate_health_observation(
+        policy=policy,
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    linked_state = _next_state(first)
+    recollected = _observation(observed_at="2026-08-21T12:04:01Z")
+    replay_decision = evaluate_health_observation(
+        policy=policy,
+        prior_state=linked_state,
+        predecessor_decision=first,
+        observation=recollected,
+        evaluated_at="2026-08-21T12:04:01Z",
+    )
+
+    with pytest.raises(ValueError, match="exact predecessor decision"):
+        evaluate_health_observation(
+            policy=policy,
+            prior_state=_next_state(replay_decision),
+            predecessor_decision=first,
+            observation=_second_observation(),
+            evaluated_at="2026-08-21T12:05:00Z",
+        )
+
+
+def test_gap_and_out_of_order_windows_cannot_build_a_healthy_streak() -> None:
+    policy = _policy()
+    first = evaluate_health_observation(
+        policy=policy,
+        prior_state=_initial_state(),
+        observation=_observation(),
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    gap = evaluate_health_observation(
+        policy=policy,
+        prior_state=_next_state(first),
+        predecessor_decision=first,
+        observation=_window_observation(3),
+        evaluated_at="2026-08-21T12:06:00Z",
+    )
+    out_of_order = evaluate_health_observation(
+        policy=policy,
+        prior_state=_next_state(gap),
+        predecessor_decision=gap,
+        observation=_window_observation(2),
         evaluated_at="2026-08-21T12:06:00Z",
     )
 
-    assert reused.status is HealthDecisionStatus.INSUFFICIENT_EVIDENCE
-    assert reused.reason_codes == (HealthReasonCode.STATE_TERMINAL,)
-    assert reused.next_evaluation_at is None
+    assert gap.status is HealthDecisionStatus.INSUFFICIENT_EVIDENCE
+    assert gap.reason_codes == (HealthReasonCode.WINDOW_GAP,)
+    assert gap.next_state.consecutive_healthy_windows == 0
+    assert out_of_order.status is HealthDecisionStatus.INSUFFICIENT_EVIDENCE
+    assert out_of_order.reason_codes == (HealthReasonCode.WINDOW_OUT_OF_ORDER,)
+    assert out_of_order.next_state.consecutive_healthy_windows == 0

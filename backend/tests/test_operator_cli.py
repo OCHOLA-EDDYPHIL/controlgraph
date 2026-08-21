@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from health_execution_test_data import make_health_root, make_healthy_chain
 from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
 from test_service_claim_release import _released_store
 
@@ -56,12 +57,11 @@ from controlgraph_canary.contracts.operator_observability import (
     TargetTrafficReadResultV1,
 )
 from controlgraph_canary.contracts.promotion_execution import (
-    PROMOTION_COMMAND_V1,
-    PROMOTION_DISPATCH_RESULT_V1,
-    VERIFIED_APPLY_RECEIPT_LOCATOR_V1,
-    PromotionCommandV1,
-    PromotionDispatchResultV1,
-    VerifiedApplyReceiptLocatorV1,
+    PROMOTION_COMMAND_V2,
+    PROMOTION_DISPATCH_RESULT_V2,
+    PromotionCommandV2,
+    PromotionDispatchResultV2,
+    create_promotion_authorization,
 )
 from controlgraph_canary.contracts.root_creation import (
     ROOT_CREATION_COMMAND_V1,
@@ -228,53 +228,68 @@ def _success_fixtures(tmp_path: Path) -> list[tuple[Any, argparse.Namespace, obj
         observed_at="2026-08-19T12:05:00Z",
     )
 
-    locator = VerifiedApplyReceiptLocatorV1(
-        schema_version=VERIFIED_APPLY_RECEIPT_LOCATOR_V1,
-        receipt_id="receipt-apply-cli-001",
-        request_id="apply-cli-001",
-        idempotency_key="apply-cli-intent-001",
-        capability_sha256="1" * 64,
-        mutation_sha256="2" * 64,
-        expected_poststate_sha256="3" * 64,
-        provider_operation="operations/apply-cli-001",
-        receipt_sha256="4" * 64,
+    promotion_chain = make_healthy_chain()
+    promotion_proof = promotion_chain.healthy_promotion_proof
+    assert promotion_proof is not None
+    promotion_authorization = create_promotion_authorization(
+        root=make_health_root(),
+        signed_health_chain=promotion_chain,
+        request_id="promote-cli-001",
+        idempotency_key="promote-cli-intent-001",
+        scheduled_at=promotion_proof.issued_at,
     )
-    promotion_command = PromotionCommandV1(
-        schema_version=PROMOTION_COMMAND_V1,
-        root_id=records.root.root_id,
-        expected_root_sha256=records.root.root_sha256,
+    promotion_command = PromotionCommandV2(
+        schema_version=PROMOTION_COMMAND_V2,
+        root_id=promotion_authorization.root_id,
+        expected_root_sha256=promotion_authorization.root_sha256,
         expected_epoch=1,
         request_id="promote-cli-001",
         idempotency_key="promote-cli-intent-001",
-        scheduled_at="2026-08-19T12:06:00Z",
-        verified_apply_receipt=locator,
+        scheduled_at=promotion_authorization.scheduled_at,
+        verified_apply_receipt=promotion_authorization.verified_apply_receipt,
+        health_chain_locator=promotion_authorization.health_chain_locator,
     )
     promotion_file = tmp_path / "promotion-command.json"
     promotion_file.write_bytes(canonical_json_bytes(promotion_command))
-    promotion_result = PromotionDispatchResultV1(
-        schema_version=PROMOTION_DISPATCH_RESULT_V1,
+    promotion_result = PromotionDispatchResultV2(
+        schema_version=PROMOTION_DISPATCH_RESULT_V2,
         request_id=promotion_command.request_id,
         idempotency_key=promotion_command.idempotency_key,
-        target=target,
+        target=promotion_authorization.target,
         root_id=promotion_command.root_id,
         root_sha256=promotion_command.expected_root_sha256,
         epoch=promotion_command.expected_epoch,
-        stable_revision=plan.stable_revision,
-        candidate_revision=plan.candidate_revision,
+        stable_revision=promotion_authorization.stable_revision,
+        candidate_revision=promotion_authorization.candidate_revision,
         stable_percent=0,
         candidate_percent=100,
-        provider_etag="etag-canary-cli-001",
-        verified_apply_receipt=locator,
-        capability_id="capability-promote-cli-001",
+        provider_etag=promotion_authorization.provider_etag,
+        verified_apply_receipt=promotion_authorization.verified_apply_receipt,
+        source_receipt_sha256=promotion_authorization.source_receipt_sha256,
+        expected_prestate_sha256=promotion_authorization.expected_prestate_sha256,
+        terminal_health_decision_sha256=(
+            promotion_authorization.terminal_health_decision_sha256
+        ),
+        health_chain_sha256=(
+            promotion_authorization.health_chain_locator.health_chain_sha256
+        ),
+        health_chain_locator=promotion_authorization.health_chain_locator,
+        healthy_promotion_proof_sha256=(
+            promotion_authorization.healthy_promotion_proof_sha256
+        ),
+        desired_poststate_sha256=promotion_authorization.desired_poststate_sha256,
+        proof_valid_until=promotion_authorization.proof_valid_until,
+        promotion_authorization_sha256=canonical_sha256(promotion_authorization),
+        capability_id=promotion_authorization.capability_id,
         capability_sha256="e" * 64,
         task_id="task-promote-cli-001",
         task_name=(
-            f"projects/{target.project_id}/locations/us-central1/"
+            f"projects/{promotion_authorization.target.project_id}/locations/us-central1/"
             f"queues/controlgraph-execution/tasks/cg-{'e' * 64}"
         ),
         enqueue_disposition="CREATED",
-        scheduled_at="2026-08-19T12:06:00Z",
-        expires_at="2026-08-19T12:12:00Z",
+        scheduled_at=promotion_authorization.scheduled_at,
+        expires_at="2026-08-21T12:10:00Z",
     )
 
     release_invocation, _release_store, release_result = _released_store()

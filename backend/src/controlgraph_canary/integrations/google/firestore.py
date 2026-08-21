@@ -43,7 +43,9 @@ from controlgraph_canary.application.cloud_run import (
 from controlgraph_canary.application.evidence_chain import current_evidence_chain_head
 from controlgraph_canary.application.promotion_store import (
     DirectPromotionEnqueueStart,
+    DirectPromotionEnqueueStartV2,
     PromotionEnqueuePermit,
+    PromotionEnqueuePermitV2,
 )
 from controlgraph_canary.application.revocation_store import (
     EpochRevocationProofState,
@@ -76,13 +78,19 @@ from controlgraph_canary.contracts.models import (
 )
 from controlgraph_canary.contracts.promotion_execution import (
     PROMOTION_DISPATCH_IDENTITY_V1,
+    PROMOTION_DISPATCH_IDENTITY_V2,
     PromotionCommandV1,
+    PromotionCommandV2,
     PromotionDispatchIdentityKind,
     PromotionDispatchIdentityV1,
+    PromotionDispatchIdentityV2,
     PromotionDispatchRecordV1,
+    PromotionDispatchRecordV2,
     PromotionDispatchState,
     promotion_command_sha256,
+    promotion_command_v2_sha256,
     promotion_dispatch_id,
+    promotion_dispatch_v2_id,
 )
 from controlgraph_canary.contracts.revocation import (
     EpochRevocationAuditV1,
@@ -97,7 +105,9 @@ from controlgraph_canary.contracts.revocation import (
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
+    RolloutRootV3,
     RootCreationResultV1,
+    RootCreationResultV2,
     SignedEvidenceEventV1,
     capability_lineage_anchor,
 )
@@ -121,7 +131,7 @@ from controlgraph_canary.contracts.storage import (
     ServiceClaimTargetClassification,
     ServiceClaimTerminalRootState,
     active_service_claim_matches_root,
-    active_service_claim_matches_root_v2,
+    active_service_claim_matches_root_v3,
     capability_lineage_anchor_document_id,
     capability_lineage_anchor_logical_id,
     epoch_authority_document_id,
@@ -135,12 +145,18 @@ from controlgraph_canary.contracts.storage import (
     promotion_dispatch_document_id,
     promotion_dispatch_identity_document_id,
     promotion_dispatch_identity_logical_id,
+    promotion_dispatch_identity_v2_document_id,
+    promotion_dispatch_identity_v2_logical_id,
+    promotion_dispatch_v2_document_id,
     rollout_root_document_id,
     rollout_root_v2_document_id,
+    rollout_root_v3_document_id,
     root_creation_result_document_id,
+    root_creation_result_v2_document_id,
     service_claim_document_id,
     service_claim_logical_id,
     service_claim_matches_root_v2,
+    service_claim_matches_root_v3,
     service_claim_release_identity_document_id,
     service_claim_release_identity_logical_id,
     service_claim_release_progress_document_id,
@@ -1483,12 +1499,14 @@ def _validate_released_takeover(
         raise ValueError("new rollout does not follow one safely released claim")
 
 
-def _rollout_root_v2_target_configuration_sha256(
-    root: RolloutRootV2,
+def _content_addressed_root_target_configuration_sha256(
+    root: RolloutRootV2 | RolloutRootV3,
     *,
     stable_percent: int,
     candidate_percent: int,
 ) -> str:
+    if type(root) not in (RolloutRootV2, RolloutRootV3):
+        raise TypeError("an exact content-addressed rollout root is required")
     plan = root.content.rollout_plan
     return target_configuration_projection_sha256(
         TargetConfigurationProjection(
@@ -1502,10 +1520,10 @@ def _rollout_root_v2_target_configuration_sha256(
     )
 
 
-def _validate_released_takeover_v2(
+def _validate_released_takeover_content_addressed(
     configured_target: TargetBinding,
     expected_released_claim: StoredRecord[ServiceClaimRecord],
-    root: RolloutRootV2,
+    root: RolloutRootV2 | RolloutRootV3,
     claim: ServiceClaimRecord,
 ) -> None:
     previous = expected_released_claim.value
@@ -1525,30 +1543,30 @@ def _validate_released_takeover_v2(
 
 def _validate_initial_root_creation_bundle(
     configured_target: TargetBinding,
-    root: RolloutRootV2,
+    root: RolloutRootV3,
     claim: ServiceClaimRecord,
     authority: EpochAuthorityRecord,
     lineage_anchor: CapabilityLineageAnchorV1,
     signed_evidence: SignedEvidenceEventV1,
-    creation_result: RootCreationResultV1,
+    creation_result: RootCreationResultV2,
     expected_released_claim: StoredRecord[ServiceClaimRecord] | None,
 ) -> None:
     exact_records = (
-        (root, RolloutRootV2),
+        (root, RolloutRootV3),
         (claim, ServiceClaimRecord),
         (authority, EpochAuthorityRecord),
         (lineage_anchor, CapabilityLineageAnchorV1),
         (signed_evidence, SignedEvidenceEventV1),
-        (creation_result, RootCreationResultV1),
+        (creation_result, RootCreationResultV2),
     )
     if any(type(record) is not model_type for record, model_type in exact_records):
         raise TypeError("root creation requires exact bundle records")
-    stable_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+    stable_configuration_sha256 = _content_addressed_root_target_configuration_sha256(
         root,
         stable_percent=100,
         candidate_percent=0,
     )
-    candidate_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+    candidate_configuration_sha256 = _content_addressed_root_target_configuration_sha256(
         root,
         stable_percent=0,
         candidate_percent=100,
@@ -1571,7 +1589,7 @@ def _validate_initial_root_creation_bundle(
         or creation_result.lineage_anchor != lineage_anchor
         or creation_result.signed_evidence != signed_evidence
         or lineage_anchor != capability_lineage_anchor(root)
-        or not active_service_claim_matches_root_v2(
+        or not active_service_claim_matches_root_v3(
             claim,
             root,
             stable_target_configuration_sha256=stable_configuration_sha256,
@@ -1590,7 +1608,7 @@ def _validate_initial_root_creation_bundle(
     if expected_released_claim is not None:
         if type(expected_released_claim) is not StoredRecord:
             raise TypeError("released claim takeover requires an exact stored claim")
-        _validate_released_takeover_v2(
+        _validate_released_takeover_content_addressed(
             configured_target,
             expected_released_claim,
             root,
@@ -1636,22 +1654,32 @@ def _validate_read_root_creation_bundle(
     ):
         raise ValueError("root creation bundle is incoherent")
     if claim.root_id == root.root_id:
-        stable_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+        stable_configuration_sha256 = _content_addressed_root_target_configuration_sha256(
             root,
             stable_percent=100,
             candidate_percent=0,
         )
-        candidate_configuration_sha256 = _rollout_root_v2_target_configuration_sha256(
+        candidate_configuration_sha256 = _content_addressed_root_target_configuration_sha256(
             root,
             stable_percent=0,
             candidate_percent=100,
         )
-        if not service_claim_matches_root_v2(
-            claim,
-            root,
-            stable_target_configuration_sha256=stable_configuration_sha256,
-            candidate_target_configuration_sha256=candidate_configuration_sha256,
-        ):
+        if type(root) is RolloutRootV2:
+            claim_matches = service_claim_matches_root_v2(
+                claim,
+                root,
+                stable_target_configuration_sha256=stable_configuration_sha256,
+                candidate_target_configuration_sha256=candidate_configuration_sha256,
+            )
+        else:
+            root_v3 = cast(RolloutRootV3, root)
+            claim_matches = service_claim_matches_root_v3(
+                claim,
+                root_v3,
+                stable_target_configuration_sha256=stable_configuration_sha256,
+                candidate_target_configuration_sha256=candidate_configuration_sha256,
+            )
+        if not claim_matches:
             raise ValueError("root creation bundle claim is incoherent")
         if bundle.service_claim.revision == 0 and (
             result.winner_service_claim_sha256 != canonical_sha256(claim)
@@ -1659,21 +1687,29 @@ def _validate_read_root_creation_bundle(
             raise ValueError("root creation bundle initial claim digest does not match")
 
 
-def _adopted_root_creation_result(result: RootCreationResultV1) -> RootCreationResultV1:
-    return RootCreationResultV1.model_validate(
-        {**result.model_dump(mode="python"), "outcome": "ADOPTED"}
-    )
+def _adopted_root_creation_result(
+    result: RootCreationResultV1 | RootCreationResultV2,
+) -> RootCreationResultV1 | RootCreationResultV2:
+    if type(result) is RootCreationResultV1:
+        return RootCreationResultV1.model_validate(
+            {**result.model_dump(mode="python"), "outcome": "ADOPTED"}
+        )
+    if type(result) is RootCreationResultV2:
+        return RootCreationResultV2.model_validate(
+            {**result.model_dump(mode="python"), "outcome": "ADOPTED"}
+        )
+    raise TypeError("root creation adoption requires an exact result")
 
 
 def _root_creation_bundle_matches_request(
     bundle: RootCreationBundle,
     *,
-    root: RolloutRootV2,
+    root: RolloutRootV3,
     service_claim: ServiceClaimRecord,
     authority: EpochAuthorityRecord,
     lineage_anchor: CapabilityLineageAnchorV1,
     signed_evidence: SignedEvidenceEventV1,
-    creation_result: RootCreationResultV1,
+    creation_result: RootCreationResultV2,
 ) -> bool:
     return (
         bundle.root == StoredRecord(root, 0)
@@ -1952,6 +1988,130 @@ def _validate_promotion_replacement(
         valid = False
     if not valid:
         raise ValueError("promotion replacement is not a monotonic transition")
+
+
+def _validate_promotion_record_v2(
+    configured_target: TargetBinding,
+    command: PromotionCommandV2,
+    record: PromotionDispatchRecordV2,
+) -> None:
+    if type(command) is not PromotionCommandV2 or type(record) is not PromotionDispatchRecordV2:
+        raise TypeError("V2 promotion dispatch requires exact contracts")
+    command_sha256 = promotion_command_v2_sha256(command)
+    if (
+        record.target != configured_target
+        or record.command_sha256 != command_sha256
+        or record.dispatch_id != promotion_dispatch_v2_id(command_sha256)
+        or record.request_id != command.request_id
+        or record.idempotency_key != command.idempotency_key
+        or record.root_id != command.root_id
+        or record.root_sha256 != command.expected_root_sha256
+        or record.epoch != command.expected_epoch
+        or record.scheduled_at != command.scheduled_at
+        or record.source_receipt_sha256
+        != command.verified_apply_receipt.receipt_sha256
+        or record.health_chain_sha256
+        != command.health_chain_locator.health_chain_sha256
+    ):
+        raise ValueError("V2 promotion dispatch does not match its command")
+
+
+def _promotion_dispatch_identity_v2(
+    record: PromotionDispatchRecordV2,
+    kind: PromotionDispatchIdentityKind,
+) -> PromotionDispatchIdentityV2:
+    identity_value = (
+        record.request_id
+        if kind is PromotionDispatchIdentityKind.REQUEST
+        else record.idempotency_key
+    )
+    return PromotionDispatchIdentityV2(
+        schema_version=PROMOTION_DISPATCH_IDENTITY_V2,
+        identity_kind=kind,
+        identity_value=identity_value,
+        dispatch_id=record.dispatch_id,
+        command_sha256=record.command_sha256,
+        promotion_authorization_sha256=record.promotion_authorization_sha256,
+        capability_id=record.capability_id,
+        root_id=record.root_id,
+        root_sha256=record.root_sha256,
+        epoch=record.epoch,
+        scheduled_at=record.scheduled_at,
+        source_receipt_sha256=record.source_receipt_sha256,
+        health_chain_sha256=record.health_chain_sha256,
+        claimed_at=record.prepared_at,
+    )
+
+
+def _promotion_identity_matches_record_v2(
+    identity: PromotionDispatchIdentityV2,
+    record: PromotionDispatchRecordV2,
+    kind: PromotionDispatchIdentityKind,
+) -> bool:
+    return identity == _promotion_dispatch_identity_v2(record, kind)
+
+
+def _validate_promotion_replacement_v2(
+    configured_target: TargetBinding,
+    expected: StoredRecord[PromotionDispatchRecordV2],
+    replacement: PromotionDispatchRecordV2,
+) -> None:
+    if (
+        type(expected) is not StoredRecord
+        or type(expected.value) is not PromotionDispatchRecordV2
+        or type(replacement) is not PromotionDispatchRecordV2
+    ):
+        raise TypeError("V2 promotion compare-and-set requires exact records")
+    current = expected.value
+    if current.target != configured_target or replacement.target != configured_target:
+        raise ValueError("V2 promotion dispatch target does not match configuration")
+    immutable_fields = (
+        "schema_version",
+        "dispatch_id",
+        "command_sha256",
+        "promotion_authorization_sha256",
+        "capability_id",
+        "request_id",
+        "idempotency_key",
+        "target",
+        "root_id",
+        "root_sha256",
+        "epoch",
+        "scheduled_at",
+        "source_receipt_sha256",
+        "health_chain_sha256",
+        "task_sha256",
+        "task_name",
+        "task",
+        "prepared_at",
+    )
+    if any(getattr(current, field) != getattr(replacement, field) for field in immutable_fields):
+        raise ValueError("V2 promotion replacement changes an immutable binding")
+    terminal_states = {
+        PromotionDispatchState.CREATED,
+        PromotionDispatchState.DUPLICATE,
+        PromotionDispatchState.AMBIGUOUS,
+    }
+    if current.state is PromotionDispatchState.PREPARED:
+        valid = (
+            expected.revision == 0
+            and replacement.state is PromotionDispatchState.ENQUEUE_STARTED
+            and replacement.enqueue_started_at is not None
+            and replacement.terminal_at is None
+            and replacement.result is None
+        )
+    elif current.state is PromotionDispatchState.ENQUEUE_STARTED:
+        valid = (
+            expected.revision == 1
+            and replacement.state in terminal_states
+            and replacement.enqueue_started_at == current.enqueue_started_at
+            and replacement.terminal_at is not None
+            and replacement.result is not None
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("V2 promotion replacement is not a monotonic transition")
 
 
 class FirestoreAuthorityStore:
@@ -2236,6 +2396,81 @@ class FirestoreAuthorityStore:
             model_type=model_type,
         )
 
+    async def _transaction_read_content_addressed_root(
+        self,
+        transaction: _TransactionPort,
+        client: AsyncFirestoreAuthorityClientPort,
+        root_id: str,
+    ) -> _DecodedDocument[RolloutRootV2 | RolloutRootV3] | None:
+        v2_document_id = rollout_root_v2_document_id(root_id)
+        v3_document_id = rollout_root_v3_document_id(root_id)
+        v2 = await self._transaction_read(
+            transaction,
+            reference=self._reference(
+                client,
+                AuthorityStorageKind.ROLLOUT_ROOT_V2,
+                v2_document_id,
+            ),
+            kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+            logical_id=root_id,
+            document_id=v2_document_id,
+            model_type=RolloutRootV2,
+        )
+        v3 = await self._transaction_read(
+            transaction,
+            reference=self._reference(
+                client,
+                AuthorityStorageKind.ROLLOUT_ROOT_V3,
+                v3_document_id,
+            ),
+            kind=AuthorityStorageKind.ROLLOUT_ROOT_V3,
+            logical_id=root_id,
+            document_id=v3_document_id,
+            model_type=RolloutRootV3,
+        )
+        if v2 is not None and v3 is not None:
+            raise AuthorityStoreCorruptRecord
+        return cast(_DecodedDocument[RolloutRootV2 | RolloutRootV3] | None, v3 or v2)
+
+    async def _transaction_read_root_creation_result(
+        self,
+        transaction: _TransactionPort,
+        client: AsyncFirestoreAuthorityClientPort,
+        root_id: str,
+    ) -> _DecodedDocument[RootCreationResultV1 | RootCreationResultV2] | None:
+        v1_document_id = root_creation_result_document_id(root_id)
+        v2_document_id = root_creation_result_v2_document_id(root_id)
+        v1 = await self._transaction_read(
+            transaction,
+            reference=self._reference(
+                client,
+                AuthorityStorageKind.ROOT_CREATION_RESULT,
+                v1_document_id,
+            ),
+            kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
+            logical_id=root_id,
+            document_id=v1_document_id,
+            model_type=RootCreationResultV1,
+        )
+        v2 = await self._transaction_read(
+            transaction,
+            reference=self._reference(
+                client,
+                AuthorityStorageKind.ROOT_CREATION_RESULT_V2,
+                v2_document_id,
+            ),
+            kind=AuthorityStorageKind.ROOT_CREATION_RESULT_V2,
+            logical_id=root_id,
+            document_id=v2_document_id,
+            model_type=RootCreationResultV2,
+        )
+        if v1 is not None and v2 is not None:
+            raise AuthorityStoreCorruptRecord
+        return cast(
+            _DecodedDocument[RootCreationResultV1 | RootCreationResultV2] | None,
+            v2 or v1,
+        )
+
     async def _resolve_ambiguous(
         self,
         documents: tuple[_PreparedDocument[StrictContractModel], ...],
@@ -2487,12 +2722,12 @@ class FirestoreAuthorityStore:
 
     async def create_or_adopt_root_creation_bundle(
         self,
-        root: RolloutRootV2,
+        root: RolloutRootV3,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
         lineage_anchor: CapabilityLineageAnchorV1,
         signed_evidence: SignedEvidenceEventV1,
-        creation_result: RootCreationResultV1,
+        creation_result: RootCreationResultV2,
         *,
         expected_released_claim: StoredRecord[ServiceClaimRecord] | None = None,
     ) -> RootCreationWriteResult:
@@ -2507,9 +2742,9 @@ class FirestoreAuthorityStore:
             expected_released_claim,
         )
         root_document = _prepared_document(
-            kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
+            kind=AuthorityStorageKind.ROLLOUT_ROOT_V3,
             logical_id=root.root_id,
-            document_id=rollout_root_v2_document_id(root.root_id),
+            document_id=rollout_root_v3_document_id(root.root_id),
             revision=0,
             value=root,
         )
@@ -2548,9 +2783,9 @@ class FirestoreAuthorityStore:
             value=signed_evidence,
         )
         result_document = _prepared_document(
-            kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
+            kind=AuthorityStorageKind.ROOT_CREATION_RESULT_V2,
             logical_id=root.root_id,
-            document_id=root_creation_result_document_id(root.root_id),
+            document_id=root_creation_result_v2_document_id(root.root_id),
             revision=0,
             value=creation_result,
         )
@@ -2565,6 +2800,20 @@ class FirestoreAuthorityStore:
 
         async def create(transaction: _TransactionPort) -> None:
             client = await self._client()
+            existing_root = await self._transaction_read_content_addressed_root(
+                transaction,
+                client,
+                root.root_id,
+            )
+            existing_result = await self._transaction_read_root_creation_result(
+                transaction,
+                client,
+                root.root_id,
+            )
+            if (existing_root is None) != (existing_result is None):
+                raise AuthorityStoreCorruptRecord
+            if existing_root is not None:
+                raise _ExpectedStateMismatch
             if expected_released_claim is None:
                 for document in documents:
                     reference = self._reference(
@@ -2643,20 +2892,11 @@ class FirestoreAuthorityStore:
         async def read(transaction: _TransactionPort) -> None:
             nonlocal completed, decoded_bundle
             client = await self._client()
-            root_document_id = rollout_root_v2_document_id(root_id)
             authority_document_id = epoch_authority_document_id(root_id)
-            result_document_id = root_creation_result_document_id(root_id)
-            root = await self._transaction_read(
+            root = await self._transaction_read_content_addressed_root(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                    root_document_id,
-                ),
-                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                logical_id=root_id,
-                document_id=root_document_id,
-                model_type=RolloutRootV2,
+                client,
+                root_id,
             )
             authority = await self._transaction_read(
                 transaction,
@@ -2670,17 +2910,10 @@ class FirestoreAuthorityStore:
                 document_id=authority_document_id,
                 model_type=EpochAuthorityRecord,
             )
-            creation_result = await self._transaction_read(
+            creation_result = await self._transaction_read_root_creation_result(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROOT_CREATION_RESULT,
-                    result_document_id,
-                ),
-                kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
-                logical_id=root_id,
-                document_id=result_document_id,
-                model_type=RootCreationResultV1,
+                client,
+                root_id,
             )
             root_specific = (root, authority, creation_result)
             if all(record is None for record in root_specific):
@@ -2688,12 +2921,20 @@ class FirestoreAuthorityStore:
                 return
             if any(record is None for record in root_specific):
                 raise AuthorityStoreCorruptRecord
-            decoded_root = cast(_DecodedDocument[RolloutRootV2], root)
+            decoded_root = cast(
+                _DecodedDocument[RolloutRootV2 | RolloutRootV3],
+                root,
+            )
             decoded_authority = cast(_DecodedDocument[EpochAuthorityRecord], authority)
             decoded_result = cast(
-                _DecodedDocument[RootCreationResultV1],
+                _DecodedDocument[RootCreationResultV1 | RootCreationResultV2],
                 creation_result,
             )
+            if (type(decoded_root.value), type(decoded_result.value)) not in (
+                (RolloutRootV2, RootCreationResultV1),
+                (RolloutRootV3, RootCreationResultV2),
+            ):
+                raise AuthorityStoreCorruptRecord
             result = decoded_result.value
             claim_logical_id = service_claim_logical_id(self._target)
             claim_document_id = service_claim_document_id(self._target)
@@ -2777,20 +3018,11 @@ class FirestoreAuthorityStore:
             nonlocal decoded_state
             client = await self._client()
             root_id = command.root_id
-            root_document_id = rollout_root_v2_document_id(root_id)
             authority_document_id = epoch_authority_document_id(root_id)
-            creation_document_id = root_creation_result_document_id(root_id)
-            decoded_root = await self._transaction_read(
+            decoded_root = await self._transaction_read_content_addressed_root(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                    root_document_id,
-                ),
-                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                logical_id=root_id,
-                document_id=root_document_id,
-                model_type=RolloutRootV2,
+                client,
+                root_id,
             )
             decoded_authority = await self._transaction_read(
                 transaction,
@@ -2804,17 +3036,10 @@ class FirestoreAuthorityStore:
                 document_id=authority_document_id,
                 model_type=EpochAuthorityRecord,
             )
-            decoded_creation = await self._transaction_read(
+            decoded_creation = await self._transaction_read_root_creation_result(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROOT_CREATION_RESULT,
-                    creation_document_id,
-                ),
-                kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
-                logical_id=root_id,
-                document_id=creation_document_id,
-                model_type=RootCreationResultV1,
+                client,
+                root_id,
             )
             root_specific = (decoded_root, decoded_authority, decoded_creation)
             root_bundle: RootCreationBundle | None = None
@@ -2822,15 +3047,23 @@ class FirestoreAuthorityStore:
             if any(value is not None for value in root_specific):
                 if any(value is None for value in root_specific):
                     raise AuthorityStoreCorruptRecord
-                root_record = cast(_DecodedDocument[RolloutRootV2], decoded_root)
+                root_record = cast(
+                    _DecodedDocument[RolloutRootV2 | RolloutRootV3],
+                    decoded_root,
+                )
                 authority_record = cast(
                     _DecodedDocument[EpochAuthorityRecord],
                     decoded_authority,
                 )
                 creation_record = cast(
-                    _DecodedDocument[RootCreationResultV1],
+                    _DecodedDocument[RootCreationResultV1 | RootCreationResultV2],
                     decoded_creation,
                 )
+                if (type(root_record.value), type(creation_record.value)) not in (
+                    (RolloutRootV2, RootCreationResultV1),
+                    (RolloutRootV3, RootCreationResultV2),
+                ):
+                    raise AuthorityStoreCorruptRecord
                 creation = creation_record.value
                 claim_logical_id = service_claim_logical_id(self._target)
                 claim_document_id = service_claim_document_id(self._target)
@@ -3212,18 +3445,10 @@ class FirestoreAuthorityStore:
         async def write(transaction: _TransactionPort) -> None:
             client = await self._client()
             root_id = commit.progress.root_id
-            root_document_id = rollout_root_v2_document_id(root_id)
-            current_root = await self._transaction_read(
+            current_root = await self._transaction_read_content_addressed_root(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                    root_document_id,
-                ),
-                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                logical_id=root_id,
-                document_id=root_document_id,
-                model_type=RolloutRootV2,
+                client,
+                root_id,
             )
             current_claim = await self._transaction_read(
                 transaction,
@@ -3532,18 +3757,10 @@ class FirestoreAuthorityStore:
         async def write(transaction: _TransactionPort) -> None:
             client = await self._client()
             root_id = commit.result.root_id
-            root_document_id = rollout_root_v2_document_id(root_id)
-            current_root = await self._transaction_read(
+            current_root = await self._transaction_read_content_addressed_root(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                    root_document_id,
-                ),
-                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                logical_id=root_id,
-                document_id=root_document_id,
-                model_type=RolloutRootV2,
+                client,
+                root_id,
             )
             current_claim = await self._transaction_read(
                 transaction,
@@ -3895,20 +4112,11 @@ class FirestoreAuthorityStore:
             nonlocal decoded_state
             client = await self._client()
             root_id = command.root_id
-            root_document_id = rollout_root_v2_document_id(root_id)
             authority_document_id = epoch_authority_document_id(root_id)
-            creation_result_document_id = root_creation_result_document_id(root_id)
-            decoded_root = await self._transaction_read(
+            decoded_root = await self._transaction_read_content_addressed_root(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                    root_document_id,
-                ),
-                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                logical_id=root_id,
-                document_id=root_document_id,
-                model_type=RolloutRootV2,
+                client,
+                root_id,
             )
             decoded_authority = await self._transaction_read(
                 transaction,
@@ -3922,17 +4130,10 @@ class FirestoreAuthorityStore:
                 document_id=authority_document_id,
                 model_type=EpochAuthorityRecord,
             )
-            decoded_creation_result = await self._transaction_read(
+            decoded_creation_result = await self._transaction_read_root_creation_result(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROOT_CREATION_RESULT,
-                    creation_result_document_id,
-                ),
-                kind=AuthorityStorageKind.ROOT_CREATION_RESULT,
-                logical_id=root_id,
-                document_id=creation_result_document_id,
-                model_type=RootCreationResultV1,
+                client,
+                root_id,
             )
             root_specific = (
                 decoded_root,
@@ -3944,15 +4145,23 @@ class FirestoreAuthorityStore:
             if any(record is not None for record in root_specific):
                 if any(record is None for record in root_specific):
                     raise AuthorityStoreCorruptRecord
-                root_record = cast(_DecodedDocument[RolloutRootV2], decoded_root)
+                root_record = cast(
+                    _DecodedDocument[RolloutRootV2 | RolloutRootV3],
+                    decoded_root,
+                )
                 authority_record = cast(
                     _DecodedDocument[EpochAuthorityRecord],
                     decoded_authority,
                 )
                 creation_record = cast(
-                    _DecodedDocument[RootCreationResultV1],
+                    _DecodedDocument[RootCreationResultV1 | RootCreationResultV2],
                     decoded_creation_result,
                 )
+                if (type(root_record.value), type(creation_record.value)) not in (
+                    (RolloutRootV2, RootCreationResultV1),
+                    (RolloutRootV3, RootCreationResultV2),
+                ):
+                    raise AuthorityStoreCorruptRecord
                 creation = creation_record.value
                 claim_logical_id = service_claim_logical_id(self._target)
                 claim_document_id = service_claim_document_id(self._target)
@@ -4264,17 +4473,10 @@ class FirestoreAuthorityStore:
         async def write(transaction: _TransactionPort) -> None:
             client = await self._client()
             root_id = commit.result.root_id
-            current_root = await self._transaction_read(
+            current_root = await self._transaction_read_content_addressed_root(
                 transaction,
-                reference=self._reference(
-                    client,
-                    AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                    rollout_root_v2_document_id(root_id),
-                ),
-                kind=AuthorityStorageKind.ROLLOUT_ROOT_V2,
-                logical_id=root_id,
-                document_id=rollout_root_v2_document_id(root_id),
-                model_type=RolloutRootV2,
+                client,
+                root_id,
             )
             claim_logical_id = service_claim_logical_id(self._target)
             claim_document_id = service_claim_document_id(self._target)
@@ -5314,6 +5516,395 @@ class FirestoreAuthorityStore:
         return DirectPromotionEnqueueStart(
             dispatch=stored,
             permit=PromotionEnqueuePermit._from_direct_store_start(stored),
+        )
+
+    async def read_promotion_dispatch_v2(
+        self,
+        command: PromotionCommandV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2] | None:
+        """Read one V2 command's isolated identity ownership and exact dispatch."""
+
+        if type(command) is not PromotionCommandV2:
+            raise TypeError("V2 promotion dispatch read requires an exact command")
+        command_sha256 = promotion_command_v2_sha256(command)
+        dispatch_id = promotion_dispatch_v2_id(command_sha256)
+        request_logical_id = promotion_dispatch_identity_v2_logical_id(
+            PromotionDispatchIdentityKind.REQUEST.value,
+            command.request_id,
+        )
+        request_document_id = promotion_dispatch_identity_v2_document_id(
+            PromotionDispatchIdentityKind.REQUEST.value,
+            command.request_id,
+        )
+        idempotency_logical_id = promotion_dispatch_identity_v2_logical_id(
+            PromotionDispatchIdentityKind.IDEMPOTENCY.value,
+            command.idempotency_key,
+        )
+        idempotency_document_id = promotion_dispatch_identity_v2_document_id(
+            PromotionDispatchIdentityKind.IDEMPOTENCY.value,
+            command.idempotency_key,
+        )
+        dispatch_document_id = promotion_dispatch_v2_document_id(dispatch_id)
+        decoded_request: _DecodedDocument[PromotionDispatchIdentityV2] | None = None
+        decoded_idempotency: _DecodedDocument[PromotionDispatchIdentityV2] | None = None
+        decoded_dispatch: _DecodedDocument[PromotionDispatchRecordV2] | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal decoded_request, decoded_idempotency, decoded_dispatch
+            client = await self._client()
+            decoded_request = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                    request_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                logical_id=request_logical_id,
+                document_id=request_document_id,
+                model_type=PromotionDispatchIdentityV2,
+            )
+            decoded_idempotency = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                    idempotency_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                logical_id=idempotency_logical_id,
+                document_id=idempotency_document_id,
+                model_type=PromotionDispatchIdentityV2,
+            )
+            decoded_dispatch = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+                    dispatch_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+                logical_id=dispatch_id,
+                document_id=dispatch_document_id,
+                model_type=PromotionDispatchRecordV2,
+            )
+
+        await self._run_consistent_read(read)
+        source_sha256 = command.verified_apply_receipt.receipt_sha256
+
+        def matches_command(
+            decoded: _DecodedDocument[PromotionDispatchIdentityV2],
+            kind: PromotionDispatchIdentityKind,
+            value: str,
+        ) -> bool:
+            identity = decoded.value
+            return (
+                identity.identity_kind is kind
+                and identity.identity_value == value
+                and identity.dispatch_id == dispatch_id
+                and identity.command_sha256 == command_sha256
+                and identity.root_id == command.root_id
+                and identity.root_sha256 == command.expected_root_sha256
+                and identity.epoch == command.expected_epoch
+                and identity.scheduled_at == command.scheduled_at
+                and identity.source_receipt_sha256 == source_sha256
+                and identity.health_chain_sha256
+                == command.health_chain_locator.health_chain_sha256
+            )
+
+        request_conflicts = decoded_request is not None and not matches_command(
+            decoded_request,
+            PromotionDispatchIdentityKind.REQUEST,
+            command.request_id,
+        )
+        idempotency_conflicts = decoded_idempotency is not None and not matches_command(
+            decoded_idempotency,
+            PromotionDispatchIdentityKind.IDEMPOTENCY,
+            command.idempotency_key,
+        )
+        if request_conflicts or idempotency_conflicts:
+            if decoded_dispatch is not None:
+                raise AuthorityStoreCorruptRecord
+            raise AuthorityStoreConflict
+        if decoded_request is None and decoded_idempotency is None and decoded_dispatch is None:
+            return None
+        if decoded_request is None or decoded_idempotency is None or decoded_dispatch is None:
+            raise AuthorityStoreCorruptRecord
+        record = decoded_dispatch.value
+        try:
+            _validate_promotion_record_v2(self._target, command, record)
+            if not _promotion_identity_matches_record_v2(
+                decoded_request.value,
+                record,
+                PromotionDispatchIdentityKind.REQUEST,
+            ) or not _promotion_identity_matches_record_v2(
+                decoded_idempotency.value,
+                record,
+                PromotionDispatchIdentityKind.IDEMPOTENCY,
+            ):
+                raise ValueError("V2 promotion ownership does not match its dispatch")
+        except (TypeError, ValueError):
+            raise AuthorityStoreCorruptRecord from None
+        return decoded_dispatch.stored
+
+    async def prepare_or_adopt_promotion_dispatch_v2(
+        self,
+        command: PromotionCommandV2,
+        prepared: PromotionDispatchRecordV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2]:
+        """Reserve both V2 identities and persist the exact authorized task."""
+
+        _validate_promotion_record_v2(self._target, command, prepared)
+        if prepared.state is not PromotionDispatchState.PREPARED:
+            raise ValueError("V2 promotion preparation must be PREPARED")
+        request_identity = _promotion_dispatch_identity_v2(
+            prepared,
+            PromotionDispatchIdentityKind.REQUEST,
+        )
+        idempotency_identity = _promotion_dispatch_identity_v2(
+            prepared,
+            PromotionDispatchIdentityKind.IDEMPOTENCY,
+        )
+        request_logical_id = promotion_dispatch_identity_v2_logical_id(
+            request_identity.identity_kind.value,
+            request_identity.identity_value,
+        )
+        idempotency_logical_id = promotion_dispatch_identity_v2_logical_id(
+            idempotency_identity.identity_kind.value,
+            idempotency_identity.identity_value,
+        )
+        request_document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+            logical_id=request_logical_id,
+            document_id=promotion_dispatch_identity_v2_document_id(
+                request_identity.identity_kind.value,
+                request_identity.identity_value,
+            ),
+            revision=0,
+            value=request_identity,
+        )
+        idempotency_document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+            logical_id=idempotency_logical_id,
+            document_id=promotion_dispatch_identity_v2_document_id(
+                idempotency_identity.identity_kind.value,
+                idempotency_identity.identity_value,
+            ),
+            revision=0,
+            value=idempotency_identity,
+        )
+        dispatch_document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+            logical_id=prepared.dispatch_id,
+            document_id=promotion_dispatch_v2_document_id(prepared.dispatch_id),
+            revision=0,
+            value=prepared,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            request_document,
+            idempotency_document,
+            dispatch_document,
+        )
+
+        async def create(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            request_reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                request_document.document_id,
+            )
+            idempotency_reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                idempotency_document.document_id,
+            )
+            dispatch_reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+                dispatch_document.document_id,
+            )
+            existing_request = await self._transaction_read(
+                transaction,
+                reference=request_reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                logical_id=request_logical_id,
+                document_id=request_document.document_id,
+                model_type=PromotionDispatchIdentityV2,
+            )
+            existing_idempotency = await self._transaction_read(
+                transaction,
+                reference=idempotency_reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                logical_id=idempotency_logical_id,
+                document_id=idempotency_document.document_id,
+                model_type=PromotionDispatchIdentityV2,
+            )
+            existing_dispatch = await self._transaction_read(
+                transaction,
+                reference=dispatch_reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+                logical_id=prepared.dispatch_id,
+                document_id=dispatch_document.document_id,
+                model_type=PromotionDispatchRecordV2,
+            )
+            if any(
+                value is not None
+                for value in (existing_request, existing_idempotency, existing_dispatch)
+            ):
+                raise _ExpectedStateMismatch
+            transaction.create(
+                request_reference,
+                _document_data(request_document.wrapper),
+            )
+            transaction.create(
+                idempotency_reference,
+                _document_data(idempotency_document.wrapper),
+            )
+            transaction.create(
+                dispatch_reference,
+                _document_data(dispatch_document.wrapper),
+            )
+
+        try:
+            await self._run_transaction(documents, create)
+        except AuthorityStoreConflict:
+            adopted = await self.read_promotion_dispatch_v2(command)
+            if adopted is None:
+                raise AuthorityStoreOutcomeUnknown from None
+            return adopted
+        return _stored(dispatch_document)
+
+    async def _compare_and_set_promotion_dispatch_v2(
+        self,
+        expected: StoredRecord[PromotionDispatchRecordV2],
+        replacement: PromotionDispatchRecordV2,
+    ) -> tuple[
+        StoredRecord[PromotionDispatchRecordV2],
+        _TransactionCommitDisposition,
+    ]:
+        """Advance one V2 dispatch through its closed monotonic state machine."""
+
+        _validate_promotion_replacement_v2(self._target, expected, replacement)
+        current = expected.value
+        request_identity = _promotion_dispatch_identity_v2(
+            current,
+            PromotionDispatchIdentityKind.REQUEST,
+        )
+        idempotency_identity = _promotion_dispatch_identity_v2(
+            current,
+            PromotionDispatchIdentityKind.IDEMPOTENCY,
+        )
+        request_logical_id = promotion_dispatch_identity_v2_logical_id(
+            request_identity.identity_kind.value,
+            request_identity.identity_value,
+        )
+        idempotency_logical_id = promotion_dispatch_identity_v2_logical_id(
+            idempotency_identity.identity_kind.value,
+            idempotency_identity.identity_value,
+        )
+        document = _prepared_document(
+            kind=AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+            logical_id=replacement.dispatch_id,
+            document_id=promotion_dispatch_v2_document_id(replacement.dispatch_id),
+            revision=expected.revision + 1,
+            value=replacement,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (document,)
+
+        async def update(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            request_document_id = promotion_dispatch_identity_v2_document_id(
+                request_identity.identity_kind.value,
+                request_identity.identity_value,
+            )
+            idempotency_document_id = promotion_dispatch_identity_v2_document_id(
+                idempotency_identity.identity_kind.value,
+                idempotency_identity.identity_value,
+            )
+            decoded_request = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                    request_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                logical_id=request_logical_id,
+                document_id=request_document_id,
+                model_type=PromotionDispatchIdentityV2,
+            )
+            decoded_idempotency = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                    idempotency_document_id,
+                ),
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+                logical_id=idempotency_logical_id,
+                document_id=idempotency_document_id,
+                model_type=PromotionDispatchIdentityV2,
+            )
+            if (
+                decoded_request is None
+                or decoded_idempotency is None
+                or decoded_request.value != request_identity
+                or decoded_idempotency.value != idempotency_identity
+            ):
+                raise AuthorityStoreCorruptRecord
+            reference = self._reference(
+                client,
+                AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+                document.document_id,
+            )
+            decoded_current = await self._transaction_read(
+                transaction,
+                reference=reference,
+                kind=AuthorityStorageKind.PROMOTION_DISPATCH_V2,
+                logical_id=current.dispatch_id,
+                document_id=document.document_id,
+                model_type=PromotionDispatchRecordV2,
+            )
+            if decoded_current is None or decoded_current.stored != expected:
+                raise _ExpectedStateMismatch
+            transaction.update(reference, _document_data(document.wrapper))
+
+        disposition = await self._run_transaction(documents, update)
+        return _stored(document), disposition
+
+    async def compare_and_set_promotion_dispatch_v2(
+        self,
+        expected: StoredRecord[PromotionDispatchRecordV2],
+        replacement: PromotionDispatchRecordV2,
+    ) -> StoredRecord[PromotionDispatchRecordV2]:
+        """Commit one non-dispatching V2 promotion state transition."""
+
+        if replacement.state is PromotionDispatchState.ENQUEUE_STARTED:
+            raise ValueError("V2 promotion enqueue starts require direct confirmation")
+        stored, _ = await self._compare_and_set_promotion_dispatch_v2(
+            expected,
+            replacement,
+        )
+        return stored
+
+    async def begin_promotion_enqueue_v2(
+        self,
+        expected: StoredRecord[PromotionDispatchRecordV2],
+        replacement: PromotionDispatchRecordV2,
+    ) -> DirectPromotionEnqueueStartV2:
+        """Issue V2 enqueue authority only for a directly confirmed start CAS."""
+
+        if replacement.state is not PromotionDispatchState.ENQUEUE_STARTED:
+            raise ValueError("V2 promotion enqueue start requires ENQUEUE_STARTED")
+        stored, disposition = await self._compare_and_set_promotion_dispatch_v2(
+            expected,
+            replacement,
+        )
+        if disposition is not _TransactionCommitDisposition.DIRECT_CONFIRMED:
+            raise AuthorityStoreOutcomeUnknown
+        return DirectPromotionEnqueueStartV2(
+            dispatch=stored,
+            permit=PromotionEnqueuePermitV2._from_direct_store_start(stored),
         )
 
     async def read_receipt(

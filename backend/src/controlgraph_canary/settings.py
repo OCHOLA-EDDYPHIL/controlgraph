@@ -62,6 +62,7 @@ API_ROOT_ENVIRONMENT_KEYS = (
 
 ISSUER_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
+    "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
     "CONTROLGRAPH_SIGNING_ALGORITHM",
 )
 
@@ -255,6 +256,7 @@ class ControllerSettings:
             ServiceRole.EVIDENCE_WRITER,
             ServiceRole.COORDINATOR,
             ServiceRole.VERIFIER,
+            ServiceRole.ISSUER,
         }:
             evidence_key_version = source["CONTROLGRAPH_EVIDENCE_KEY_VERSION"].strip()
             expected_key_version = re.compile(
