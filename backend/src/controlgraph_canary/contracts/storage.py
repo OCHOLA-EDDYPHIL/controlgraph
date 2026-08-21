@@ -37,7 +37,9 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionDispatchIdentityKind,
     PromotionDispatchIdentityV1,
+    PromotionDispatchIdentityV2,
     PromotionDispatchRecordV1,
+    PromotionDispatchRecordV2,
     PromotionDispatchState,
 )
 from controlgraph_canary.contracts.revocation import (
@@ -48,7 +50,9 @@ from controlgraph_canary.contracts.revocation import (
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
+    RolloutRootV3,
     RootCreationResultV1,
+    RootCreationResultV2,
     SignedEvidenceEventV1,
 )
 
@@ -57,6 +61,9 @@ AUTHORITY_STORAGE_DOCUMENT_V1: Final = "controlgraph.authority-storage-document/
 FIRESTORE_DOCUMENT_ID_DOMAIN: Final = b"controlgraph.firestore-document-id/v1\0"
 _PROMOTION_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
     b"controlgraph.promotion-dispatch-identity-logical-id/v1\0"
+)
+_PROMOTION_V2_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
+    b"controlgraph.promotion-dispatch-identity-logical-id/v2\0"
 )
 SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1: Final = "controlgraph.service-claim-terminal-root-proof/v1"
 SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1: Final = (
@@ -435,17 +442,82 @@ def active_service_claim_matches_root_v2(
     )
 
 
+def service_claim_matches_root_v3(
+    claim: ServiceClaimRecord,
+    root: RolloutRootV3,
+    *,
+    stable_target_configuration_sha256: str,
+    candidate_target_configuration_sha256: str,
+) -> bool:
+    """Return whether one claim exactly binds a V3 rollout root."""
+
+    if type(claim) is not ServiceClaimRecord or type(root) is not RolloutRootV3:
+        return False
+    if any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (
+            stable_target_configuration_sha256,
+            candidate_target_configuration_sha256,
+        )
+    ):
+        return False
+    content = root.content
+    snapshot = content.stable_snapshot
+    plan = content.rollout_plan
+    expected_reader = f"controlgraph-verifier@{content.target.project_id}.iam.gserviceaccount.com"
+    return (
+        claim.target == content.target
+        and claim.root_id == root.root_id
+        and claim.root_sha256 == root.root_sha256
+        and claim.stable_revision == plan.stable_revision
+        and claim.candidate_revision == plan.candidate_revision
+        and claim.initial_epoch == plan.initial_epoch
+        and claim.baseline_service_generation == snapshot.service_generation
+        and claim.baseline_configuration_sha256 == snapshot.configuration_sha256
+        and claim.baseline_revision_configuration_sha256
+        == plan.stable_revision_configuration_sha256
+        and claim.candidate_revision_configuration_sha256
+        == plan.candidate_revision_configuration_sha256
+        and claim.stable_target_configuration_sha256 == stable_target_configuration_sha256
+        and claim.candidate_target_configuration_sha256 == candidate_target_configuration_sha256
+        and claim.operator_owner == content.approved_by
+        and claim.workload_creator == "controlgraph.api/v1"
+        and claim.terminal_release_condition == SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+        and snapshot.captured_by == expected_reader
+        and snapshot.captured_at <= content.approved_at <= claim.claimed_at
+    )
+
+
+def active_service_claim_matches_root_v3(
+    claim: ServiceClaimRecord,
+    root: RolloutRootV3,
+    *,
+    stable_target_configuration_sha256: str,
+    candidate_target_configuration_sha256: str,
+) -> bool:
+    """Return whether one active claim exactly binds a V3 root."""
+
+    return claim.status is ServiceClaimStatus.ACTIVE and service_claim_matches_root_v3(
+        claim,
+        root,
+        stable_target_configuration_sha256=stable_target_configuration_sha256,
+        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+    )
+
+
 class AuthorityStorageKind(StrEnum):
     """Closed Firestore record families used by the authority database."""
 
     ROLLOUT_ROOT = "controlgraph-rollout-roots-v1"
     ROLLOUT_ROOT_V2 = "controlgraph-rollout-roots-v2"
+    ROLLOUT_ROOT_V3 = "controlgraph-rollout-roots-v3"
     SERVICE_CLAIM = "controlgraph-service-claims-v1"
     EPOCH_AUTHORITY = "controlgraph-epoch-authorities-v1"
     EXECUTION_RECEIPT = "controlgraph-execution-receipts-v1"
     CAPABILITY_LINEAGE_ANCHOR = "controlgraph-capability-lineage-anchors-v1"
     SIGNED_EVIDENCE_EVENT = "controlgraph-signed-evidence-events-v1"
     ROOT_CREATION_RESULT = "controlgraph-root-creation-results-v1"
+    ROOT_CREATION_RESULT_V2 = "controlgraph-root-creation-results-v2"
     EVIDENCE_CHAIN_HEAD = "controlgraph-evidence-chain-heads-v1"
     EPOCH_REVOCATION_IDENTITY = "controlgraph-epoch-revocation-identities-v1"
     EPOCH_REVOCATION_RESULT = "controlgraph-epoch-revocation-results-v1"
@@ -455,6 +527,8 @@ class AuthorityStorageKind(StrEnum):
     SERVICE_CLAIM_RELEASE_RESULT = "controlgraph-service-claim-release-results-v1"
     PROMOTION_DISPATCH_IDENTITY = "controlgraph-promotion-dispatch-identities-v1"
     PROMOTION_DISPATCH = "controlgraph-promotion-dispatches-v1"
+    PROMOTION_DISPATCH_IDENTITY_V2 = "controlgraph-promotion-dispatch-identities-v2"
+    PROMOTION_DISPATCH_V2 = "controlgraph-promotion-dispatches-v2"
 
 
 class AuthorityStorageDocument(StrictContractModel):
@@ -475,6 +549,8 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = RolloutRoot
         elif self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT_V2:
             model_type = RolloutRootV2
+        elif self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT_V3:
+            model_type = RolloutRootV3
         elif self.record_kind is AuthorityStorageKind.SERVICE_CLAIM:
             model_type = ServiceClaimRecord
         elif self.record_kind is AuthorityStorageKind.EPOCH_AUTHORITY:
@@ -487,6 +563,8 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = SignedEvidenceEventV1
         elif self.record_kind is AuthorityStorageKind.ROOT_CREATION_RESULT:
             model_type = RootCreationResultV1
+        elif self.record_kind is AuthorityStorageKind.ROOT_CREATION_RESULT_V2:
+            model_type = RootCreationResultV2
         elif self.record_kind is AuthorityStorageKind.EVIDENCE_CHAIN_HEAD:
             model_type = EvidenceChainHeadV1
         elif self.record_kind is AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY:
@@ -499,6 +577,10 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = PromotionDispatchIdentityV1
         elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH:
             model_type = PromotionDispatchRecordV1
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2:
+            model_type = PromotionDispatchIdentityV2
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_V2:
+            model_type = PromotionDispatchRecordV2
         else:
             from controlgraph_canary.contracts.service_claim_release import (
                 ServiceClaimReleaseIdentityV1,
@@ -527,9 +609,11 @@ class AuthorityStorageDocument(StrictContractModel):
         immutable_kinds = {
             AuthorityStorageKind.ROLLOUT_ROOT,
             AuthorityStorageKind.ROLLOUT_ROOT_V2,
+            AuthorityStorageKind.ROLLOUT_ROOT_V3,
             AuthorityStorageKind.CAPABILITY_LINEAGE_ANCHOR,
             AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
             AuthorityStorageKind.ROOT_CREATION_RESULT,
+            AuthorityStorageKind.ROOT_CREATION_RESULT_V2,
             AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
             AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
             AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
@@ -537,6 +621,7 @@ class AuthorityStorageDocument(StrictContractModel):
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
             AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
+            AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
         }
         if self.record_kind in immutable_kinds and self.revision != 0:
             raise ValueError("immutable authority record must remain at revision zero")
@@ -574,8 +659,11 @@ class AuthorityStorageDocument(StrictContractModel):
             )
         elif self.record_kind is AuthorityStorageKind.SIGNED_EVIDENCE_EVENT:
             expected_logical_id = cast(SignedEvidenceEventV1, payload).event.evidence_id
-        elif self.record_kind is AuthorityStorageKind.ROOT_CREATION_RESULT:
-            result = cast(RootCreationResultV1, payload)
+        elif self.record_kind in {
+            AuthorityStorageKind.ROOT_CREATION_RESULT,
+            AuthorityStorageKind.ROOT_CREATION_RESULT_V2,
+        }:
+            result = cast(RootCreationResultV1 | RootCreationResultV2, payload)
             if result.outcome != "CREATED":
                 raise ValueError("persisted root creation result must identify the winner")
             expected_logical_id = result.root.root_id
@@ -597,6 +685,12 @@ class AuthorityStorageDocument(StrictContractModel):
                 promotion_identity.identity_kind.value,
                 promotion_identity.identity_value,
             )
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2:
+            promotion_identity_v2 = cast(PromotionDispatchIdentityV2, payload)
+            expected_logical_id = promotion_dispatch_identity_v2_logical_id(
+                promotion_identity_v2.identity_kind.value,
+                promotion_identity_v2.identity_value,
+            )
         elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH:
             dispatch = cast(PromotionDispatchRecordV1, payload)
             expected_revision = {
@@ -609,6 +703,18 @@ class AuthorityStorageDocument(StrictContractModel):
             if self.revision != expected_revision:
                 raise ValueError("promotion dispatch state and storage revision do not match")
             expected_logical_id = dispatch.dispatch_id
+        elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_V2:
+            dispatch_v2 = cast(PromotionDispatchRecordV2, payload)
+            expected_revision = {
+                PromotionDispatchState.PREPARED: 0,
+                PromotionDispatchState.ENQUEUE_STARTED: 1,
+                PromotionDispatchState.CREATED: 2,
+                PromotionDispatchState.DUPLICATE: 2,
+                PromotionDispatchState.AMBIGUOUS: 2,
+            }[dispatch_v2.state]
+            if self.revision != expected_revision:
+                raise ValueError("V2 promotion state and storage revision do not match")
+            expected_logical_id = dispatch_v2.dispatch_id
         elif self.record_kind in {
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
@@ -638,7 +744,7 @@ class AuthorityStorageDocument(StrictContractModel):
                 ).result_id
         else:
             expected_logical_id = cast(
-                RolloutRoot | RolloutRootV2 | EpochAuthorityRecord,
+                RolloutRoot | RolloutRootV2 | RolloutRootV3 | EpochAuthorityRecord,
                 payload,
             ).root_id
         if self.logical_id != expected_logical_id:
@@ -672,6 +778,12 @@ def rollout_root_v2_document_id(root_id: str) -> str:
     """Return the domain-separated document ID for one v2 rollout root."""
 
     return _document_id(AuthorityStorageKind.ROLLOUT_ROOT_V2, root_id)
+
+
+def rollout_root_v3_document_id(root_id: str) -> str:
+    """Return the domain-separated document ID for one v3 rollout root."""
+
+    return _document_id(AuthorityStorageKind.ROLLOUT_ROOT_V3, root_id)
 
 
 def service_claim_logical_id(target: TargetBinding) -> str:
@@ -720,6 +832,12 @@ def root_creation_result_document_id(root_id: str) -> str:
     """Return the domain-separated document ID for one root creation winner."""
 
     return _document_id(AuthorityStorageKind.ROOT_CREATION_RESULT, root_id)
+
+
+def root_creation_result_v2_document_id(root_id: str) -> str:
+    """Return the domain-separated document ID for one V2 creation result."""
+
+    return _document_id(AuthorityStorageKind.ROOT_CREATION_RESULT_V2, root_id)
 
 
 def evidence_chain_head_document_id(root_id: str) -> str:
@@ -822,6 +940,39 @@ def promotion_dispatch_document_id(dispatch_id: str) -> str:
     return _document_id(AuthorityStorageKind.PROMOTION_DISPATCH, dispatch_id)
 
 
+def promotion_dispatch_identity_v2_logical_id(kind: str, identity_value: str) -> str:
+    """Return the isolated collision domain for one V2 promotion identity."""
+
+    if kind not in {
+        PromotionDispatchIdentityKind.REQUEST.value,
+        PromotionDispatchIdentityKind.IDEMPOTENCY.value,
+    }:
+        raise ValueError("V2 promotion dispatch identity kind is invalid")
+    identity = _LogicalIdentity(value=identity_value).value
+    digest = hashlib.sha256(
+        _PROMOTION_V2_IDENTITY_LOGICAL_ID_DOMAIN
+        + kind.encode("ascii")
+        + b"\0"
+        + identity.encode("ascii")
+    ).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def promotion_dispatch_identity_v2_document_id(kind: str, identity_value: str) -> str:
+    """Return the immutable document ID for one V2 promotion identity claim."""
+
+    return _document_id(
+        AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
+        promotion_dispatch_identity_v2_logical_id(kind, identity_value),
+    )
+
+
+def promotion_dispatch_v2_document_id(dispatch_id: str) -> str:
+    """Return the document ID for one monotonic V2 promotion dispatch."""
+
+    return _document_id(AuthorityStorageKind.PROMOTION_DISPATCH_V2, dispatch_id)
+
+
 def execution_receipt_logical_id(target: TargetBinding, idempotency_key: str) -> str:
     """Return one target-bound claim identity for an idempotency key."""
 
@@ -864,6 +1015,7 @@ __all__ = [
     "ServiceClaimTerminalRootState",
     "active_service_claim_matches_root",
     "active_service_claim_matches_root_v2",
+    "active_service_claim_matches_root_v3",
     "capability_lineage_anchor_document_id",
     "capability_lineage_anchor_logical_id",
     "epoch_authority_document_id",
@@ -877,13 +1029,19 @@ __all__ = [
     "promotion_dispatch_document_id",
     "promotion_dispatch_identity_document_id",
     "promotion_dispatch_identity_logical_id",
+    "promotion_dispatch_identity_v2_document_id",
+    "promotion_dispatch_identity_v2_logical_id",
+    "promotion_dispatch_v2_document_id",
     "rollout_root_document_id",
     "rollout_root_v2_document_id",
+    "rollout_root_v3_document_id",
     "root_creation_result_document_id",
+    "root_creation_result_v2_document_id",
     "service_claim_document_id",
     "service_claim_logical_id",
     "service_claim_matches_root",
     "service_claim_matches_root_v2",
+    "service_claim_matches_root_v3",
     "service_claim_release_identity_document_id",
     "service_claim_release_identity_logical_id",
     "service_claim_release_progress_document_id",

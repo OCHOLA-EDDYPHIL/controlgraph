@@ -20,6 +20,7 @@ from controlgraph_canary.application.candidate_revision import (
 )
 from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
+    HEALTH_ATTESTATION_PATH,
     RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     CallerRole,
@@ -165,7 +166,11 @@ class CoordinatorInternalRoute:
             or (
                 self.override_path is not None
                 and self.override_path
-                not in {RECEIPT_AUTHORITY_PATH, CLASSIFICATION_EVIDENCE_PATH}
+                not in {
+                    RECEIPT_AUTHORITY_PATH,
+                    CLASSIFICATION_EVIDENCE_PATH,
+                    HEALTH_ATTESTATION_PATH,
+                }
             )
             or (
                 self.override_path == RECEIPT_AUTHORITY_PATH
@@ -178,14 +183,16 @@ class CoordinatorInternalRoute:
                 and self.override_path != RECEIPT_AUTHORITY_PATH
             )
             or (
-                self.override_path == CLASSIFICATION_EVIDENCE_PATH
+                self.override_path
+                in {CLASSIFICATION_EVIDENCE_PATH, HEALTH_ATTESTATION_PATH}
                 and (self.caller_role, self.service_role)
                 != (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER)
             )
             or (
                 (self.caller_role, self.service_role)
                 == (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER)
-                and self.override_path != CLASSIFICATION_EVIDENCE_PATH
+                and self.override_path
+                not in {CLASSIFICATION_EVIDENCE_PATH, HEALTH_ATTESTATION_PATH}
             )
         ):
             raise ValueError("coordinator internal route coordinates are invalid")

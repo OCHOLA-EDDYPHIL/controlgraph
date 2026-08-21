@@ -10,8 +10,14 @@ from typing import Final
 
 from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 from controlgraph_canary.contracts.codec import RestrictedJson, canonical_json_value_bytes
-from controlgraph_canary.contracts.models import MutationIntent, RolloutRoot, TargetBinding
-from controlgraph_canary.contracts.root_creation import RolloutRootV2
+from controlgraph_canary.contracts.models import (
+    CapabilityAction,
+    MutationIntent,
+    RolloutRoot,
+    TargetBinding,
+)
+from controlgraph_canary.contracts.promotion_execution import PromotionMutationIntentV2
+from controlgraph_canary.contracts.root_creation import RolloutRootV2, RolloutRootV3
 
 TARGET_CONFIGURATION_DOMAIN: Final = b"controlgraph.target-configuration-sha256/v1\0"
 TARGET_CONFIGURATION_V1: Final = "controlgraph.target-configuration/v1"
@@ -21,6 +27,7 @@ CLOUD_RUN_REVISION_CONFIGURATION_DOMAIN: Final = (
 CLOUD_RUN_REVISION_CONFIGURATION_V1: Final = (
     "controlgraph.cloud-run-revision-configuration/v1"
 )
+type TargetMutationIntent = MutationIntent | PromotionMutationIntentV2
 _CLOUD_RUN_NAME: Final = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _OPAQUE_TOKEN: Final = re.compile(
     r'^(?:[A-Za-z0-9._~:/+=-]+|"[A-Za-z0-9._~:/+=-]+")$'
@@ -381,17 +388,24 @@ class TargetConfigurationProjection:
 
 
 def target_configuration_projection(
-    intent: MutationIntent,
+    intent: TargetMutationIntent,
     *,
     expected_concurrency: int,
 ) -> TargetConfigurationProjection:
     """Project only the exact poststate fields shared by receipts and readback."""
 
-    if type(intent) is not MutationIntent:
+    if type(intent) not in (MutationIntent, PromotionMutationIntentV2):
         raise TypeError("an exact mutation intent is required")
     if intent.concurrency is not None and intent.concurrency != expected_concurrency:
         raise ValueError("mutation intent concurrency does not match the expected concurrency")
-    return TargetConfigurationProjection(
+    if type(intent) is PromotionMutationIntentV2 and (
+        intent.action is not CapabilityAction.PROMOTE_CANDIDATE
+        or intent.stable_percent != 0
+        or intent.candidate_percent != 100
+        or intent.concurrency is not None
+    ):
+        raise ValueError("V2 promotion intent does not describe exact candidate traffic")
+    projected = TargetConfigurationProjection(
         target=intent.target,
         stable_revision=intent.stable_revision,
         candidate_revision=intent.candidate_revision,
@@ -399,10 +413,17 @@ def target_configuration_projection(
         candidate_percent=intent.candidate_percent,
         concurrency=expected_concurrency,
     )
+    if (
+        type(intent) is PromotionMutationIntentV2
+        and target_configuration_projection_sha256(projected)
+        != intent.desired_poststate_sha256
+    ):
+        raise ValueError("V2 promotion intent does not bind its desired poststate")
+    return projected
 
 
 def target_configuration_sha256(
-    intent: MutationIntent,
+    intent: TargetMutationIntent,
     *,
     expected_concurrency: int,
 ) -> str:
@@ -468,6 +489,29 @@ def rollout_root_v2_target_configuration_sha256(
 
     if type(root) is not RolloutRootV2:
         raise TypeError("an exact v2 rollout root is required")
+    plan = root.content.rollout_plan
+    return target_configuration_projection_sha256(
+        TargetConfigurationProjection(
+            target=root.content.target,
+            stable_revision=plan.stable_revision,
+            candidate_revision=plan.candidate_revision,
+            stable_percent=stable_percent,
+            candidate_percent=candidate_percent,
+            concurrency=plan.concurrency,
+        )
+    )
+
+
+def rollout_root_v3_target_configuration_sha256(
+    root: RolloutRootV3,
+    *,
+    stable_percent: int,
+    candidate_percent: int,
+) -> str:
+    """Hash one V3 root-bound target traffic state without provider types."""
+
+    if type(root) is not RolloutRootV3:
+        raise TypeError("an exact V3 rollout root is required")
     plan = root.content.rollout_plan
     return target_configuration_projection_sha256(
         TargetConfigurationProjection(
@@ -806,9 +850,11 @@ __all__ = [
     "CloudRunVpcEgress",
     "DeclaredRevision",
     "TargetConfigurationProjection",
+    "TargetMutationIntent",
     "cloud_run_revision_configuration_sha256",
     "rollout_root_target_configuration_sha256",
     "rollout_root_v2_target_configuration_sha256",
+    "rollout_root_v3_target_configuration_sha256",
     "target_configuration_projection",
     "target_configuration_projection_sha256",
     "target_configuration_sha256",

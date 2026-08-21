@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records, root_v2_target
+from root_v2_test_data import PROJECT_NUMBER, make_root_v3_records, root_v2_target
 from test_m2_firestore_authority_store import (
     _FakeClient,
     _FakeTransactionRunner,
@@ -149,7 +149,7 @@ def _principal() -> AuthenticationContext:
 
 
 def _invocation() -> ServiceClaimReleaseInvocationV1:
-    records = make_root_v2_records()
+    records = make_root_v3_records()
     principal = _principal()
     return ServiceClaimReleaseInvocationV1(
         schema_version=SERVICE_CLAIM_RELEASE_INVOCATION_V1,
@@ -174,7 +174,7 @@ def _invocation() -> ServiceClaimReleaseInvocationV1:
 
 
 def _root_bundle() -> RootCreationBundle:
-    records = make_root_v2_records()
+    records = make_root_v3_records()
     return RootCreationBundle(
         root=StoredRecord(records.root, 0),
         service_claim=StoredRecord(records.service_claim, 0),
@@ -315,7 +315,7 @@ async def _created_firestore_release_stores() -> tuple[
     runner = _FakeTransactionRunner()
     first = _firestore_store(client, runner)
     second = _firestore_store(client, runner)
-    records = make_root_v2_records()
+    records = make_root_v3_records()
     await first.create_or_adopt_root_creation_bundle(
         records.root,
         records.service_claim,
@@ -334,7 +334,7 @@ def _firestore_releaser(
     evidence: _EvidenceClient | None = None,
     classification: _ClassificationClient | None = None,
 ) -> ServiceClaimReleaser:
-    key = make_root_v2_records().root.content.evidence_signing_key_version
+    key = make_root_v3_records().root.content.evidence_signing_key_version
     return ServiceClaimReleaser(
         store=store,
         evidence_client=evidence or _EvidenceClient(key),
@@ -591,7 +591,7 @@ def _releaser(
     *,
     classification: _ClassificationClient | None = None,
 ) -> tuple[ServiceClaimReleaser, _EvidenceClient, _ClassificationClient]:
-    key = make_root_v2_records().root.content.evidence_signing_key_version
+    key = make_root_v3_records().root.content.evidence_signing_key_version
     evidence = _EvidenceClient(key)
     selected_classification = classification or _ClassificationClient(key)
     times = iter((NOW, NOW + timedelta(seconds=2)))
@@ -666,7 +666,7 @@ def test_durable_release_replay_reverifies_every_bound_evidence_envelope(
         "release": expected.release_evidence_id,
     }
     verifier = _EvidenceClient(
-        make_root_v2_records().root.content.evidence_signing_key_version
+        make_root_v3_records().root.content.evidence_signing_key_version
     )
     if invalid_kind is not None:
         verifier.invalid_evidence_id = evidence_ids[invalid_kind]
@@ -988,7 +988,7 @@ def test_existing_identity_without_exact_progress_blocks_silent_takeover() -> No
 def test_classification_failure_leaves_durable_fence_without_final_release() -> None:
     invocation = _invocation()
     store = _Store(invocation)
-    key = make_root_v2_records().root.content.evidence_signing_key_version
+    key = make_root_v3_records().root.content.evidence_signing_key_version
     classification = _ClassificationClient(key)
     classification.error = RuntimeError("provider details must not escape")
     releaser, _, _ = _releaser(store, classification=classification)
@@ -1015,7 +1015,7 @@ def test_fenced_release_requires_exact_immediate_successor_ancestry(
     async def scenario() -> None:
         invocation = _invocation()
         store = _Store(invocation)
-        key = make_root_v2_records().root.content.evidence_signing_key_version
+        key = make_root_v3_records().root.content.evidence_signing_key_version
         evidence = _EvidenceClient(key)
         classification = _ClassificationClient(key)
         releaser = ServiceClaimReleaser(
@@ -1245,7 +1245,7 @@ def test_firestore_finalize_appends_after_interleaved_head_and_rechecks_predeces
     async def scenario() -> None:
         store, _, client = await _created_firestore_release_stores()
         invocation = _invocation()
-        key = make_root_v2_records().root.content.evidence_signing_key_version
+        key = make_root_v3_records().root.content.evidence_signing_key_version
         releaser = _firestore_releaser(
             store,
             evidence=_EvidenceClient(key),
@@ -1381,7 +1381,7 @@ def test_firestore_separate_instances_have_one_fence_and_finalize_winner() -> No
         first, second, _ = await _created_firestore_release_stores()
         invocation = _invocation()
         initial = await first.read_service_claim_release_state(invocation)
-        key = make_root_v2_records().root.content.evidence_signing_key_version
+        key = make_root_v3_records().root.content.evidence_signing_key_version
         first_releaser = _firestore_releaser(
             first,
             evidence=_EvidenceClient(key, b"coordinator-instance-a"),
@@ -1464,7 +1464,7 @@ def test_firestore_classification_failure_retains_the_exact_fence(
     async def scenario() -> None:
         store, _, _ = await _created_firestore_release_stores()
         invocation = _invocation()
-        key = make_root_v2_records().root.content.evidence_signing_key_version
+        key = make_root_v3_records().root.content.evidence_signing_key_version
         classification = _ClassificationClient(key)
         classification.error = classification_error
         releaser = _firestore_releaser(store, classification=classification)

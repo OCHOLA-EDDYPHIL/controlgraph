@@ -19,7 +19,15 @@ from controlgraph_canary.application.authority_store import (
 )
 from controlgraph_canary.application.cloud_run import (
     rollout_root_v2_target_configuration_sha256,
+    rollout_root_v3_target_configuration_sha256,
 )
+from controlgraph_canary.application.health_orchestration import (
+    HealthAttestationVerifier,
+    HealthOrchestrationError,
+    HealthOrchestrationErrorCode,
+    verify_healthy_promotion_chain,
+)
+from controlgraph_canary.application.promotion_store import PromotionHealthChainReader
 from controlgraph_canary.application.root_authority import (
     RootAuthorityBundleReader,
     TrustedRootAuthority,
@@ -52,6 +60,7 @@ from controlgraph_canary.contracts.codec import (
     canonical_json_value_bytes,
     canonical_sha256,
 )
+from controlgraph_canary.contracts.health_execution import SignedHealthDecisionChainV1
 from controlgraph_canary.contracts.models import (
     CAPABILITY_CLAIMS_V1,
     SIGNED_CAPABILITY_V1,
@@ -64,11 +73,15 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
 )
 from controlgraph_canary.contracts.promotion_execution import (
+    PromotionAuthorizationV1,
     VerifiedApplyReceiptLocatorV1,
+    create_promotion_authorization,
+    promotion_capability_id,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
+    RolloutRootV3,
 )
 from controlgraph_canary.contracts.storage import (
     ServiceClaimStatus,
@@ -182,8 +195,8 @@ class CapabilityIssuanceRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class PromotionCapabilityIssuanceRequest:
-    """Root preconditions and exact verified canary receipt selected for promotion."""
+class PromotionCapabilityIssuanceRequestV2:
+    """Health-authorized root preconditions selected for current promotion."""
 
     root_id: str
     expected_root_sha256: str
@@ -192,6 +205,7 @@ class PromotionCapabilityIssuanceRequest:
     idempotency_key: str
     scheduled_at: str
     verified_apply_receipt: VerifiedApplyReceiptLocatorV1
+    authorization: PromotionAuthorizationV1
 
     def __post_init__(self) -> None:
         _validate_identifier("root_id", self.root_id)
@@ -212,6 +226,19 @@ class PromotionCapabilityIssuanceRequest:
         validate_utc_second(self.scheduled_at)
         if type(self.verified_apply_receipt) is not VerifiedApplyReceiptLocatorV1:
             raise ValueError("verified_apply_receipt is invalid")
+        if type(self.authorization) is not PromotionAuthorizationV1:
+            raise ValueError("promotion authorization is invalid")
+        authorization = self.authorization
+        if (
+            self.root_id != authorization.root_id
+            or self.expected_root_sha256 != authorization.root_sha256
+            or self.expected_epoch != authorization.epoch
+            or self.request_id != authorization.request_id
+            or self.idempotency_key != authorization.idempotency_key
+            or self.scheduled_at != authorization.scheduled_at
+            or self.verified_apply_receipt != authorization.verified_apply_receipt
+        ):
+            raise ValueError("promotion request does not match its authorization")
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,7 +372,7 @@ class TrustBundleCapabilityVerifier:
 @dataclass(frozen=True, slots=True)
 class _TrustedIssuanceState:
     snapshot: TrustedRootAuthority
-    root: RolloutRootV2
+    root: RolloutRootV2 | RolloutRootV3
     lineage_anchor: CapabilityLineageAnchorV1
     authority: EpochAuthorityRecord
 
@@ -368,6 +395,8 @@ class CapabilityIssuer:
         lineage_resolver: CapabilityLineageResolver | None = None,
         envelope_verifier: CapabilityEnvelopeVerifier | None = None,
         receipt_reader: VerifiedApplyReceiptReader | None = None,
+        promotion_health_chain_reader: PromotionHealthChainReader | None = None,
+        health_signature_verifier: HealthAttestationVerifier | None = None,
     ) -> None:
         if type(configuration) is not CapabilityIssuerConfiguration:
             raise TypeError("an exact capability issuer configuration is required")
@@ -392,12 +421,29 @@ class CapabilityIssuer:
                 or receipt_target != configuration.target
             ):
                 raise ValueError("receipt reader target does not match issuer configuration")
+        if (promotion_health_chain_reader is None) != (
+            health_signature_verifier is None
+        ):
+            raise ValueError(
+                "promotion health-chain reading and verification must be configured together"
+            )
+        if promotion_health_chain_reader is not None:
+            try:
+                health_target = promotion_health_chain_reader.target
+            except Exception:
+                raise TypeError("a target-bound health-chain reader is required") from None
+            if type(health_target) is not TargetBinding or health_target != configuration.target:
+                raise ValueError("health-chain reader target does not match issuer configuration")
+            if not isinstance(health_signature_verifier, HealthAttestationVerifier):
+                raise TypeError("an exact health signature verifier is required")
         self._store = store
         self._signer = signer
         self._configuration = configuration
         self._lineage_resolver = lineage_resolver
         self._envelope_verifier = envelope_verifier
         self._receipt_reader = receipt_reader
+        self._promotion_health_chain_reader = promotion_health_chain_reader
+        self._health_signature_verifier = health_signature_verifier
 
     async def issue(
         self,
@@ -438,27 +484,38 @@ class CapabilityIssuer:
 
     async def issue_promotion(
         self,
-        request: PromotionCapabilityIssuanceRequest,
+        request: PromotionCapabilityIssuanceRequestV2,
         *,
         principal: AuthenticatedIssuancePrincipal | None,
         now: datetime,
     ) -> SignedCapability:
-        """Issue one root-scoped promotion from an exact durable 90/10 receipt."""
+        """Issue one V3 promotion after independently replaying its signed health chain."""
 
-        if type(request) is not PromotionCapabilityIssuanceRequest:
+        if type(request) is not PromotionCapabilityIssuanceRequestV2:
             raise TypeError("an exact promotion issuance request is required")
         issued_at, issued_second = _utc_second(now)
         self._authorize(principal)
         scheduled_second = _parse_utc_second(request.scheduled_at)
-        configured_expiry = issued_second + self._configuration.lifetime_seconds
+        proof_expiry = _parse_utc_second(request.authorization.proof_valid_until)
+        configured_expiry = min(
+            issued_second + self._configuration.lifetime_seconds,
+            proof_expiry,
+        )
         if (
             scheduled_second < issued_second
+            or issued_second
+            < _parse_utc_second(request.authorization.healthy_promotion_proof.issued_at)
             or configured_expiry - scheduled_second
             < MIN_PROMOTION_EXECUTION_MARGIN_SECONDS
         ):
             raise _deny(CapabilityIssuanceErrorCode.VALIDITY_EXHAUSTED)
         state = await self._read_trusted_state(request.root_id, issued_second)
         self._validate_expected_state(state, request)
+        chain = await self._read_verified_promotion_health_chain(
+            state,
+            request,
+            now,
+        )
         source_receipt = await self._read_verified_apply_receipt(
             state,
             request,
@@ -473,7 +530,7 @@ class CapabilityIssuer:
             issued_at=issued_at,
             not_before=request.scheduled_at,
             issued_second=issued_second,
-            expires_second=None,
+            expires_second=proof_expiry,
             lineage=(),
             parent_digest=None,
             action=CapabilityAction.PROMOTE_CANDIDATE,
@@ -481,6 +538,11 @@ class CapabilityIssuer:
         )
         confirmed_state = await self._read_trusted_state(request.root_id, issued_second)
         self._validate_expected_state(confirmed_state, request)
+        confirmed_chain = await self._read_verified_promotion_health_chain(
+            confirmed_state,
+            request,
+            now,
+        )
         confirmed_receipt = await self._read_verified_apply_receipt(
             confirmed_state,
             request,
@@ -489,6 +551,7 @@ class CapabilityIssuer:
         if (
             confirmed_state.snapshot != state.snapshot
             or confirmed_receipt != source_receipt
+            or confirmed_chain != chain
         ):
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return envelope
@@ -497,7 +560,7 @@ class CapabilityIssuer:
         self,
         *,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
+        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequestV2,
         issued_at: str,
         not_before: str,
         issued_second: int,
@@ -567,7 +630,7 @@ class CapabilityIssuer:
     @staticmethod
     def _validate_expected_state(
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
+        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequestV2,
     ) -> None:
         if (
             state.root.root_sha256 != request.expected_root_sha256
@@ -634,10 +697,60 @@ class CapabilityIssuer:
             authority=authority,
         )
 
+    async def _read_verified_promotion_health_chain(
+        self,
+        state: _TrustedIssuanceState,
+        request: PromotionCapabilityIssuanceRequestV2,
+        now: datetime,
+    ) -> SignedHealthDecisionChainV1:
+        reader = self._promotion_health_chain_reader
+        verifier = self._health_signature_verifier
+        if (
+            type(state.root) is not RolloutRootV3
+            or reader is None
+            or verifier is None
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        try:
+            chain = await reader.read_promotion_health_chain(
+                request.authorization.health_chain_locator
+            )
+        except (AuthorityStoreCorruptRecord, ContractError, TypeError, ValueError):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        except Exception:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
+        if chain is None:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        try:
+            promotion = await verify_healthy_promotion_chain(
+                chain=chain,
+                signature_verifier=verifier,
+                now=now,
+            )
+            expected = create_promotion_authorization(
+                root=state.root,
+                signed_health_chain=chain,
+                request_id=request.request_id,
+                idempotency_key=request.idempotency_key,
+                scheduled_at=request.scheduled_at,
+            )
+        except HealthOrchestrationError as error:
+            if error.code is HealthOrchestrationErrorCode.PROMOTION_PROOF_EXPIRED:
+                raise _deny(CapabilityIssuanceErrorCode.VALIDITY_EXHAUSTED) from None
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        except (ContractError, TypeError, ValueError):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        if (
+            expected != request.authorization
+            or promotion != request.authorization.healthy_promotion_proof
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        return chain
+
     async def _read_verified_apply_receipt(
         self,
         state: _TrustedIssuanceState,
-        request: PromotionCapabilityIssuanceRequest,
+        request: PromotionCapabilityIssuanceRequestV2,
         issued_second: int,
     ) -> StoredRecord[ExecutionReceipt]:
         reader = self._receipt_reader
@@ -658,11 +771,19 @@ class CapabilityIssuer:
         root = state.root
         content = root.content
         plan = content.rollout_plan
-        expected_poststate_sha256 = rollout_root_v2_target_configuration_sha256(
-            root,
-            stable_percent=90,
-            candidate_percent=10,
-        )
+        if type(root) is RolloutRootV2:
+            expected_poststate_sha256 = rollout_root_v2_target_configuration_sha256(
+                root,
+                stable_percent=90,
+                candidate_percent=10,
+            )
+        else:
+            root_v3 = cast(RolloutRootV3, root)
+            expected_poststate_sha256 = rollout_root_v3_target_configuration_sha256(
+                root_v3,
+                stable_percent=90,
+                candidate_percent=10,
+            )
         expected_receipt_id = execution_receipt_logical_id(
             content.target,
             locator.idempotency_key,
@@ -817,7 +938,7 @@ class CapabilityIssuer:
         self,
         *,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
+        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequestV2,
         issued_at: str,
         not_before: str,
         expires_at: str,
@@ -850,7 +971,7 @@ class CapabilityIssuer:
             "subject": self._configuration.subject_identity,
             "target": content.target.model_dump(mode="json"),
         }
-        if type(request) is PromotionCapabilityIssuanceRequest:
+        if type(request) is PromotionCapabilityIssuanceRequestV2:
             identity_material["scheduled_at"] = request.scheduled_at
             identity_material["verified_apply_receipt"] = (
                 cast(
@@ -858,9 +979,14 @@ class CapabilityIssuer:
                     request.verified_apply_receipt.model_dump(mode="json"),
                 )
             )
+        capability_id = (
+            promotion_capability_id(request.authorization)
+            if type(request) is PromotionCapabilityIssuanceRequestV2
+            else _capability_id(identity_material)
+        )
         return CapabilityClaims(
             schema_version=CAPABILITY_CLAIMS_V1,
-            capability_id=_capability_id(identity_material),
+            capability_id=capability_id,
             issuer=self._configuration.issuer_identity,
             subject=self._configuration.subject_identity,
             audience=self._configuration.handler_audience,
@@ -901,7 +1027,7 @@ __all__ = [
     "CapabilityIssuer",
     "CapabilityIssuerConfiguration",
     "CapabilityLineageResolver",
-    "PromotionCapabilityIssuanceRequest",
+    "PromotionCapabilityIssuanceRequestV2",
     "TrustBundleCapabilityVerifier",
     "VerifiedApplyReceiptReader",
 ]

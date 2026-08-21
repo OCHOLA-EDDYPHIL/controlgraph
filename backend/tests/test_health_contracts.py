@@ -29,6 +29,7 @@ from controlgraph_canary.contracts import (
     binary64_milliseconds_to_microseconds,
     canonical_json_bytes,
     canonical_sha256,
+    create_rollout_health_policy_v2,
     decode_contract,
     monitoring_query_id,
     monitoring_sample_set_sha256,
@@ -428,6 +429,8 @@ def test_v2_policy_is_frozen_and_canonical() -> None:
     assert policy.maximum_observation_delay_seconds == 300
     assert policy.maximum_windows == 10
     assert policy.latency_source_conversion.endswith("TIES_TO_EVEN")
+    assert create_rollout_health_policy_v2() == policy
+    assert create_rollout_health_policy_v2() is not create_rollout_health_policy_v2()
 
 
 @pytest.mark.parametrize(
@@ -743,8 +746,11 @@ def test_observation_rejects_scope_digest_or_classification_drift(
 
 def test_state_enforces_streak_and_window_continuity() -> None:
     state = _state(evaluated=True)
+    linked_wait_state = _state(prior_decision_sha256="f" * 64)
 
     assert decode_contract(canonical_json_bytes(state), HealthEvaluationStateV1) == state
+    assert linked_wait_state.evaluated_windows == 0
+    assert linked_wait_state.prior_decision_sha256 == "f" * 64
     with pytest.raises(ValidationError, match="both be active"):
         _state(
             evaluated=True,

@@ -389,6 +389,77 @@ class RolloutHealthPolicyV2(StrictContractModel):
     boundary_sample_action: Literal["INCLUDE_START_EXCLUDE_END"]
 
 
+def create_rollout_health_policy_v2() -> RolloutHealthPolicyV2:
+    """Return the one frozen V2 policy admitted for newly created rollout roots."""
+
+    return RolloutHealthPolicyV2(
+        schema_version=ROLLOUT_HEALTH_POLICY_V2,
+        observation_schema_version=MONITORING_WINDOW_OBSERVATION_V1,
+        decision_schema_version=HEALTH_DECISION_V1,
+        monitored_resource_type=_RESOURCE_TYPE,
+        request_count_metric_type=_REQUEST_COUNT_METRIC,
+        successful_response_code_class="2xx",
+        server_error_response_code_class="5xx",
+        latency_metric_type=_REQUEST_LATENCY_METRIC,
+        request_unit="1",
+        latency_unit="ms",
+        latency_source_conversion=(
+            "IEEE_754_BINARY64_MILLISECONDS_TO_INTEGER_MICROSECONDS_TIES_TO_EVEN"
+        ),
+        alignment_period_seconds=_WINDOW_SECONDS,
+        request_per_series_aligner="ALIGN_SUM",
+        request_cross_series_reducer="REDUCE_SUM",
+        request_group_by_field="metric.labels.response_code_class",
+        total_request_definition="SUM_1XX_2XX_3XX_4XX_5XX",
+        availability_definition="SUCCESSFUL_2XX_OVER_TOTAL_REQUESTS",
+        server_error_rate_definition="SERVER_ERROR_5XX_OVER_TOTAL_REQUESTS",
+        latency_definition="MERGED_DISTRIBUTION_PERCENTILE_95",
+        latency_primary_per_series_aligner="ALIGN_SUM",
+        latency_primary_cross_series_reducer="REDUCE_SUM",
+        latency_secondary_per_series_aligner="ALIGN_PERCENTILE_95",
+        latency_secondary_cross_series_reducer="REDUCE_NONE",
+        latency_secondary_output_metric_kind="GAUGE",
+        latency_secondary_output_value_type="DOUBLE",
+        latency_rounding="CEILING_TO_INTEGER_MILLISECOND",
+        configuration_name_source="TARGET_SERVICE_NAME",
+        route_filter="",
+        provider_interval_semantics="START_EXCLUSIVE_END_INCLUSIVE",
+        page_size=1_000,
+        view="FULL",
+        order_by=None,
+        window_seconds=_WINDOW_SECONDS,
+        window_semantics="HALF_OPEN_START_INCLUSIVE_END_EXCLUSIVE",
+        observation_delay_seconds=_OBSERVATION_DELAY_SECONDS,
+        maximum_observation_delay_seconds=_MAXIMUM_OBSERVATION_DELAY_SECONDS,
+        minimum_request_count=100,
+        healthy_maximum_error_rate_basis_points=100,
+        unhealthy_minimum_error_rate_basis_points=500,
+        healthy_maximum_p95_latency_ms=500,
+        unhealthy_minimum_p95_latency_ms=1_000,
+        healthy_minimum_availability_basis_points=9_900,
+        unhealthy_maximum_availability_basis_points=9_500,
+        error_rate_rounding="CEILING_BASIS_POINTS",
+        availability_rate_rounding="FLOOR_BASIS_POINTS",
+        healthy_consecutive_windows=2,
+        unhealthy_consecutive_windows=2,
+        maximum_windows=_MAXIMUM_WINDOWS,
+        early_observation_action="WAIT",
+        missing_observation_action="INSUFFICIENT_EVIDENCE",
+        partial_observation_action="INSUFFICIENT_EVIDENCE",
+        late_observation_action="INSUFFICIENT_EVIDENCE",
+        malformed_observation_action="INSUFFICIENT_EVIDENCE",
+        unknown_response_code_class_action="INSUFFICIENT_EVIDENCE",
+        identical_duplicate_action="DEDUPLICATE_BY_SAMPLE_SHA256",
+        conflicting_duplicate_action="INSUFFICIENT_EVIDENCE",
+        sample_set_digest_domain="controlgraph.monitoring-sample-set/v1",
+        sample_set_digest_algorithm=(
+            "SHA256_DOMAIN_NUL_UINT16_COUNT_ORDERED_32_BYTE_DIGESTS"
+        ),
+        out_of_order_action="INSUFFICIENT_EVIDENCE",
+        boundary_sample_action="INCLUDE_START_EXCLUDE_END",
+    )
+
+
 class MonitoringMetricQueryV1(StrictContractModel):
     """One exact, target-bound Cloud Monitoring query for a health window."""
 
@@ -809,7 +880,6 @@ class HealthEvaluationStateV1(StrictContractModel):
                 self.last_window_ended_at is not None
                 or self.last_observation_sha256 is not None
                 or self.consumed_sample_set_sha256s
-                or self.prior_decision_sha256 is not None
             ):
                 raise ValueError("initial health state cannot cite a prior evaluation")
         elif self.last_window_ended_at is None or self.last_observation_sha256 is None:
@@ -1280,6 +1350,7 @@ __all__ = [
     "MonitoringWindowObservationV1",
     "RolloutHealthPolicyV2",
     "binary64_milliseconds_to_microseconds",
+    "create_rollout_health_policy_v2",
     "derive_monitoring_metric_queries",
     "monitoring_query_id",
     "monitoring_sample_set_sha256",

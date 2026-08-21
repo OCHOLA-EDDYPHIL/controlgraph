@@ -34,8 +34,21 @@ from controlgraph_canary.application.evidence_signing import (
     EvidenceSigningErrorCode,
     EvidenceSigningService,
 )
+from controlgraph_canary.application.health_attestation import (
+    HealthAttestationError,
+    HealthAttestationErrorCode,
+    HealthAttestationSigningService,
+)
+from controlgraph_canary.application.health_pipeline import (
+    ApiHealthEvaluationClient,
+    CoordinatorHealthEvaluationService,
+    HealthPipelineError,
+    HealthPipelineErrorCode,
+    VerifierHealthEvaluationService,
+)
 from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
+    HEALTH_ATTESTATION_PATH,
     RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     AuthenticationDenialCode,
@@ -102,6 +115,14 @@ from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
     decode_contract,
 )
+from controlgraph_canary.contracts.health_execution import (
+    HealthAttestationSigningRequestV1,
+)
+from controlgraph_canary.contracts.health_pipeline import (
+    HealthEvaluationCommandV1,
+    HealthEvaluationInvocationV1,
+    VerifierHealthEvaluationRequestV1,
+)
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
 from controlgraph_canary.contracts.operator_observability import (
     ExecutionReceiptReadCommandV1,
@@ -114,9 +135,9 @@ from controlgraph_canary.contracts.operator_observability import (
     TargetTrafficReadRequestV1,
 )
 from controlgraph_canary.contracts.promotion_execution import (
-    PromotionCapabilityIssuanceCommandV1,
-    PromotionCommandV1,
-    PromotionInvocationV1,
+    PromotionCapabilityIssuanceCommandV2,
+    PromotionCommandV2,
+    PromotionInvocationV2,
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_PROOF_RELAY_RESPONSE_V1,
@@ -271,6 +292,15 @@ class OperatorObservationDenied(BaseModel):
     correlation_id: str
 
 
+class HealthPipelineDenied(BaseModel):
+    """Payload-free deterministic health-pipeline denial."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 
 
@@ -296,6 +326,11 @@ def create_service_app(
     coordinator_canary_relay: CoordinatorCanaryRelay | None = None,
     api_promotion_client: ApiPromotionClient | None = None,
     coordinator_promotion_relay: CoordinatorPromotionRelay | None = None,
+    api_health_evaluation_client: ApiHealthEvaluationClient | None = None,
+    coordinator_health_evaluation_service: (
+        CoordinatorHealthEvaluationService | None
+    ) = None,
+    verifier_health_evaluation_service: VerifierHealthEvaluationService | None = None,
     api_epoch_revocation_client: ApiEpochRevocationClient | None = None,
     coordinator_epoch_revocation_relay: CoordinatorEpochRevocationRelay | None = None,
     api_service_claim_release_client: ApiServiceClaimReleaseClient | None = None,
@@ -311,6 +346,8 @@ def create_service_app(
     classification_evidence_authentication_policy: (
         RouteAuthenticationPolicy | None
     ) = None,
+    health_attestation_signing_service: HealthAttestationSigningService | None = None,
+    health_attestation_authentication_policy: RouteAuthenticationPolicy | None = None,
     capability_issuance_service: CapabilityIssuanceService | None = None,
     receipt_authority_service: ReceiptAuthorityService | None = None,
     receipt_authority_authentication_policy: RouteAuthenticationPolicy | None = None,
@@ -365,6 +402,18 @@ def create_service_app(
         raise ValueError("promotion dispatch is limited to the API route")
     if coordinator_promotion_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("promotion coordination is limited to the coordinator route")
+    if api_health_evaluation_client is not None and role is not ServiceRole.API:
+        raise ValueError("health evaluation is limited to the API route")
+    if (
+        coordinator_health_evaluation_service is not None
+        and role is not ServiceRole.COORDINATOR
+    ):
+        raise ValueError("health evaluation coordination is coordinator-limited")
+    if (
+        verifier_health_evaluation_service is not None
+        and role is not ServiceRole.VERIFIER
+    ):
+        raise ValueError("health evaluation verification is verifier-limited")
     if api_epoch_revocation_client is not None and role is not ServiceRole.API:
         raise ValueError("manual revocation is limited to the API route")
     if coordinator_epoch_revocation_relay is not None and role is not ServiceRole.COORDINATOR:
@@ -400,6 +449,25 @@ def create_service_app(
     ):
         raise ValueError(
             "classification evidence is limited to the verifier-to-writer route"
+        )
+    if (health_attestation_signing_service is None) != (
+        health_attestation_authentication_policy is None
+    ):
+        raise ValueError(
+            "health attestation service and policy must be configured together"
+        )
+    if health_attestation_signing_service is not None and (
+        role is not ServiceRole.EVIDENCE_WRITER
+        or type(health_attestation_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or health_attestation_authentication_policy.service_role
+        is not ServiceRole.EVIDENCE_WRITER
+        or health_attestation_authentication_policy.path != HEALTH_ATTESTATION_PATH
+        or health_attestation_authentication_policy.caller.role
+        is not CallerRole.VERIFIER
+    ):
+        raise ValueError(
+            "health attestation is limited to the verifier-to-writer route"
         )
     if capability_issuance_service is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability issuance is limited to the issuer route")
@@ -503,6 +571,7 @@ def create_service_app(
             api_root_creation_client is not None
             or api_canary_client is not None
             or api_promotion_client is not None
+            or api_health_evaluation_client is not None
             or api_epoch_revocation_client is not None
             or api_service_claim_release_client is not None
             or api_operator_observation_client is not None
@@ -520,7 +589,7 @@ def create_service_app(
                         raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
                     canary_result = await api_canary_client.dispatch(command, context)
                     response_body = canonical_json_bytes(canary_result)
-                elif type(command) is PromotionCommandV1:
+                elif type(command) is PromotionCommandV2:
                     if api_promotion_client is None:
                         raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
                     promotion_result = await api_promotion_client.dispatch(
@@ -528,6 +597,16 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(promotion_result)
+                elif type(command) is HealthEvaluationCommandV1:
+                    if api_health_evaluation_client is None:
+                        raise HealthPipelineError(
+                            HealthPipelineErrorCode.CONFIGURATION_INVALID
+                        )
+                    health_result = await api_health_evaluation_client.evaluate(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(health_result)
                 elif type(command) is ServiceClaimReleaseCommandV1:
                     if api_service_claim_release_client is None:
                         raise ServiceClaimReleaseError(
@@ -602,6 +681,8 @@ def create_service_app(
                 return _root_creation_denial(error.code.value, correlation_id)
             except CanaryExecutionError as error:
                 return _canary_execution_denial(error.code.value, correlation_id)
+            except HealthPipelineError as error:
+                return _health_pipeline_denial(error.code.value, correlation_id)
             except EpochRevocationError as error:
                 return _epoch_revocation_denial(error.code.value, correlation_id)
             except ServiceClaimReleaseError as error:
@@ -626,6 +707,7 @@ def create_service_app(
             coordinator_root_creation_relay is not None
             or coordinator_canary_relay is not None
             or coordinator_promotion_relay is not None
+            or coordinator_health_evaluation_service is not None
             or coordinator_epoch_revocation_relay is not None
             or coordinator_service_claim_release_relay is not None
             or coordinator_operator_observation_relay is not None
@@ -649,7 +731,7 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(canary_result)
-                elif type(invocation) is PromotionInvocationV1:
+                elif type(invocation) is PromotionInvocationV2:
                     if coordinator_promotion_relay is None:
                         raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
                     promotion_result = await coordinator_promotion_relay.dispatch(
@@ -657,6 +739,18 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(promotion_result)
+                elif type(invocation) is HealthEvaluationInvocationV1:
+                    if coordinator_health_evaluation_service is None:
+                        raise HealthPipelineError(
+                            HealthPipelineErrorCode.CONFIGURATION_INVALID
+                        )
+                    health_result = (
+                        await coordinator_health_evaluation_service.evaluate(
+                            invocation,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(health_result)
                 elif type(invocation) is ServiceClaimReleaseInvocationV1:
                     if coordinator_service_claim_release_relay is None:
                         raise ServiceClaimReleaseError(
@@ -784,6 +878,8 @@ def create_service_app(
                 return _root_creation_denial(error.code.value, correlation_id)
             except CanaryExecutionError as error:
                 return _canary_execution_denial(error.code.value, correlation_id)
+            except HealthPipelineError as error:
+                return _health_pipeline_denial(error.code.value, correlation_id)
             except EpochRevocationError as error:
                 return _epoch_revocation_denial(error.code.value, correlation_id)
             except ServiceClaimReleaseError as error:
@@ -865,6 +961,7 @@ def create_service_app(
             or service_claim_classification_service is not None
             or stable_snapshot_capture_service is not None
             or target_traffic_observation_service is not None
+            or verifier_health_evaluation_service is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -899,6 +996,18 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(traffic_result)
+                elif type(verifier_request) is VerifierHealthEvaluationRequestV1:
+                    if verifier_health_evaluation_service is None:
+                        raise HealthPipelineError(
+                            HealthPipelineErrorCode.CONFIGURATION_INVALID
+                        )
+                    verifier_health_result = (
+                        await verifier_health_evaluation_service.evaluate(
+                            verifier_request,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(verifier_health_result)
                 else:
                     if (
                         type(verifier_request)
@@ -923,6 +1032,8 @@ def create_service_app(
                 return _root_preflight_denial(error.code.value, correlation_id)
             except RootPreflightError as error:
                 return _root_preflight_denial(error.code.value, correlation_id)
+            except HealthPipelineError as error:
+                return _health_pipeline_denial(error.code.value, correlation_id)
             except ServiceClaimClassificationError as error:
                 return _service_claim_classification_denial(
                     error.code.value,
@@ -1085,6 +1196,64 @@ def create_service_app(
             headers={"X-ControlGraph-Correlation-Id": correlation_id},
         )
 
+    async def health_attestation_work(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        policy = health_attestation_authentication_policy
+        service = health_attestation_signing_service
+        if (
+            authenticator is None
+            or type(policy) is not RouteAuthenticationPolicy
+            or type(service) is not HealthAttestationSigningService
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CONFIGURATION_INVALID,
+                correlation_id,
+            )
+        try:
+            authorization_header = authentication_header(request.headers, policy)
+            context = authenticator.authenticate(authorization_header, policy)
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if (
+            type(context) is not AuthenticationContext
+            or context.role is not CallerRole.VERIFIER
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            body = await _read_contract_body(request)
+            signing_request = decode_contract(
+                body,
+                HealthAttestationSigningRequestV1,
+            )
+            signed = await service.attest(signing_request, context)
+            response_body = canonical_json_bytes(signed)
+        except asyncio.CancelledError:
+            raise
+        except ContractError as error:
+            return _health_attestation_denial(error.code.value, correlation_id)
+        except HealthAttestationError as error:
+            return _health_attestation_denial(error.code.value, correlation_id)
+        except Exception:
+            return _health_attestation_denial(
+                HealthAttestationErrorCode.UNAVAILABLE.value,
+                correlation_id,
+            )
+        return Response(
+            content=response_body,
+            status_code=200,
+            media_type="application/json",
+            headers={"X-ControlGraph-Correlation-Id": correlation_id},
+        )
+
     for path in protected_paths(role):
         app.add_api_route(path, protected_work, methods=["POST"], include_in_schema=False)
     if receipt_authority_service is not None:
@@ -1098,6 +1267,13 @@ def create_service_app(
         app.add_api_route(
             CLASSIFICATION_EVIDENCE_PATH,
             classification_evidence_work,
+            methods=["POST"],
+            include_in_schema=False,
+        )
+    if health_attestation_signing_service is not None:
+        app.add_api_route(
+            HEALTH_ATTESTATION_PATH,
+            health_attestation_work,
             methods=["POST"],
             include_in_schema=False,
         )
@@ -1115,11 +1291,12 @@ def _decode_api_command(
 ) -> (
     RootCreationCommandV1
     | ApplyCanaryCommandV1
-    | PromotionCommandV1
+    | PromotionCommandV2
     | ServiceClaimReleaseCommandV1
     | StableSnapshotCaptureCommandV1
     | ExecutionReceiptReadCommandV1
     | TargetTrafficReadCommandV1
+    | HealthEvaluationCommandV1
     | EpochRevocationProofCommandV1
     | EpochRevocationCommandV1
 ):
@@ -1134,7 +1311,12 @@ def _decode_api_command(
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
     try:
-        return decode_contract(body, PromotionCommandV1)
+        return decode_contract(body, PromotionCommandV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, HealthEvaluationCommandV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -1171,11 +1353,12 @@ def _decode_coordinator_invocation(
 ) -> (
     RootCreationInvocationV1
     | ApplyCanaryInvocationV1
-    | PromotionInvocationV1
+    | PromotionInvocationV2
     | ServiceClaimReleaseInvocationV1
     | StableSnapshotCaptureInvocationV1
     | ExecutionReceiptReadInvocationV1
     | TargetTrafficReadInvocationV1
+    | HealthEvaluationInvocationV1
     | EpochRevocationProofInvocationV1
     | EpochRevocationInvocationV1
 ):
@@ -1190,7 +1373,12 @@ def _decode_coordinator_invocation(
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
     try:
-        return decode_contract(body, PromotionInvocationV1)
+        return decode_contract(body, PromotionInvocationV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, HealthEvaluationInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -1228,6 +1416,7 @@ def _decode_verifier_request(
     RootPreflightRequestV1
     | StableSnapshotCaptureRequestV1
     | TargetTrafficReadRequestV1
+    | VerifierHealthEvaluationRequestV1
     | ServiceClaimClassificationRequestV1
 ):
     try:
@@ -1245,18 +1434,23 @@ def _decode_verifier_request(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, VerifierHealthEvaluationRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, ServiceClaimClassificationRequestV1)
 
 
 def _decode_issuance_command(
     body: bytes,
-) -> CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV1:
+) -> CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV2:
     try:
         return decode_contract(body, CapabilityIssuanceCommandV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
-    return decode_contract(body, PromotionCapabilityIssuanceCommandV1)
+    return decode_contract(body, PromotionCapabilityIssuanceCommandV2)
 
 
 def _authentication_denial(
@@ -1306,6 +1500,24 @@ def _evidence_signing_denial(code: str, correlation_id: str) -> JSONResponse:
         EvidenceSigningErrorCode.CALLER_DENIED.value,
         EvidenceSigningErrorCode.TARGET_DENIED.value,
         EvidenceSigningErrorCode.ACTOR_DENIED.value,
+    }:
+        status_code = 403
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+def _health_attestation_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = EvidenceSigningDenied(code=code, correlation_id=correlation_id)
+    if code in {"CONTRACT_INVALID", "CONTRACT_VERSION_UNSUPPORTED"}:
+        status_code = 400
+    elif code in {
+        HealthAttestationErrorCode.CALLER_DENIED.value,
+        HealthAttestationErrorCode.REQUEST_DENIED.value,
     }:
         status_code = 403
     else:
@@ -1380,6 +1592,39 @@ def _canary_execution_denial(code: str, correlation_id: str) -> JSONResponse:
     }:
         status_code = 403
     elif code == CanaryExecutionErrorCode.IDENTITY_CONFLICT.value:
+        status_code = 409
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
+def _health_pipeline_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = HealthPipelineDenied(code=code, correlation_id=correlation_id)
+    status_code = 503
+    if code in {
+        ContractErrorCode.INVALID.value,
+        ContractErrorCode.VERSION_UNSUPPORTED.value,
+    }:
+        status_code = 400
+    elif code in {
+        HealthPipelineErrorCode.CALLER_DENIED.value,
+        HealthPipelineErrorCode.OPERATOR_DENIED.value,
+        HealthPipelineErrorCode.COMMAND_DENIED.value,
+    }:
+        status_code = 403
+    elif code in {
+        HealthPipelineErrorCode.AUTHORITY_STALE.value,
+        HealthPipelineErrorCode.RECEIPT_INVALID.value,
+        HealthPipelineErrorCode.STORE_CONFLICT.value,
+        HealthPipelineErrorCode.EVALUATION_NOT_READY.value,
+        HealthPipelineErrorCode.EVALUATION_TERMINAL.value,
+        HealthPipelineErrorCode.TRUSTED_STATE_INVALID.value,
+        HealthPipelineErrorCode.VERIFIER_RESPONSE_INVALID.value,
+        HealthPipelineErrorCode.RESPONSE_INVALID.value,
+        HealthPipelineErrorCode.RESULT_INVALID.value,
+    }:
         status_code = 409
     return JSONResponse(
         status_code=status_code,

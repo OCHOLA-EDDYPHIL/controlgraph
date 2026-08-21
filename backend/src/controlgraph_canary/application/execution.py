@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from threading import Lock
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreError,
@@ -16,7 +16,14 @@ from controlgraph_canary.application.authority_store import (
     StoredRecord,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
-from controlgraph_canary.application.identity import AuthenticationContext, ServiceRole
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_v3_target_configuration_sha256,
+)
+from controlgraph_canary.application.identity import (
+    AuthenticationContext,
+    RouteAuthenticationPolicy,
+    ServiceRole,
+)
 from controlgraph_canary.application.root_authority import (
     RootAuthorityBundle,
     inspect_root_authority_bundle,
@@ -38,7 +45,14 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
     TaskRequest,
 )
-from controlgraph_canary.contracts.root_creation import RolloutRootV2
+from controlgraph_canary.contracts.promotion_execution import (
+    PromotionAuthorizationV1,
+    PromotionMutationIntentV2,
+    PromotionTaskRequestV2,
+    create_verified_apply_receipt_locator,
+    promotion_capability_id,
+)
+from controlgraph_canary.contracts.root_creation import RolloutRootV2, RolloutRootV3
 from controlgraph_canary.contracts.storage import (
     ServiceClaimStatus,
     execution_receipt_logical_id,
@@ -59,8 +73,8 @@ class FinalAuthorityReader(Protocol):
 
 
 @runtime_checkable
-class TargetBoundMutationAdapter[ResultT](Protocol):
-    """A target-bound adapter that admits only an internal mutation permit."""
+class PreparedTargetMutation[ResultT](Protocol):
+    """One fully prepared provider call awaiting only a final-gate permit."""
 
     @property
     def target(self) -> TargetBinding: ...
@@ -68,7 +82,39 @@ class TargetBoundMutationAdapter[ResultT](Protocol):
     @property
     def service_role(self) -> ServiceRole: ...
 
+    @property
+    def intent(self) -> MutationIntent | PromotionMutationIntentV2: ...
+
     async def mutate(self, permit: MutationPermit) -> ResultT: ...
+
+
+@runtime_checkable
+class TargetBoundMutationAdapter[ResultT](Protocol):
+    """Prepare one target-bound provider call before the final authority read."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    @property
+    def service_role(self) -> ServiceRole: ...
+
+    async def prepare(
+        self,
+        intent: MutationIntent | PromotionMutationIntentV2,
+    ) -> PreparedTargetMutation[ResultT]: ...
+
+
+@runtime_checkable
+class PromotionSourceReceiptReader(Protocol):
+    """Strongly read the durable APPLY_CANARY receipt named by a promotion."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def read_receipt(
+        self,
+        idempotency_key: str,
+    ) -> StoredRecord[ExecutionReceipt] | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +280,7 @@ class MutationPermit:
         *,
         target: TargetBinding,
         service_role: ServiceRole,
-        intent: MutationIntent,
+        intent: MutationIntent | PromotionMutationIntentV2,
         receipt_id: str,
         binding: MutationBinding,
     ) -> None:
@@ -243,7 +289,7 @@ class MutationPermit:
         if (
             type(target) is not TargetBinding
             or type(service_role) is not ServiceRole
-            or type(intent) is not MutationIntent
+            or type(intent) not in (MutationIntent, PromotionMutationIntentV2)
             or type(receipt_id) is not str
             or type(binding) is not MutationBinding
             or intent.target != target
@@ -258,7 +304,7 @@ class MutationPermit:
         self._lock = Lock()
 
     @property
-    def intent(self) -> MutationIntent:
+    def intent(self) -> MutationIntent | PromotionMutationIntentV2:
         """Consume and return the immutable command sealed into this permit."""
 
         with self._lock:
@@ -280,6 +326,8 @@ class FinalMutationGate[ResultT]:
         *,
         authority_reader: FinalAuthorityReader,
         adapter: TargetBoundMutationAdapter[ResultT],
+        route_policy: RouteAuthenticationPolicy,
+        source_receipt_reader: PromotionSourceReceiptReader | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         try:
@@ -299,10 +347,30 @@ class FinalMutationGate[ResultT]:
             ServiceRole.RECOVERY,
         }:
             raise ValueError("final mutation adapter must use an execution role")
+        if type(route_policy) is not RouteAuthenticationPolicy:
+            raise TypeError("final mutation gate requires an exact route policy")
+        if (
+            route_policy.service_role is not service_role
+            or route_policy.project_id != reader_target.project_id
+        ):
+            raise ValueError("final mutation route policy does not match the adapter")
+        if source_receipt_reader is not None:
+            try:
+                receipt_target = source_receipt_reader.target
+            except Exception:
+                raise TypeError(
+                    "promotion source receipt reader must be target-bound"
+                ) from None
+            if type(receipt_target) is not TargetBinding or receipt_target != reader_target:
+                raise ValueError(
+                    "promotion source receipt reader does not share the exact target"
+                )
         if clock is not None and not callable(clock):
             raise TypeError("final mutation clock must be callable")
         self._authority_reader = authority_reader
         self._adapter = adapter
+        self._route_policy = route_policy
+        self._source_receipt_reader = source_receipt_reader
         self._target = reader_target
         self._service_role = service_role
         self._clock = clock or _now_utc_second
@@ -324,6 +392,28 @@ class FinalMutationGate[ResultT]:
         if entry_denial is not None:
             return lease._denial(entry_denial)
         try:
+            prepared = await self._adapter.prepare(verified.request.intent)
+        except asyncio.CancelledError:
+            lease._close_with_denial(ReasonCode.AUTHORITY_UNAVAILABLE)
+            raise
+        except Exception:
+            return lease._close_with_denial(ReasonCode.AUTHORITY_UNAVAILABLE)
+        if not _prepared_mutation_matches(
+            prepared,
+            verified=verified,
+            target=self._target,
+            service_role=self._service_role,
+        ):
+            return lease._close_with_denial(ReasonCode.CLAIM_BINDING_MISMATCH)
+        if type(verified.request) is PromotionTaskRequestV2:
+            try:
+                receipt_denial = await self._revalidate_promotion_source_receipt(verified)
+            except asyncio.CancelledError:
+                lease._close_with_denial(ReasonCode.AUTHORITY_UNAVAILABLE)
+                raise
+            if receipt_denial is not None:
+                return lease._close_with_denial(receipt_denial)
+        try:
             snapshot = await self._authority_reader.read_root_creation_bundle(
                 verified.request.intent.root_id
             )
@@ -343,6 +433,7 @@ class FinalMutationGate[ResultT]:
             verified=verified,
             target=self._target,
             service_role=self._service_role,
+            route_policy=self._route_policy,
             now_second=now_second,
         )
         observed_authority_epoch = _observed_authority_epoch(
@@ -356,13 +447,86 @@ class FinalMutationGate[ResultT]:
             return lease._close_with_denial(ReasonCode.AUTHORITY_UNAVAILABLE)
         permit = lease._authorize(verified, self._target, self._service_role)
         try:
-            result = await self._adapter.mutate(permit)
+            result = await prepared.mutate(permit)
             return FinalMutationResult(
                 result=result,
                 observed_authority_epoch=observed_authority_epoch,
             )
         finally:
             permit._close()
+
+    async def _revalidate_promotion_source_receipt(
+        self,
+        verified: VerifiedMutation,
+    ) -> ReasonCode | None:
+        request = verified.request
+        if type(request) is not PromotionTaskRequestV2:
+            return None
+        reader = self._source_receipt_reader
+        if reader is None:
+            return ReasonCode.AUTHORITY_UNAVAILABLE
+        locator = request.intent.authorization.verified_apply_receipt
+        try:
+            stored = await reader.read_receipt(locator.idempotency_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ReasonCode.AUTHORITY_UNAVAILABLE
+        if (
+            type(stored) is not StoredRecord
+            or type(stored.value) is not ExecutionReceipt
+            or stored.revision < 2
+        ):
+            return ReasonCode.AUTHORITY_UNAVAILABLE
+        receipt = stored.value
+        try:
+            observed_locator = create_verified_apply_receipt_locator(receipt)
+        except (TypeError, ValueError):
+            return ReasonCode.AUTHORITY_UNAVAILABLE
+        intent = request.intent
+        authorization = intent.authorization
+        if (
+            observed_locator != locator
+            or canonical_sha256(receipt) != authorization.source_receipt_sha256
+            or receipt.target != intent.target
+            or receipt.root_id != intent.root_id
+            or receipt.root_sha256 != intent.root_sha256
+            or receipt.epoch != intent.epoch
+            or receipt.action is not CapabilityAction.APPLY_CANARY
+            or receipt.outcome is not ReceiptOutcome.VERIFIED
+            or receipt.expected_poststate_sha256 != intent.expected_prestate_sha256
+            or receipt.observed_etag != authorization.provider_etag
+            or receipt.observed_authority_epoch != intent.epoch
+        ):
+            return ReasonCode.CLAIM_BINDING_MISMATCH
+        return None
+
+
+def _prepared_mutation_matches(
+    prepared: object,
+    *,
+    verified: VerifiedMutation,
+    target: TargetBinding,
+    service_role: ServiceRole,
+) -> bool:
+    if not isinstance(prepared, PreparedTargetMutation):
+        return False
+    try:
+        prepared_target = prepared.target
+        prepared_role = prepared.service_role
+        prepared_intent = prepared.intent
+        mutate = prepared.mutate
+    except Exception:
+        return False
+    return (
+        type(prepared_target) is TargetBinding
+        and prepared_target == target
+        and type(prepared_role) is ServiceRole
+        and prepared_role is service_role
+        and type(prepared_intent) in (MutationIntent, PromotionMutationIntentV2)
+        and prepared_intent == verified.request.intent
+        and callable(mutate)
+    )
 
 
 def _validate_claimed_record(claimed: object) -> None:
@@ -411,14 +575,15 @@ def _binding_matches_verified(
     binding: MutationBinding,
     verified: VerifiedMutation,
 ) -> bool:
+    request = verified.request
     if (
-        type(verified.request) is not TaskRequest
-        or type(verified.root) is not RolloutRootV2
+        type(request) not in (TaskRequest, PromotionTaskRequestV2)
+        or type(verified.root) not in (RolloutRootV2, RolloutRootV3)
         or type(verified.caller) is not AuthenticationContext
     ):
         return False
-    intent = verified.request.intent
-    return (
+    intent = request.intent
+    common_matches = (
         binding.idempotency_key == intent.idempotency_key
         and binding.request_id == intent.request_id
         and binding.root_id == intent.root_id
@@ -435,7 +600,20 @@ def _binding_matches_verified(
         and binding.provider_precondition == intent.provider_etag
         and binding.plan_sha256 == intent.plan_sha256
         and binding.capability_sha256 == verified.capability_sha256
-        and binding.payload_sha256 == canonical_sha256(verified.request)
+        and binding.payload_sha256 == canonical_sha256(request)
+        and verified.capability_sha256 == canonical_sha256(request.capability)
+        and verified.claims_sha256 == request.capability.claims_sha256
+    )
+    if not common_matches:
+        return False
+    if type(request) is TaskRequest:
+        return type(intent) is MutationIntent
+    promotion_request = cast(PromotionTaskRequestV2, request)
+    return (
+        type(intent) is PromotionMutationIntentV2
+        and type(verified.root) is RolloutRootV3
+        and binding.expected_poststate_sha256 == intent.desired_poststate_sha256
+        and _promotion_request_matches_root(promotion_request, verified.root)
     )
 
 
@@ -445,6 +623,7 @@ def _final_authority_denial(
     verified: VerifiedMutation,
     target: TargetBinding,
     service_role: ServiceRole,
+    route_policy: RouteAuthenticationPolicy,
     now_second: int,
 ) -> ReasonCode | None:
     if snapshot is None:
@@ -457,6 +636,13 @@ def _final_authority_denial(
     intent = verified.request.intent
     if type(verified.earliest_lineage_issued_at) is not int:
         return ReasonCode.AUTHORITY_UNAVAILABLE
+    caller_denial = _final_caller_denial(
+        verified,
+        route_policy=route_policy,
+        now_second=now_second,
+    )
+    if caller_denial is not None:
+        return caller_denial
     observed_authority_epoch = _coherent_authority_epoch(
         snapshot,
         verified=verified,
@@ -482,9 +668,151 @@ def _final_authority_denial(
         verified.request.expires_at
     ):
         return ReasonCode.CAPABILITY_EXPIRED
+    if type(verified.request) is PromotionTaskRequestV2:
+        if type(verified.root) is not RolloutRootV3 or not _promotion_request_matches_root(
+            verified.request,
+            verified.root,
+        ):
+            return ReasonCode.CLAIM_BINDING_MISMATCH
+        if now_second >= _parse_utc_second(verified.request.intent.proof_valid_until):
+            return ReasonCode.CAPABILITY_EXPIRED
     if not _role_admits(service_role, intent.action):
         return ReasonCode.CLAIM_BINDING_MISMATCH
     return None
+
+
+def _final_caller_denial(
+    verified: VerifiedMutation,
+    *,
+    route_policy: RouteAuthenticationPolicy,
+    now_second: int,
+) -> ReasonCode | None:
+    caller = verified.caller
+    request = verified.request
+    if type(caller) is not AuthenticationContext:
+        return ReasonCode.CALLER_UNAUTHENTICATED
+    if (
+        caller.role is not route_policy.caller.role
+        or caller.email != route_policy.caller.email
+        or caller.subject != route_policy.caller.subject
+        or caller.audience != route_policy.audience
+        or request.handler_audience != route_policy.audience
+        or caller.issuer not in {"accounts.google.com", "https://accounts.google.com"}
+        or type(caller.issued_at) is not int
+        or type(caller.expires_at) is not int
+        or not caller.issued_at <= now_second < caller.expires_at
+        or caller.expires_at - caller.issued_at > 3_660
+    ):
+        return ReasonCode.CALLER_UNAUTHORIZED
+    return None
+
+
+def _promotion_request_matches_root(
+    request: PromotionTaskRequestV2,
+    root: RolloutRootV3,
+) -> bool:
+    """Recheck all compact promotion authority bindings without an external read."""
+
+    if type(request) is not PromotionTaskRequestV2 or type(root) is not RolloutRootV3:
+        return False
+    intent = request.intent
+    authorization = intent.authorization
+    claims = request.capability.claims
+    content = root.content
+    plan = content.rollout_plan
+    bounds = content.authority_bounds
+    if type(authorization) is not PromotionAuthorizationV1:
+        return False
+    try:
+        capability_id = promotion_capability_id(authorization)
+        expected_prestate_sha256 = rollout_root_v3_target_configuration_sha256(
+            root,
+            stable_percent=90,
+            candidate_percent=10,
+        )
+        desired_poststate_sha256 = rollout_root_v3_target_configuration_sha256(
+            root,
+            stable_percent=0,
+            candidate_percent=100,
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        authorization.root_schema_version == root.schema_version
+        and authorization.root_id == root.root_id
+        and authorization.root_sha256 == root.root_sha256
+        and authorization.target == content.target
+        and authorization.epoch == claims.epoch == intent.epoch
+        and authorization.request_id == claims.request_id == intent.request_id
+        and authorization.idempotency_key
+        == claims.idempotency_key
+        == intent.idempotency_key
+        and authorization.scheduled_at == request.scheduled_at == claims.not_before
+        and authorization.plan_sha256 == canonical_sha256(plan)
+        and authorization.policy_schema_version == content.health_policy.schema_version
+        and authorization.policy_sha256 == canonical_sha256(content.health_policy)
+        and authorization.stable_snapshot_sha256
+        == canonical_sha256(content.stable_snapshot)
+        and authorization.stable_revision == plan.stable_revision
+        and authorization.stable_revision_configuration_sha256
+        == plan.stable_revision_configuration_sha256
+        and authorization.candidate_revision == plan.candidate_revision
+        and authorization.candidate_revision_configuration_sha256
+        == plan.candidate_revision_configuration_sha256
+        and authorization.concurrency == plan.concurrency
+        and authorization.evidence_signing_key_version
+        == content.evidence_signing_key_version
+        and authorization.capability_signing_key_version
+        == bounds.capability_signing_key_version
+        and authorization.issuer_identity == bounds.issuer_identity
+        and authorization.executor_identity == bounds.executor_identity
+        and authorization.executor_audience == bounds.executor_audience
+        and authorization.expected_prestate_sha256 == expected_prestate_sha256
+        and authorization.desired_poststate_sha256 == desired_poststate_sha256
+        and authorization.expected_stable_percent == 90
+        and authorization.expected_candidate_percent == 10
+        and authorization.stable_percent == 0
+        and authorization.candidate_percent == 100
+        and authorization.provider_etag == claims.provider_etag == intent.provider_etag
+        and authorization.capability_id == capability_id
+        and intent.capability_id == capability_id
+        and claims.capability_id == capability_id
+        and intent.promotion_authorization_sha256 == canonical_sha256(authorization)
+        and intent.target == authorization.target
+        and intent.root_id == authorization.root_id
+        and intent.root_sha256 == authorization.root_sha256
+        and intent.action is CapabilityAction.PROMOTE_CANDIDATE
+        and intent.stable_revision == authorization.stable_revision
+        and intent.candidate_revision == authorization.candidate_revision
+        and intent.stable_percent == 0
+        and intent.candidate_percent == 100
+        and intent.concurrency is None
+        and intent.plan_sha256 == authorization.plan_sha256
+        and intent.expected_prestate_sha256 == authorization.expected_prestate_sha256
+        and intent.terminal_health_decision_sha256
+        == authorization.terminal_health_decision_sha256
+        and intent.health_chain_sha256
+        == authorization.health_chain_locator.health_chain_sha256
+        and intent.desired_poststate_sha256 == authorization.desired_poststate_sha256
+        and intent.proof_valid_until == authorization.proof_valid_until
+        and claims.issuer == authorization.issuer_identity
+        and claims.subject == authorization.executor_identity
+        and claims.audience == authorization.executor_audience
+        and claims.target == authorization.target
+        and claims.root_id == authorization.root_id
+        and claims.root_sha256 == authorization.root_sha256
+        and claims.action is CapabilityAction.PROMOTE_CANDIDATE
+        and claims.stable_revision == authorization.stable_revision
+        and claims.candidate_revision == authorization.candidate_revision
+        and claims.stable_percent == 0
+        and claims.candidate_percent == 100
+        and claims.concurrency is None
+        and claims.plan_sha256 == authorization.plan_sha256
+        and claims.signing_key_version
+        == authorization.capability_signing_key_version
+        and request.handler_audience == authorization.executor_audience
+        and request.expires_at <= authorization.proof_valid_until
+    )
 
 
 def _observed_authority_epoch(
@@ -591,6 +919,8 @@ __all__ = [
     "FinalMutationGate",
     "FinalMutationResult",
     "MutationPermit",
+    "PreparedTargetMutation",
+    "PromotionSourceReceiptReader",
     "ReceiptDispatchLease",
     "TargetBoundMutationAdapter",
 ]

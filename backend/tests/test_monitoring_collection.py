@@ -18,6 +18,7 @@ from controlgraph_canary.application.monitoring import (
     MonitoringCollectionScope,
     MonitoringQueryCollection,
     MonitoringWindowCollector,
+    _issue_monitoring_collection_scope,
 )
 from controlgraph_canary.contracts import (
     HealthSignal,
@@ -69,7 +70,9 @@ def _scope(**changes: object) -> MonitoringCollectionScope:
         "observation_started_at": "2026-08-21T12:00:00Z",
     }
     values.update(changes)
-    return MonitoringCollectionScope(**values)  # type: ignore[arg-type]
+    return _issue_monitoring_collection_scope(  # type: ignore[arg-type]
+        **values,
+    )
 
 
 def _clock(minute: int = 4, second: int = 0) -> Callable[[], datetime]:

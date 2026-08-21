@@ -28,6 +28,7 @@ from controlgraph_canary.application.cloud_run import (
     cloud_run_revision_configuration_sha256,
 )
 from controlgraph_canary.application.identity import (
+    HEALTH_ATTESTATION_PATH,
     AuthenticationContext,
     CallerRole,
     RouteAuthenticationPolicy,
@@ -397,6 +398,30 @@ def _route(role: ServiceRole) -> CoordinatorInternalRoute:
     )
 
 
+def test_health_attestation_route_is_sealed_to_verifier_evidence_writer() -> None:
+    route = CoordinatorInternalRoute(
+        project_id=PROJECT,
+        project_number=PROJECT_NUMBER,
+        caller_role=CallerRole.VERIFIER,
+        service_role=ServiceRole.EVIDENCE_WRITER,
+        audience=EVIDENCE_AUDIENCE,
+        override_path=HEALTH_ATTESTATION_PATH,
+    )
+
+    assert route.path == HEALTH_ATTESTATION_PATH
+    assert route.url == f"{EVIDENCE_AUDIENCE}{HEALTH_ATTESTATION_PATH}"
+
+    with pytest.raises(ValueError, match="route coordinates are invalid"):
+        CoordinatorInternalRoute(
+            project_id=PROJECT,
+            project_number=PROJECT_NUMBER,
+            caller_role=CallerRole.COORDINATOR,
+            service_role=ServiceRole.EVIDENCE_WRITER,
+            audience=EVIDENCE_AUDIENCE,
+            override_path=HEALTH_ATTESTATION_PATH,
+        )
+
+
 def _preflight_service(reader: _Reader) -> RootPreflightService:
     return RootPreflightService(
         target=_target(),
@@ -685,13 +710,19 @@ def test_one_shot_oidc_transport_uses_exact_audience_url_and_never_retries() -> 
     assert len(poster.calls) == 2
 
 
-def test_evidence_client_verifies_exact_ecdsa_signature_and_key_version() -> None:
+@pytest.mark.parametrize(
+    "service_role",
+    [ServiceRole.COORDINATOR, ServiceRole.VERIFIER, ServiceRole.ISSUER],
+)
+def test_evidence_client_verifies_exact_ecdsa_signature_and_key_version(
+    service_role: ServiceRole,
+) -> None:
     private_key = ec.generate_private_key(ec.SECP256R1())
     signed = _signed_event(private_key)
     kms = _KmsClient(private_key)
     verifier = GoogleKmsEvidenceSignatureVerifier(
         project_id=PROJECT,
-        service_role=ServiceRole.COORDINATOR,
+        service_role=service_role,
         key_version=EVIDENCE_KEY_VERSION,
         client=kms,
     )
@@ -731,6 +762,29 @@ def test_evidence_client_verifies_exact_ecdsa_signature_and_key_version() -> Non
             ).sign(_event())
         )
     assert invalid.value.code is RootTrustClientErrorCode.EVIDENCE_INVALID
+
+
+@pytest.mark.parametrize(
+    "service_role",
+    [
+        ServiceRole.API,
+        ServiceRole.EVIDENCE_WRITER,
+        ServiceRole.EXECUTOR,
+        ServiceRole.RECOVERY,
+    ],
+)
+def test_evidence_verifier_rejects_roles_outside_read_only_trust_boundary(
+    service_role: ServiceRole,
+) -> None:
+    with pytest.raises(Exception) as failure:
+        GoogleKmsEvidenceSignatureVerifier(
+            project_id=PROJECT,
+            service_role=service_role,
+            key_version=EVIDENCE_KEY_VERSION,
+            client=_KmsClient(ec.generate_private_key(ec.SECP256R1())),
+        )
+
+    assert "evidence verification role is invalid" in str(failure.value)
 
 
 def test_evidence_verifier_rejects_kms_response_substitution() -> None:

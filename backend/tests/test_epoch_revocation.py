@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records, root_v2_target
+from root_v2_test_data import PROJECT_NUMBER, make_root_v3_records, root_v2_target
 from test_final_authority_execution import _lease
 from test_m2_firestore_authority_store import (
     _FakeClient,
@@ -194,6 +194,16 @@ class _NoMutationAdapter:
         self.target = root_v2_target()
         self.service_role = ServiceRole.EXECUTOR
         self.calls: list[MutationPermit] = []
+        self._prepared_intent: MutationIntent | None = None
+
+    @property
+    def intent(self) -> MutationIntent:
+        assert self._prepared_intent is not None
+        return self._prepared_intent
+
+    async def prepare(self, intent: MutationIntent) -> _NoMutationAdapter:
+        self._prepared_intent = intent
+        return self
 
     async def mutate(self, permit: MutationPermit) -> str:
         self.calls.append(permit)
@@ -225,6 +235,26 @@ def _policy() -> RouteAuthenticationPolicy:
             role=CallerRole.OPERATOR,
             email=OPERATOR,
             subject=OPERATOR_SUBJECT,
+        ),
+    )
+
+
+def _execution_policy() -> RouteAuthenticationPolicy:
+    target = root_v2_target()
+    return RouteAuthenticationPolicy(
+        project_id=target.project_id,
+        project_number=PROJECT_NUMBER,
+        service_role=ServiceRole.EXECUTOR,
+        path=protected_path(ServiceRole.EXECUTOR),
+        audience=(
+            f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        caller=CallerBinding(
+            role=CallerRole.EXECUTION_TASK_CALLER,
+            email=(
+                f"cg-execution-task-caller@{target.project_id}.iam.gserviceaccount.com"
+            ),
+            subject="234567890123456789012",
         ),
     )
 
@@ -320,7 +350,7 @@ async def _created_store() -> tuple[
     object,
 ]:
     store, client, runner = _store()
-    records = make_root_v2_records()
+    records = make_root_v3_records()
     await store.create_or_adopt_root_creation_bundle(
         records.root,
         records.service_claim,
@@ -1098,6 +1128,7 @@ def test_committed_revocation_fences_issuance_and_delayed_execution() -> None:
         execution = await FinalMutationGate(
             authority_reader=store,
             adapter=adapter,
+            route_policy=_execution_policy(),
             clock=lambda: NOW,
         ).execute(_lease(verified), verified)
 

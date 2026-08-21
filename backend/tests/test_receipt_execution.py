@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from root_v2_support import RootBundle, root_bundle, root_records
@@ -35,8 +35,11 @@ from controlgraph_canary.application.execution import (
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
+    CallerBinding,
     CallerRole,
+    RouteAuthenticationPolicy,
     ServiceRole,
+    protected_path,
 )
 from controlgraph_canary.application.receipt_execution import (
     ReceiptClassifyingMutationAdapter,
@@ -71,6 +74,8 @@ ONE_DIGEST = "1" * 64
 TWO_DIGEST = "2" * 64
 THREE_DIGEST = "3" * 64
 NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
+PROJECT_NUMBER = "123456789012"
+SUBJECT = "123456789012345678901"
 KEY_VERSION = (
     f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
@@ -84,6 +89,25 @@ def _target() -> TargetBinding:
         region="us-central1",
         environment="nonprod",
         service_name="controlgraph-reference-target",
+    )
+
+
+def _route_policy() -> RouteAuthenticationPolicy:
+    return RouteAuthenticationPolicy(
+        project_id=PROJECT_ID,
+        project_number=PROJECT_NUMBER,
+        service_role=ServiceRole.EXECUTOR,
+        path=protected_path(ServiceRole.EXECUTOR),
+        audience=(
+            f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        caller=CallerBinding(
+            role=CallerRole.EXECUTION_TASK_CALLER,
+            email=(
+                f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
+            ),
+            subject=SUBJECT,
+        ),
     )
 
 
@@ -161,12 +185,12 @@ def _verified() -> VerifiedMutation:
     )
     caller = AuthenticationContext(
         role=CallerRole.EXECUTION_TASK_CALLER,
-        email=f"task-executor@{PROJECT_ID}.iam.gserviceaccount.com",
+        email=f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com",
         subject="123456789012345678901",
         issuer="https://accounts.google.com",
         audience=audience,
-        issued_at=1,
-        expires_at=2,
+        issued_at=int(datetime(2026, 8, 19, 12, 0, tzinfo=UTC).timestamp()),
+        expires_at=int(datetime(2026, 8, 19, 13, 0, tzinfo=UTC).timestamp()),
     )
     return VerifiedMutation(
         request=request,
@@ -320,6 +344,22 @@ class _SubstitutingClaimStore(_Store):
         return ReceiptClaimAdopted(self.record)
 
 
+class _BlockingClaimStore(_Store):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.started = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def claim_or_adopt_receipt(
+        self,
+        receipt: ExecutionReceipt,
+        binding: MutationBinding,
+    ) -> ReceiptClaimResult:
+        self.started.set()
+        await self.resume.wait()
+        return await super().claim_or_adopt_receipt(receipt, binding)
+
+
 class _ConflictingResolutionStore(_Store):
     async def compare_and_set_receipt(
         self,
@@ -400,6 +440,16 @@ class _Adapter:
         self.events = events
         self.error = error
         self.calls: list[MutationIntent] = []
+        self._prepared_intent: MutationIntent | None = None
+
+    @property
+    def intent(self) -> MutationIntent:
+        assert self._prepared_intent is not None
+        return self._prepared_intent
+
+    async def prepare(self, intent: MutationIntent) -> _Adapter:
+        self._prepared_intent = intent
+        return self
 
     async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
         self.events.append("adapter")
@@ -423,6 +473,16 @@ class _CloudRunAdapterSpy:
         self.events = events
         self.error = error
         self.calls: list[MutationIntent] = []
+        self._prepared_intent: MutationIntent | None = None
+
+    @property
+    def intent(self) -> MutationIntent:
+        assert self._prepared_intent is not None
+        return self._prepared_intent
+
+    async def prepare(self, intent: MutationIntent) -> _CloudRunAdapterSpy:
+        self._prepared_intent = intent
+        return self
 
     async def mutate(self, permit: MutationPermit) -> CloudRunMutationResult:
         self.events.append("cloud-run-adapter")
@@ -430,6 +490,12 @@ class _CloudRunAdapterSpy:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class _PreparationFailureAdapter(_Adapter):
+    async def prepare(self, intent: MutationIntent) -> _PreparationFailureAdapter:
+        del intent
+        raise RuntimeError("synthetic preparation failure")
 
 
 class _Readback:
@@ -489,6 +555,7 @@ def _coordinator(
         final_gate=FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
+            route_policy=_route_policy(),
             clock=clock,
         ),
         readback=readback,
@@ -549,6 +616,32 @@ def test_direct_claim_dispatches_once_and_verifies_in_exact_order() -> None:
     asyncio.run(scenario())
 
 
+def test_adapter_preparation_failure_is_denied_without_ambiguous_provider_state() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _Store(events)
+        reader = _Reader(_snapshot(), events)
+        adapter = _PreparationFailureAdapter(_applied(), events)
+        readback = _Readback([_exact_readback()], events)
+
+        result = await _coordinator(
+            store,
+            reader,
+            adapter,
+            readback,
+            _Clock(),
+        ).execute(_verified())
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.DENIED
+        assert result.reason_code is ReasonCode.AUTHORITY_UNAVAILABLE
+        assert result.receipt.value.provider_operation is None
+        assert adapter.calls == []
+        assert events == ["claim", "cas"]
+
+    asyncio.run(scenario())
+
+
 def test_concurrent_exact_duplicate_has_one_adapter_call() -> None:
     async def scenario() -> None:
         events: list[str] = []
@@ -572,6 +665,40 @@ def test_concurrent_exact_duplicate_has_one_adapter_call() -> None:
         assert type(completed) is ReceiptExecutionStored
         assert completed.receipt.value.outcome is ReceiptOutcome.VERIFIED
         assert len(adapter.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_caller_expiring_while_receipt_claim_waits_never_reaches_adapter() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = _BlockingClaimStore(events)
+        reader = _Reader(_snapshot(), events)
+        adapter = _Adapter(_applied(), events)
+        readback = _Readback([_exact_readback()], events)
+        clock = _Clock()
+        original = _verified()
+        verified = replace(
+            original,
+            caller=replace(
+                original.caller,
+                expires_at=int((NOW + timedelta(seconds=1)).timestamp()),
+            ),
+        )
+        coordinator = _coordinator(store, reader, adapter, readback, clock)
+
+        pending = asyncio.create_task(coordinator.execute(verified))
+        await asyncio.wait_for(store.started.wait(), timeout=1)
+        clock.value = NOW + timedelta(seconds=2)
+        store.resume.set()
+        result = await pending
+
+        assert type(result) is ReceiptExecutionStored
+        assert result.receipt.value.outcome is ReceiptOutcome.DENIED
+        assert result.reason_code is ReasonCode.CALLER_UNAUTHORIZED
+        assert adapter.calls == []
+        assert "authority" in events
+        assert "adapter" not in events
 
     asyncio.run(scenario())
 

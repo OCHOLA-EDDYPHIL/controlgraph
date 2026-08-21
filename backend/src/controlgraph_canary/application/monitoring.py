@@ -7,7 +7,7 @@ import hashlib
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
@@ -39,6 +39,7 @@ _BINARY64 = re.compile(r"^[0-9a-f]{16}$")
 _WINDOW_SECONDS = 60
 _MAXIMUM_POINTS = 64
 _OBSERVATION_ID_DOMAIN = b"controlgraph.monitoring-observation-id/v1\0"
+_SCOPE_FACTORY_TOKEN = object()
 _RESPONSE_CODE_ORDER: tuple[ResponseCodeClass, ...] = (
     "1xx",
     "2xx",
@@ -80,9 +81,14 @@ class MonitoringCollectionScope:
     epoch: int
     candidate_revision: str
     observation_started_at: str
+    _factory_token: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if type(self.policy) is not RolloutHealthPolicyV2 or type(self.target) is not TargetBinding:
+        if (
+            self._factory_token is not _SCOPE_FACTORY_TOKEN
+            or type(self.policy) is not RolloutHealthPolicyV2
+            or type(self.target) is not TargetBinding
+        ):
             raise ValueError("monitoring collection scope is invalid")
         try:
             window_started_at, window_ended_at = _window_bounds(
@@ -101,6 +107,30 @@ class MonitoringCollectionScope:
             )
         except (TypeError, ValueError):
             raise ValueError("monitoring collection scope is invalid") from None
+
+
+def _issue_monitoring_collection_scope(
+    *,
+    policy: RolloutHealthPolicyV2,
+    target: TargetBinding,
+    root_id: str,
+    root_sha256: str,
+    epoch: int,
+    candidate_revision: str,
+    observation_started_at: str,
+) -> MonitoringCollectionScope:
+    """Issue a scope only after the health-orchestration factory validates its anchor."""
+
+    return MonitoringCollectionScope(
+        policy=policy,
+        target=target,
+        root_id=root_id,
+        root_sha256=root_sha256,
+        epoch=epoch,
+        candidate_revision=candidate_revision,
+        observation_started_at=observation_started_at,
+        _factory_token=_SCOPE_FACTORY_TOKEN,
+    )
 
 
 @dataclass(frozen=True, slots=True)

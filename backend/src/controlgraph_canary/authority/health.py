@@ -407,7 +407,6 @@ class HealthEvaluationState:
             or self.evaluated_windows
             or self.last_observation_sha256 is not None
             or self.consumed_sample_set_sha256s
-            or self.prior_decision_sha256 is not None
         ):
             raise ValueError("evaluated health state requires a prior window")
         if self.evaluated_windows == 0 and self.last_window_ended_at is not None:

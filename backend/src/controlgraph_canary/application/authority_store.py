@@ -26,7 +26,9 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
+    RolloutRootV3,
     RootCreationResultV1,
+    RootCreationResultV2,
     SignedEvidenceEventV1,
 )
 from controlgraph_canary.contracts.storage import (
@@ -315,45 +317,55 @@ class CreatedRollout:
 
 @dataclass(frozen=True, slots=True)
 class RootCreationBundle:
-    """One coherent view of the six records created for a v2 rollout root."""
+    """One coherent view of six exact V2-era or V3-era root records."""
 
-    root: StoredRecord[RolloutRootV2]
+    root: StoredRecord[RolloutRootV2 | RolloutRootV3]
     service_claim: StoredRecord[ServiceClaimRecord]
     authority: StoredRecord[EpochAuthorityRecord]
     lineage_anchor: StoredRecord[CapabilityLineageAnchorV1]
     signed_evidence: StoredRecord[SignedEvidenceEventV1]
-    creation_result: StoredRecord[RootCreationResultV1]
+    creation_result: StoredRecord[RootCreationResultV1 | RootCreationResultV2]
 
     def __post_init__(self) -> None:
         expected_types = (
-            (self.root, RolloutRootV2),
             (self.service_claim, ServiceClaimRecord),
             (self.authority, EpochAuthorityRecord),
             (self.lineage_anchor, CapabilityLineageAnchorV1),
             (self.signed_evidence, SignedEvidenceEventV1),
-            (self.creation_result, RootCreationResultV1),
         )
         if any(
             type(record) is not StoredRecord or type(record.value) is not model_type
             for record, model_type in expected_types
-        ):
+        ) or type(self.root) is not StoredRecord or type(self.creation_result) is not StoredRecord:
             raise TypeError("root creation bundle requires exact stored records")
+        pair = (type(self.root.value), type(self.creation_result.value))
+        if pair not in (
+            (RolloutRootV2, RootCreationResultV1),
+            (RolloutRootV3, RootCreationResultV2),
+        ):
+            raise TypeError("root creation bundle versions do not match")
 
 
 @dataclass(frozen=True, slots=True)
 class RootCreationWriteResult:
     """Direct creation or exact replay adoption with its coherent stored winner."""
 
-    result: RootCreationResultV1
+    result: RootCreationResultV1 | RootCreationResultV2
     bundle: RootCreationBundle
 
     def __post_init__(self) -> None:
-        if type(self.result) is not RootCreationResultV1:
+        if type(self.result) not in (RootCreationResultV1, RootCreationResultV2):
             raise TypeError("root creation write requires an exact result")
         persisted = self.bundle.creation_result.value
-        normalized = RootCreationResultV1.model_validate(
-            {**self.result.model_dump(mode="python"), "outcome": "CREATED"}
-        )
+        normalized: RootCreationResultV1 | RootCreationResultV2
+        if type(self.result) is RootCreationResultV1:
+            normalized = RootCreationResultV1.model_validate(
+                {**self.result.model_dump(mode="python"), "outcome": "CREATED"}
+            )
+        else:
+            normalized = RootCreationResultV2.model_validate(
+                {**self.result.model_dump(mode="python"), "outcome": "CREATED"}
+            )
         if persisted != normalized:
             raise ValueError("root creation write result does not match its stored winner")
 
@@ -420,12 +432,12 @@ class AuthorityStore(Protocol):
 
     async def create_or_adopt_root_creation_bundle(
         self,
-        root: RolloutRootV2,
+        root: RolloutRootV3,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
         lineage_anchor: CapabilityLineageAnchorV1,
         signed_evidence: SignedEvidenceEventV1,
-        creation_result: RootCreationResultV1,
+        creation_result: RootCreationResultV2,
         *,
         expected_released_claim: StoredRecord[ServiceClaimRecord] | None = None,
     ) -> RootCreationWriteResult: ...

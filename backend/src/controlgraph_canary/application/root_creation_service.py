@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStore,
@@ -34,6 +34,7 @@ from controlgraph_canary.contracts.models import EvidenceEvent
 from controlgraph_canary.contracts.root_creation import (
     RootCreationCommandV1,
     RootCreationResultV1,
+    RootCreationResultV2,
     SignedEvidenceEventV1,
 )
 from controlgraph_canary.contracts.root_trust import (
@@ -279,7 +280,12 @@ class RolloutRootCreator:
         if not self._matches_existing(command, principal, claim, winner):
             raise RootCreationError(RootCreationErrorCode.ACTIVE_CLAIM_CONFLICT)
         try:
-            adopted = RootCreationResultV1.model_validate(
+            result_type = (
+                RootCreationResultV1
+                if type(winner) is RootCreationResultV1
+                else RootCreationResultV2
+            )
+            adopted = result_type.model_validate(
                 {**winner.model_dump(mode="python"), "outcome": "ADOPTED"}
             )
             return _ExistingClaimDecision(
@@ -296,16 +302,17 @@ class RolloutRootCreator:
         claim: ServiceClaimRecord,
         winner: object,
     ) -> bool:
-        if type(winner) is not RootCreationResultV1:
+        if type(winner) not in (RootCreationResultV1, RootCreationResultV2):
             return False
-        root = winner.root
+        typed_winner = cast(RootCreationResultV1 | RootCreationResultV2, winner)
+        root = typed_winner.root
         return (
-            winner.outcome == "CREATED"
-            and winner.request_id == command.request_id
-            and winner.idempotency_key == command.idempotency_key
-            and winner.operator_identity == principal.email
-            and winner.operator_subject == principal.subject
-            and winner.root.content.target == self._configuration.target
+            typed_winner.outcome == "CREATED"
+            and typed_winner.request_id == command.request_id
+            and typed_winner.idempotency_key == command.idempotency_key
+            and typed_winner.operator_identity == principal.email
+            and typed_winner.operator_subject == principal.subject
+            and typed_winner.root.content.target == self._configuration.target
             and claim.root_id == root.root_id
             and claim.root_sha256 == root.root_sha256
             and stable_snapshots_match(

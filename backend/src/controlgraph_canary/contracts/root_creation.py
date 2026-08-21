@@ -22,12 +22,15 @@ from controlgraph_canary.contracts.base import (
     UtcSecond,
 )
 from controlgraph_canary.contracts.codec import (
+    ContractError,
     RestrictedJson,
     canonical_json_bytes,
     canonical_json_value_bytes,
     canonical_sha256,
     decode_base64url,
+    decode_contract,
 )
+from controlgraph_canary.contracts.health import RolloutHealthPolicyV2
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
@@ -44,9 +47,12 @@ ROOT_ACTION_GRANT_V1: Final = "controlgraph.root-action-grant/v1"
 ROOT_AUTHORITY_BOUNDS_V1: Final = "controlgraph.root-authority-bounds/v1"
 ROLLOUT_ROOT_CONTENT_V2: Final = "controlgraph.rollout-root-content/v2"
 ROLLOUT_ROOT_V2: Final = "controlgraph.rollout-root/v2"
+ROLLOUT_ROOT_CONTENT_V3: Final = "controlgraph.rollout-root-content/v3"
+ROLLOUT_ROOT_V3: Final = "controlgraph.rollout-root/v3"
 CAPABILITY_LINEAGE_ANCHOR_V1: Final = "controlgraph.capability-lineage-anchor/v1"
 SIGNED_EVIDENCE_EVENT_V1: Final = "controlgraph.signed-evidence-event/v1"
 ROOT_CREATION_RESULT_V1: Final = "controlgraph.root-creation-result/v1"
+ROOT_CREATION_RESULT_V2: Final = "controlgraph.root-creation-result/v2"
 ROOT_CREATION_EVIDENCE_SUBJECT_V1: Final = "controlgraph.root-creation-evidence-subject/v1"
 ROOT_CREATION_COMMAND_V1: Final = "controlgraph.root-creation-command/v1"
 
@@ -327,6 +333,89 @@ class RolloutRootV2(StrictContractModel):
         return self
 
 
+class RolloutRootContentV3(StrictContractModel):
+    """Canonical root content that embeds the exact Monitoring health policy."""
+
+    schema_version: Literal["controlgraph.rollout-root-content/v3"]
+    target: TargetBinding
+    stable_snapshot: StableSnapshot
+    health_policy: RolloutHealthPolicyV2
+    rollout_plan: RolloutPlanV1
+    authority_bounds: RootAuthorityBoundsV1
+    evidence_signing_key_version: KeyVersionResource
+    approved_by: BoundedText
+    approved_by_subject: GoogleSubject
+    approved_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_content_bindings(self) -> Self:
+        _validate_target(self.target)
+        _validate_operator_identity(self.approved_by)
+        if self.stable_snapshot.target != self.target:
+            raise ValueError("root snapshot target does not match root target")
+        if self.rollout_plan.target != self.target:
+            raise ValueError("root plan target does not match root target")
+        if self.authority_bounds.target != self.target:
+            raise ValueError("root authority target does not match root target")
+        plan = self.rollout_plan
+        snapshot = self.stable_snapshot
+        bounds = self.authority_bounds
+        expected_reader = (
+            f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
+        )
+        if snapshot.captured_by != expected_reader:
+            raise ValueError("root snapshot was not captured by the configured verifier")
+        if snapshot.captured_at > self.approved_at:
+            raise ValueError("root approval predates its stable snapshot")
+        if plan.stable_snapshot_sha256 != canonical_sha256(snapshot):
+            raise ValueError("root plan does not bind the canonical stable snapshot")
+        if plan.health_policy_sha256 != canonical_sha256(self.health_policy):
+            raise ValueError("root plan does not bind the canonical health policy")
+        if (
+            plan.stable_revision != snapshot.stable_revision
+            or plan.stable_revision_configuration_sha256
+            != snapshot.stable_revision_configuration_sha256
+            or plan.concurrency != snapshot.concurrency
+        ):
+            raise ValueError("root plan does not bind the stable snapshot configuration")
+        if (
+            bounds.stable_revision != plan.stable_revision
+            or bounds.stable_revision_configuration_sha256
+            != plan.stable_revision_configuration_sha256
+            or bounds.candidate_revision != plan.candidate_revision
+            or bounds.candidate_revision_configuration_sha256
+            != plan.candidate_revision_configuration_sha256
+            or bounds.concurrency != plan.concurrency
+            or bounds.plan_sha256 != canonical_sha256(plan)
+            or bounds.maximum_recovery_attempts != plan.maximum_recovery_attempts
+        ):
+            raise ValueError("root authority bounds do not match the canonical plan")
+        _validate_signing_key(
+            self.evidence_signing_key_version,
+            project_id=self.target.project_id,
+            key_name="evidence-signing",
+        )
+        return self
+
+
+class RolloutRootV3(StrictContractModel):
+    """A self-addressing immutable root with a V2 health policy."""
+
+    schema_version: Literal["controlgraph.rollout-root/v3"]
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    content: RolloutRootContentV3
+
+    @model_validator(mode="after")
+    def validate_content_address(self) -> Self:
+        expected_digest = canonical_sha256(self.content)
+        if self.root_sha256 != expected_digest:
+            raise ValueError("rollout root digest does not match its canonical content")
+        if self.root_id != f"cgroot:{expected_digest}":
+            raise ValueError("rollout root identifier does not match its content digest")
+        return self
+
+
 class CapabilityLineageAnchorV1(StrictContractModel):
     """Immutable maximum authority inherited by the first capability."""
 
@@ -527,6 +616,134 @@ class RootCreationResultV1(StrictContractModel):
         return self
 
 
+class RootCreationResultV2(StrictContractModel):
+    """A root-creation winner whose emitted root embeds the V2 health policy."""
+
+    schema_version: Literal["controlgraph.root-creation-result/v2"]
+    outcome: Literal["CREATED", "ADOPTED"]
+    request_id: Identifier
+    idempotency_key: Identifier
+    operator_identity: BoundedText
+    operator_subject: GoogleSubject
+    request_sha256: Sha256Digest
+    created_at: UtcSecond
+    winner_request_id: Identifier
+    winner_idempotency_key: Identifier
+    winner_operator_identity: BoundedText
+    winner_operator_subject: GoogleSubject
+    winner_request_sha256: Sha256Digest
+    winner_service_claim_id: Identifier
+    winner_service_claim_sha256: Sha256Digest
+    winner_authority_id: Identifier
+    winner_authority_sha256: Sha256Digest
+    winner_lineage_anchor_id: Identifier
+    winner_lineage_anchor_sha256: Sha256Digest
+    winner_evidence_id: Identifier
+    winner_evidence_sha256: Sha256Digest
+    root: RolloutRootV3
+    initial_authority: EpochAuthorityRecord
+    lineage_anchor: CapabilityLineageAnchorV1
+    evidence_subject: RootCreationEvidenceSubjectV1
+    signed_evidence: SignedEvidenceEventV1
+
+    @model_validator(mode="after")
+    def validate_deterministic_winner(self) -> Self:
+        _validate_operator_identity(self.operator_identity)
+        _validate_operator_identity(self.winner_operator_identity)
+        if (
+            self.request_id != self.winner_request_id
+            or self.idempotency_key != self.winner_idempotency_key
+            or self.operator_identity != self.winner_operator_identity
+            or self.operator_subject != self.winner_operator_subject
+            or self.winner_operator_identity != self.root.content.approved_by
+            or self.winner_operator_subject != self.root.content.approved_by_subject
+        ):
+            raise ValueError("root creation may adopt only the exact winning request")
+        expected_request_sha256 = root_creation_request_sha256(
+            root=self.root,
+            request_id=self.request_id,
+            idempotency_key=self.idempotency_key,
+            operator_identity=self.operator_identity,
+            operator_subject=self.operator_subject,
+        )
+        if (
+            self.request_sha256 != expected_request_sha256
+            or self.winner_request_sha256 != expected_request_sha256
+        ):
+            raise ValueError("root creation request digest does not match the winner")
+        expected_anchor = capability_lineage_anchor(self.root)
+        if self.lineage_anchor != expected_anchor:
+            raise ValueError("root creation lineage anchor does not match the root")
+        anchor_sha256 = canonical_sha256(self.lineage_anchor)
+        authority_sha256 = canonical_sha256(self.initial_authority)
+        evidence_sha256 = canonical_sha256(self.signed_evidence)
+        event = self.signed_evidence.event
+        if (
+            self.root.content.approved_at > self.created_at
+            or event.occurred_at != self.created_at
+            or event.kind is not EvidenceKind.ROOT_CREATED
+            or event.sequence != 0
+            or event.previous_event_sha256 is not None
+            or event.root_id != self.root.root_id
+            or event.root_sha256 != self.root.root_sha256
+            or event.target != self.root.content.target
+            or event.epoch != self.root.content.rollout_plan.initial_epoch
+            or event.actor != self.winner_operator_identity
+            or event.request_id != self.winner_request_id
+            or event.receipt_id is not None
+            or event.reason_code is not None
+            or event.provider_operation is not None
+            or event.target_configuration_sha256
+            != self.root.content.stable_snapshot.configuration_sha256
+            or event.subject_sha256 != canonical_sha256(self.evidence_subject)
+            or self.signed_evidence.signing_key_version
+            != self.root.content.evidence_signing_key_version
+        ):
+            raise ValueError("root creation evidence does not match the winning root")
+        if (
+            self.initial_authority.root_id != self.root.root_id
+            or self.initial_authority.root_sha256 != self.root.root_sha256
+            or self.initial_authority.target != self.root.content.target
+            or self.initial_authority.current_epoch != self.root.content.rollout_plan.initial_epoch
+            or self.initial_authority.previous_epoch is not None
+            or self.initial_authority.revision != 0
+            or self.initial_authority.cause is not EpochChangeCause.ROOT_CREATED
+            or self.initial_authority.changed_by != self.winner_operator_identity
+            or self.initial_authority.request_id != self.winner_request_id
+            or self.initial_authority.evidence_id != event.evidence_id
+            or self.initial_authority.changed_at != self.created_at
+        ):
+            raise ValueError("initial authority does not match the winning root")
+        expected_claim_id = canonical_sha256(self.root.content.target)
+        expected_anchor_id = f"cganchor:{anchor_sha256}"
+        expected_subject = RootCreationEvidenceSubjectV1(
+            schema_version=ROOT_CREATION_EVIDENCE_SUBJECT_V1,
+            root_id=self.root.root_id,
+            root_sha256=self.root.root_sha256,
+            request_sha256=expected_request_sha256,
+            created_at=self.created_at,
+            service_claim_id=self.winner_service_claim_id,
+            service_claim_sha256=self.winner_service_claim_sha256,
+            authority_id=self.winner_authority_id,
+            authority_sha256=self.winner_authority_sha256,
+            lineage_anchor_id=self.winner_lineage_anchor_id,
+            lineage_anchor_sha256=self.winner_lineage_anchor_sha256,
+            evidence_id=self.winner_evidence_id,
+        )
+        if (
+            self.winner_service_claim_id != expected_claim_id
+            or self.winner_authority_id != self.root.root_id
+            or self.winner_authority_sha256 != authority_sha256
+            or self.winner_lineage_anchor_id != expected_anchor_id
+            or self.winner_lineage_anchor_sha256 != anchor_sha256
+            or self.winner_evidence_id != event.evidence_id
+            or self.winner_evidence_sha256 != evidence_sha256
+            or self.evidence_subject != expected_subject
+        ):
+            raise ValueError("root creation artifact identity or digest does not match")
+        return self
+
+
 def create_rollout_root(content: RolloutRootContentV2) -> RolloutRootV2:
     """Create the sole valid self-address for canonical root content."""
 
@@ -541,10 +758,40 @@ def create_rollout_root(content: RolloutRootContentV2) -> RolloutRootV2:
     )
 
 
-def capability_lineage_anchor(root: RolloutRootV2) -> CapabilityLineageAnchorV1:
+def create_rollout_root_v3(content: RolloutRootContentV3) -> RolloutRootV3:
+    """Create the sole valid self-address for V3 rollout-root content."""
+
+    if type(content) is not RolloutRootContentV3:
+        raise TypeError("V3 root creation requires exact rollout-root content")
+    digest = canonical_sha256(content)
+    return RolloutRootV3(
+        schema_version=ROLLOUT_ROOT_V3,
+        root_id=f"cgroot:{digest}",
+        root_sha256=digest,
+        content=content,
+    )
+
+
+def decode_root_creation_result(
+    data: bytes | str,
+) -> RootCreationResultV1 | RootCreationResultV2:
+    """Decode only one exact historical or current root-creation result."""
+
+    try:
+        return decode_contract(data, RootCreationResultV2)
+    except ContractError as current_error:
+        try:
+            return decode_contract(data, RootCreationResultV1)
+        except ContractError:
+            raise current_error from None
+
+
+def capability_lineage_anchor(
+    root: RolloutRootV2 | RolloutRootV3,
+) -> CapabilityLineageAnchorV1:
     """Project immutable root authority into the first lineage anchor."""
 
-    if type(root) is not RolloutRootV2:
+    if type(root) not in (RolloutRootV2, RolloutRootV3):
         raise TypeError("lineage anchoring requires an exact rollout root")
     content = root.content
     plan = content.rollout_plan
@@ -567,7 +814,7 @@ def capability_lineage_anchor(root: RolloutRootV2) -> CapabilityLineageAnchorV1:
 
 def root_creation_request_sha256(
     *,
-    root: RolloutRootV2,
+    root: RolloutRootV2 | RolloutRootV3,
     request_id: str,
     idempotency_key: str,
     operator_identity: str,
@@ -575,7 +822,7 @@ def root_creation_request_sha256(
 ) -> str:
     """Hash the complete authenticated root-creation request projection."""
 
-    if type(root) is not RolloutRootV2:
+    if type(root) not in (RolloutRootV2, RolloutRootV3):
         raise TypeError("root creation request hashing requires an exact rollout root")
     try:
         request = _RootCreationRequestProjection(
@@ -695,26 +942,34 @@ __all__ = [
     "ROLLOUT_HEALTH_POLICY_V1",
     "ROLLOUT_PLAN_V1",
     "ROLLOUT_ROOT_CONTENT_V2",
+    "ROLLOUT_ROOT_CONTENT_V3",
     "ROLLOUT_ROOT_V2",
+    "ROLLOUT_ROOT_V3",
     "ROOT_ACTION_GRANT_V1",
     "ROOT_AUTHORITY_BOUNDS_V1",
     "ROOT_CREATION_COMMAND_V1",
     "ROOT_CREATION_EVIDENCE_SUBJECT_V1",
     "ROOT_CREATION_RESULT_V1",
+    "ROOT_CREATION_RESULT_V2",
     "SIGNED_EVIDENCE_EVENT_V1",
     "CapabilityLineageAnchorV1",
     "RolloutHealthPolicyV1",
     "RolloutPlanV1",
     "RolloutRootContentV2",
+    "RolloutRootContentV3",
     "RolloutRootV2",
+    "RolloutRootV3",
     "RootActionGrantV1",
     "RootAuthorityBoundsV1",
     "RootCreationCommandV1",
     "RootCreationEvidenceSubjectV1",
     "RootCreationResultV1",
+    "RootCreationResultV2",
     "SignedEvidenceEventV1",
     "capability_lineage_anchor",
     "create_rollout_root",
+    "create_rollout_root_v3",
+    "decode_root_creation_result",
     "evidence_payload_sha256",
     "evidence_signing_input_sha256",
     "root_creation_request_sha256",

@@ -19,6 +19,7 @@ module "issuer" {
     CONTROLGRAPH_SERVICE_NAME           = local.service_names.issuer
     CONTROLGRAPH_CONTROLLER_ID          = "${var.project_id}:${var.region}:issuer"
     CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
     CONTROLGRAPH_SIGNING_ALGORITHM      = data.terraform_remote_state.foundation.outputs.signing_keys.capability.algorithm
   })
 }

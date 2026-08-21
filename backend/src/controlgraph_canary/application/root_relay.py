@@ -24,11 +24,12 @@ from controlgraph_canary.application.root_trust import (
 from controlgraph_canary.contracts.codec import (
     ContractError,
     canonical_json_bytes,
-    decode_contract,
 )
 from controlgraph_canary.contracts.root_creation import (
     RootCreationCommandV1,
     RootCreationResultV1,
+    RootCreationResultV2,
+    decode_root_creation_result,
 )
 from controlgraph_canary.contracts.root_relay import (
     ROOT_CREATION_INVOCATION_V1,
@@ -103,7 +104,7 @@ class ApiRootCreationClient:
         self,
         command: RootCreationCommandV1,
         principal: AuthenticationContext,
-    ) -> RootCreationResultV1:
+    ) -> RootCreationResultV1 | RootCreationResultV2:
         """Return only an exact coordinator result for the authenticated command."""
 
         if type(command) is not RootCreationCommandV1:
@@ -142,7 +143,7 @@ class ApiRootCreationClient:
         except Exception:
             raise RootRelayError(RootRelayErrorCode.TRANSPORT_UNAVAILABLE) from None
         try:
-            result = decode_contract(body, RootCreationResultV1)
+            result = decode_root_creation_result(body)
         except ContractError:
             raise RootRelayError(RootRelayErrorCode.RESPONSE_INVALID) from None
         except Exception:
@@ -182,7 +183,7 @@ class CoordinatorRootCreationRelay:
         self,
         invocation: RootCreationInvocationV1,
         caller: AuthenticationContext,
-    ) -> RootCreationResultV1:
+    ) -> RootCreationResultV1 | RootCreationResultV2:
         """Return the canonical creation winner after both identity checks."""
 
         if not _context_matches_policy(
@@ -255,16 +256,17 @@ def _result_matches_invocation(
     result: object,
     invocation: RootCreationInvocationV1,
 ) -> bool:
-    if type(result) is not RootCreationResultV1:
+    if type(result) not in (RootCreationResultV1, RootCreationResultV2):
         return False
+    typed_result = cast(RootCreationResultV1 | RootCreationResultV2, result)
     command = invocation.command
-    root_snapshot = result.root.content.stable_snapshot
+    root_snapshot = typed_result.root.content.stable_snapshot
     return (
-        result.request_id == command.request_id
-        and result.idempotency_key == command.idempotency_key
-        and result.operator_identity == invocation.operator_identity
-        and result.operator_subject == invocation.operator_subject
-        and result.root.content.target == command.expected_stable_snapshot.target
+        typed_result.request_id == command.request_id
+        and typed_result.idempotency_key == command.idempotency_key
+        and typed_result.operator_identity == invocation.operator_identity
+        and typed_result.operator_subject == invocation.operator_subject
+        and typed_result.root.content.target == command.expected_stable_snapshot.target
         and stable_snapshots_match(
             root_snapshot,
             command.expected_stable_snapshot,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import re
 from collections.abc import Sequence
 from threading import Lock
@@ -22,6 +23,13 @@ from controlgraph_canary.application.signing import (
     TrustBundleVerifier,
     VerificationProfile,
     make_trust_bundle_entry,
+)
+from controlgraph_canary.contracts.codec import ContractError, decode_base64url
+from controlgraph_canary.contracts.health_execution import (
+    HEALTH_ATTESTATION_PURPOSE,
+    P256_SIGNING_ALGORITHM,
+    SignedHealthDecisionProofV1,
+    health_attestation_signing_input_sha256,
 )
 from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
 
@@ -250,6 +258,57 @@ async def _load_version_async(
         raise _error(SigningErrorCode.KEY_VERSION_DISABLED, "KMS key version is not enabled")
 
 
+async def _load_public_key_async(
+    client: _AsyncKmsClient,
+    profile: SigningProfile,
+) -> str:
+    try:
+        raw_response = await client.get_public_key(
+            {"name": profile.key_version},
+            retry=None,
+            timeout=_KMS_REQUEST_TIMEOUT_SECONDS,
+        )
+        response = cast(_PublicKeyResponse, raw_response)
+        response_name = response.name
+        algorithm_name = _enum_name(response.algorithm)
+        public_key_pem = response.pem
+        public_key_crc32c = response.pem_crc32c
+    except asyncio.CancelledError:
+        raise
+    except SigningError:
+        raise
+    except Exception:
+        raise _error(
+            SigningErrorCode.PROVIDER_FAILURE,
+            "KMS public key lookup failed",
+        ) from None
+    if type(response_name) is not str or response_name != profile.key_version:
+        raise _error(
+            SigningErrorCode.KEY_VERSION_MISMATCH,
+            "KMS returned another public key version",
+        )
+    if algorithm_name != SIGNING_ALGORITHM or algorithm_name != profile.algorithm:
+        raise _error(
+            SigningErrorCode.ALGORITHM_MISMATCH,
+            "KMS public key algorithm is invalid",
+        )
+    if type(public_key_pem) is not str:
+        raise _error(SigningErrorCode.PUBLIC_KEY_INVALID, "KMS public key PEM is invalid")
+    try:
+        public_key_bytes = public_key_pem.encode("ascii")
+    except UnicodeEncodeError:
+        raise _error(
+            SigningErrorCode.PUBLIC_KEY_INVALID,
+            "KMS public key PEM is invalid",
+        ) from None
+    if (
+        type(public_key_crc32c) is not int
+        or public_key_crc32c != _crc32c(public_key_bytes)
+    ):
+        raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
+    return public_key_pem
+
+
 class GoogleKmsDigestSigner:
     """Sign only SHA-256 digests with one exact KMS key version and algorithm."""
 
@@ -370,7 +429,7 @@ class GoogleKmsAsyncDigestSigner:
 
 
 class GoogleKmsEvidenceSignatureVerifier:
-    """Verify evidence against one live, exact, coordinator-readable KMS version."""
+    """Verify evidence against one exact KMS version from a read-only trust role."""
 
     def __init__(
         self,
@@ -380,7 +439,11 @@ class GoogleKmsEvidenceSignatureVerifier:
         key_version: str,
         client: object | None = None,
     ) -> None:
-        if service_role is not ServiceRole.COORDINATOR:
+        if service_role not in {
+            ServiceRole.COORDINATOR,
+            ServiceRole.VERIFIER,
+            ServiceRole.ISSUER,
+        }:
             raise _error(
                 SigningErrorCode.PROFILE_INVALID,
                 "evidence verification role is invalid",
@@ -422,50 +485,7 @@ class GoogleKmsEvidenceSignatureVerifier:
             client = _default_async_client()
             self._client = client
         await _load_version_async(client, self._profile)
-        try:
-            raw_response = await client.get_public_key(
-                {"name": self._profile.key_version},
-                retry=None,
-                timeout=_KMS_REQUEST_TIMEOUT_SECONDS,
-            )
-            response = cast(_PublicKeyResponse, raw_response)
-            response_name = response.name
-            algorithm_name = _enum_name(response.algorithm)
-            public_key_pem = response.pem
-            public_key_crc32c = response.pem_crc32c
-        except asyncio.CancelledError:
-            raise
-        except SigningError:
-            raise
-        except Exception:
-            raise _error(
-                SigningErrorCode.PROVIDER_FAILURE,
-                "KMS public key lookup failed",
-            ) from None
-        if type(response_name) is not str or response_name != self._profile.key_version:
-            raise _error(
-                SigningErrorCode.KEY_VERSION_MISMATCH,
-                "KMS returned another public key version",
-            )
-        if algorithm_name != SIGNING_ALGORITHM or algorithm_name != self._profile.algorithm:
-            raise _error(
-                SigningErrorCode.ALGORITHM_MISMATCH,
-                "KMS public key algorithm is invalid",
-            )
-        if type(public_key_pem) is not str:
-            raise _error(SigningErrorCode.PUBLIC_KEY_INVALID, "KMS public key PEM is invalid")
-        try:
-            public_key_bytes = public_key_pem.encode("ascii")
-        except UnicodeEncodeError:
-            raise _error(
-                SigningErrorCode.PUBLIC_KEY_INVALID,
-                "KMS public key PEM is invalid",
-            ) from None
-        if (
-            type(public_key_crc32c) is not int
-            or public_key_crc32c != _crc32c(public_key_bytes)
-        ):
-            raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
+        public_key_pem = await _load_public_key_async(client, self._profile)
         bundle = TrustBundle(
             entries=(
                 make_trust_bundle_entry(
@@ -492,6 +512,128 @@ class GoogleKmsEvidenceSignatureVerifier:
             ),
             bundle,
         ).verify(signed.event, detached)
+
+
+class GoogleKmsHealthAttestationVerifier:
+    """Verify the fixed health-attestation purpose with one exact evidence key."""
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        service_role: ServiceRole,
+        key_version: str,
+        client: object | None = None,
+    ) -> None:
+        if service_role not in {
+            ServiceRole.COORDINATOR,
+            ServiceRole.EVIDENCE_WRITER,
+            ServiceRole.VERIFIER,
+            ServiceRole.ISSUER,
+        }:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "health attestation verification role is invalid",
+            )
+        try:
+            profile = SigningProfile.evidence(project_id, key_version)
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "health attestation verification profile is invalid",
+            ) from None
+        self._profile = profile
+        self._client = None if client is None else cast(_AsyncKmsClient, client)
+
+    @property
+    def project_id(self) -> str:
+        return self._profile.project_id
+
+    @property
+    def key_version(self) -> str:
+        return self._profile.key_version
+
+    async def verify(self, signed: SignedHealthDecisionProofV1) -> None:
+        """Verify exact bindings and a canonical P-256 signature without retries."""
+
+        if (
+            type(signed) is not SignedHealthDecisionProofV1
+            or signed.purpose != HEALTH_ATTESTATION_PURPOSE
+            or signed.signing_algorithm != P256_SIGNING_ALGORITHM
+            or signed.signing_key_version != self._profile.key_version
+            or signed.proof.decision.target.project_id != self._profile.project_id
+        ):
+            raise _error(
+                SigningErrorCode.KEY_VERSION_UNTRUSTED,
+                "health attestation key version is not trusted",
+            )
+        expected_digest = health_attestation_signing_input_sha256(
+            signed.proof,
+            self._profile.key_version,
+        )
+        if not hmac.compare_digest(expected_digest, signed.signing_input_sha256):
+            raise _error(
+                SigningErrorCode.DIGEST_MISMATCH,
+                "health attestation signing digest is invalid",
+            )
+        try:
+            signature = decode_base64url(signed.signature, maximum_bytes=72)
+        except ContractError:
+            raise _error(
+                SigningErrorCode.SIGNATURE_INVALID,
+                "health attestation signature encoding is invalid",
+            ) from None
+        client = self._client
+        if client is None:
+            client = _default_async_client()
+            self._client = client
+        await _load_version_async(client, self._profile)
+        public_key_pem = await _load_public_key_async(client, self._profile)
+        _verify_p256_sha256_digest_signature(
+            public_key_pem=public_key_pem,
+            digest=bytes.fromhex(expected_digest),
+            signature=signature,
+        )
+
+
+def _verify_p256_sha256_digest_signature(
+    *,
+    public_key_pem: str,
+    digest: bytes,
+    signature: bytes,
+) -> None:
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+        encoded = public_key_pem.encode("ascii")
+        loaded = serialization.load_pem_public_key(encoded)
+        if (
+            not isinstance(loaded, ec.EllipticCurvePublicKey)
+            or not isinstance(loaded.curve, ec.SECP256R1)
+            or loaded.public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            != encoded
+        ):
+            raise ValueError("noncanonical public key")
+        r, s = utils.decode_dss_signature(signature)
+        if r <= 0 or s <= 0 or utils.encode_dss_signature(r, s) != signature:
+            raise ValueError("noncanonical signature")
+        loaded.verify(
+            signature,
+            digest,
+            ec.ECDSA(utils.Prehashed(hashes.SHA256())),
+        )
+    except (InvalidSignature, AttributeError, TypeError, UnicodeEncodeError, ValueError):
+        raise _error(
+            SigningErrorCode.SIGNATURE_INVALID,
+            "health attestation signature verification failed",
+        ) from None
 
 
 class GoogleKmsCapabilityTrustLoader:
@@ -649,5 +791,6 @@ __all__ = [
     "GoogleKmsCapabilityTrustLoader",
     "GoogleKmsDigestSigner",
     "GoogleKmsEvidenceSignatureVerifier",
+    "GoogleKmsHealthAttestationVerifier",
     "GoogleKmsTrustBundlePublisher",
 ]

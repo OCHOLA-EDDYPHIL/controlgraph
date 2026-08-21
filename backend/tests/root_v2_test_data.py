@@ -14,20 +14,26 @@ from controlgraph_canary.contracts import (
     EvidenceEvent,
     EvidenceKind,
     RolloutHealthPolicyV1,
+    RolloutHealthPolicyV2,
     RolloutPlanV1,
     RolloutRootContentV2,
+    RolloutRootContentV3,
     RolloutRootV2,
+    RolloutRootV3,
     RootActionGrantV1,
     RootAuthorityBoundsV1,
     RootCreationEvidenceSubjectV1,
     RootCreationResultV1,
+    RootCreationResultV2,
     SignedEvidenceEventV1,
     StableSnapshot,
     TargetBinding,
     TrafficAllocation,
     canonical_sha256,
     capability_lineage_anchor,
+    create_rollout_health_policy_v2,
     create_rollout_root,
+    create_rollout_root_v3,
     encode_base64url,
     evidence_payload_sha256,
     evidence_signing_input_sha256,
@@ -55,6 +61,16 @@ class RootV2Records:
     lineage_anchor: CapabilityLineageAnchorV1
     signed_evidence: SignedEvidenceEventV1
     creation_result: RootCreationResultV1
+
+
+@dataclass(frozen=True, slots=True)
+class RootV3Records:
+    root: RolloutRootV3
+    service_claim: ServiceClaimRecord
+    authority: EpochAuthorityRecord
+    lineage_anchor: CapabilityLineageAnchorV1
+    signed_evidence: SignedEvidenceEventV1
+    creation_result: RootCreationResultV2
 
 
 def root_v2_target(*, project_id: str = PROJECT) -> TargetBinding:
@@ -351,6 +367,130 @@ def make_root_v2_records(
         signed_evidence=signed_evidence,
     )
     return RootV2Records(
+        root=root,
+        service_claim=claim,
+        authority=authority,
+        lineage_anchor=anchor,
+        signed_evidence=signed_evidence,
+        creation_result=result,
+    )
+
+
+def make_root_v3_records(
+    *,
+    project_id: str = PROJECT,
+    variant: int = 1,
+) -> RootV3Records:
+    """Build the current root family from the historical fixture coordinates."""
+
+    historical = make_root_v2_records(project_id=project_id, variant=variant)
+    historical_root = historical.root
+    historical_result = historical.creation_result
+    policy: RolloutHealthPolicyV2 = create_rollout_health_policy_v2()
+    plan = RolloutPlanV1.model_validate(
+        {
+            **historical_root.content.rollout_plan.model_dump(mode="python"),
+            "health_policy_sha256": canonical_sha256(policy),
+        }
+    )
+    bounds = RootAuthorityBoundsV1.model_validate(
+        {
+            **historical_root.content.authority_bounds.model_dump(mode="python"),
+            "plan_sha256": canonical_sha256(plan),
+        }
+    )
+    root = create_rollout_root_v3(
+        RolloutRootContentV3(
+            schema_version="controlgraph.rollout-root-content/v3",
+            target=historical_root.content.target,
+            stable_snapshot=historical_root.content.stable_snapshot,
+            health_policy=policy,
+            rollout_plan=plan,
+            authority_bounds=bounds,
+            evidence_signing_key_version=(
+                historical_root.content.evidence_signing_key_version
+            ),
+            approved_by=historical_root.content.approved_by,
+            approved_by_subject=historical_root.content.approved_by_subject,
+            approved_at=historical_root.content.approved_at,
+        )
+    )
+    claim = ServiceClaimRecord.model_validate(
+        {
+            **historical.service_claim.model_dump(mode="python"),
+            "root_id": root.root_id,
+            "root_sha256": root.root_sha256,
+        }
+    )
+    authority = EpochAuthorityRecord.model_validate(
+        {
+            **historical.authority.model_dump(mode="python"),
+            "root_id": root.root_id,
+            "root_sha256": root.root_sha256,
+        }
+    )
+    anchor = capability_lineage_anchor(root)
+    request_digest = root_creation_request_sha256(
+        root=root,
+        request_id=historical_result.request_id,
+        idempotency_key=historical_result.idempotency_key,
+        operator_identity=historical_result.operator_identity,
+        operator_subject=historical_result.operator_subject,
+    )
+    anchor_digest = canonical_sha256(anchor)
+    subject = RootCreationEvidenceSubjectV1.model_validate(
+        {
+            **historical_result.evidence_subject.model_dump(mode="python"),
+            "root_id": root.root_id,
+            "root_sha256": root.root_sha256,
+            "request_sha256": request_digest,
+            "service_claim_sha256": canonical_sha256(claim),
+            "authority_id": root.root_id,
+            "authority_sha256": canonical_sha256(authority),
+            "lineage_anchor_id": f"cganchor:{anchor_digest}",
+            "lineage_anchor_sha256": anchor_digest,
+        }
+    )
+    event = EvidenceEvent.model_validate(
+        {
+            **historical.signed_evidence.event.model_dump(mode="python"),
+            "root_id": root.root_id,
+            "root_sha256": root.root_sha256,
+            "subject_sha256": canonical_sha256(subject),
+        }
+    )
+    evidence_key = root.content.evidence_signing_key_version
+    signed_evidence = SignedEvidenceEventV1.model_validate(
+        {
+            **historical.signed_evidence.model_dump(mode="python"),
+            "event": event,
+            "payload_sha256": evidence_payload_sha256(event),
+            "signing_input_sha256": evidence_signing_input_sha256(
+                event,
+                evidence_key,
+            ),
+        }
+    )
+    result = RootCreationResultV2.model_validate(
+        {
+            **historical_result.model_dump(mode="python"),
+            "schema_version": "controlgraph.root-creation-result/v2",
+            "request_sha256": request_digest,
+            "winner_request_sha256": request_digest,
+            "winner_service_claim_sha256": canonical_sha256(claim),
+            "winner_authority_id": root.root_id,
+            "winner_authority_sha256": canonical_sha256(authority),
+            "winner_lineage_anchor_id": f"cganchor:{anchor_digest}",
+            "winner_lineage_anchor_sha256": anchor_digest,
+            "winner_evidence_sha256": canonical_sha256(signed_evidence),
+            "root": root,
+            "initial_authority": authority,
+            "lineage_anchor": anchor,
+            "evidence_subject": subject,
+            "signed_evidence": signed_evidence,
+        }
+    )
+    return RootV3Records(
         root=root,
         service_claim=claim,
         authority=authority,

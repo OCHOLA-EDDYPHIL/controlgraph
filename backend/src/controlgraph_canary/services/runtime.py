@@ -29,8 +29,22 @@ from controlgraph_canary.application.capability_verification import (
 from controlgraph_canary.application.cloud_run import CloudRunTargetConfiguration
 from controlgraph_canary.application.evidence_signing import EvidenceSigningService
 from controlgraph_canary.application.execution import FinalMutationGate
+from controlgraph_canary.application.health_attestation import (
+    HealthAttestationSigningService,
+    VerifierHealthAttestationClient,
+)
+from controlgraph_canary.application.health_orchestration import (
+    VerifierHealthProofService,
+)
+from controlgraph_canary.application.health_pipeline import (
+    ApiHealthEvaluationClient,
+    CoordinatorHealthEvaluationClient,
+    CoordinatorHealthEvaluationService,
+    VerifierHealthEvaluationService,
+)
 from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
+    HEALTH_ATTESTATION_PATH,
     RECEIPT_AUTHORITY_PATH,
     CallerBinding,
     CallerRole,
@@ -54,8 +68,9 @@ from controlgraph_canary.application.promotion_execution import (
     CoordinatorPromotionCapabilityClient,
     CoordinatorPromotionRelay,
     PromotionRolloutCoordinator,
+    StoredPromotionAuthorizationResolver,
 )
-from controlgraph_canary.application.promotion_store import PromotionDispatchStore
+from controlgraph_canary.application.promotion_store import PromotionDispatchStoreV2
 from controlgraph_canary.application.receipt_authority import (
     ReceiptAuthorityClient,
     ReceiptAuthorityService,
@@ -114,13 +129,18 @@ from controlgraph_canary.application.tasks import (
     TaskDispatcher,
     TaskEnqueuer,
 )
+from controlgraph_canary.contracts.health import (
+    RolloutHealthPolicyV2,
+    create_rollout_health_policy_v2,
+)
+from controlgraph_canary.contracts.health_execution import PostApplyHealthAnchorV1
 from controlgraph_canary.contracts.models import TargetBinding
 from controlgraph_canary.contracts.operator_observability import (
     STABLE_SNAPSHOT_CAPTURE_REQUEST_V1,
     StableSnapshotCaptureRequestV1,
     TargetTrafficReadRequestV1,
 )
-from controlgraph_canary.contracts.root_creation import RolloutHealthPolicyV1
+from controlgraph_canary.contracts.root_creation import RolloutRootV3
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimClassificationRequestV1,
@@ -139,6 +159,7 @@ from controlgraph_canary.integrations.google.kms import (
     GoogleKmsCapabilityTrustLoader,
     GoogleKmsDigestSigner,
     GoogleKmsEvidenceSignatureVerifier,
+    GoogleKmsHealthAttestationVerifier,
 )
 from controlgraph_canary.integrations.google.tasks import GoogleCloudTasksEnqueuer
 from controlgraph_canary.settings import ControllerSettings
@@ -185,6 +206,7 @@ def create_runtime_service_app(
     capability_verification_clock: Callable[[], datetime] | None = None,
     revocation_clock: Callable[[], datetime] | None = None,
     revocation_attempt_id_factory: Callable[[], str] | None = None,
+    health_evaluation_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Compose a fail-closed service from validated startup coordinates."""
 
@@ -197,6 +219,7 @@ def create_runtime_service_app(
         ServiceRole.COORDINATOR,
         ServiceRole.ISSUER,
         ServiceRole.EXECUTOR,
+        ServiceRole.VERIFIER,
     }:
         raise ValueError("KMS dependencies are limited to signing and trust roles")
     policy = runtime_route_policy(role, source)
@@ -212,6 +235,8 @@ def create_runtime_service_app(
     evidence_signing_service = None
     classification_evidence_signing_service = None
     classification_evidence_authentication_policy = None
+    health_attestation_signing_service = None
+    health_attestation_authentication_policy = None
     root_preflight_service = None
     stable_snapshot_capture_service = None
     target_traffic_observation_service = None
@@ -228,6 +253,9 @@ def create_runtime_service_app(
     coordinator_canary_relay = None
     api_promotion_client = None
     coordinator_promotion_relay = None
+    api_health_evaluation_client = None
+    coordinator_health_evaluation_service = None
+    verifier_health_evaluation_service = None
     api_epoch_revocation_client = None
     coordinator_epoch_revocation_relay = None
     capability_issuance_service = None
@@ -241,9 +269,11 @@ def create_runtime_service_app(
         profile = SigningProfile.evidence(settings.project_id, settings.evidence_key_version)
         if settings.signing_algorithm != profile.algorithm:
             raise ValueError("evidence-writer signing algorithm is invalid")
-        evidence_signer = AsyncPurposeSealedSigner(
-            GoogleKmsAsyncDigestSigner(profile, client=kms_client)
+        evidence_signing_backend = GoogleKmsAsyncDigestSigner(
+            profile,
+            client=kms_client,
         )
+        evidence_signer = AsyncPurposeSealedSigner(evidence_signing_backend)
         evidence_signing_service = EvidenceSigningService(
             project_id=settings.project_id,
             authentication_policy=policy,
@@ -261,9 +291,26 @@ def create_runtime_service_app(
                 signer=evidence_signer,
             )
         )
+        health_attestation_authentication_policy = _health_attestation_policy(
+            settings
+        )
+        health_attestation_signing_service = HealthAttestationSigningService(
+            project_id=settings.project_id,
+            authentication_policy=health_attestation_authentication_policy,
+            signer=evidence_signing_backend,
+            signature_verifier=GoogleKmsHealthAttestationVerifier(
+                project_id=settings.project_id,
+                service_role=ServiceRole.EVIDENCE_WRITER,
+                key_version=settings.evidence_key_version,
+                client=kms_client,
+            ),
+        )
     elif role is ServiceRole.VERIFIER:
         from controlgraph_canary.integrations.google.cloud_run import (
             CloudRunV2SnapshotReader,
+        )
+        from controlgraph_canary.integrations.google.monitoring import (
+            GoogleCloudMonitoringCollector,
         )
 
         if (
@@ -371,6 +418,49 @@ def create_runtime_service_app(
                 caller_role=CallerRole.VERIFIER,
             )
         )
+        health_attestation_verifier = GoogleKmsHealthAttestationVerifier(
+            project_id=settings.project_id,
+            service_role=ServiceRole.VERIFIER,
+            key_version=settings.evidence_key_version,
+            client=kms_client,
+        )
+        health_attestor = VerifierHealthAttestationClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.VERIFIER,
+                service_role=ServiceRole.EVIDENCE_WRITER,
+                audience=settings.evidence_writer_url,
+                override_path=HEALTH_ATTESTATION_PATH,
+            ),
+            transport=selected_transport,
+            signing_key_version=settings.evidence_key_version,
+        )
+        health_query_collector = GoogleCloudMonitoringCollector(
+            target=target,
+            service_role=ServiceRole.VERIFIER,
+            configured_project_id=settings.project_id,
+        )
+
+        def health_proof_service_factory(
+            *,
+            root: RolloutRootV3,
+            anchor: PostApplyHealthAnchorV1,
+        ) -> VerifierHealthProofService:
+            return VerifierHealthProofService(
+                root=root,
+                anchor=anchor,
+                query_collector=health_query_collector,
+                attestor=health_attestor,
+                signature_verifier=health_attestation_verifier,
+                clock=health_evaluation_clock,
+            )
+
+        verifier_health_evaluation_service = VerifierHealthEvaluationService(
+            target=target,
+            authentication_policy=policy,
+            proof_service_factory=health_proof_service_factory,
+        )
 
         def classification_reader_factory(
             request: ServiceClaimClassificationRequestV1,
@@ -463,6 +553,17 @@ def create_runtime_service_app(
             authentication_policy=policy,
             transport=selected_transport,
         )
+        api_health_evaluation_client = ApiHealthEvaluationClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+        )
         api_epoch_revocation_client = ApiEpochRevocationClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -490,8 +591,14 @@ def create_runtime_service_app(
         from controlgraph_canary.integrations.google.firestore import (
             FirestoreAuthorityStore,
         )
+        from controlgraph_canary.integrations.google.firestore_health import (
+            FirestoreHealthChainReader,
+        )
 
-        if settings.capability_key_version is None:
+        if (
+            settings.capability_key_version is None
+            or settings.evidence_key_version is None
+        ):
             raise ValueError("issuer capability-signing configuration is incomplete")
         target = _reference_target(settings)
         selected_store = (
@@ -523,6 +630,17 @@ def create_runtime_service_app(
                     ),
                 ),
                 receipt_reader=selected_store,
+                promotion_health_chain_reader=FirestoreHealthChainReader(
+                    target=target,
+                    configured_project_id=settings.project_id,
+                    service_role=ServiceRole.ISSUER,
+                ),
+                health_signature_verifier=GoogleKmsHealthAttestationVerifier(
+                    project_id=settings.project_id,
+                    service_role=ServiceRole.ISSUER,
+                    key_version=settings.evidence_key_version,
+                    client=kms_client,
+                ),
             ),
             authentication_policy=policy,
             clock=capability_issuance_clock,
@@ -595,6 +713,8 @@ def create_runtime_service_app(
             final_gate=FinalMutationGate(
                 authority_reader=selected_store,
                 adapter=mutation_adapter,
+                route_policy=policy,
+                source_receipt_reader=receipt_store,
                 clock=final_authority_clock,
             ),
             readback=CloudRunV2ReceiptReadback(
@@ -622,6 +742,9 @@ def create_runtime_service_app(
     elif role is ServiceRole.COORDINATOR:
         from controlgraph_canary.integrations.google.firestore import (
             FirestoreAuthorityStore,
+        )
+        from controlgraph_canary.integrations.google.firestore_health import (
+            FirestoreHealthChainStore,
         )
 
         if (
@@ -698,6 +821,11 @@ def create_runtime_service_app(
                 configured_project_id=settings.project_id,
             )
         )
+        health_chain_store = FirestoreHealthChainStore(
+            target=target,
+            configured_project_id=settings.project_id,
+            service_role=ServiceRole.COORDINATOR,
+        )
         coordinator_operator_observation_relay = CoordinatorOperatorObservationRelay(
             authentication_policy=policy,
             operator_policy=_operator_api_policy(settings),
@@ -730,6 +858,25 @@ def create_runtime_service_app(
         )
         receipt_authority_service = ReceiptAuthorityService(selected_store)
         receipt_authority_authentication_policy = _receipt_authority_policy(settings)
+        health_signature_verifier = GoogleKmsHealthAttestationVerifier(
+            project_id=settings.project_id,
+            service_role=ServiceRole.COORDINATOR,
+            key_version=settings.evidence_key_version,
+            client=kms_client,
+        )
+        coordinator_health_evaluation_service = CoordinatorHealthEvaluationService(
+            target=target,
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            authority_reader=selected_store,
+            receipt_reader=selected_store,
+            health_store=health_chain_store,
+            verifier=CoordinatorHealthEvaluationClient(
+                route=verifier_route,
+                transport=selected_transport,
+                signature_verifier=health_signature_verifier,
+            ),
+        )
         creator = RolloutRootCreator(
             store=selected_store,
             preflight_client=coordinator_clients.preflight,
@@ -841,6 +988,12 @@ def create_runtime_service_app(
             operator_policy=_operator_api_policy(settings),
             coordinator=PromotionRolloutCoordinator(
                 target=target,
+                authorization_resolver=StoredPromotionAuthorizationResolver(
+                    target=target,
+                    root_reader=selected_store,
+                    health_chain_reader=health_chain_store,
+                    health_signature_verifier=health_signature_verifier,
+                ),
                 capability_client=CoordinatorPromotionCapabilityClient(
                     route=CoordinatorInternalRoute(
                         project_id=settings.project_id,
@@ -851,7 +1004,7 @@ def create_runtime_service_app(
                     ),
                     transport=selected_transport,
                 ),
-                dispatch_store=cast(PromotionDispatchStore, selected_store),
+                dispatch_store=cast(PromotionDispatchStoreV2, selected_store),
                 task_dispatcher=TaskDispatcher(
                     task_addressor,
                     selected_task_enqueuer,
@@ -874,6 +1027,8 @@ def create_runtime_service_app(
         raise ValueError("Cloud Run preflight clocks are verifier-limited")
     if classification_clock is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("claim-classification clocks are verifier-limited")
+    if health_evaluation_clock is not None and role is not ServiceRole.VERIFIER:
+        raise ValueError("health-evaluation clocks are verifier-limited")
     if (
         services_client_factory is not None or revisions_client_factory is not None
     ) and role not in {ServiceRole.VERIFIER, ServiceRole.EXECUTOR}:
@@ -923,6 +1078,10 @@ def create_runtime_service_app(
         classification_evidence_authentication_policy=(
             classification_evidence_authentication_policy
         ),
+        health_attestation_signing_service=health_attestation_signing_service,
+        health_attestation_authentication_policy=(
+            health_attestation_authentication_policy
+        ),
         root_preflight_service=root_preflight_service,
         stable_snapshot_capture_service=stable_snapshot_capture_service,
         target_traffic_observation_service=target_traffic_observation_service,
@@ -939,6 +1098,9 @@ def create_runtime_service_app(
         coordinator_canary_relay=coordinator_canary_relay,
         api_promotion_client=api_promotion_client,
         coordinator_promotion_relay=coordinator_promotion_relay,
+        api_health_evaluation_client=api_health_evaluation_client,
+        coordinator_health_evaluation_service=coordinator_health_evaluation_service,
+        verifier_health_evaluation_service=verifier_health_evaluation_service,
         api_epoch_revocation_client=api_epoch_revocation_client,
         coordinator_epoch_revocation_relay=coordinator_epoch_revocation_relay,
         api_service_claim_release_client=api_service_claim_release_client,
@@ -988,6 +1150,10 @@ def create_runtime_service_app(
         app.state.controlgraph_classification_evidence_signing = (
             classification_evidence_signing_service
         )
+    if health_attestation_signing_service is not None:
+        app.state.controlgraph_health_attestation_signing = (
+            health_attestation_signing_service
+        )
     if api_canary_client is not None:
         app.state.controlgraph_canary_client = api_canary_client
     if coordinator_canary_relay is not None:
@@ -996,6 +1162,18 @@ def create_runtime_service_app(
         app.state.controlgraph_promotion_client = api_promotion_client
     if coordinator_promotion_relay is not None:
         app.state.controlgraph_promotion_relay = coordinator_promotion_relay
+    if api_health_evaluation_client is not None:
+        app.state.controlgraph_health_evaluation_client = (
+            api_health_evaluation_client
+        )
+    if coordinator_health_evaluation_service is not None:
+        app.state.controlgraph_health_evaluation_service = (
+            coordinator_health_evaluation_service
+        )
+    if verifier_health_evaluation_service is not None:
+        app.state.controlgraph_verifier_health_evaluation = (
+            verifier_health_evaluation_service
+        )
     if api_epoch_revocation_client is not None:
         app.state.controlgraph_epoch_revocation_client = api_epoch_revocation_client
     if coordinator_epoch_revocation_relay is not None:
@@ -1090,23 +1268,33 @@ def _classification_evidence_policy(
     )
 
 
-def _root_health_policy() -> RolloutHealthPolicyV1:
-    return RolloutHealthPolicyV1(
-        schema_version="controlgraph.rollout-health-policy/v1",
-        input_schema_version="controlgraph.health-input/v1",
-        evaluation_window_seconds=60,
-        minimum_request_count=100,
-        maximum_error_rate_basis_points=100,
-        maximum_p95_latency_ms=500,
-        minimum_probe_count=10,
-        minimum_probe_success_basis_points=9_900,
-        healthy_consecutive_windows=2,
-        unhealthy_consecutive_windows=2,
-        window_semantics="HALF_OPEN_START_INCLUSIVE_END_EXCLUSIVE",
-        incomplete_data_action="INDETERMINATE_NO_MUTATION",
-        late_data_action="INDETERMINATE_NO_MUTATION",
-        duplicate_data_action="REJECT",
+def _health_attestation_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    if (
+        settings.classification_evidence_caller_identity is None
+        or settings.classification_evidence_caller_subject is None
+    ):
+        raise ValueError("health attestation policy is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.EVIDENCE_WRITER,
+        path=HEALTH_ATTESTATION_PATH,
+        audience=_service_audience(
+            ServiceRole.EVIDENCE_WRITER,
+            settings.project_number,
+        ),
+        caller=CallerBinding(
+            role=CallerRole.VERIFIER,
+            email=settings.classification_evidence_caller_identity,
+            subject=settings.classification_evidence_caller_subject,
+        ),
     )
+
+
+def _root_health_policy() -> RolloutHealthPolicyV2:
+    return create_rollout_health_policy_v2()
 
 
 __all__ = ["CoordinatorTrustClients", "create_runtime_service_app"]

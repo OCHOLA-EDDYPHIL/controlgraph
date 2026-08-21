@@ -45,7 +45,7 @@ from controlgraph_canary.contracts import (
 from controlgraph_canary.contracts.codec import encode_base64url
 from controlgraph_canary.contracts.root_creation import (
     RootCreationCommandV1,
-    RootCreationResultV1,
+    decode_root_creation_result,
 )
 from controlgraph_canary.contracts.root_relay import (
     ROOT_CREATION_INVOCATION_V1,
@@ -373,7 +373,7 @@ def test_api_http_route_accepts_only_public_command_fields() -> None:
         headers=OPERATOR_HEADERS,
     )
     assert response.status_code == 200
-    assert decode_contract(response.content, RootCreationResultV1) == _write_result().result
+    assert decode_root_creation_result(response.content) == _write_result().result
 
     body = canonical_json_bytes(_command())[:-1] + (
         b',"operator_identity":"attacker@example.test"}'

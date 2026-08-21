@@ -162,6 +162,8 @@ locals {
       "firestore_authority_read",
       "kms_capability_sign",
       "kms_capability_version_read",
+      "kms_evidence_public_key_read",
+      "kms_evidence_version_read",
     ])
     executor = toset([
       "firestore_authority_read",
@@ -192,6 +194,7 @@ locals {
       "run_target_snapshot",
     ])
     evidence_writer = toset([
+      "kms_evidence_public_key_read",
       "kms_evidence_sign",
       "kms_evidence_version_read",
     ])
@@ -251,6 +254,8 @@ locals {
         "firestore_authority_read",
         "kms_capability_sign",
         "kms_capability_version_read",
+        "kms_evidence_public_key_read",
+        "kms_evidence_version_read",
       ])
       executor = toset([
         "firestore_authority_read",
@@ -278,6 +283,7 @@ locals {
         "run_target_snapshot",
       ])
       evidence_writer = toset([
+        "kms_evidence_public_key_read",
         "kms_evidence_sign",
         "kms_evidence_version_read",
       ])
@@ -394,7 +400,11 @@ check "verifier_and_evidence_writer_are_separated" {
       !contains(local.identity_expected_allows.coordinator, "kms_evidence_sign") &&
       contains(local.identity_expected_allows.coordinator, "kms_evidence_public_key_read") &&
       contains(local.identity_expected_allows.coordinator, "kms_evidence_version_read") &&
+      !contains(local.identity_expected_allows.issuer, "kms_evidence_sign") &&
+      contains(local.identity_expected_allows.issuer, "kms_evidence_public_key_read") &&
+      contains(local.identity_expected_allows.issuer, "kms_evidence_version_read") &&
       local.identity_expected_allows.evidence_writer == toset([
+        "kms_evidence_public_key_read",
         "kms_evidence_sign",
         "kms_evidence_version_read",
       ]) &&
