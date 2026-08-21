@@ -153,6 +153,20 @@ def _request() -> ServiceClaimClassificationRequestV1:
     )
 
 
+def _stable_recovery_request() -> ServiceClaimClassificationRequestV1:
+    records = make_root_v2_records()
+    return _request().model_copy(
+        update={
+            "expected_classification": (
+                ServiceClaimTargetClassification.STABLE_RESTORED
+            ),
+            "expected_target_configuration_sha256": (
+                records.service_claim.stable_target_configuration_sha256
+            ),
+        }
+    )
+
+
 def _service_state(
     request: ServiceClaimClassificationRequestV1,
     **changes: object,
@@ -273,6 +287,45 @@ def test_verifier_fresh_read_builds_exact_actor_and_chain_bound_attestation() ->
         signing_request.subject
     )
     assert attestation.signed_evidence.event == signing_request.event
+
+
+def test_stable_recovery_accepts_provider_omitted_zero_candidate_allocations() -> None:
+    request = _stable_recovery_request()
+    reader = _Reader(request)
+    reader.state = _service_state(
+        request,
+        traffic=(
+            CloudRunTrafficAllocation(
+                revision=request.stable_revision,
+                percent=100,
+                tag="stable",
+            ),
+        ),
+        traffic_statuses=(
+            CloudRunTrafficStatus(
+                revision=request.stable_revision,
+                percent=100,
+                tag="stable",
+                uri="https://stable.example.test",
+            ),
+        ),
+    )
+    evidence = _EvidenceClient()
+    service = ServiceClaimClassificationService(
+        authentication_policy=_coordinator_policy(),
+        reader_factory=lambda _: reader,
+        evidence_client=evidence,
+        clock=lambda: NOW,
+    )
+
+    attestation = asyncio.run(
+        service.classify(request, _context(CallerRole.COORDINATOR))
+    )
+
+    assert attestation.signing_request.result.classification is (
+        ServiceClaimTargetClassification.STABLE_RESTORED
+    )
+    assert evidence.requests == [attestation.signing_request]
 
 
 @pytest.mark.parametrize(
