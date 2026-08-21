@@ -272,6 +272,7 @@ locals {
         "kms_capability_version_read",
         "kms_evidence_public_key_read",
         "kms_evidence_version_read",
+        "monitoring_health_read",
         "run_reference_invoke",
         "run_evidence_writer_invoke",
         "run_target_snapshot",
@@ -400,6 +401,26 @@ check "verifier_and_evidence_writer_are_separated" {
       local.identity_implemented_allows.evidence_writer == local.identity_expected_allows.evidence_writer
     )
     error_message = "Verification, authority writes, and evidence signing must remain separate."
+  }
+}
+
+check "monitoring_health_read_is_implemented_for_verifier_only" {
+  assert {
+    condition = (
+      toset([
+        for identity, allows in local.identity_expected_allows : identity
+        if contains(allows, "monitoring_health_read")
+      ]) == toset(["verifier"]) &&
+      toset([
+        for identity, allows in local.identity_implemented_allows : identity
+        if contains(allows, "monitoring_health_read")
+      ]) == toset(["verifier"]) &&
+      !contains(
+        local.iam_permission_matrix.verifier.pending_allows,
+        "monitoring_health_read",
+      )
+    )
+    error_message = "Monitoring health read must be implemented for the verifier and no other identity."
   }
 }
 

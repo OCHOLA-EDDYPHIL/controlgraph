@@ -295,6 +295,7 @@ dependencies = [
     { name = "google-auth" },
     { name = "google-cloud-firestore" },
     { name = "google-cloud-kms" },
+    { name = "google-cloud-monitoring" },
     { name = "google-cloud-run" },
     { name = "google-cloud-tasks" },
     { name = "google-crc32c" },
@@ -318,6 +319,7 @@ requires-dist = [
     { name = "google-auth", specifier = ">=2.40,<3" },
     { name = "google-cloud-firestore", specifier = ">=2.21,<3" },
     { name = "google-cloud-kms", specifier = ">=3.6,<4" },
+    { name = "google-cloud-monitoring", specifier = ">=2.31,<3" },
     { name = "google-cloud-run", specifier = ">=0.16,<0.17" },
     { name = "google-cloud-tasks", specifier = ">=2.20,<3" },
     { name = "google-crc32c", specifier = ">=1.7,<2" },
@@ -477,6 +479,22 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/73/53/4bde1d2c31e72e898c2bdfac25ac27da52c3b4e1936a411fbe96f01d65a4/google_cloud_kms-3.16.0.tar.gz", hash = "sha256:c89c66ccffc1358f973801ed1b45bd92b35ddbbc2545db9032af6d4643b20c76", size = 448119, upload-time = "2026-07-16T20:36:20.6Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/b0/f102b5c077df60cfeac7ace7a1ccbe6d5e934dfadf37ff8b8ddbcdce8a24/google_cloud_kms-3.16.0-py3-none-any.whl", hash = "sha256:ad3c102961ba58179f7261814d9cd28dded93603bd33c8224b4b072897bbe81e", size = 359027, upload-time = "2026-07-16T20:35:57.575Z" },
+]
+
+[[package]]
+name = "google-cloud-monitoring"
+version = "2.31.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/84/9d/9522e169db3887e7f354bb9aa544a6e26c435ce19337e32432598db18c6f/google_cloud_monitoring-2.31.0.tar.gz", hash = "sha256:b4c9d3528c8643d4eb4b9d688cbb3c5914bc5f69b314ff7c5e1b47bdc073a9ae", size = 404747, upload-time = "2026-06-03T15:28:24.938Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/30/aa6635296da9c1c14d2e64f64e1cacd4f4debf8ab7e646c0559545f0f70d/google_cloud_monitoring-2.31.0-py3-none-any.whl", hash = "sha256:64f3d56ead48f0a0674f650cb2828c47b936582a02a27c55f2836681a86281c3", size = 391010, upload-time = "2026-06-03T15:27:39.536Z" },
 ]
 
 [[package]]

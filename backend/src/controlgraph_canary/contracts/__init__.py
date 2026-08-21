@@ -27,6 +27,8 @@ from controlgraph_canary.contracts.health import (
     MonitoringWindowObservationV1,
     RolloutHealthPolicyV2,
     binary64_milliseconds_to_microseconds,
+    derive_monitoring_metric_queries,
+    monitoring_query_id,
     monitoring_sample_set_sha256,
 )
 from controlgraph_canary.contracts.models import (
@@ -169,6 +171,7 @@ __all__ = [
     "create_rollout_root",
     "decode_base64url",
     "decode_contract",
+    "derive_monitoring_metric_queries",
     "encode_base64url",
     "epoch_revocation_evidence_id",
     "epoch_revocation_proof_matches_command",
@@ -176,6 +179,7 @@ __all__ = [
     "epoch_revocation_request_sha256",
     "evidence_payload_sha256",
     "evidence_signing_input_sha256",
+    "monitoring_query_id",
     "monitoring_sample_set_sha256",
     "root_creation_request_sha256",
     "root_preflight_request_sha256",

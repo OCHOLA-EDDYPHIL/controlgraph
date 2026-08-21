@@ -152,9 +152,11 @@ def test_conflict_metadata_takes_precedence_over_adapter_replay_deduplication() 
         observation=observation,
         evaluated_at="2026-08-21T12:04:00Z",
     )
+    selected = observation.sample_sha256s
     conflict = _observation(
         observation_id="health-window-001-conflict",
         observed_at="2026-08-21T12:04:01Z",
+        source_sample_sha256s=tuple(sorted((*selected, "f" * 64))),
         duplicate_count=1,
         conflicting_duplicate=True,
     )
@@ -167,10 +169,42 @@ def test_conflict_metadata_takes_precedence_over_adapter_replay_deduplication() 
     )
 
     assert replayed.status is HealthDecisionStatus.INSUFFICIENT_EVIDENCE
-    assert replayed.reason_codes == (
-        HealthReasonCode.SAMPLE_CONFLICTING_DUPLICATE,
-    )
+    assert replayed.reason_codes == (HealthReasonCode.SAMPLE_CONFLICTING_DUPLICATE,)
     assert replayed.next_state.consecutive_healthy_windows == 0
+
+
+def test_evaluator_adapter_binds_distinct_conflict_sets_to_distinct_observations() -> None:
+    selected = _observation().sample_sha256s
+    first_conflict = _observation(
+        observation_id="health-window-001-conflict",
+        source_sample_sha256s=tuple(sorted((*selected, "e" * 64))),
+        duplicate_count=1,
+        conflicting_duplicate=True,
+    )
+    second_conflict = _observation(
+        observation_id="health-window-001-conflict",
+        source_sample_sha256s=tuple(sorted((*selected, "f" * 64))),
+        duplicate_count=1,
+        conflicting_duplicate=True,
+    )
+
+    first = evaluate_health_observation(
+        policy=_policy(),
+        prior_state=_initial_state(),
+        observation=first_conflict,
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+    second = evaluate_health_observation(
+        policy=_policy(),
+        prior_state=_initial_state(),
+        observation=second_conflict,
+        evaluated_at="2026-08-21T12:04:00Z",
+    )
+
+    assert first.observation_sha256 == canonical_sha256(first_conflict)
+    assert second.observation_sha256 == canonical_sha256(second_conflict)
+    assert first.observation_sha256 != second.observation_sha256
+    assert canonical_sha256(first) != canonical_sha256(second)
 
 
 def test_identical_canonical_inputs_produce_identical_decision_bytes() -> None:
@@ -248,9 +282,7 @@ def test_early_observation_waits_without_advancing_state() -> None:
 
 
 def test_invalid_canonical_scope_is_rejected_before_it_can_claim_health() -> None:
-    mismatched = _observation().model_copy(
-        update={"root_id": "cgroot:" + "9" * 64}
-    )
+    mismatched = _observation().model_copy(update={"root_id": "cgroot:" + "9" * 64})
 
     with pytest.raises(ContractError):
         evaluate_health_observation(
