@@ -86,7 +86,7 @@ jobs:
               --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
               --tag "$image" \
               backend
-            [[ "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$image")" == "$GITHUB_SHA" ]]
+            [[ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" == "$GITHUB_SHA" ]]
           done
 
       - name: Authenticate as the image builder
