@@ -141,6 +141,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     "cryptoKeyVersions/1"
                 ),
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
+                "CONTROLGRAPH_RECOVERY_URL": (
+                    f"https://controlgraph-recovery-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
             }
         )
     if role is ServiceRole.API:
@@ -202,6 +206,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
                 ),
                 "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL": (
+                    f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
             }
         )
     if role is ServiceRole.VERIFIER:
@@ -777,6 +785,7 @@ def test_service_app_rejects_a_policy_for_another_role() -> None:
             ServiceRole.EVIDENCE_WRITER,
             ServiceRole.ISSUER,
             ServiceRole.EXECUTOR,
+            ServiceRole.RECOVERY,
             ServiceRole.VERIFIER,
         }
     ),

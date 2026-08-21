@@ -53,6 +53,8 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_RECOVERY_TASK_CALLER",
     "CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL",
     "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT",
+    "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL",
+    "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT",
 )
 
 API_ROOT_ENVIRONMENT_KEYS = (
@@ -64,13 +66,23 @@ ISSUER_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
     "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
     "CONTROLGRAPH_SIGNING_ALGORITHM",
+    "CONTROLGRAPH_RECOVERY_URL",
 )
 
-EXECUTOR_ENVIRONMENT_KEYS = (
+EXECUTOR_MUTATION_WORKER_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
+    "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
     "CONTROLGRAPH_COORDINATOR_URL",
     "CONTROLGRAPH_TARGET_NETWORK_RESOURCE",
     "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE",
+    "CONTROLGRAPH_RECOVERY_FACADE_CALLER_EMAIL",
+    "CONTROLGRAPH_RECOVERY_FACADE_CALLER_SUBJECT",
+)
+
+RECOVERY_WORKER_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_CAPABILITY_KEY_VERSION",
+    "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+    "CONTROLGRAPH_EXECUTOR_URL",
 )
 
 VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS = (
@@ -100,13 +112,13 @@ def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]
     if type(role) is str and role.strip() == ServiceRole.ISSUER.value:
         return REQUIRED_ENVIRONMENT_KEYS + ISSUER_ENVIRONMENT_KEYS
     mutations_enabled = environment.get("CONTROLGRAPH_MUTATIONS_ENABLED")
-    if (
-        type(role) is str
-        and role.strip() == ServiceRole.EXECUTOR.value
-        and type(mutations_enabled) is str
-        and mutations_enabled.strip().lower() == "true"
-    ):
-        return REQUIRED_ENVIRONMENT_KEYS + EXECUTOR_ENVIRONMENT_KEYS
+    if type(role) is str and type(mutations_enabled) is str:
+        selected_role = role.strip()
+        enabled = mutations_enabled.strip().lower() == "true"
+        if selected_role == ServiceRole.EXECUTOR.value and enabled:
+            return REQUIRED_ENVIRONMENT_KEYS + EXECUTOR_MUTATION_WORKER_ENVIRONMENT_KEYS
+        if selected_role == ServiceRole.RECOVERY.value and enabled:
+            return REQUIRED_ENVIRONMENT_KEYS + RECOVERY_WORKER_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.COORDINATOR.value:
         return REQUIRED_ENVIRONMENT_KEYS + COORDINATOR_TRUST_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.VERIFIER.value:
@@ -143,6 +155,10 @@ class ControllerSettings:
     recovery_task_caller: str | None
     receipt_authority_caller_identity: str | None
     receipt_authority_caller_subject: str | None
+    recovery_receipt_authority_caller_identity: str | None
+    recovery_receipt_authority_caller_subject: str | None
+    recovery_facade_caller_identity: str | None
+    recovery_facade_caller_subject: str | None
     classification_evidence_caller_identity: str | None
     classification_evidence_caller_subject: str | None
     target_network_resource: str | None
@@ -198,8 +214,11 @@ class ControllerSettings:
         if mutation_flag not in {"true", "false"}:
             raise ValueError("CONTROLGRAPH_MUTATIONS_ENABLED must be true or false")
         mutations_enabled = mutation_flag == "true"
-        if mutations_enabled and service_role is not ServiceRole.EXECUTOR:
-            raise ValueError("only the executor may enable controlled mutations")
+        if mutations_enabled and service_role not in {
+            ServiceRole.EXECUTOR,
+            ServiceRole.RECOVERY,
+        }:
+            raise ValueError("only an execution worker may enable controlled mutations")
         if environment_name != "nonprod":
             raise ValueError("CONTROLGRAPH_ENVIRONMENT must be nonprod")
 
@@ -217,6 +236,10 @@ class ControllerSettings:
         recovery_task_caller: str | None = None
         receipt_authority_caller_identity: str | None = None
         receipt_authority_caller_subject: str | None = None
+        recovery_receipt_authority_caller_identity: str | None = None
+        recovery_receipt_authority_caller_subject: str | None = None
+        recovery_facade_caller_identity: str | None = None
+        recovery_facade_caller_subject: str | None = None
         classification_evidence_caller_identity: str | None = None
         classification_evidence_caller_subject: str | None = None
         target_network_resource: str | None = None
@@ -226,10 +249,9 @@ class ControllerSettings:
         operator_identity: str | None = None
         operator_subject: str | None = None
         operator_oauth_client_audience: str | None = None
-        executor_mutation_enabled = (
-            service_role is ServiceRole.EXECUTOR and mutations_enabled
-        )
-        if service_role is ServiceRole.API or executor_mutation_enabled:
+        executor_enabled = service_role is ServiceRole.EXECUTOR and mutations_enabled
+        recovery_enabled = service_role is ServiceRole.RECOVERY and mutations_enabled
+        if service_role is ServiceRole.API or executor_enabled:
             coordinator_url = source["CONTROLGRAPH_COORDINATOR_URL"].strip()
             _validate_service_url(
                 coordinator_url,
@@ -241,23 +263,23 @@ class ControllerSettings:
                 "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"
             ]
             if (
-                raw_operator_oauth_client_audience
-                != raw_operator_oauth_client_audience.strip()
-                or _GOOGLE_OAUTH_CLIENT_AUDIENCE.fullmatch(
-                    raw_operator_oauth_client_audience
-                )
+                raw_operator_oauth_client_audience != raw_operator_oauth_client_audience.strip()
+                or _GOOGLE_OAUTH_CLIENT_AUDIENCE.fullmatch(raw_operator_oauth_client_audience)
                 is None
             ):
-                raise ValueError(
-                    "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE is invalid"
-                )
+                raise ValueError("CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE is invalid")
             operator_oauth_client_audience = raw_operator_oauth_client_audience
-        if service_role in {
-            ServiceRole.EVIDENCE_WRITER,
-            ServiceRole.COORDINATOR,
-            ServiceRole.VERIFIER,
-            ServiceRole.ISSUER,
-        }:
+        if (
+            service_role
+            in {
+                ServiceRole.EVIDENCE_WRITER,
+                ServiceRole.COORDINATOR,
+                ServiceRole.VERIFIER,
+                ServiceRole.ISSUER,
+            }
+            or executor_enabled
+            or recovery_enabled
+        ):
             evidence_key_version = source["CONTROLGRAPH_EVIDENCE_KEY_VERSION"].strip()
             expected_key_version = re.compile(
                 rf"^projects/{re.escape(project_id)}/locations/us-central1/"
@@ -270,25 +292,23 @@ class ControllerSettings:
             signing_algorithm = source["CONTROLGRAPH_SIGNING_ALGORITHM"].strip()
             if signing_algorithm != SIGNING_ALGORITHM:
                 raise ValueError("CONTROLGRAPH_SIGNING_ALGORITHM is unsupported")
-        if service_role in {
-            ServiceRole.COORDINATOR,
-            ServiceRole.ISSUER,
-        } or executor_mutation_enabled:
-            capability_key_version = source[
-                "CONTROLGRAPH_CAPABILITY_KEY_VERSION"
-            ].strip()
+        if (
+            service_role
+            in {
+                ServiceRole.COORDINATOR,
+                ServiceRole.ISSUER,
+            }
+            or executor_enabled
+            or recovery_enabled
+        ):
+            capability_key_version = source["CONTROLGRAPH_CAPABILITY_KEY_VERSION"].strip()
             expected_capability_key_version = re.compile(
                 rf"^projects/{re.escape(project_id)}/locations/us-central1/"
                 r"keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
                 r"cryptoKeyVersions/[1-9][0-9]*$"
             )
-            if (
-                expected_capability_key_version.fullmatch(capability_key_version)
-                is None
-            ):
-                raise ValueError(
-                    "CONTROLGRAPH_CAPABILITY_KEY_VERSION is outside its purpose"
-                )
+            if expected_capability_key_version.fullmatch(capability_key_version) is None:
+                raise ValueError("CONTROLGRAPH_CAPABILITY_KEY_VERSION is outside its purpose")
         if service_role is ServiceRole.COORDINATOR:
             issuer_url = source["CONTROLGRAPH_ISSUER_URL"].strip()
             verifier_url = source["CONTROLGRAPH_VERIFIER_URL"].strip()
@@ -303,15 +323,8 @@ class ControllerSettings:
             candidate_revision_configuration_sha256 = source[
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256"
             ].strip()
-            if (
-                _DIGEST.fullmatch(
-                    f"sha256:{candidate_revision_configuration_sha256}"
-                )
-                is None
-            ):
-                raise ValueError(
-                    "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256 is invalid"
-                )
+            if _DIGEST.fullmatch(f"sha256:{candidate_revision_configuration_sha256}") is None:
+                raise ValueError("CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256 is invalid")
             operator_identity = source["CONTROLGRAPH_OPERATOR_EMAIL"].strip()
             operator_subject = source["CONTROLGRAPH_OPERATOR_SUBJECT"].strip()
             _validate_operator_identity(operator_identity)
@@ -327,12 +340,8 @@ class ControllerSettings:
                 raise ValueError("CONTROLGRAPH_EXECUTION_QUEUE is invalid")
             if recovery_queue != "controlgraph-recovery":
                 raise ValueError("CONTROLGRAPH_RECOVERY_QUEUE is invalid")
-            execution_task_caller = source[
-                "CONTROLGRAPH_EXECUTION_TASK_CALLER"
-            ].strip()
-            recovery_task_caller = source[
-                "CONTROLGRAPH_RECOVERY_TASK_CALLER"
-            ].strip()
+            execution_task_caller = source["CONTROLGRAPH_EXECUTION_TASK_CALLER"].strip()
+            recovery_task_caller = source["CONTROLGRAPH_RECOVERY_TASK_CALLER"].strip()
             _validate_task_caller(
                 execution_task_caller,
                 project_id=project_id,
@@ -355,6 +364,37 @@ class ControllerSettings:
             ].strip()
             if _PROJECT_NUMBER.fullmatch(receipt_authority_caller_subject) is None:
                 raise ValueError("receipt authority caller subject is invalid")
+            recovery_receipt_authority_caller_identity = source[
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL"
+            ].strip()
+            if recovery_receipt_authority_caller_identity != (
+                f"controlgraph-executor@{project_id}.iam.gserviceaccount.com"
+            ):
+                raise ValueError("recovery receipt authority caller identity is invalid")
+            recovery_receipt_authority_caller_subject = source[
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT"
+            ].strip()
+            if _PROJECT_NUMBER.fullmatch(recovery_receipt_authority_caller_subject) is None:
+                raise ValueError("recovery receipt authority caller subject is invalid")
+        if service_role is ServiceRole.ISSUER:
+            recovery_url = source["CONTROLGRAPH_RECOVERY_URL"].strip()
+            _validate_service_url(recovery_url, ServiceRole.RECOVERY, project_number)
+        if recovery_enabled:
+            executor_url = source["CONTROLGRAPH_EXECUTOR_URL"].strip()
+            _validate_service_url(executor_url, ServiceRole.EXECUTOR, project_number)
+        if executor_enabled:
+            recovery_facade_caller_identity = source[
+                "CONTROLGRAPH_RECOVERY_FACADE_CALLER_EMAIL"
+            ].strip()
+            if recovery_facade_caller_identity != (
+                f"controlgraph-recovery@{project_id}.iam.gserviceaccount.com"
+            ):
+                raise ValueError("recovery facade caller identity is invalid")
+            recovery_facade_caller_subject = source[
+                "CONTROLGRAPH_RECOVERY_FACADE_CALLER_SUBJECT"
+            ].strip()
+            if _PROJECT_NUMBER.fullmatch(recovery_facade_caller_subject) is None:
+                raise ValueError("recovery facade caller subject is invalid")
         if service_role is ServiceRole.EVIDENCE_WRITER:
             classification_evidence_caller_identity = source[
                 "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_EMAIL"
@@ -366,27 +406,18 @@ class ControllerSettings:
             classification_evidence_caller_subject = source[
                 "CONTROLGRAPH_CLASSIFICATION_EVIDENCE_CALLER_SUBJECT"
             ].strip()
-            if (
-                _PROJECT_NUMBER.fullmatch(classification_evidence_caller_subject)
-                is None
-            ):
+            if _PROJECT_NUMBER.fullmatch(classification_evidence_caller_subject) is None:
                 raise ValueError("classification evidence caller subject is invalid")
         if service_role is ServiceRole.VERIFIER:
-            evidence_writer_url = source[
-                "CONTROLGRAPH_EVIDENCE_WRITER_URL"
-            ].strip()
+            evidence_writer_url = source["CONTROLGRAPH_EVIDENCE_WRITER_URL"].strip()
             _validate_service_url(
                 evidence_writer_url,
                 ServiceRole.EVIDENCE_WRITER,
                 project_number,
             )
-        if service_role is ServiceRole.VERIFIER or executor_mutation_enabled:
-            target_network_resource = source[
-                "CONTROLGRAPH_TARGET_NETWORK_RESOURCE"
-            ].strip()
-            target_subnetwork_resource = source[
-                "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"
-            ].strip()
+        if service_role is ServiceRole.VERIFIER or executor_enabled:
+            target_network_resource = source["CONTROLGRAPH_TARGET_NETWORK_RESOURCE"].strip()
+            target_subnetwork_resource = source["CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"].strip()
             _validate_target_resource(
                 target_network_resource,
                 prefix=f"projects/{project_id}/global/networks/",
@@ -422,18 +453,16 @@ class ControllerSettings:
             recovery_task_caller=recovery_task_caller,
             receipt_authority_caller_identity=receipt_authority_caller_identity,
             receipt_authority_caller_subject=receipt_authority_caller_subject,
-            classification_evidence_caller_identity=(
-                classification_evidence_caller_identity
-            ),
-            classification_evidence_caller_subject=(
-                classification_evidence_caller_subject
-            ),
+            recovery_receipt_authority_caller_identity=(recovery_receipt_authority_caller_identity),
+            recovery_receipt_authority_caller_subject=(recovery_receipt_authority_caller_subject),
+            recovery_facade_caller_identity=recovery_facade_caller_identity,
+            recovery_facade_caller_subject=recovery_facade_caller_subject,
+            classification_evidence_caller_identity=(classification_evidence_caller_identity),
+            classification_evidence_caller_subject=(classification_evidence_caller_subject),
             target_network_resource=target_network_resource,
             target_subnetwork_resource=target_subnetwork_resource,
             coordinator_url=coordinator_url,
-            candidate_revision_configuration_sha256=(
-                candidate_revision_configuration_sha256
-            ),
+            candidate_revision_configuration_sha256=(candidate_revision_configuration_sha256),
             operator_identity=operator_identity,
             operator_subject=operator_subject,
             operator_oauth_client_audience=operator_oauth_client_audience,
@@ -441,9 +470,7 @@ class ControllerSettings:
 
 
 def _validate_service_url(value: str, role: ServiceRole, project_number: str) -> None:
-    expected = (
-        f"https://{runtime_service_name(role)}-{project_number}.us-central1.run.app"
-    )
+    expected = f"https://{runtime_service_name(role)}-{project_number}.us-central1.run.app"
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -485,13 +512,9 @@ def _validate_task_caller(
 
 
 def _validate_operator_identity(value: str) -> None:
-    if (
-        re.fullmatch(
-            r"[a-z0-9][a-z0-9._%+\-]{0,63}@"
-            r"[a-z0-9](?:[a-z0-9.\-]{0,251}[a-z0-9])?",
-            value,
-        )
-        is None
-        or value.endswith(".iam.gserviceaccount.com")
-    ):
+    if re.fullmatch(
+        r"[a-z0-9][a-z0-9._%+\-]{0,63}@"
+        r"[a-z0-9](?:[a-z0-9.\-]{0,251}[a-z0-9])?",
+        value,
+    ) is None or value.endswith(".iam.gserviceaccount.com"):
         raise ValueError("CONTROLGRAPH_OPERATOR_EMAIL is invalid")

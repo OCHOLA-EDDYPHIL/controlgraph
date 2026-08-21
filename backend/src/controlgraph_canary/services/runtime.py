@@ -26,7 +26,10 @@ from controlgraph_canary.application.capability_verification import (
     CapabilityVerifier,
     CapabilityVerifierConfiguration,
 )
-from controlgraph_canary.application.cloud_run import CloudRunTargetConfiguration
+from controlgraph_canary.application.cloud_run import (
+    CloudRunMutationPurpose,
+    CloudRunTargetConfiguration,
+)
 from controlgraph_canary.application.evidence_signing import EvidenceSigningService
 from controlgraph_canary.application.execution import FinalMutationGate
 from controlgraph_canary.application.health_attestation import (
@@ -46,6 +49,9 @@ from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
     HEALTH_ATTESTATION_PATH,
     RECEIPT_AUTHORITY_PATH,
+    RECOVERY_EXECUTION_FACADE_PATH,
+    RECOVERY_PRESTATE_ATTESTATION_PATH,
+    RECOVERY_RECEIPT_AUTHORITY_PATH,
     CallerBinding,
     CallerRole,
     RouteAuthenticationPolicy,
@@ -78,7 +84,21 @@ from controlgraph_canary.application.receipt_authority import (
 from controlgraph_canary.application.receipt_execution import (
     ReceiptClassifyingMutationAdapter,
     ReceiptExecutionCoordinator,
+    RecoveryExecutorFacade,
+    RecoveryTaskForwarder,
 )
+from controlgraph_canary.application.recovery_execution import (
+    ApiRecoveryClient,
+    CoordinatorRecoveryCapabilityClient,
+    CoordinatorRecoveryPrestateClient,
+    CoordinatorRecoveryRelay,
+    RecoveryPrestateSigningService,
+    RecoveryRolloutCoordinator,
+    StoredRecoveryAuthorizationResolver,
+    VerifierRecoveryPrestateAttestationClient,
+    VerifierRecoveryPrestateService,
+)
+from controlgraph_canary.application.recovery_store import RecoveryDispatchStore
 from controlgraph_canary.application.revocation import EpochRevoker
 from controlgraph_canary.application.revocation_proof import EpochRevocationProofService
 from controlgraph_canary.application.revocation_relay import (
@@ -145,7 +165,13 @@ from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimClassificationRequestV1,
 )
-from controlgraph_canary.http.receipt import create_receipt_task_handler
+from controlgraph_canary.http.receipt import (
+    RecoveryExecutorClient,
+    RecoveryExecutorFacadeHandler,
+    create_receipt_task_handler,
+    create_recovery_executor_facade_handler,
+    create_recovery_forwarding_task_handler,
+)
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.integrations.google.identity import (
     GoogleIdentityVerifier,
@@ -160,6 +186,7 @@ from controlgraph_canary.integrations.google.kms import (
     GoogleKmsDigestSigner,
     GoogleKmsEvidenceSignatureVerifier,
     GoogleKmsHealthAttestationVerifier,
+    GoogleKmsRecoveryPrestateAttestationVerifier,
 )
 from controlgraph_canary.integrations.google.tasks import GoogleCloudTasksEnqueuer
 from controlgraph_canary.settings import ControllerSettings
@@ -207,6 +234,7 @@ def create_runtime_service_app(
     revocation_clock: Callable[[], datetime] | None = None,
     revocation_attempt_id_factory: Callable[[], str] | None = None,
     health_evaluation_clock: Callable[[], datetime] | None = None,
+    recovery_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Compose a fail-closed service from validated startup coordinates."""
 
@@ -219,6 +247,7 @@ def create_runtime_service_app(
         ServiceRole.COORDINATOR,
         ServiceRole.ISSUER,
         ServiceRole.EXECUTOR,
+        ServiceRole.RECOVERY,
         ServiceRole.VERIFIER,
     }:
         raise ValueError("KMS dependencies are limited to signing and trust roles")
@@ -227,9 +256,7 @@ def create_runtime_service_app(
         verifier=token_verifier,
         clock=clock,
         operator_oauth_client_audience=(
-            settings.operator_oauth_client_audience
-            if role is ServiceRole.API
-            else None
+            settings.operator_oauth_client_audience if role is ServiceRole.API else None
         ),
     )
     evidence_signing_service = None
@@ -237,6 +264,8 @@ def create_runtime_service_app(
     classification_evidence_authentication_policy = None
     health_attestation_signing_service = None
     health_attestation_authentication_policy = None
+    recovery_prestate_signing_service = None
+    recovery_prestate_authentication_policy = None
     root_preflight_service = None
     stable_snapshot_capture_service = None
     target_traffic_observation_service = None
@@ -256,13 +285,19 @@ def create_runtime_service_app(
     api_health_evaluation_client = None
     coordinator_health_evaluation_service = None
     verifier_health_evaluation_service = None
+    api_recovery_client = None
+    coordinator_recovery_relay = None
+    verifier_recovery_prestate_service = None
     api_epoch_revocation_client = None
     coordinator_epoch_revocation_relay = None
     capability_issuance_service = None
     receipt_authority_service = None
     receipt_authority_authentication_policy = None
+    recovery_receipt_authority_authentication_policy = None
     capability_verifier = None
     verified_task_handler = None
+    recovery_executor_facade_handler: RecoveryExecutorFacadeHandler | None = None
+    recovery_executor_facade_authentication_policy = None
     if role is ServiceRole.EVIDENCE_WRITER:
         if settings.evidence_key_version is None or settings.signing_algorithm is None:
             raise ValueError("evidence-writer signing configuration is incomplete")
@@ -279,21 +314,13 @@ def create_runtime_service_app(
             authentication_policy=policy,
             signer=evidence_signer,
         )
-        classification_evidence_authentication_policy = (
-            _classification_evidence_policy(settings)
+        classification_evidence_authentication_policy = _classification_evidence_policy(settings)
+        classification_evidence_signing_service = ClassificationEvidenceSigningService(
+            project_id=settings.project_id,
+            authentication_policy=(classification_evidence_authentication_policy),
+            signer=evidence_signer,
         )
-        classification_evidence_signing_service = (
-            ClassificationEvidenceSigningService(
-                project_id=settings.project_id,
-                authentication_policy=(
-                    classification_evidence_authentication_policy
-                ),
-                signer=evidence_signer,
-            )
-        )
-        health_attestation_authentication_policy = _health_attestation_policy(
-            settings
-        )
+        health_attestation_authentication_policy = _health_attestation_policy(settings)
         health_attestation_signing_service = HealthAttestationSigningService(
             project_id=settings.project_id,
             authentication_policy=health_attestation_authentication_policy,
@@ -304,6 +331,12 @@ def create_runtime_service_app(
                 key_version=settings.evidence_key_version,
                 client=kms_client,
             ),
+        )
+        recovery_prestate_authentication_policy = _recovery_prestate_policy(settings)
+        recovery_prestate_signing_service = RecoveryPrestateSigningService(
+            project_id=settings.project_id,
+            authentication_policy=recovery_prestate_authentication_policy,
+            signer=evidence_signing_backend,
         )
     elif role is ServiceRole.VERIFIER:
         from controlgraph_canary.integrations.google.cloud_run import (
@@ -389,10 +422,8 @@ def create_runtime_service_app(
         ) -> CloudRunV2SnapshotReader:
             if (
                 request.target != target
-                or request.stable_revision
-                != "controlgraph-reference-target-stable-v3"
-                or request.candidate_revision
-                != "controlgraph-reference-target-candidate-v3"
+                or request.stable_revision != "controlgraph-reference-target-stable-v3"
+                or request.candidate_revision != "controlgraph-reference-target-candidate-v3"
                 or request.concurrency != 8
             ):
                 raise ValueError("target traffic request is not configured")
@@ -460,6 +491,46 @@ def create_runtime_service_app(
             target=target,
             authentication_policy=policy,
             proof_service_factory=health_proof_service_factory,
+        )
+        recovery_prestate_verifier = GoogleKmsRecoveryPrestateAttestationVerifier(
+            project_id=settings.project_id,
+            service_role=ServiceRole.VERIFIER,
+            key_version=settings.evidence_key_version,
+            client=kms_client,
+        )
+        recovery_prestate_attestor = VerifierRecoveryPrestateAttestationClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.VERIFIER,
+                service_role=ServiceRole.EVIDENCE_WRITER,
+                audience=settings.evidence_writer_url,
+                override_path=RECOVERY_PRESTATE_ATTESTATION_PATH,
+            ),
+            transport=selected_transport,
+            signing_key_version=settings.evidence_key_version,
+        )
+        verifier_recovery_prestate_service = VerifierRecoveryPrestateService(
+            target=target,
+            authentication_policy=policy,
+            reader=CloudRunV2SnapshotReader(
+                configuration=CloudRunTargetConfiguration(
+                    target=target,
+                    stable_revision="controlgraph-reference-target-stable-v3",
+                    candidate_revision="controlgraph-reference-target-candidate-v3",
+                    stable_concurrency=8,
+                    candidate_concurrency=8,
+                    network_resource=target_network_resource,
+                    subnetwork_resource=target_subnetwork_resource,
+                ),
+                service_role=ServiceRole.VERIFIER,
+                configured_project_id=settings.project_id,
+                services_client_factory=services_client_factory,
+                revisions_client_factory=revisions_client_factory,
+            ),
+            attestor=recovery_prestate_attestor,
+            signature_verifier=recovery_prestate_verifier,
+            clock=preflight_clock,
         )
 
         def classification_reader_factory(
@@ -564,6 +635,17 @@ def create_runtime_service_app(
             authentication_policy=policy,
             transport=selected_transport,
         )
+        api_recovery_client = ApiRecoveryClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+        )
         api_epoch_revocation_client = ApiEpochRevocationClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -598,6 +680,7 @@ def create_runtime_service_app(
         if (
             settings.capability_key_version is None
             or settings.evidence_key_version is None
+            or settings.recovery_url is None
         ):
             raise ValueError("issuer capability-signing configuration is incomplete")
         target = _reference_target(settings)
@@ -618,6 +701,11 @@ def create_runtime_service_app(
                 client=kms_client,
             )
         )
+        health_chain_reader = FirestoreHealthChainReader(
+            target=target,
+            configured_project_id=settings.project_id,
+            service_role=ServiceRole.ISSUER,
+        )
         capability_issuance_service = CapabilityIssuanceService(
             issuer=CapabilityIssuer(
                 store=selected_store,
@@ -628,14 +716,27 @@ def create_runtime_service_app(
                         ServiceRole.EXECUTOR,
                         settings.project_number,
                     ),
+                    recovery_handler_audience=settings.recovery_url,
                 ),
                 receipt_reader=selected_store,
-                promotion_health_chain_reader=FirestoreHealthChainReader(
-                    target=target,
-                    configured_project_id=settings.project_id,
-                    service_role=ServiceRole.ISSUER,
-                ),
+                promotion_health_chain_reader=health_chain_reader,
                 health_signature_verifier=GoogleKmsHealthAttestationVerifier(
+                    project_id=settings.project_id,
+                    service_role=ServiceRole.ISSUER,
+                    key_version=settings.evidence_key_version,
+                    client=kms_client,
+                ),
+                recovery_intent_reader=health_chain_reader,
+                recovery_health_chain_reader=health_chain_reader,
+                recovery_prestate_verifier=(
+                    GoogleKmsRecoveryPrestateAttestationVerifier(
+                        project_id=settings.project_id,
+                        service_role=ServiceRole.ISSUER,
+                        key_version=settings.evidence_key_version,
+                        client=kms_client,
+                    )
+                ),
+                revocation_evidence_verifier=GoogleKmsEvidenceSignatureVerifier(
                     project_id=settings.project_id,
                     service_role=ServiceRole.ISSUER,
                     key_version=settings.evidence_key_version,
@@ -656,9 +757,12 @@ def create_runtime_service_app(
 
         if (
             settings.capability_key_version is None
+            or settings.evidence_key_version is None
             or settings.coordinator_url is None
             or settings.target_network_resource is None
             or settings.target_subnetwork_resource is None
+            or settings.recovery_facade_caller_identity is None
+            or settings.recovery_facade_caller_subject is None
         ):
             raise ValueError("executor mutation configuration is incomplete")
         target = _reference_target(settings)
@@ -724,14 +828,15 @@ def create_runtime_service_app(
             ),
             clock=receipt_clock,
         )
+        capability_trust_verifier = GoogleKmsCapabilityTrustLoader(
+            project_id=settings.project_id,
+            service_role=ServiceRole.EXECUTOR,
+            key_version=settings.capability_key_version,
+            client=kms_client,
+        ).load()
         capability_verifier = CapabilityVerifier(
             root_reader=selected_store,
-            trust_verifier=GoogleKmsCapabilityTrustLoader(
-                project_id=settings.project_id,
-                service_role=ServiceRole.EXECUTOR,
-                key_version=settings.capability_key_version,
-                client=kms_client,
-            ).load(),
+            trust_verifier=capability_trust_verifier,
             configuration=CapabilityVerifierConfiguration(
                 target=target,
                 route_policy=policy,
@@ -739,6 +844,138 @@ def create_runtime_service_app(
             clock=capability_verification_clock,
         )
         verified_task_handler = create_receipt_task_handler(receipt_coordinator)
+        recovery_executor_facade_authentication_policy = _recovery_executor_facade_policy(settings)
+        recovery_receipt_store = ReceiptAuthorityClient(
+            target=target,
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.EXECUTOR,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+                override_path=RECOVERY_RECEIPT_AUTHORITY_PATH,
+            ),
+            transport=selected_transport,
+        )
+        recovery_mutation_adapter = ReceiptClassifyingMutationAdapter(
+            CloudRunV2Adapter(
+                configuration=cloud_run_configuration,
+                service_role=ServiceRole.EXECUTOR,
+                configured_project_id=settings.project_id,
+                mutation_purpose=CloudRunMutationPurpose.STABLE_RECOVERY,
+                services_client_factory=services_client_factory,
+                revisions_client_factory=revisions_client_factory,
+            )
+        )
+        recovery_receipt_coordinator = ReceiptExecutionCoordinator(
+            store=recovery_receipt_store,
+            final_gate=FinalMutationGate(
+                authority_reader=selected_store,
+                adapter=recovery_mutation_adapter,
+                route_policy=recovery_executor_facade_authentication_policy,
+                source_receipt_reader=recovery_receipt_store,
+                mutation_purpose=CloudRunMutationPurpose.STABLE_RECOVERY,
+                clock=final_authority_clock,
+            ),
+            readback=CloudRunV2ReceiptReadback(
+                configuration=cloud_run_configuration,
+                configured_project_id=settings.project_id,
+                mutation_purpose=CloudRunMutationPurpose.STABLE_RECOVERY,
+                services_client_factory=readback_services_client_factory,
+            ),
+            clock=receipt_clock,
+        )
+        recovery_facade_verifier = CapabilityVerifier(
+            root_reader=selected_store,
+            trust_verifier=capability_trust_verifier,
+            configuration=CapabilityVerifierConfiguration(
+                target=target,
+                route_policy=recovery_executor_facade_authentication_policy,
+                recovery_executor_facade=True,
+            ),
+            recovery_prestate_verifier=(
+                GoogleKmsRecoveryPrestateAttestationVerifier(
+                    project_id=settings.project_id,
+                    service_role=ServiceRole.EXECUTOR,
+                    key_version=settings.evidence_key_version,
+                    client=kms_client,
+                )
+            ),
+            clock=capability_verification_clock,
+        )
+        recovery_executor_facade_handler = create_recovery_executor_facade_handler(
+            RecoveryExecutorFacade(
+                verifier=recovery_facade_verifier,
+                coordinator=recovery_receipt_coordinator,
+            )
+        )
+    elif role is ServiceRole.RECOVERY and settings.mutations_enabled:
+        from controlgraph_canary.integrations.google.firestore import (
+            FirestoreAuthorityStore,
+        )
+
+        if (
+            settings.capability_key_version is None
+            or settings.evidence_key_version is None
+            or settings.executor_url is None
+        ):
+            raise ValueError("recovery forwarding configuration is incomplete")
+        target = _reference_target(settings)
+        selected_store = (
+            authority_store
+            if authority_store is not None
+            else FirestoreAuthorityStore(
+                target=target,
+                configured_project_id=settings.project_id,
+            )
+        )
+        selected_transport = (
+            internal_transport
+            if internal_transport is not None
+            else GoogleOneShotOidcTransport(
+                project_id=settings.project_id,
+                caller_role=CallerRole.RECOVERY,
+            )
+        )
+        capability_verifier = CapabilityVerifier(
+            root_reader=selected_store,
+            trust_verifier=GoogleKmsCapabilityTrustLoader(
+                project_id=settings.project_id,
+                service_role=ServiceRole.RECOVERY,
+                key_version=settings.capability_key_version,
+                client=kms_client,
+            ).load(),
+            configuration=CapabilityVerifierConfiguration(
+                target=target,
+                route_policy=policy,
+            ),
+            recovery_prestate_verifier=(
+                GoogleKmsRecoveryPrestateAttestationVerifier(
+                    project_id=settings.project_id,
+                    service_role=ServiceRole.RECOVERY,
+                    key_version=settings.evidence_key_version,
+                    client=kms_client,
+                )
+            ),
+            clock=capability_verification_clock,
+        )
+        verified_task_handler = create_recovery_forwarding_task_handler(
+            RecoveryTaskForwarder(
+                client=RecoveryExecutorClient(
+                    target=target,
+                    route=CoordinatorInternalRoute(
+                        project_id=settings.project_id,
+                        project_number=settings.project_number,
+                        caller_role=CallerRole.RECOVERY,
+                        service_role=ServiceRole.EXECUTOR,
+                        audience=settings.executor_url,
+                        override_path=RECOVERY_EXECUTION_FACADE_PATH,
+                    ),
+                    transport=selected_transport,
+                ),
+                route_policy=policy,
+            )
+        )
     elif role is ServiceRole.COORDINATOR:
         from controlgraph_canary.integrations.google.firestore import (
             FirestoreAuthorityStore,
@@ -858,24 +1095,14 @@ def create_runtime_service_app(
         )
         receipt_authority_service = ReceiptAuthorityService(selected_store)
         receipt_authority_authentication_policy = _receipt_authority_policy(settings)
+        recovery_receipt_authority_authentication_policy = _recovery_receipt_authority_policy(
+            settings
+        )
         health_signature_verifier = GoogleKmsHealthAttestationVerifier(
             project_id=settings.project_id,
             service_role=ServiceRole.COORDINATOR,
             key_version=settings.evidence_key_version,
             client=kms_client,
-        )
-        coordinator_health_evaluation_service = CoordinatorHealthEvaluationService(
-            target=target,
-            authentication_policy=policy,
-            operator_policy=_operator_api_policy(settings),
-            authority_reader=selected_store,
-            receipt_reader=selected_store,
-            health_store=health_chain_store,
-            verifier=CoordinatorHealthEvaluationClient(
-                route=verifier_route,
-                transport=selected_transport,
-                signature_verifier=health_signature_verifier,
-            ),
         )
         creator = RolloutRootCreator(
             store=selected_store,
@@ -937,12 +1164,10 @@ def create_runtime_service_app(
                 operator_policy=_operator_api_policy(settings),
             ),
         )
-        coordinator_service_claim_release_relay = (
-            CoordinatorServiceClaimReleaseRelay(
-                authentication_policy=policy,
-                operator_policy=_operator_api_policy(settings),
-                releaser=service_claim_releaser,
-            )
+        coordinator_service_claim_release_relay = CoordinatorServiceClaimReleaseRelay(
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            releaser=service_claim_releaser,
         )
         capability_client = CoordinatorCapabilityClient(
             route=CoordinatorInternalRoute(
@@ -969,6 +1194,65 @@ def create_runtime_service_app(
             task_enqueuer
             if task_enqueuer is not None
             else GoogleCloudTasksEnqueuer.from_default_credentials(task_addressor)
+        )
+        recovery_prestate_verifier = GoogleKmsRecoveryPrestateAttestationVerifier(
+            project_id=settings.project_id,
+            service_role=ServiceRole.COORDINATOR,
+            key_version=settings.evidence_key_version,
+            client=kms_client,
+        )
+        recovery_coordinator = RecoveryRolloutCoordinator(
+            target=target,
+            authorization_resolver=StoredRecoveryAuthorizationResolver(
+                target=target,
+                root_reader=selected_store,
+                receipt_reader=selected_store,
+                intent_reader=health_chain_store,
+                health_chain_reader=health_chain_store,
+                health_signature_verifier=health_signature_verifier,
+                revocation_evidence_verifier=coordinator_clients.evidence,
+                prestate_evaluator=CoordinatorRecoveryPrestateClient(
+                    route=verifier_route,
+                    transport=selected_transport,
+                    signature_verifier=recovery_prestate_verifier,
+                ),
+                prestate_signature_verifier=recovery_prestate_verifier,
+            ),
+            capability_client=CoordinatorRecoveryCapabilityClient(
+                route=CoordinatorInternalRoute(
+                    project_id=settings.project_id,
+                    project_number=settings.project_number,
+                    caller_role=CallerRole.COORDINATOR,
+                    service_role=ServiceRole.ISSUER,
+                    audience=settings.issuer_url,
+                ),
+                transport=selected_transport,
+            ),
+            dispatch_store=cast(RecoveryDispatchStore, health_chain_store),
+            task_dispatcher=TaskDispatcher(
+                task_addressor,
+                selected_task_enqueuer,
+            ),
+            clock=recovery_clock,
+        )
+        coordinator_recovery_relay = CoordinatorRecoveryRelay(
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            coordinator=recovery_coordinator,
+        )
+        coordinator_health_evaluation_service = CoordinatorHealthEvaluationService(
+            target=target,
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            authority_reader=selected_store,
+            receipt_reader=selected_store,
+            health_store=health_chain_store,
+            verifier=CoordinatorHealthEvaluationClient(
+                route=verifier_route,
+                transport=selected_transport,
+                signature_verifier=health_signature_verifier,
+            ),
+            recovery_coordinator=recovery_coordinator,
         )
         coordinator_canary_relay = CoordinatorCanaryRelay(
             authentication_policy=policy,
@@ -1018,6 +1302,7 @@ def create_runtime_service_app(
             ServiceRole.API,
             ServiceRole.COORDINATOR,
             ServiceRole.EXECUTOR,
+            ServiceRole.RECOVERY,
             ServiceRole.VERIFIER,
         }
         and internal_transport is not None
@@ -1039,6 +1324,7 @@ def create_runtime_service_app(
         ServiceRole.COORDINATOR,
         ServiceRole.ISSUER,
         ServiceRole.EXECUTOR,
+        ServiceRole.RECOVERY,
     }:
         raise ValueError("authority-store dependencies are role-limited")
     if root_creation_clock is not None and role is not ServiceRole.COORDINATOR:
@@ -1047,22 +1333,22 @@ def create_runtime_service_app(
         raise ValueError("revocation clocks are coordinator-limited")
     if revocation_attempt_id_factory is not None and role is not ServiceRole.API:
         raise ValueError("revocation attempt identities are API-limited")
-    if (
-        service_claim_release_clock is not None
-        and role is not ServiceRole.COORDINATOR
-    ):
+    if service_claim_release_clock is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("service-claim release clocks are coordinator-limited")
     if capability_issuance_clock is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability-issuance clocks are issuer-limited")
     if (
-        canary_clock is not None or promotion_clock is not None or task_enqueuer is not None
+        canary_clock is not None
+        or promotion_clock is not None
+        or recovery_clock is not None
+        or task_enqueuer is not None
     ) and role is not (ServiceRole.COORDINATOR):
         raise ValueError("canary-dispatch dependencies are coordinator-limited")
     if (
         final_authority_clock is not None
         or receipt_clock is not None
         or capability_verification_clock is not None
-    ) and role is not ServiceRole.EXECUTOR:
+    ) and role not in {ServiceRole.EXECUTOR, ServiceRole.RECOVERY}:
         raise ValueError("executor clocks are executor-limited")
     app = create_service_app(
         role,
@@ -1072,28 +1358,22 @@ def create_runtime_service_app(
         capability_verifier=capability_verifier,
         verified_task_handler=verified_task_handler,
         evidence_signing_service=evidence_signing_service,
-        classification_evidence_signing_service=(
-            classification_evidence_signing_service
-        ),
+        classification_evidence_signing_service=(classification_evidence_signing_service),
         classification_evidence_authentication_policy=(
             classification_evidence_authentication_policy
         ),
         health_attestation_signing_service=health_attestation_signing_service,
-        health_attestation_authentication_policy=(
-            health_attestation_authentication_policy
-        ),
+        health_attestation_authentication_policy=(health_attestation_authentication_policy),
+        recovery_prestate_signing_service=recovery_prestate_signing_service,
+        recovery_prestate_authentication_policy=(recovery_prestate_authentication_policy),
         root_preflight_service=root_preflight_service,
         stable_snapshot_capture_service=stable_snapshot_capture_service,
         target_traffic_observation_service=target_traffic_observation_service,
-        service_claim_classification_service=(
-            service_claim_classification_service
-        ),
+        service_claim_classification_service=(service_claim_classification_service),
         api_root_creation_client=api_root_creation_client,
         coordinator_root_creation_relay=coordinator_root_creation_relay,
         api_operator_observation_client=api_operator_observation_client,
-        coordinator_operator_observation_relay=(
-            coordinator_operator_observation_relay
-        ),
+        coordinator_operator_observation_relay=(coordinator_operator_observation_relay),
         api_canary_client=api_canary_client,
         coordinator_canary_relay=coordinator_canary_relay,
         api_promotion_client=api_promotion_client,
@@ -1101,15 +1381,23 @@ def create_runtime_service_app(
         api_health_evaluation_client=api_health_evaluation_client,
         coordinator_health_evaluation_service=coordinator_health_evaluation_service,
         verifier_health_evaluation_service=verifier_health_evaluation_service,
+        api_recovery_client=api_recovery_client,
+        coordinator_recovery_relay=coordinator_recovery_relay,
+        verifier_recovery_prestate_service=verifier_recovery_prestate_service,
         api_epoch_revocation_client=api_epoch_revocation_client,
         coordinator_epoch_revocation_relay=coordinator_epoch_revocation_relay,
         api_service_claim_release_client=api_service_claim_release_client,
-        coordinator_service_claim_release_relay=(
-            coordinator_service_claim_release_relay
-        ),
+        coordinator_service_claim_release_relay=(coordinator_service_claim_release_relay),
         capability_issuance_service=capability_issuance_service,
         receipt_authority_service=receipt_authority_service,
         receipt_authority_authentication_policy=(receipt_authority_authentication_policy),
+        recovery_receipt_authority_authentication_policy=(
+            recovery_receipt_authority_authentication_policy
+        ),
+        recovery_executor_facade_handler=recovery_executor_facade_handler,
+        recovery_executor_facade_authentication_policy=(
+            recovery_executor_facade_authentication_policy
+        ),
         mutation_enabled=settings.mutations_enabled,
     )
     if coordinator_clients is not None:
@@ -1121,39 +1409,25 @@ def create_runtime_service_app(
     if stable_snapshot_capture_service is not None:
         app.state.controlgraph_stable_snapshot_capture = stable_snapshot_capture_service
     if target_traffic_observation_service is not None:
-        app.state.controlgraph_target_traffic_observation = (
-            target_traffic_observation_service
-        )
+        app.state.controlgraph_target_traffic_observation = target_traffic_observation_service
     if api_operator_observation_client is not None:
-        app.state.controlgraph_operator_observation_client = (
-            api_operator_observation_client
-        )
+        app.state.controlgraph_operator_observation_client = api_operator_observation_client
     if coordinator_operator_observation_relay is not None:
-        app.state.controlgraph_operator_observation_relay = (
-            coordinator_operator_observation_relay
-        )
+        app.state.controlgraph_operator_observation_relay = coordinator_operator_observation_relay
     if service_claim_releaser is not None:
         app.state.controlgraph_service_claim_releaser = service_claim_releaser
     if api_service_claim_release_client is not None:
-        app.state.controlgraph_service_claim_release_client = (
-            api_service_claim_release_client
-        )
+        app.state.controlgraph_service_claim_release_client = api_service_claim_release_client
     if coordinator_service_claim_release_relay is not None:
-        app.state.controlgraph_service_claim_release_relay = (
-            coordinator_service_claim_release_relay
-        )
+        app.state.controlgraph_service_claim_release_relay = coordinator_service_claim_release_relay
     if service_claim_classification_service is not None:
-        app.state.controlgraph_service_claim_classification = (
-            service_claim_classification_service
-        )
+        app.state.controlgraph_service_claim_classification = service_claim_classification_service
     if classification_evidence_signing_service is not None:
         app.state.controlgraph_classification_evidence_signing = (
             classification_evidence_signing_service
         )
     if health_attestation_signing_service is not None:
-        app.state.controlgraph_health_attestation_signing = (
-            health_attestation_signing_service
-        )
+        app.state.controlgraph_health_attestation_signing = health_attestation_signing_service
     if api_canary_client is not None:
         app.state.controlgraph_canary_client = api_canary_client
     if coordinator_canary_relay is not None:
@@ -1163,17 +1437,19 @@ def create_runtime_service_app(
     if coordinator_promotion_relay is not None:
         app.state.controlgraph_promotion_relay = coordinator_promotion_relay
     if api_health_evaluation_client is not None:
-        app.state.controlgraph_health_evaluation_client = (
-            api_health_evaluation_client
-        )
+        app.state.controlgraph_health_evaluation_client = api_health_evaluation_client
     if coordinator_health_evaluation_service is not None:
-        app.state.controlgraph_health_evaluation_service = (
-            coordinator_health_evaluation_service
-        )
+        app.state.controlgraph_health_evaluation_service = coordinator_health_evaluation_service
     if verifier_health_evaluation_service is not None:
-        app.state.controlgraph_verifier_health_evaluation = (
-            verifier_health_evaluation_service
-        )
+        app.state.controlgraph_verifier_health_evaluation = verifier_health_evaluation_service
+    if api_recovery_client is not None:
+        app.state.controlgraph_recovery_client = api_recovery_client
+    if coordinator_recovery_relay is not None:
+        app.state.controlgraph_recovery_relay = coordinator_recovery_relay
+    if verifier_recovery_prestate_service is not None:
+        app.state.controlgraph_recovery_prestate_verifier = verifier_recovery_prestate_service
+    if recovery_prestate_signing_service is not None:
+        app.state.controlgraph_recovery_prestate_signing = recovery_prestate_signing_service
     if api_epoch_revocation_client is not None:
         app.state.controlgraph_epoch_revocation_client = api_epoch_revocation_client
     if coordinator_epoch_revocation_relay is not None:
@@ -1184,6 +1460,8 @@ def create_runtime_service_app(
         app.state.controlgraph_receipt_authority = receipt_authority_service
     if verified_task_handler is not None:
         app.state.controlgraph_receipt_execution = verified_task_handler
+    if recovery_executor_facade_handler is not None:
+        app.state.controlgraph_recovery_executor_facade = recovery_executor_facade_handler
     return app
 
 
@@ -1243,6 +1521,56 @@ def _receipt_authority_policy(
     )
 
 
+def _recovery_receipt_authority_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    if (
+        settings.recovery_receipt_authority_caller_identity is None
+        or settings.recovery_receipt_authority_caller_subject is None
+    ):
+        raise ValueError("recovery receipt authority policy is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.COORDINATOR,
+        path=RECOVERY_RECEIPT_AUTHORITY_PATH,
+        audience=_service_audience(
+            ServiceRole.COORDINATOR,
+            settings.project_number,
+        ),
+        caller=CallerBinding(
+            role=CallerRole.EXECUTOR,
+            email=settings.recovery_receipt_authority_caller_identity,
+            subject=settings.recovery_receipt_authority_caller_subject,
+        ),
+    )
+
+
+def _recovery_executor_facade_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    if (
+        settings.recovery_facade_caller_identity is None
+        or settings.recovery_facade_caller_subject is None
+    ):
+        raise ValueError("recovery executor facade policy is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.EXECUTOR,
+        path=RECOVERY_EXECUTION_FACADE_PATH,
+        audience=_service_audience(
+            ServiceRole.EXECUTOR,
+            settings.project_number,
+        ),
+        caller=CallerBinding(
+            role=CallerRole.RECOVERY,
+            email=settings.recovery_facade_caller_identity,
+            subject=settings.recovery_facade_caller_subject,
+        ),
+    )
+
+
 def _classification_evidence_policy(
     settings: ControllerSettings,
 ) -> RouteAuthenticationPolicy:
@@ -1281,6 +1609,31 @@ def _health_attestation_policy(
         project_number=settings.project_number,
         service_role=ServiceRole.EVIDENCE_WRITER,
         path=HEALTH_ATTESTATION_PATH,
+        audience=_service_audience(
+            ServiceRole.EVIDENCE_WRITER,
+            settings.project_number,
+        ),
+        caller=CallerBinding(
+            role=CallerRole.VERIFIER,
+            email=settings.classification_evidence_caller_identity,
+            subject=settings.classification_evidence_caller_subject,
+        ),
+    )
+
+
+def _recovery_prestate_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    if (
+        settings.classification_evidence_caller_identity is None
+        or settings.classification_evidence_caller_subject is None
+    ):
+        raise ValueError("recovery prestate policy is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.EVIDENCE_WRITER,
+        path=RECOVERY_PRESTATE_ATTESTATION_PATH,
         audience=_service_audience(
             ServiceRole.EVIDENCE_WRITER,
             settings.project_number,

@@ -2,11 +2,11 @@
 
 ## Status
 
-This threat model defines the required security boundary for ControlGraph Canary. Controls named
-as requirements are not claims that the current scaffold has deployed them. The repository now
-contains local and emulator-tested authority persistence, signing, task-delivery, and
-mutation-disabled service boundaries. Those pieces are not yet composed into the M3 enforcement
-path or accepted in a hosted environment, and no Cloud Run mutation capability is enabled.
+This threat model defines the implemented security boundary for ControlGraph Canary through
+deterministic health, promotion, and captured-stable recovery. The repository contains the
+authority, signing, task-delivery, target-bound mutation, receipt/readback, Monitoring, and
+recovery composition described below. Source implementation and local verification do not claim
+that a particular revision has passed hosted acceptance.
 
 ## Protected assets and safety outcomes
 
@@ -19,9 +19,10 @@ The protected assets are:
 - execution receipts and evidence records; and
 - workload and operator identity bindings.
 
-The primary safety outcome is that delayed, replayed, tampered, expired, misbound, overbroad, or
-revoked work cannot reach the Cloud Run mutation adapter. When a provider response is uncertain,
-the outcome remains explicit and no blind retry is performed.
+The primary safety outcome is that work which is delayed, replayed, tampered, expired, misbound,
+overbroad, or observed as revoked by the final authority check cannot reach the Cloud Run mutation
+adapter. When a provider response is uncertain, the outcome remains explicit and no blind retry
+is performed.
 
 ControlGraph protects control-plane mutation authorization. It does not claim to secure arbitrary
 application code, eliminate all Google Cloud compromise, or make a Firestore epoch read and a
@@ -46,24 +47,23 @@ API boundary -----> deterministic application facade and reducer
                           |
                           | addressed task + dedicated OIDC caller
                           v
-Cloud Tasks boundary ---> Executor or recovery ingress boundary
-                                |
-                                | caller, signature, lineage, scope,
-                                | binding, time, request checks
-                                v
-                         Firestore authority boundary
-                                |
-                                | fresh exact-epoch result and receipt claim
-                                v
-                         Narrow Cloud Run Admin API adapter
-                                |
-                                | conditional provider update
-                                v
-                         Bound Cloud Run target
+Cloud Tasks boundary ---> Executor normal ingress
+             |
+             +----------> Recovery ingress -- one unchanged task --> Executor recovery facade
+                                      |                                |
+                                      | caller, signature, root,       | independent revalidation,
+                                      | epoch, prestate, source        | separate recovery receipt,
+                                      | receipt, binding, time         | fresh epoch check
+                                      v                                v
+                               Firestore authority              Narrow Cloud Run adapter
+                                                                    |
+                                                                    | conditional update
+                                                                    v
+                                                            Bound Cloud Run target
 
 Verifier identity ------ independent read ------> Bound Cloud Run target
 Cloud Monitoring ------- bounded observations --> Deterministic policy input
-Evidence writer -------- append facts ----------> Evidence boundary
+Evidence writer -------- sign facts ------------> Evidence boundary
 Console ---------------- read-only API ----------> Operator information
 Optional Gemini/ADK advisor -- bounded read-only facade; never enters the authority path
 ```
@@ -86,9 +86,11 @@ console never invokes Google Cloud control-plane APIs directly.
 Rollout roots are immutable. Service claims, current epochs, and receipts use fixed canonical
 document identities and transactional compare-and-set operations. Firestore IAM is
 database-granular, so only the coordinator authority facade receives write permission. Executors
-and recovery workers read authority directly but use narrow authenticated facade operations for
-receipt claims and compare-and-set transitions. Reads used to authorize a mutation are strongly
-consistent and never fall back to a cache. An unavailable or corrupt record denies mutation.
+read authority directly and use separate narrow authenticated facade operations for normal and
+recovery receipt claims and compare-and-set transitions. Recovery workers read the authority
+needed to validate forwarding but cannot write receipts. Reads used to authorize a mutation are
+strongly consistent and never fall back to a cache. An unavailable or corrupt record denies
+mutation.
 
 ### KMS boundary
 
@@ -107,9 +109,15 @@ delivery.
 ### Cloud Run mutation boundary
 
 The adapter is constructed for one configured project, region, and service. Its public operations
-cover exact reads and the narrow traffic or approved concurrency updates required by the canary
-contract. It accepts no arbitrary resource coordinate, image, environment variable, cloud API
-method, or field mask. Every update carries the approved provider precondition.
+cover exact reads and narrow traffic updates while enforcing the approved concurrency as an
+unchanged precondition. It accepts no arbitrary resource coordinate, image, environment variable,
+cloud API method, or field mask. Every update carries the approved provider precondition.
+
+Only the executor identity receives the service-scoped traffic-update, fixed target
+service-account `actAs`, and operation-read grants. Cloud Run IAM permits the recovery identity to
+invoke the executor service, while application caller policy admits it only at the recovery
+facade. That facade accepts no normal execution action, and its adapter purpose permits only the
+captured stable revision at 100 percent traffic.
 
 ### Evidence boundary
 
@@ -125,9 +133,9 @@ readback, immutable request bindings, and signed evidence make omission or alter
 | API | Authenticate requests and invoke narrow application use cases. | No signing or target mutation. |
 | Coordinator | Select deterministic next commands already permitted by state and policy. | No authority approval or cloud mutation. |
 | Issuer | Read approved authority and request capability signatures. | No Cloud Run permission. |
-| Executor | Apply approved canary or promotion traffic after all gates. | No deploy, retarget, or arbitrary service update. |
-| Recovery | Restore only the captured stable configuration. | Cannot promote, choose a revision, or widen recovery bounds. |
-| Verifier | Read exact target configuration and classify it. | No mutation or authority write. |
+| Executor | Apply approved canary or promotion traffic, or execute independently reverified recovery-facade work, after all gates. | No deploy, retarget, arbitrary service update, or cross-purpose route use. |
+| Recovery | Validate and forward one unchanged captured-stable task to the executor recovery facade. | No direct target update, target `actAs`, operation read, receipt write, promotion, or revision selection. |
+| Verifier | Read exact target and Monitoring state and produce bounded health or prestate evidence. | No mutation or authority write. |
 | Evidence writer | Sign append-only evidence facts with the evidence key. | No authority-store write, capability signing, or target mutation. |
 | Task caller | Invoke one protected handler with the configured audience. | No mutation authority by identity alone. |
 | Optional Gemini/ADK advisor | Summarize bounded, already recorded facts. | No health, authority, safety, rollout, recovery, or execution decision. |
@@ -150,7 +158,7 @@ readback, immutable request bindings, and signed evidence make omission or alter
 | Ambiguous Cloud Run write | One provider attempt; durable `AMBIGUOUS` receipt; exact independent readback; no blind retry. | Inject timeout after possible commit and prove only exact readback can classify the result. |
 | Ambiguous Firestore write | Mutation identity, canonical wrapper, exact readback, and explicit unknown outcome. | Lose the commit response; adopt only the exact stored poststate, otherwise return unknown. |
 | Concurrent root creation | Canonical service-claim key and transactional root/claim/authority creation. | Racing creates for one service produce exactly one active root. |
-| Recovery abuse | Separate recovery identity and action; root-bound captured stable revision; restore-only adapter operation. | Attempt promotion or arbitrary revision recovery and observe denial before mutation. |
+| Recovery abuse | Separate task caller, recovery identity, executor facade, receipt route, signed verifier prestate, and restore-only adapter purpose; no direct recovery target permissions. | Substitute a prior APPLY receipt, candidate or arbitrary revision, prestate, root, epoch, or facade response and observe a fail-closed denial before mutation. |
 | Evidence tampering or omission | Canonical event identity, append-only records, signed evidence where required, and independent target readback. | Alter or remove a record and detect a digest, signature, or sequence discontinuity. |
 | Prompt injection or unsafe model output | Models remain outside authority packages and call only a read-only application facade. | Adversarial text cannot produce a capability, authority transition, task enqueue, or adapter call. |
 | Credential disclosure | Never log or persist authorization headers, tokens, signatures as secrets, private keys, or raw provider errors. | Secret-shaped fixtures are rejected or redacted and error chains expose no credential material. |
@@ -175,6 +183,14 @@ the Cloud Run API call because the two providers do not share an atomic transact
 does not conceal that residual interval. Exact provider preconditions prevent overwriting a
 changed service, while the required delayed-task demonstration proves revocation for work held
 before the fresh read.
+
+Recovery adds two independent gates before that same last-mile sequence. The recovery service
+verifies the addressed delivery and forwards the canonical task once without receiving mutation
+permissions. The executor facade then redecodes and reverifies that exact task and its signed
+current prestate, claims only through the recovery receipt route, and uses the final gate to reread
+the source receipt and current root and epoch before admitting a stable-only mutation. Duplicate
+deliveries can adopt or read back the exact receipt; they do not reconstruct dispatch authority or
+blindly repeat the provider call.
 
 ## Assumptions and non-goals
 

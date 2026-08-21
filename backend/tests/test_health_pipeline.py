@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import struct
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from health_execution_test_data import (
@@ -11,7 +11,9 @@ from health_execution_test_data import (
     make_signed_proof,
     make_verified_apply_receipt,
 )
+from recovery_v2_test_data import RecoveryV2Bundle, _finish_bundle
 from root_v2_test_data import PROJECT_NUMBER, make_root_v3_records
+from test_recovery_execution_contracts import _dispatch_result
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
@@ -48,6 +50,7 @@ from controlgraph_canary.application.monitoring import (
     MonitoringCollectedPoint,
     MonitoringQueryCollection,
 )
+from controlgraph_canary.application.recovery_execution import RecoveryCoordinator
 from controlgraph_canary.application.root_trust import CoordinatorInternalRoute
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
 from controlgraph_canary.contracts.codec import (
@@ -74,6 +77,7 @@ from controlgraph_canary.contracts.health_pipeline import (
     HealthEvaluationCommandV1,
     HealthEvaluationInvocationV1,
     HealthEvaluationResultV1,
+    HealthEvaluationResultV2,
     VerifierHealthEvaluationRequestV1,
     create_verifier_health_evaluation_request,
 )
@@ -82,6 +86,11 @@ from controlgraph_canary.contracts.models import EpochChangeCause, ExecutionRece
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionHealthChainLocatorV1,
     create_verified_apply_receipt_locator,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryCommandV2,
+    RecoveryDispatchResultV2,
+    RecoveryIntentV1,
 )
 from controlgraph_canary.contracts.root_creation import RolloutRootV3
 
@@ -95,6 +104,15 @@ class _Clock:
 
 
 class _HealthyQueryCollector:
+    def __init__(
+        self,
+        *,
+        successful_request_count: int = 995,
+        server_error_count: int = 1,
+    ) -> None:
+        self._successful_request_count = successful_request_count
+        self._server_error_count = server_error_count
+
     async def collect(
         self,
         query: MonitoringMetricQueryV1,
@@ -129,10 +147,10 @@ class _HealthyQueryCollector:
                     provider_double_bits=None,
                 )
                 for response_code_class, count in (
-                    ("2xx", 995),
+                    ("2xx", self._successful_request_count),
                     ("3xx", 2),
                     ("4xx", 2),
-                    ("5xx", 1),
+                    ("5xx", self._server_error_count),
                 )
             )
         return MonitoringQueryCollection(
@@ -145,18 +163,31 @@ class _HealthyQueryCollector:
 class _Attestor:
     purpose = HEALTH_ATTESTATION_PURPOSE
 
-    def __init__(self, anchor: PostApplyHealthAnchorV1) -> None:
+    def __init__(
+        self,
+        anchor: PostApplyHealthAnchorV1,
+        *,
+        unhealthy: bool = False,
+    ) -> None:
         self._anchor = anchor
+        self._unhealthy = unhealthy
         self.signing_key_version = anchor.evidence_signing_key_version
 
     async def attest(
         self,
         request: HealthAttestationSigningRequestV1,
     ) -> SignedHealthDecisionProofV1:
+        marker = f"pipeline-proof-{request.pending_proof.sequence}".encode()
+        if self._unhealthy:
+            marker = (
+                b"first-unhealthy-recovery-proof"
+                if request.pending_proof.sequence == 1
+                else b"second-unhealthy-recovery-proof"
+            )
         return make_signed_proof(
             request.pending_proof,
             self._anchor,
-            marker=f"pipeline-proof-{request.pending_proof.sequence}".encode(),
+            marker=marker,
         )
 
 
@@ -181,8 +212,9 @@ class _SignatureVerifier:
 
 
 class _ProofServiceFactory:
-    def __init__(self, clock: _Clock) -> None:
+    def __init__(self, clock: _Clock, *, unhealthy: bool = False) -> None:
         self.clock = clock
+        self.unhealthy = unhealthy
         self.calls = 0
 
     def __call__(
@@ -195,8 +227,15 @@ class _ProofServiceFactory:
         return VerifierHealthProofService(
             root=root,
             anchor=anchor,
-            query_collector=_HealthyQueryCollector(),
-            attestor=_Attestor(anchor),
+            query_collector=(
+                _HealthyQueryCollector(
+                    successful_request_count=946,
+                    server_error_count=50,
+                )
+                if self.unhealthy
+                else _HealthyQueryCollector()
+            ),
+            attestor=_Attestor(anchor, unhealthy=self.unhealthy),
             signature_verifier=_SignatureVerifier(
                 anchor.target.project_id,
                 anchor.evidence_signing_key_version,
@@ -289,6 +328,7 @@ class _HealthStore:
         self,
         expected: HealthChainSnapshot,
         signed_proof: SignedHealthDecisionProofV1,
+        recovery_intent: RecoveryIntentV1 | None = None,
     ) -> HealthChainAppendResult:
         self.append_calls += 1
         if self.snapshot != expected:
@@ -302,10 +342,11 @@ class _HealthStore:
         self.snapshot = HealthChainSnapshot(
             anchor=expected.anchor,
             manifest=StoredRecord(manifest, manifest.terminal_sequence),
-            signed_proofs=tuple(
-                StoredRecord(proof, 0) for proof in chain.signed_proofs
-            ),
+            signed_proofs=tuple(StoredRecord(proof, 0) for proof in chain.signed_proofs),
             signed_chain=chain,
+            recovery_intent=(
+                StoredRecord(recovery_intent, 0) if recovery_intent is not None else None
+            ),
         )
         if self.raise_conflict_after_write:
             self.raise_conflict_after_write = False
@@ -346,6 +387,54 @@ class _HealthStore:
         return None
 
 
+class _RecoveryCoordinator:
+    async def dispatch(
+        self,
+        command: RecoveryCommandV2,
+    ) -> RecoveryDispatchResultV2:
+        raise AssertionError(f"unexpected recovery dispatch: {command.root_id}")
+
+
+class _CapturingRecoveryCoordinator:
+    def __init__(self, root: RolloutRootV3) -> None:
+        self._root = root
+        self.commands: list[RecoveryCommandV2] = []
+        self.issuances: list[RecoveryV2Bundle] = []
+        self._results: dict[str, RecoveryDispatchResultV2] = {}
+
+    async def dispatch(
+        self,
+        command: RecoveryCommandV2,
+    ) -> RecoveryDispatchResultV2:
+        self.commands.append(command)
+        command_sha256 = canonical_sha256(command)
+        existing = self._results.get(command_sha256)
+        if existing is not None:
+            return existing
+        triggered_at = datetime.strptime(
+            command.source.triggered_at,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=UTC)
+        scheduled_at = datetime.strptime(
+            command.scheduled_at,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=UTC)
+        bundle = _finish_bundle(
+            root=self._root,
+            command=command,
+            requested_at=(triggered_at + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            retrieved_at=(triggered_at + timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            valid_until=(triggered_at + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            current_provider_etag="pipeline-recovery-etag-9",
+            service_generation=9,
+            task_expires_at=(scheduled_at + timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        result = _dispatch_result(bundle)
+        self.issuances.append(bundle)
+        self._results[command_sha256] = result
+        return result
+
+
 @dataclass
 class _LoopbackTransport:
     coordinator_caller: AuthenticationContext
@@ -384,10 +473,7 @@ class _LoopbackTransport:
 
 
 def _audience(role: ServiceRole) -> str:
-    return (
-        f"https://{runtime_service_name(role)}-{PROJECT_NUMBER}"
-        ".us-central1.run.app"
-    )
+    return f"https://{runtime_service_name(role)}-{PROJECT_NUMBER}.us-central1.run.app"
 
 
 def _policy(
@@ -469,6 +555,8 @@ def _pipeline(
     clock: _Clock,
     receipt_revision: int = 2,
     reject_client_signatures: bool = False,
+    unhealthy: bool = False,
+    recovery_coordinator: RecoveryCoordinator | None = None,
 ) -> tuple[
     ApiHealthEvaluationClient,
     _LoopbackTransport,
@@ -493,7 +581,7 @@ def _pipeline(
     verifier_service = VerifierHealthEvaluationService(
         target=root.content.target,
         authentication_policy=verifier_policy,
-        proof_service_factory=_ProofServiceFactory(clock),
+        proof_service_factory=_ProofServiceFactory(clock, unhealthy=unhealthy),
     )
     client_signature_verifier = _SignatureVerifier(
         root.content.target.project_id,
@@ -513,6 +601,7 @@ def _pipeline(
         receipt_reader=authority,
         health_store=store,
         verifier=verifier_client,
+        recovery_coordinator=recovery_coordinator or _RecoveryCoordinator(),
     )
     transport.coordinator_service = coordinator_service
     transport.verifier_service = verifier_service
@@ -536,7 +625,7 @@ def _pipeline(
 
 def _next_command(
     command: HealthEvaluationCommandV1,
-    result: HealthEvaluationResultV1,
+    result: HealthEvaluationResultV1 | HealthEvaluationResultV2,
 ) -> HealthEvaluationCommandV1:
     values = command.model_dump(mode="python")
     values.update(
@@ -599,8 +688,7 @@ def test_live_pipeline_advances_by_predecessor_and_returns_locator_only_when_hea
     assert len(transport.verifier_requests) == 2
     assert transport.verifier_requests[0].prior_signed_proof is None
     assert (
-        transport.verifier_requests[1].prior_signed_proof
-        == store.snapshot.signed_proofs[0].value  # type: ignore[union-attr]
+        transport.verifier_requests[1].prior_signed_proof == store.snapshot.signed_proofs[0].value  # type: ignore[union-attr]
     )
     assert "signed_proofs" not in VerifierHealthEvaluationRequestV1.model_fields
     assert all(
@@ -619,6 +707,55 @@ def test_live_pipeline_advances_by_predecessor_and_returns_locator_only_when_hea
         )
     assert stale.value.code is HealthPipelineErrorCode.STORE_CONFLICT
     assert len(transport.verifier_requests) == 2
+
+
+def test_terminal_unhealthy_v3_pipeline_dispatches_one_root_bound_recovery() -> None:
+    clock = _Clock(datetime(2026, 8, 21, 12, 8, tzinfo=UTC))
+    root, _ = make_anchor()
+    recovery = _CapturingRecoveryCoordinator(root)
+    (
+        api,
+        _,
+        _,
+        store,
+        first_command,
+        operator,
+        _,
+        _,
+    ) = _pipeline(
+        clock=clock,
+        unhealthy=True,
+        recovery_coordinator=recovery,
+    )
+
+    first = asyncio.run(api.evaluate(first_command, operator))
+    second_command = _next_command(first_command, first)
+    clock.value = datetime(2026, 8, 21, 12, 9, tzinfo=UTC)
+    terminal = asyncio.run(api.evaluate(second_command, operator))
+    replay = asyncio.run(api.evaluate(second_command, operator))
+
+    assert first.terminal_status is HealthDecisionStatus.WAIT
+    assert first.recovery_dispatch is None
+    assert terminal.terminal_status is HealthDecisionStatus.UNHEALTHY
+    assert terminal.recovery_dispatch is not None
+    assert replay.recovery_dispatch == terminal.recovery_dispatch
+    assert replay.append_disposition == "ADOPTED"
+    assert len(recovery.commands) == 2
+    assert recovery.commands[0] == recovery.commands[1]
+    assert len(recovery.issuances) == 1
+    issued = recovery.issuances[0]
+    assert issued.command == recovery.commands[0]
+    assert issued.authorization.root_schema_version == root.schema_version
+    assert issued.authorization.source.basis.value == "TERMINAL_UNHEALTHY_V3"
+    assert issued.issuance_result.capability.claims.action.value == "RECOVER_STABLE_V1"
+    assert (
+        issued.issuance_result.capability.claims.subject
+        == root.content.authority_bounds.recovery_identity
+    )
+    assert issued.issuance_result.capability.signature
+    assert store.snapshot is not None
+    assert store.snapshot.recovery_intent is not None
+    assert store.snapshot.recovery_intent.value.command == issued.command
 
 
 def test_coordinator_rechecks_authority_before_cas_append() -> None:

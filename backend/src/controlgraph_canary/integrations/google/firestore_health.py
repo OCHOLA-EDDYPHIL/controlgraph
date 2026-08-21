@@ -21,6 +21,10 @@ from controlgraph_canary.application.health_store import (
     HealthChainWriteDisposition,
 )
 from controlgraph_canary.application.identity import ServiceRole
+from controlgraph_canary.application.recovery_store import (
+    DirectRecoveryEnqueueStart,
+    RecoveryEnqueuePermit,
+)
 from controlgraph_canary.contracts.base import StrictContractModel
 from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
@@ -38,16 +42,37 @@ from controlgraph_canary.contracts.health_storage import (
     HealthChainManifestV1,
     HealthStorageDocumentV1,
     HealthStorageKind,
+    RecoveryDispatchStorageRecordV2,
     create_health_chain_manifest,
+    create_recovery_dispatch_storage_record,
     health_anchor_document_id,
     health_chain_head_document_id,
     health_chain_manifest_document_id,
+    recovery_dispatch_document_id,
+    recovery_dispatch_identity_document_id,
+    recovery_dispatch_identity_logical_id,
+    recovery_dispatch_storage_record_value,
+    recovery_intent_document_id,
     signed_health_proof_document_id,
     signed_health_proof_logical_id,
 )
 from controlgraph_canary.contracts.models import TargetBinding
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionHealthChainLocatorV1,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RECOVERY_DISPATCH_IDENTITY_V2,
+    RecoveryCommandV2,
+    RecoveryDispatchIdentityKind,
+    RecoveryDispatchIdentityV2,
+    RecoveryDispatchRecordV2,
+    RecoveryDispatchState,
+    RecoveryHealthChainLocatorV1,
+    RecoveryIntentV1,
+    RevokedV2RecoverySourceV1,
+    recovery_command_sha256,
+    recovery_dispatch_id,
+    recovery_intent_id,
 )
 from controlgraph_canary.integrations.google.firestore import (
     FIRESTORE_AUTHORITY_DATABASE,
@@ -134,6 +159,12 @@ def _payload_target(value: StrictContractModel) -> TargetBinding:
         return value.proof.decision.target
     if type(value) is HealthChainManifestV1:
         return value.target
+    if type(value) is RecoveryIntentV1:
+        return value.command.source.target
+    if type(value) is RecoveryDispatchIdentityV2:
+        return value.target
+    if type(value) is RecoveryDispatchStorageRecordV2:
+        return value.target
     raise TypeError("health storage payload type is unsupported")
 
 
@@ -167,6 +198,80 @@ def _stored[ModelT: StrictContractModel](
     document: _PreparedDocument[ModelT],
 ) -> StoredRecord[ModelT]:
     return StoredRecord(document.value, document.wrapper.revision)
+
+
+def _recovery_dispatch_identity(
+    record: RecoveryDispatchRecordV2,
+    kind: RecoveryDispatchIdentityKind,
+) -> RecoveryDispatchIdentityV2:
+    identity_value = (
+        record.request_id
+        if kind is RecoveryDispatchIdentityKind.REQUEST
+        else record.idempotency_key
+    )
+    return RecoveryDispatchIdentityV2(
+        schema_version=RECOVERY_DISPATCH_IDENTITY_V2,
+        identity_kind=kind,
+        identity_value=identity_value,
+        target=record.target,
+        dispatch_id=record.dispatch_id,
+        command_sha256=record.command_sha256,
+        recovery_authorization_sha256=record.recovery_authorization_sha256,
+        capability_id=record.capability_id,
+        root_id=record.root_id,
+        root_sha256=record.root_sha256,
+        epoch=record.epoch,
+        scheduled_at=record.scheduled_at,
+        source_receipt_sha256=record.source_receipt_sha256,
+        trigger_proof_sha256=record.trigger_proof_sha256,
+        prestate_attestation_sha256=record.prestate_attestation_sha256,
+        claimed_at=record.prepared_at,
+    )
+
+
+def _recovery_transition_is_exact(
+    expected: StoredRecord[RecoveryDispatchRecordV2],
+    replacement: RecoveryDispatchRecordV2,
+) -> bool:
+    if (
+        type(expected) is not StoredRecord
+        or type(expected.value) is not RecoveryDispatchRecordV2
+        or type(replacement) is not RecoveryDispatchRecordV2
+    ):
+        return False
+    current = expected.value
+    current_projection = current.model_dump(
+        mode="python",
+        exclude={"state", "enqueue_started_at", "terminal_at", "result"},
+    )
+    replacement_projection = replacement.model_dump(
+        mode="python",
+        exclude={"state", "enqueue_started_at", "terminal_at", "result"},
+    )
+    if current_projection != replacement_projection:
+        return False
+    if current.state is RecoveryDispatchState.PREPARED:
+        return (
+            expected.revision == 0
+            and replacement.state is RecoveryDispatchState.ENQUEUE_STARTED
+            and replacement.enqueue_started_at is not None
+            and replacement.terminal_at is None
+            and replacement.result is None
+        )
+    if current.state is RecoveryDispatchState.ENQUEUE_STARTED:
+        return (
+            expected.revision == 1
+            and replacement.state
+            in {
+                RecoveryDispatchState.CREATED,
+                RecoveryDispatchState.DUPLICATE,
+                RecoveryDispatchState.AMBIGUOUS,
+            }
+            and replacement.enqueue_started_at == current.enqueue_started_at
+            and replacement.terminal_at is not None
+            and replacement.result is not None
+        )
+    return False
 
 
 class FirestoreHealthChainReader:
@@ -434,7 +539,7 @@ class FirestoreHealthChainReader:
                 snapshot = await self._get_snapshot(reference, transaction=None)
         except asyncio.CancelledError:
             raise
-        except AuthorityStoreCorruptRecord:
+        except (AuthorityStoreConflict, AuthorityStoreCorruptRecord):
             raise
         except Exception:
             raise AuthorityStoreUnavailable from None
@@ -462,7 +567,7 @@ class FirestoreHealthChainReader:
                 )
         except asyncio.CancelledError:
             raise
-        except AuthorityStoreCorruptRecord:
+        except (AuthorityStoreConflict, AuthorityStoreCorruptRecord):
             raise
         except Exception:
             raise AuthorityStoreUnavailable from None
@@ -518,12 +623,31 @@ class FirestoreHealthChainReader:
             raise AuthorityStoreCorruptRecord from None
         if expected_manifest != value:
             raise AuthorityStoreCorruptRecord
+        recovery_intent: _DecodedDocument[RecoveryIntentV1] | None = None
+        if value.terminal_status.value == "unhealthy":
+            recovery_intent = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_INTENT,
+                logical_id=recovery_intent_id(value.root_sha256),
+                document_id=recovery_intent_document_id(
+                    self._target,
+                    value.root_sha256,
+                ),
+                model_type=RecoveryIntentV1,
+            )
+            if recovery_intent is None:
+                raise AuthorityStoreCorruptRecord
         try:
             return HealthChainSnapshot(
                 anchor=anchor.stored,
                 manifest=manifest.stored,
                 signed_proofs=tuple(proof_records),
                 signed_chain=chain,
+                recovery_intent=(
+                    recovery_intent.stored
+                    if recovery_intent is not None
+                    else None
+                ),
             )
         except (TypeError, ValueError):
             raise AuthorityStoreCorruptRecord from None
@@ -656,6 +780,75 @@ class FirestoreHealthChainReader:
             != locator.ordered_proof_chain_sha256
             or value.terminal_sequence != locator.terminal_sequence
             or chain.healthy_promotion_proof is None
+        ):
+            raise AuthorityStoreCorruptRecord
+        return chain
+
+    async def read_recovery_intent(
+        self,
+        root_sha256: str,
+    ) -> StoredRecord[RecoveryIntentV1] | None:
+        """Strongly read the sole target- and root-scoped recovery intent."""
+
+        logical_id = recovery_intent_id(root_sha256)
+        decoded = await self._strong_read(
+            kind=HealthStorageKind.RECOVERY_INTENT,
+            logical_id=logical_id,
+            document_id=recovery_intent_document_id(self._target, root_sha256),
+            model_type=RecoveryIntentV1,
+        )
+        if decoded is None:
+            return None
+        if (
+            decoded.wrapper.revision != 0
+            or decoded.value.root_sha256 != root_sha256
+            or decoded.value.intent_id != logical_id
+        ):
+            raise AuthorityStoreCorruptRecord
+        return decoded.stored
+
+    async def read_recovery_health_chain(
+        self,
+        locator: RecoveryHealthChainLocatorV1,
+    ) -> SignedHealthDecisionChainV1 | None:
+        """Load a full chain only through every terminal-unhealthy binding."""
+
+        if type(locator) is not RecoveryHealthChainLocatorV1:
+            raise TypeError("recovery health-chain lookup requires an exact locator")
+        snapshot = await self.read_health_chain_by_manifest(
+            locator.health_chain_sha256
+        )
+        if snapshot is None:
+            return None
+        manifest = snapshot.manifest
+        chain = snapshot.signed_chain
+        if manifest is None or chain is None:
+            raise AuthorityStoreCorruptRecord
+        value = manifest.value
+        terminal = chain.signed_proofs[-1]
+        if (
+            value.root_id != locator.root_id
+            or value.root_sha256 != locator.root_sha256
+            or value.target != locator.target
+            or value.epoch != locator.epoch
+            or value.anchor_id != locator.anchor_id
+            or value.anchor_sha256 != locator.anchor_sha256
+            or value.chain_id != locator.chain_id
+            or value.manifest_sha256 != locator.health_chain_sha256
+            or value.chain_head_sha256 != locator.chain_head_sha256
+            or value.ordered_proof_chain_sha256
+            != locator.ordered_proof_chain_sha256
+            or value.terminal_sequence != locator.terminal_sequence
+            or value.terminal_status.value != "unhealthy"
+            or canonical_sha256(terminal)
+            != locator.terminal_signed_proof_sha256
+            or terminal.proof.decision_sha256
+            != locator.terminal_health_decision_sha256
+            or chain.anchor.source_receipt_sha256
+            != locator.source_receipt_sha256
+            or chain.anchor.expected_prestate_sha256
+            != locator.expected_prestate_sha256
+            or terminal.proof.decision.evaluated_at != locator.terminal_decided_at
         ):
             raise AuthorityStoreCorruptRecord
         return chain
@@ -811,6 +1004,7 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
         self,
         expected: HealthChainSnapshot,
         signed_proof: SignedHealthDecisionProofV1,
+        recovery_intent: RecoveryIntentV1 | None = None,
     ) -> HealthChainAppendResult:
         """CAS-append one exact signed proof without serializing its aggregate chain."""
 
@@ -832,6 +1026,16 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
             manifest = create_health_chain_manifest(chain)
         except (TypeError, ValueError):
             raise ValueError("signed proof is not the exact next chain element") from None
+        is_unhealthy = manifest.terminal_status.value == "unhealthy"
+        if is_unhealthy != (recovery_intent is not None):
+            raise ValueError(
+                "terminal unhealthy append requires exactly one recovery intent"
+            )
+        validated_intent = (
+            RecoveryIntentV1.model_validate(recovery_intent)
+            if recovery_intent is not None
+            else None
+        )
         signed_digest = canonical_sha256(validated_proof)
         proof_document = _prepared_document(
             kind=HealthStorageKind.SIGNED_HEALTH_DECISION_PROOF,
@@ -864,11 +1068,28 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
             revision=manifest.terminal_sequence,
             value=manifest,
         )
+        intent_document = (
+            _prepared_document(
+                kind=HealthStorageKind.RECOVERY_INTENT,
+                logical_id=validated_intent.intent_id,
+                document_id=recovery_intent_document_id(
+                    self._target,
+                    validated_intent.root_sha256,
+                ),
+                revision=0,
+                value=validated_intent,
+            )
+            if validated_intent is not None
+            else None
+        )
         candidate = HealthChainSnapshot(
             anchor=expected.anchor,
             manifest=_stored(head_document),
             signed_proofs=(*expected.signed_proofs, _stored(proof_document)),
             signed_chain=chain,
+            recovery_intent=(
+                _stored(intent_document) if intent_document is not None else None
+            ),
         )
 
         async def append(transaction: _TransactionPort) -> None:
@@ -904,6 +1125,17 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
                 document_id=manifest_document.document_id,
                 model_type=HealthChainManifestV1,
             )
+            current_intent = (
+                await self._transaction_read(
+                    transaction,
+                    kind=HealthStorageKind.RECOVERY_INTENT,
+                    logical_id=intent_document.wrapper.logical_id,
+                    document_id=intent_document.document_id,
+                    model_type=RecoveryIntentV1,
+                )
+                if intent_document is not None
+                else None
+            )
             if current_anchor is None or current_anchor.stored != expected.anchor:
                 raise _ExpectedStateMismatch
             candidate_is_current = (
@@ -918,8 +1150,18 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
                 cast(_DecodedDocument[StrictContractModel] | None, current_manifest),
                 cast(_PreparedDocument[StrictContractModel], manifest_document),
             )
+            intent_is_current = (
+                intent_document is None
+                or _matches_prepared_content(
+                    cast(
+                        _DecodedDocument[StrictContractModel] | None,
+                        current_intent,
+                    ),
+                    cast(_PreparedDocument[StrictContractModel], intent_document),
+                )
+            )
             if candidate_is_current:
-                if proof_is_current and manifest_is_current:
+                if proof_is_current and manifest_is_current and intent_is_current:
                     raise _ExactDuplicate
                 raise AuthorityStoreCorruptRecord
             expected_is_current = (
@@ -930,7 +1172,11 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
             )
             if not expected_is_current:
                 raise _ExpectedStateMismatch
-            if current_proof is not None or current_manifest is not None:
+            if (
+                current_proof is not None
+                or current_manifest is not None
+                or current_intent is not None
+            ):
                 raise AuthorityStoreCorruptRecord
             client = await self._client()
             transaction.create(
@@ -949,6 +1195,15 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
                 ),
                 _document_data(manifest_document.wrapper),
             )
+            if intent_document is not None:
+                transaction.create(
+                    self._reference(
+                        client,
+                        HealthStorageKind.RECOVERY_INTENT,
+                        intent_document.document_id,
+                    ),
+                    _document_data(intent_document.wrapper),
+                )
             head_reference = self._reference(
                 client,
                 HealthStorageKind.HEALTH_CHAIN_HEAD,
@@ -966,7 +1221,7 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
                 )
 
         try:
-            await self._execute_write(3, append)
+            await self._execute_write(4 if intent_document is not None else 3, append)
         except asyncio.CancelledError:
             raise
         except _ExactDuplicate:
@@ -995,6 +1250,452 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
         return HealthChainAppendResult(
             HealthChainWriteDisposition.CREATED,
             candidate,
+        )
+
+    async def create_or_adopt_recovery_intent(
+        self,
+        intent: RecoveryIntentV1,
+    ) -> StoredRecord[RecoveryIntentV1]:
+        """Reserve the sole root-level recovery command or adopt its exact value."""
+
+        if type(intent) is not RecoveryIntentV1:
+            raise TypeError("recovery intent persistence requires an exact intent")
+        validated = RecoveryIntentV1.model_validate(intent)
+        if (
+            type(validated.command.source) is not RevokedV2RecoverySourceV1
+            or validated.command.source.target != self._target
+        ):
+            raise ValueError("recovery intent does not match the configured target")
+        document = _prepared_document(
+            kind=HealthStorageKind.RECOVERY_INTENT,
+            logical_id=validated.intent_id,
+            document_id=recovery_intent_document_id(
+                self._target,
+                validated.root_sha256,
+            ),
+            revision=0,
+            value=validated,
+        )
+
+        async def create(transaction: _TransactionPort) -> None:
+            current = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_INTENT,
+                logical_id=validated.intent_id,
+                document_id=document.document_id,
+                model_type=RecoveryIntentV1,
+            )
+            if current is not None:
+                if current.stored == _stored(document):
+                    raise _ExactDuplicate
+                raise _ExpectedStateMismatch
+            client = await self._client()
+            transaction.create(
+                self._reference(
+                    client,
+                    HealthStorageKind.RECOVERY_INTENT,
+                    document.document_id,
+                ),
+                _document_data(document.wrapper),
+            )
+
+        try:
+            await self._execute_write(1, create)
+        except asyncio.CancelledError:
+            raise
+        except _ExactDuplicate:
+            adopted = await self.read_recovery_intent(validated.root_sha256)
+            if adopted != _stored(document):
+                raise AuthorityStoreCorruptRecord from None
+            return adopted
+        except _ExpectedStateMismatch:
+            raise AuthorityStoreConflict from None
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception as error:
+            try:
+                adopted = await self.read_recovery_intent(validated.root_sha256)
+            except Exception:
+                raise AuthorityStoreOutcomeUnknown from None
+            if adopted == _stored(document):
+                return adopted
+            if adopted is not None or _is_contention(error):
+                raise AuthorityStoreConflict from None
+            raise AuthorityStoreOutcomeUnknown from None
+        return _stored(document)
+
+    async def read_recovery_dispatch(
+        self,
+        command: RecoveryCommandV2,
+    ) -> StoredRecord[RecoveryDispatchRecordV2] | None:
+        """Read one dispatch only through both immutable request identities."""
+
+        if type(command) is not RecoveryCommandV2:
+            raise TypeError("recovery dispatch read requires an exact command")
+        command_sha256 = recovery_command_sha256(command)
+        dispatch_id = recovery_dispatch_id(command_sha256)
+        request_logical_id = recovery_dispatch_identity_logical_id(
+            RecoveryDispatchIdentityKind.REQUEST.value,
+            command.request_id,
+        )
+        idempotency_logical_id = recovery_dispatch_identity_logical_id(
+            RecoveryDispatchIdentityKind.IDEMPOTENCY.value,
+            command.idempotency_key,
+        )
+        result: StoredRecord[RecoveryDispatchRecordV2] | None = None
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal result
+            request = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH_IDENTITY,
+                logical_id=request_logical_id,
+                document_id=recovery_dispatch_identity_document_id(
+                    self._target,
+                    RecoveryDispatchIdentityKind.REQUEST.value,
+                    command.request_id,
+                ),
+                model_type=RecoveryDispatchIdentityV2,
+            )
+            idempotency = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH_IDENTITY,
+                logical_id=idempotency_logical_id,
+                document_id=recovery_dispatch_identity_document_id(
+                    self._target,
+                    RecoveryDispatchIdentityKind.IDEMPOTENCY.value,
+                    command.idempotency_key,
+                ),
+                model_type=RecoveryDispatchIdentityV2,
+            )
+            dispatch = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH,
+                logical_id=dispatch_id,
+                document_id=recovery_dispatch_document_id(
+                    self._target,
+                    dispatch_id,
+                ),
+                model_type=RecoveryDispatchStorageRecordV2,
+            )
+            if request is None and idempotency is None and dispatch is None:
+                result = None
+                return
+            if request is None or idempotency is None or dispatch is None:
+                raise AuthorityStoreCorruptRecord
+            try:
+                dispatch_value = recovery_dispatch_storage_record_value(
+                    dispatch.value
+                )
+            except (TypeError, ValueError):
+                raise AuthorityStoreCorruptRecord from None
+            expected_request = _recovery_dispatch_identity(
+                dispatch_value,
+                RecoveryDispatchIdentityKind.REQUEST,
+            )
+            expected_idempotency = _recovery_dispatch_identity(
+                dispatch_value,
+                RecoveryDispatchIdentityKind.IDEMPOTENCY,
+            )
+            if (
+                request.value != expected_request
+                or idempotency.value != expected_idempotency
+                or request.wrapper.revision != 0
+                or idempotency.wrapper.revision != 0
+                or dispatch_value.command_sha256 != command_sha256
+                or dispatch_value.request_id != command.request_id
+                or dispatch_value.idempotency_key != command.idempotency_key
+                or dispatch_value.root_sha256 != command.expected_root_sha256
+                or dispatch_value.epoch != command.expected_epoch
+            ):
+                raise AuthorityStoreConflict
+            result = StoredRecord(dispatch_value, dispatch.wrapper.revision)
+
+        await self._run_consistent_read(read)
+        return result
+
+    async def prepare_or_adopt_recovery_dispatch(
+        self,
+        intent: StoredRecord[RecoveryIntentV1],
+        prepared: RecoveryDispatchRecordV2,
+    ) -> StoredRecord[RecoveryDispatchRecordV2]:
+        """Create immutable dispatch ownership after exact root intent ownership."""
+
+        if (
+            type(intent) is not StoredRecord
+            or type(intent.value) is not RecoveryIntentV1
+            or intent.revision != 0
+            or type(prepared) is not RecoveryDispatchRecordV2
+            or prepared.state is not RecoveryDispatchState.PREPARED
+            or prepared.command_sha256 != intent.value.command_sha256
+            or prepared.root_sha256 != intent.value.root_sha256
+            or prepared.epoch != intent.value.epoch
+        ):
+            raise ValueError("prepared recovery dispatch does not match its root intent")
+        command = intent.value.command
+        request_identity = _recovery_dispatch_identity(
+            prepared,
+            RecoveryDispatchIdentityKind.REQUEST,
+        )
+        idempotency_identity = _recovery_dispatch_identity(
+            prepared,
+            RecoveryDispatchIdentityKind.IDEMPOTENCY,
+        )
+        request_document = _prepared_document(
+            kind=HealthStorageKind.RECOVERY_DISPATCH_IDENTITY,
+            logical_id=recovery_dispatch_identity_logical_id(
+                request_identity.identity_kind.value,
+                request_identity.identity_value,
+            ),
+            document_id=recovery_dispatch_identity_document_id(
+                self._target,
+                request_identity.identity_kind.value,
+                request_identity.identity_value,
+            ),
+            revision=0,
+            value=request_identity,
+        )
+        idempotency_document = _prepared_document(
+            kind=HealthStorageKind.RECOVERY_DISPATCH_IDENTITY,
+            logical_id=recovery_dispatch_identity_logical_id(
+                idempotency_identity.identity_kind.value,
+                idempotency_identity.identity_value,
+            ),
+            document_id=recovery_dispatch_identity_document_id(
+                self._target,
+                idempotency_identity.identity_kind.value,
+                idempotency_identity.identity_value,
+            ),
+            revision=0,
+            value=idempotency_identity,
+        )
+        dispatch_storage = create_recovery_dispatch_storage_record(prepared)
+        dispatch_document = _prepared_document(
+            kind=HealthStorageKind.RECOVERY_DISPATCH,
+            logical_id=prepared.dispatch_id,
+            document_id=recovery_dispatch_document_id(
+                self._target,
+                prepared.dispatch_id,
+            ),
+            revision=0,
+            value=dispatch_storage,
+        )
+
+        async def create(transaction: _TransactionPort) -> None:
+            current_intent = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_INTENT,
+                logical_id=intent.value.intent_id,
+                document_id=recovery_intent_document_id(
+                    self._target,
+                    intent.value.root_sha256,
+                ),
+                model_type=RecoveryIntentV1,
+            )
+            current_request = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH_IDENTITY,
+                logical_id=request_document.wrapper.logical_id,
+                document_id=request_document.document_id,
+                model_type=RecoveryDispatchIdentityV2,
+            )
+            current_idempotency = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH_IDENTITY,
+                logical_id=idempotency_document.wrapper.logical_id,
+                document_id=idempotency_document.document_id,
+                model_type=RecoveryDispatchIdentityV2,
+            )
+            current_dispatch = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH,
+                logical_id=prepared.dispatch_id,
+                document_id=dispatch_document.document_id,
+                model_type=RecoveryDispatchStorageRecordV2,
+            )
+            if current_intent is None or current_intent.stored != intent:
+                raise _ExpectedStateMismatch
+            current_values = (current_request, current_idempotency, current_dispatch)
+            if all(value is None for value in current_values):
+                client = await self._client()
+                for document in (
+                    request_document,
+                    idempotency_document,
+                    dispatch_document,
+                ):
+                    transaction.create(
+                        self._reference(
+                            client,
+                            document.wrapper.record_kind,
+                            document.document_id,
+                        ),
+                        _document_data(document.wrapper),
+                    )
+                return
+            exact = (
+                _matches_prepared_content(
+                    cast(_DecodedDocument[StrictContractModel] | None, current_request),
+                    cast(_PreparedDocument[StrictContractModel], request_document),
+                )
+                and _matches_prepared_content(
+                    cast(
+                        _DecodedDocument[StrictContractModel] | None,
+                        current_idempotency,
+                    ),
+                    cast(_PreparedDocument[StrictContractModel], idempotency_document),
+                )
+                and _matches_prepared_content(
+                    cast(_DecodedDocument[StrictContractModel] | None, current_dispatch),
+                    cast(_PreparedDocument[StrictContractModel], dispatch_document),
+                )
+            )
+            if exact:
+                raise _ExactDuplicate
+            raise _ExpectedStateMismatch
+
+        try:
+            await self._execute_write(3, create)
+        except asyncio.CancelledError:
+            raise
+        except _ExactDuplicate:
+            adopted = await self.read_recovery_dispatch(command)
+            if adopted != StoredRecord(prepared, 0):
+                raise AuthorityStoreCorruptRecord from None
+            return adopted
+        except _ExpectedStateMismatch:
+            raise AuthorityStoreConflict from None
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception as error:
+            try:
+                adopted = await self.read_recovery_dispatch(command)
+            except Exception:
+                raise AuthorityStoreOutcomeUnknown from None
+            if adopted == StoredRecord(prepared, 0):
+                return adopted
+            if adopted is not None or _is_contention(error):
+                raise AuthorityStoreConflict from None
+            raise AuthorityStoreOutcomeUnknown from None
+        return StoredRecord(prepared, 0)
+
+    async def _compare_and_set_recovery_dispatch(
+        self,
+        expected: StoredRecord[RecoveryDispatchRecordV2],
+        replacement: RecoveryDispatchRecordV2,
+        *,
+        allow_enqueue_start: bool,
+    ) -> tuple[StoredRecord[RecoveryDispatchRecordV2], bool]:
+        if not _recovery_transition_is_exact(expected, replacement):
+            raise ValueError("recovery dispatch transition is invalid")
+        if (
+            replacement.state is RecoveryDispatchState.ENQUEUE_STARTED
+        ) != allow_enqueue_start:
+            raise ValueError("recovery enqueue transition requires its sealed operation")
+        next_revision = expected.revision + 1
+        replacement_storage = create_recovery_dispatch_storage_record(replacement)
+        replacement_document = _prepared_document(
+            kind=HealthStorageKind.RECOVERY_DISPATCH,
+            logical_id=replacement.dispatch_id,
+            document_id=recovery_dispatch_document_id(
+                self._target,
+                replacement.dispatch_id,
+            ),
+            revision=next_revision,
+            value=replacement_storage,
+        )
+
+        async def update(transaction: _TransactionPort) -> None:
+            current = await self._transaction_read(
+                transaction,
+                kind=HealthStorageKind.RECOVERY_DISPATCH,
+                logical_id=replacement.dispatch_id,
+                document_id=replacement_document.document_id,
+                model_type=RecoveryDispatchStorageRecordV2,
+            )
+            current_domain = (
+                None
+                if current is None
+                else StoredRecord(
+                    recovery_dispatch_storage_record_value(current.value),
+                    current.wrapper.revision,
+                )
+            )
+            if current_domain != expected:
+                if (
+                    current is not None
+                    and current.stored == _stored(replacement_document)
+                ):
+                    raise _ExactDuplicate
+                raise _ExpectedStateMismatch
+            client = await self._client()
+            transaction.update(
+                self._reference(
+                    client,
+                    HealthStorageKind.RECOVERY_DISPATCH,
+                    replacement_document.document_id,
+                ),
+                _document_data(replacement_document.wrapper),
+            )
+
+        try:
+            await self._execute_write(1, update)
+        except asyncio.CancelledError:
+            raise
+        except _ExactDuplicate:
+            return StoredRecord(replacement, next_revision), False
+        except _ExpectedStateMismatch:
+            raise AuthorityStoreConflict from None
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception:
+            if allow_enqueue_start:
+                raise AuthorityStoreOutcomeUnknown from None
+            try:
+                adopted = await self.read_recovery_dispatch(
+                    replacement.task.intent.authorization.prestate_attestation.result.request.command
+                )
+            except Exception:
+                raise AuthorityStoreOutcomeUnknown from None
+            if adopted == StoredRecord(replacement, next_revision):
+                return adopted, False
+            raise AuthorityStoreOutcomeUnknown from None
+        return StoredRecord(replacement, next_revision), True
+
+    async def compare_and_set_recovery_dispatch(
+        self,
+        expected: StoredRecord[RecoveryDispatchRecordV2],
+        replacement: RecoveryDispatchRecordV2,
+    ) -> StoredRecord[RecoveryDispatchRecordV2]:
+        """Advance a started dispatch only to its exact terminal result."""
+
+        if replacement.state is RecoveryDispatchState.ENQUEUE_STARTED:
+            raise ValueError("enqueue start requires direct permit issuance")
+        stored, _ = await self._compare_and_set_recovery_dispatch(
+            expected,
+            replacement,
+            allow_enqueue_start=False,
+        )
+        return stored
+
+    async def begin_recovery_enqueue(
+        self,
+        expected: StoredRecord[RecoveryDispatchRecordV2],
+        replacement: RecoveryDispatchRecordV2,
+    ) -> DirectRecoveryEnqueueStart:
+        """Mint one process-local permit only after a direct PREPARED-to-start CAS."""
+
+        if replacement.state is not RecoveryDispatchState.ENQUEUE_STARTED:
+            raise ValueError("recovery enqueue start requires ENQUEUE_STARTED")
+        stored, directly_written = await self._compare_and_set_recovery_dispatch(
+            expected,
+            replacement,
+            allow_enqueue_start=True,
+        )
+        if not directly_written:
+            raise AuthorityStoreOutcomeUnknown
+        return DirectRecoveryEnqueueStart(
+            dispatch=stored,
+            permit=RecoveryEnqueuePermit._from_direct_store_start(stored),
         )
 
 

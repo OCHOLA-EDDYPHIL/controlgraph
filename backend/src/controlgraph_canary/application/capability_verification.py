@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import re
 from collections.abc import Callable
@@ -14,7 +15,9 @@ from controlgraph_canary.application.cloud_run import (
     rollout_root_v3_target_configuration_sha256,
 )
 from controlgraph_canary.application.identity import (
+    RECOVERY_EXECUTION_FACADE_PATH,
     AuthenticationContext,
+    CallerRole,
     RouteAuthenticationPolicy,
     ServiceRole,
 )
@@ -60,6 +63,15 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionTaskRequestV2,
     promotion_capability_id,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryAuthorizationV1,
+    RecoveryPrestateAttestationV1,
+    RecoveryTaskRequestV2,
+    RevokedV2RecoverySourceV1,
+    UnhealthyRecoverySourceV1,
+    recovery_capability_id,
+    recovery_target_configuration_sha256,
+)
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
     RolloutRootV2,
@@ -69,7 +81,9 @@ from controlgraph_canary.contracts.root_creation import (
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _GOOGLE_ISSUERS = frozenset({"accounts.google.com", "https://accounts.google.com"})
 
-type ProtectedMutationRequest = TaskRequest | PromotionTaskRequestV2
+type ProtectedMutationRequest = (
+    TaskRequest | PromotionTaskRequestV2 | RecoveryTaskRequestV2
+)
 
 
 class CapabilityVerificationError(Exception):
@@ -107,18 +121,34 @@ class CapabilityRequestVerifier(Protocol):
     ) -> VerifiedMutation: ...
 
 
+@runtime_checkable
+class RecoveryPrestateAttestationVerifier(Protocol):
+    """Verify one exact recovery-prestate signature under configured evidence trust."""
+
+    @property
+    def project_id(self) -> str: ...
+
+    @property
+    def key_version(self) -> str: ...
+
+    async def verify(self, signed: RecoveryPrestateAttestationV1) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilityVerifierConfiguration:
     """Startup-sealed target, route, and workload identity bindings."""
 
     target: TargetBinding
     route_policy: RouteAuthenticationPolicy
+    recovery_executor_facade: bool = False
 
     def __post_init__(self) -> None:
         if type(self.target) is not TargetBinding:
             raise TypeError("an exact target binding is required")
         if type(self.route_policy) is not RouteAuthenticationPolicy:
             raise TypeError("an exact route authentication policy is required")
+        if type(self.recovery_executor_facade) is not bool:
+            raise TypeError("recovery executor facade selection must be exact")
         if (
             _PROJECT_ID.fullmatch(self.target.project_id) is None
             or self.target.region != "us-central1"
@@ -138,6 +168,13 @@ class CapabilityVerifierConfiguration:
             or self.route_policy.audience != expected_audience
         ):
             raise ValueError("capability route does not match the configured target")
+        is_recovery_executor_facade = (
+            self.route_policy.service_role is ServiceRole.EXECUTOR
+            and self.route_policy.path == RECOVERY_EXECUTION_FACADE_PATH
+            and self.route_policy.caller.role is CallerRole.RECOVERY
+        )
+        if self.recovery_executor_facade != is_recovery_executor_facade:
+            raise ValueError("recovery executor facade route is not exact")
 
     @property
     def issuer_identity(self) -> str:
@@ -145,12 +182,32 @@ class CapabilityVerifierConfiguration:
 
     @property
     def subject_identity(self) -> str:
-        role = self.route_policy.service_role.value
+        role = (
+            ServiceRole.RECOVERY.value
+            if self.accepts_recovery_task
+            else self.route_policy.service_role.value
+        )
         return f"controlgraph-{role}@{self.target.project_id}.iam.gserviceaccount.com"
 
     @property
+    def capability_audience(self) -> str:
+        if self.recovery_executor_facade:
+            return (
+                f"https://controlgraph-recovery-{self.route_policy.project_number}"
+                ".us-central1.run.app"
+            )
+        return self.route_policy.audience
+
+    @property
+    def accepts_recovery_task(self) -> bool:
+        return (
+            self.route_policy.service_role is ServiceRole.RECOVERY
+            or self.recovery_executor_facade
+        )
+
+    @property
     def admitted_actions(self) -> frozenset[CapabilityAction]:
-        if self.route_policy.service_role is ServiceRole.RECOVERY:
+        if self.accepts_recovery_task:
             return frozenset({CapabilityAction.RECOVER_STABLE})
         return frozenset(
             {
@@ -183,6 +240,7 @@ class CapabilityVerifier:
         trust_verifier: TrustBundleVerifier,
         configuration: CapabilityVerifierConfiguration,
         lineage_reader: CapabilityLineageReader | None = None,
+        recovery_prestate_verifier: RecoveryPrestateAttestationVerifier | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if type(configuration) is not CapabilityVerifierConfiguration:
@@ -203,7 +261,29 @@ class CapabilityVerifier:
         self._trust_verifier = trust_verifier
         self._configuration = configuration
         self._lineage_reader = lineage_reader
+        if recovery_prestate_verifier is not None and (
+            not isinstance(
+                recovery_prestate_verifier,
+                RecoveryPrestateAttestationVerifier,
+            )
+            or recovery_prestate_verifier.project_id
+            != configuration.target.project_id
+        ):
+            raise ValueError("recovery prestate verifier does not match configuration")
+        self._recovery_prestate_verifier = recovery_prestate_verifier
         self._clock = clock or _now_utc_second
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._configuration.target
+
+    @property
+    def route_policy(self) -> RouteAuthenticationPolicy:
+        return self._configuration.route_policy
+
+    @property
+    def recovery_executor_facade(self) -> bool:
+        return self._configuration.recovery_executor_facade
 
     async def verify(
         self,
@@ -217,7 +297,11 @@ class CapabilityVerifier:
         request = _decode_protected_request(payload)
         if (
             type(request) is TaskRequest
-            and request.intent.action is CapabilityAction.PROMOTE_CANDIDATE
+            and request.intent.action
+            in {
+                CapabilityAction.PROMOTE_CANDIDATE,
+                CapabilityAction.RECOVER_STABLE,
+            }
         ):
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
 
@@ -234,6 +318,8 @@ class CapabilityVerifier:
         root = root_state.root
         anchor = root_state.lineage_anchor
         self._validate_root_bindings(request, root, anchor, now_second)
+        if type(request) is RecoveryTaskRequestV2:
+            await self._verify_recovery_prestate(request)
         ancestors = await self._read_ancestors(request.capability)
         earliest_lineage_issued_at = self._validate_lineage(
             (*ancestors, request.capability),
@@ -327,6 +413,11 @@ class CapabilityVerifier:
             and now_second >= _parse_utc_second(request.intent.proof_valid_until)
         ):
             raise _deny(ReasonCode.CAPABILITY_EXPIRED)
+        if (
+            type(request) is RecoveryTaskRequestV2
+            and now_second >= _parse_utc_second(request.intent.proof_valid_until)
+        ):
+            raise _deny(ReasonCode.CAPABILITY_EXPIRED)
 
     def _validate_route_and_identity(
         self,
@@ -334,11 +425,15 @@ class CapabilityVerifier:
     ) -> None:
         claims = request.capability.claims
         configuration = self._configuration
+        if configuration.accepts_recovery_task != (
+            type(request) is RecoveryTaskRequestV2
+        ):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
         if (
             claims.issuer != configuration.issuer_identity
             or claims.subject != configuration.subject_identity
-            or claims.audience != configuration.route_policy.audience
-            or request.handler_audience != configuration.route_policy.audience
+            or claims.audience != configuration.capability_audience
+            or request.handler_audience != configuration.capability_audience
         ):
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
         if request.queue_region != configuration.target.region:
@@ -414,6 +509,8 @@ class CapabilityVerifier:
             raise _deny(ReasonCode.LINEAGE_INVALID)
         if type(request) is PromotionTaskRequestV2:
             self._validate_promotion_authorization(request, root, now_second)
+        if type(request) is RecoveryTaskRequestV2:
+            self._validate_recovery_authorization(request, root, now_second)
 
     def _validate_promotion_authorization(
         self,
@@ -508,6 +605,147 @@ class CapabilityVerifier:
             or now_second >= _parse_utc_second(authorization.proof_valid_until)
         ):
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
+
+    def _validate_recovery_authorization(
+        self,
+        request: RecoveryTaskRequestV2,
+        root: RolloutRootV2 | RolloutRootV3,
+        now_second: int,
+    ) -> None:
+        """Bind captured-stable recovery to one exact stored root and source."""
+
+        intent = request.intent
+        authorization = intent.authorization
+        claims = request.capability.claims
+        content = root.content
+        plan = content.rollout_plan
+        bounds = content.authority_bounds
+        source = authorization.source
+        try:
+            capability_id = recovery_capability_id(authorization)
+            expected_prestate_sha256 = recovery_target_configuration_sha256(
+                root,
+                stable_percent=90,
+                candidate_percent=10,
+            )
+            desired_poststate_sha256 = recovery_target_configuration_sha256(
+                root,
+                stable_percent=100,
+                candidate_percent=0,
+            )
+        except (TypeError, ValueError):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH) from None
+        root_mode_matches = (
+            type(root) is RolloutRootV3
+            and type(source) is UnhealthyRecoverySourceV1
+            and authorization.root_schema_version == root.schema_version
+            and source.epoch == authorization.epoch
+            and authorization.verified_apply_receipt.epoch
+            == authorization.epoch
+        ) or (
+            type(root) is RolloutRootV2
+            and type(source) is RevokedV2RecoverySourceV1
+            and authorization.root_schema_version == root.schema_version
+            and source.epoch == authorization.epoch
+            and source.revocation_proof.authority.current_epoch
+            == authorization.epoch
+            and source.revocation_proof.authority.previous_epoch
+            == authorization.verified_apply_receipt.epoch
+        )
+        if (
+            type(authorization) is not RecoveryAuthorizationV1
+            or not root_mode_matches
+            or authorization.prestate_attestation.result.request.root != root
+            or authorization.root_id != root.root_id
+            or authorization.root_sha256 != root.root_sha256
+            or authorization.target != content.target
+            or authorization.epoch != claims.epoch
+            or authorization.epoch != intent.epoch
+            or authorization.request_id != claims.request_id
+            or authorization.request_id != intent.request_id
+            or authorization.idempotency_key != claims.idempotency_key
+            or authorization.idempotency_key != intent.idempotency_key
+            or authorization.scheduled_at != request.scheduled_at
+            or authorization.scheduled_at != claims.not_before
+            or authorization.plan_sha256 != canonical_sha256(plan)
+            or authorization.stable_snapshot_sha256
+            != canonical_sha256(content.stable_snapshot)
+            or authorization.stable_revision != plan.stable_revision
+            or authorization.stable_revision_configuration_sha256
+            != plan.stable_revision_configuration_sha256
+            or authorization.candidate_revision != plan.candidate_revision
+            or authorization.candidate_revision_configuration_sha256
+            != plan.candidate_revision_configuration_sha256
+            or authorization.concurrency != plan.concurrency
+            or authorization.evidence_signing_key_version
+            != content.evidence_signing_key_version
+            or authorization.capability_signing_key_version
+            != bounds.capability_signing_key_version
+            or authorization.issuer_identity != bounds.issuer_identity
+            or authorization.recovery_identity != bounds.recovery_identity
+            or authorization.recovery_audience != bounds.recovery_audience
+            or authorization.maximum_attempts != plan.maximum_recovery_attempts
+            or authorization.maximum_attempts != 1
+            or authorization.maximum_capability_lifetime_seconds
+            != bounds.maximum_capability_lifetime_seconds
+            or authorization.expected_prestate_sha256
+            != expected_prestate_sha256
+            or authorization.verified_apply_receipt.expected_poststate_sha256
+            != expected_prestate_sha256
+            or authorization.desired_poststate_sha256
+            != desired_poststate_sha256
+            or authorization.current_provider_etag != claims.provider_etag
+            or authorization.current_provider_etag != intent.provider_etag
+            or authorization.capability_id != capability_id
+            or intent.capability_id != capability_id
+            or claims.capability_id != capability_id
+            or intent.recovery_authorization_sha256
+            != canonical_sha256(authorization)
+            or intent.expected_prestate_sha256
+            != authorization.expected_prestate_sha256
+            or intent.desired_poststate_sha256
+            != authorization.desired_poststate_sha256
+            or intent.source_receipt_sha256
+            != authorization.source_receipt_sha256
+            or intent.source_receipt_storage_revision
+            != authorization.source_receipt_storage_revision
+            or intent.trigger_proof_sha256
+            != authorization.trigger_proof_sha256
+            or intent.prestate_attestation_sha256
+            != authorization.prestate_attestation_sha256
+            or intent.proof_valid_until != authorization.proof_valid_until
+            or claims.issuer != authorization.issuer_identity
+            or claims.subject != authorization.recovery_identity
+            or claims.audience != authorization.recovery_audience
+            or claims.concurrency != authorization.concurrency
+            or claims.signing_key_version
+            != authorization.capability_signing_key_version
+            or request.handler_audience != authorization.recovery_audience
+            or request.expires_at > authorization.proof_valid_until
+            or now_second >= _parse_utc_second(authorization.proof_valid_until)
+        ):
+            raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
+
+    async def _verify_recovery_prestate(
+        self,
+        request: RecoveryTaskRequestV2,
+    ) -> None:
+        verifier = self._recovery_prestate_verifier
+        attestation = request.intent.authorization.prestate_attestation
+        if (
+            verifier is None
+            or verifier.project_id != request.intent.target.project_id
+            or verifier.key_version != attestation.signing_key_version
+        ):
+            raise _deny(ReasonCode.KEY_VERSION_UNTRUSTED)
+        try:
+            await verifier.verify(attestation)
+        except SigningError as error:
+            raise _deny(_signing_denial(error.code)) from None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _deny(ReasonCode.AUTHORITY_UNAVAILABLE) from None
 
     async def _read_ancestors(
         self,
@@ -609,12 +847,19 @@ class CapabilityVerifier:
         if (
             claims.issuer != configuration.issuer_identity
             or claims.subject != configuration.subject_identity
-            or claims.audience != configuration.route_policy.audience
+            or claims.audience != configuration.capability_audience
         ):
             raise _deny(ReasonCode.CLAIM_BINDING_MISMATCH)
 
 
 def _decode_protected_request(payload: bytes) -> ProtectedMutationRequest:
+    try:
+        return decode_contract(payload, RecoveryTaskRequestV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise _deny(ReasonCode.CONTRACT_INVALID) from None
+    except (TypeError, ValueError):
+        raise _deny(ReasonCode.CONTRACT_INVALID) from None
     try:
         return decode_contract(payload, PromotionTaskRequestV2)
     except ContractError as error:
@@ -684,5 +929,6 @@ __all__ = [
     "CapabilityVerifier",
     "CapabilityVerifierConfiguration",
     "ProtectedMutationRequest",
+    "RecoveryPrestateAttestationVerifier",
     "VerifiedMutation",
 ]

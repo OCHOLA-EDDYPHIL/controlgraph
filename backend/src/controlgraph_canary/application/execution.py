@@ -17,10 +17,12 @@ from controlgraph_canary.application.authority_store import (
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
 from controlgraph_canary.application.cloud_run import (
+    CloudRunMutationPurpose,
     rollout_root_v3_target_configuration_sha256,
 )
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
+    CallerRole,
     RouteAuthenticationPolicy,
     ServiceRole,
 )
@@ -51,6 +53,16 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionTaskRequestV2,
     create_verified_apply_receipt_locator,
     promotion_capability_id,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryAuthorizationV1,
+    RecoveryMutationIntentV2,
+    RecoveryTaskRequestV2,
+    RevokedV2RecoverySourceV1,
+    UnhealthyRecoverySourceV1,
+    create_recovery_apply_receipt_locator,
+    recovery_capability_id,
+    recovery_target_configuration_sha256,
 )
 from controlgraph_canary.contracts.root_creation import RolloutRootV2, RolloutRootV3
 from controlgraph_canary.contracts.storage import (
@@ -83,7 +95,9 @@ class PreparedTargetMutation[ResultT](Protocol):
     def service_role(self) -> ServiceRole: ...
 
     @property
-    def intent(self) -> MutationIntent | PromotionMutationIntentV2: ...
+    def intent(
+        self,
+    ) -> MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2: ...
 
     async def mutate(self, permit: MutationPermit) -> ResultT: ...
 
@@ -100,13 +114,13 @@ class TargetBoundMutationAdapter[ResultT](Protocol):
 
     async def prepare(
         self,
-        intent: MutationIntent | PromotionMutationIntentV2,
+        intent: MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2,
     ) -> PreparedTargetMutation[ResultT]: ...
 
 
 @runtime_checkable
-class PromotionSourceReceiptReader(Protocol):
-    """Strongly read the durable APPLY_CANARY receipt named by a promotion."""
+class MutationSourceReceiptReader(Protocol):
+    """Strongly read the durable APPLY_CANARY receipt named by derived work."""
 
     @property
     def target(self) -> TargetBinding: ...
@@ -115,6 +129,9 @@ class PromotionSourceReceiptReader(Protocol):
         self,
         idempotency_key: str,
     ) -> StoredRecord[ExecutionReceipt] | None: ...
+
+
+PromotionSourceReceiptReader = MutationSourceReceiptReader
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,7 +297,7 @@ class MutationPermit:
         *,
         target: TargetBinding,
         service_role: ServiceRole,
-        intent: MutationIntent | PromotionMutationIntentV2,
+        intent: MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2,
         receipt_id: str,
         binding: MutationBinding,
     ) -> None:
@@ -289,7 +306,12 @@ class MutationPermit:
         if (
             type(target) is not TargetBinding
             or type(service_role) is not ServiceRole
-            or type(intent) not in (MutationIntent, PromotionMutationIntentV2)
+            or type(intent)
+            not in (
+                MutationIntent,
+                PromotionMutationIntentV2,
+                RecoveryMutationIntentV2,
+            )
             or type(receipt_id) is not str
             or type(binding) is not MutationBinding
             or intent.target != target
@@ -304,7 +326,9 @@ class MutationPermit:
         self._lock = Lock()
 
     @property
-    def intent(self) -> MutationIntent | PromotionMutationIntentV2:
+    def intent(
+        self,
+    ) -> MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2:
         """Consume and return the immutable command sealed into this permit."""
 
         with self._lock:
@@ -327,7 +351,10 @@ class FinalMutationGate[ResultT]:
         authority_reader: FinalAuthorityReader,
         adapter: TargetBoundMutationAdapter[ResultT],
         route_policy: RouteAuthenticationPolicy,
-        source_receipt_reader: PromotionSourceReceiptReader | None = None,
+        source_receipt_reader: MutationSourceReceiptReader | None = None,
+        mutation_purpose: CloudRunMutationPurpose = (
+            CloudRunMutationPurpose.STANDARD_EXECUTION
+        ),
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         try:
@@ -342,11 +369,19 @@ class FinalMutationGate[ResultT]:
             or reader_target != adapter_target
         ):
             raise ValueError("final mutation dependencies do not share one exact target")
-        if type(service_role) is not ServiceRole or service_role not in {
-            ServiceRole.EXECUTOR,
-            ServiceRole.RECOVERY,
-        }:
-            raise ValueError("final mutation adapter must use an execution role")
+        if type(service_role) is not ServiceRole or service_role is not ServiceRole.EXECUTOR:
+            raise ValueError("final mutation adapter must use the executor identity")
+        if type(mutation_purpose) is not CloudRunMutationPurpose:
+            raise TypeError("an exact final mutation purpose is required")
+        adapter_purpose = getattr(
+            adapter,
+            "mutation_purpose",
+            CloudRunMutationPurpose.STANDARD_EXECUTION,
+        )
+        if type(adapter_purpose) is not CloudRunMutationPurpose or (
+            adapter_purpose is not mutation_purpose
+        ):
+            raise ValueError("final mutation adapter purpose does not match the gate")
         if type(route_policy) is not RouteAuthenticationPolicy:
             raise TypeError("final mutation gate requires an exact route policy")
         if (
@@ -354,6 +389,13 @@ class FinalMutationGate[ResultT]:
             or route_policy.project_id != reader_target.project_id
         ):
             raise ValueError("final mutation route policy does not match the adapter")
+        expected_caller_role = (
+            CallerRole.RECOVERY
+            if mutation_purpose is CloudRunMutationPurpose.STABLE_RECOVERY
+            else CallerRole.EXECUTION_TASK_CALLER
+        )
+        if route_policy.caller.role is not expected_caller_role:
+            raise ValueError("final mutation route does not match its purpose")
         if source_receipt_reader is not None:
             try:
                 receipt_target = source_receipt_reader.target
@@ -373,6 +415,7 @@ class FinalMutationGate[ResultT]:
         self._source_receipt_reader = source_receipt_reader
         self._target = reader_target
         self._service_role = service_role
+        self._mutation_purpose = mutation_purpose
         self._clock = clock or _now_utc_second
 
     @property
@@ -391,6 +434,11 @@ class FinalMutationGate[ResultT]:
         entry_denial = lease._enter(verified)
         if entry_denial is not None:
             return lease._denial(entry_denial)
+        recovery_request = type(verified.request) is RecoveryTaskRequestV2
+        if recovery_request != (
+            self._mutation_purpose is CloudRunMutationPurpose.STABLE_RECOVERY
+        ):
+            return lease._close_with_denial(ReasonCode.CLAIM_BINDING_MISMATCH)
         try:
             prepared = await self._adapter.prepare(verified.request.intent)
         except asyncio.CancelledError:
@@ -405,7 +453,7 @@ class FinalMutationGate[ResultT]:
             service_role=self._service_role,
         ):
             return lease._close_with_denial(ReasonCode.CLAIM_BINDING_MISMATCH)
-        if type(verified.request) is PromotionTaskRequestV2:
+        if type(verified.request) in (PromotionTaskRequestV2, RecoveryTaskRequestV2):
             try:
                 receipt_denial = await self._revalidate_promotion_source_receipt(verified)
             except asyncio.CancelledError:
@@ -434,6 +482,7 @@ class FinalMutationGate[ResultT]:
             target=self._target,
             service_role=self._service_role,
             route_policy=self._route_policy,
+            mutation_purpose=self._mutation_purpose,
             now_second=now_second,
         )
         observed_authority_epoch = _observed_authority_epoch(
@@ -460,12 +509,16 @@ class FinalMutationGate[ResultT]:
         verified: VerifiedMutation,
     ) -> ReasonCode | None:
         request = verified.request
-        if type(request) is not PromotionTaskRequestV2:
+        if type(request) not in (PromotionTaskRequestV2, RecoveryTaskRequestV2):
             return None
         reader = self._source_receipt_reader
         if reader is None:
             return ReasonCode.AUTHORITY_UNAVAILABLE
-        locator = request.intent.authorization.verified_apply_receipt
+        derived_request = cast(
+            PromotionTaskRequestV2 | RecoveryTaskRequestV2,
+            request,
+        )
+        locator = derived_request.intent.authorization.verified_apply_receipt
         try:
             stored = await reader.read_receipt(locator.idempotency_key)
         except asyncio.CancelledError:
@@ -479,24 +532,65 @@ class FinalMutationGate[ResultT]:
         ):
             return ReasonCode.AUTHORITY_UNAVAILABLE
         receipt = stored.value
+        if type(request) is RecoveryTaskRequestV2:
+            try:
+                observed_recovery_locator = create_recovery_apply_receipt_locator(
+                    receipt,
+                    storage_revision=stored.revision,
+                )
+            except (TypeError, ValueError):
+                return ReasonCode.AUTHORITY_UNAVAILABLE
+            intent = request.intent
+            authorization = intent.authorization
+            source = authorization.source
+            source_epoch_matches = (
+                type(source) is UnhealthyRecoverySourceV1
+                and receipt.epoch == authorization.epoch
+            ) or (
+                type(source) is RevokedV2RecoverySourceV1
+                and receipt.epoch
+                == source.revocation_proof.authority.previous_epoch
+                and authorization.epoch
+                == source.revocation_proof.authority.current_epoch
+            )
+            if (
+                observed_recovery_locator != locator
+                or canonical_sha256(receipt) != authorization.source_receipt_sha256
+                or stored.revision != authorization.source_receipt_storage_revision
+                or not source_epoch_matches
+                or receipt.target != intent.target
+                or receipt.root_id != intent.root_id
+                or receipt.root_sha256 != intent.root_sha256
+                or receipt.action is not CapabilityAction.APPLY_CANARY
+                or receipt.outcome is not ReceiptOutcome.VERIFIED
+                or receipt.expected_poststate_sha256
+                != intent.expected_prestate_sha256
+                or receipt.observed_authority_epoch != receipt.epoch
+            ):
+                return ReasonCode.CLAIM_BINDING_MISMATCH
+            return None
+        if type(request) is not PromotionTaskRequestV2:
+            return ReasonCode.CLAIM_BINDING_MISMATCH
         try:
             observed_locator = create_verified_apply_receipt_locator(receipt)
         except (TypeError, ValueError):
             return ReasonCode.AUTHORITY_UNAVAILABLE
-        intent = request.intent
-        authorization = intent.authorization
+        promotion_intent = request.intent
+        promotion_authorization = promotion_intent.authorization
         if (
             observed_locator != locator
-            or canonical_sha256(receipt) != authorization.source_receipt_sha256
-            or receipt.target != intent.target
-            or receipt.root_id != intent.root_id
-            or receipt.root_sha256 != intent.root_sha256
-            or receipt.epoch != intent.epoch
+            or canonical_sha256(receipt)
+            != promotion_authorization.source_receipt_sha256
+            or receipt.target != promotion_intent.target
+            or receipt.root_id != promotion_intent.root_id
+            or receipt.root_sha256 != promotion_intent.root_sha256
+            or receipt.epoch != promotion_intent.epoch
             or receipt.action is not CapabilityAction.APPLY_CANARY
             or receipt.outcome is not ReceiptOutcome.VERIFIED
-            or receipt.expected_poststate_sha256 != intent.expected_prestate_sha256
-            or receipt.observed_etag != authorization.provider_etag
-            or receipt.observed_authority_epoch != intent.epoch
+            or receipt.expected_poststate_sha256
+            != promotion_intent.expected_prestate_sha256
+            or receipt.observed_etag != promotion_authorization.provider_etag
+            or receipt.observed_authority_epoch != promotion_intent.epoch
         ):
             return ReasonCode.CLAIM_BINDING_MISMATCH
         return None
@@ -523,7 +617,12 @@ def _prepared_mutation_matches(
         and prepared_target == target
         and type(prepared_role) is ServiceRole
         and prepared_role is service_role
-        and type(prepared_intent) in (MutationIntent, PromotionMutationIntentV2)
+        and type(prepared_intent)
+        in (
+            MutationIntent,
+            PromotionMutationIntentV2,
+            RecoveryMutationIntentV2,
+        )
         and prepared_intent == verified.request.intent
         and callable(mutate)
     )
@@ -577,7 +676,8 @@ def _binding_matches_verified(
 ) -> bool:
     request = verified.request
     if (
-        type(request) not in (TaskRequest, PromotionTaskRequestV2)
+        type(request)
+        not in (TaskRequest, PromotionTaskRequestV2, RecoveryTaskRequestV2)
         or type(verified.root) not in (RolloutRootV2, RolloutRootV3)
         or type(verified.caller) is not AuthenticationContext
     ):
@@ -607,13 +707,22 @@ def _binding_matches_verified(
     if not common_matches:
         return False
     if type(request) is TaskRequest:
-        return type(intent) is MutationIntent
-    promotion_request = cast(PromotionTaskRequestV2, request)
+        return (
+            type(intent) is MutationIntent
+            and intent.action is not CapabilityAction.RECOVER_STABLE
+        )
+    if type(request) is PromotionTaskRequestV2:
+        return (
+            type(intent) is PromotionMutationIntentV2
+            and type(verified.root) is RolloutRootV3
+            and binding.expected_poststate_sha256 == intent.desired_poststate_sha256
+            and _promotion_request_matches_root(request, verified.root)
+        )
+    recovery_request = cast(RecoveryTaskRequestV2, request)
     return (
-        type(intent) is PromotionMutationIntentV2
-        and type(verified.root) is RolloutRootV3
+        type(intent) is RecoveryMutationIntentV2
         and binding.expected_poststate_sha256 == intent.desired_poststate_sha256
-        and _promotion_request_matches_root(promotion_request, verified.root)
+        and _recovery_request_matches_root(recovery_request, verified.root)
     )
 
 
@@ -624,6 +733,7 @@ def _final_authority_denial(
     target: TargetBinding,
     service_role: ServiceRole,
     route_policy: RouteAuthenticationPolicy,
+    mutation_purpose: CloudRunMutationPurpose,
     now_second: int,
 ) -> ReasonCode | None:
     if snapshot is None:
@@ -676,7 +786,29 @@ def _final_authority_denial(
             return ReasonCode.CLAIM_BINDING_MISMATCH
         if now_second >= _parse_utc_second(verified.request.intent.proof_valid_until):
             return ReasonCode.CAPABILITY_EXPIRED
-    if not _role_admits(service_role, intent.action):
+    if type(verified.request) is RecoveryTaskRequestV2:
+        if not _recovery_request_matches_root(verified.request, verified.root):
+            return ReasonCode.CLAIM_BINDING_MISMATCH
+        source = verified.request.intent.authorization.source
+        if (
+            type(source) is RevokedV2RecoverySourceV1
+            and (
+                authority != source.revocation_proof.authority
+                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+                or authority.previous_epoch
+                != verified.request.intent.verified_apply_receipt.epoch
+            )
+        ):
+            return ReasonCode.EPOCH_MISMATCH
+        if (
+            type(source) is UnhealthyRecoverySourceV1
+            and verified.request.intent.verified_apply_receipt.epoch
+            != authority.current_epoch
+        ):
+            return ReasonCode.EPOCH_MISMATCH
+        if now_second >= _parse_utc_second(verified.request.intent.proof_valid_until):
+            return ReasonCode.CAPABILITY_EXPIRED
+    if not _role_admits(service_role, mutation_purpose, intent.action):
         return ReasonCode.CLAIM_BINDING_MISMATCH
     return None
 
@@ -696,7 +828,7 @@ def _final_caller_denial(
         or caller.email != route_policy.caller.email
         or caller.subject != route_policy.caller.subject
         or caller.audience != route_policy.audience
-        or request.handler_audience != route_policy.audience
+        or request.handler_audience != request.capability.claims.audience
         or caller.issuer not in {"accounts.google.com", "https://accounts.google.com"}
         or type(caller.issued_at) is not int
         or type(caller.expires_at) is not int
@@ -815,6 +947,142 @@ def _promotion_request_matches_root(
     )
 
 
+def _recovery_request_matches_root(
+    request: RecoveryTaskRequestV2,
+    root: RolloutRootV2 | RolloutRootV3,
+) -> bool:
+    """Recheck stable-only recovery against the exact persisted root."""
+
+    if type(request) is not RecoveryTaskRequestV2 or type(root) not in (
+        RolloutRootV2,
+        RolloutRootV3,
+    ):
+        return False
+    intent = request.intent
+    authorization = intent.authorization
+    claims = request.capability.claims
+    content = root.content
+    plan = content.rollout_plan
+    bounds = content.authority_bounds
+    source = authorization.source
+    if type(authorization) is not RecoveryAuthorizationV1:
+        return False
+    try:
+        capability_id = recovery_capability_id(authorization)
+        expected_prestate_sha256 = recovery_target_configuration_sha256(
+            root,
+            stable_percent=90,
+            candidate_percent=10,
+        )
+        desired_poststate_sha256 = recovery_target_configuration_sha256(
+            root,
+            stable_percent=100,
+            candidate_percent=0,
+        )
+    except (TypeError, ValueError):
+        return False
+    root_mode_matches = (
+        type(root) is RolloutRootV3
+        and type(source) is UnhealthyRecoverySourceV1
+        and authorization.verified_apply_receipt.epoch == authorization.epoch
+    ) or (
+        type(root) is RolloutRootV2
+        and type(source) is RevokedV2RecoverySourceV1
+        and source.revocation_proof.authority.current_epoch
+        == authorization.epoch
+        and source.revocation_proof.authority.previous_epoch
+        == authorization.verified_apply_receipt.epoch
+    )
+    return (
+        root_mode_matches
+        and authorization.root_schema_version == root.schema_version
+        and authorization.prestate_attestation.result.request.root == root
+        and authorization.root_id == root.root_id
+        and authorization.root_sha256 == root.root_sha256
+        and authorization.target == content.target
+        and authorization.epoch == claims.epoch == intent.epoch
+        and authorization.request_id == claims.request_id == intent.request_id
+        and authorization.idempotency_key
+        == claims.idempotency_key
+        == intent.idempotency_key
+        and authorization.scheduled_at == request.scheduled_at == claims.not_before
+        and authorization.plan_sha256 == canonical_sha256(plan)
+        and authorization.stable_snapshot_sha256
+        == canonical_sha256(content.stable_snapshot)
+        and authorization.stable_revision == plan.stable_revision
+        and authorization.stable_revision_configuration_sha256
+        == plan.stable_revision_configuration_sha256
+        and authorization.candidate_revision == plan.candidate_revision
+        and authorization.candidate_revision_configuration_sha256
+        == plan.candidate_revision_configuration_sha256
+        and authorization.concurrency == plan.concurrency
+        and authorization.evidence_signing_key_version
+        == content.evidence_signing_key_version
+        and authorization.capability_signing_key_version
+        == bounds.capability_signing_key_version
+        and authorization.issuer_identity == bounds.issuer_identity
+        and authorization.recovery_identity == bounds.recovery_identity
+        and authorization.recovery_audience == bounds.recovery_audience
+        and authorization.maximum_attempts == plan.maximum_recovery_attempts == 1
+        and authorization.maximum_capability_lifetime_seconds
+        == bounds.maximum_capability_lifetime_seconds
+        and authorization.expected_prestate_sha256 == expected_prestate_sha256
+        and authorization.verified_apply_receipt.expected_poststate_sha256
+        == expected_prestate_sha256
+        and authorization.desired_poststate_sha256 == desired_poststate_sha256
+        and authorization.current_provider_etag
+        == claims.provider_etag
+        == intent.provider_etag
+        and authorization.capability_id == capability_id
+        and intent.capability_id == capability_id
+        and claims.capability_id == capability_id
+        and intent.recovery_authorization_sha256 == canonical_sha256(authorization)
+        and intent.root_schema_version == authorization.root_schema_version
+        and intent.target == authorization.target
+        and intent.root_id == authorization.root_id
+        and intent.root_sha256 == authorization.root_sha256
+        and intent.action is CapabilityAction.RECOVER_STABLE
+        and intent.stable_revision == authorization.stable_revision
+        and intent.stable_revision_configuration_sha256
+        == authorization.stable_revision_configuration_sha256
+        and intent.candidate_revision == authorization.candidate_revision
+        and intent.candidate_revision_configuration_sha256
+        == authorization.candidate_revision_configuration_sha256
+        and intent.stable_percent == 100
+        and intent.candidate_percent == 0
+        and intent.concurrency == authorization.concurrency
+        and intent.plan_sha256 == authorization.plan_sha256
+        and intent.stable_snapshot_sha256 == authorization.stable_snapshot_sha256
+        and intent.verified_apply_receipt == authorization.verified_apply_receipt
+        and intent.source_receipt_sha256 == authorization.source_receipt_sha256
+        and intent.source_receipt_storage_revision
+        == authorization.source_receipt_storage_revision
+        and intent.source == authorization.source
+        and intent.trigger_proof_sha256 == authorization.trigger_proof_sha256
+        and intent.prestate_attestation_sha256
+        == authorization.prestate_attestation_sha256
+        and intent.expected_prestate_sha256 == authorization.expected_prestate_sha256
+        and intent.desired_poststate_sha256 == authorization.desired_poststate_sha256
+        and intent.proof_valid_until == authorization.proof_valid_until
+        and claims.issuer == authorization.issuer_identity
+        and claims.subject == authorization.recovery_identity
+        and claims.audience == authorization.recovery_audience
+        and claims.target == authorization.target
+        and claims.root_id == authorization.root_id
+        and claims.root_sha256 == authorization.root_sha256
+        and claims.action is CapabilityAction.RECOVER_STABLE
+        and claims.stable_revision == authorization.stable_revision
+        and claims.candidate_revision == authorization.candidate_revision
+        and claims.stable_percent == 100
+        and claims.candidate_percent == 0
+        and claims.concurrency == authorization.concurrency
+        and claims.plan_sha256 == authorization.plan_sha256
+        and claims.signing_key_version == authorization.capability_signing_key_version
+        and request.handler_audience == authorization.recovery_audience
+        and request.expires_at <= authorization.proof_valid_until
+    )
+
+
 def _observed_authority_epoch(
     snapshot: RootAuthorityBundle | None,
     *,
@@ -884,13 +1152,23 @@ def _coherent_authority_epoch(
     return authority.current_epoch
 
 
-def _role_admits(service_role: ServiceRole, action: CapabilityAction) -> bool:
-    if service_role is ServiceRole.RECOVERY:
+def _role_admits(
+    service_role: ServiceRole,
+    mutation_purpose: CloudRunMutationPurpose,
+    action: CapabilityAction,
+) -> bool:
+    if service_role is not ServiceRole.EXECUTOR:
+        return False
+    if mutation_purpose is CloudRunMutationPurpose.STABLE_RECOVERY:
         return action is CapabilityAction.RECOVER_STABLE
-    return service_role is ServiceRole.EXECUTOR and action in {
-        CapabilityAction.APPLY_CANARY,
-        CapabilityAction.PROMOTE_CANDIDATE,
-    }
+    return (
+        mutation_purpose is CloudRunMutationPurpose.STANDARD_EXECUTION
+        and action
+        in {
+            CapabilityAction.APPLY_CANARY,
+            CapabilityAction.PROMOTE_CANDIDATE,
+        }
+    )
 
 
 def _parse_utc_second(value: str) -> int:
@@ -919,6 +1197,7 @@ __all__ = [
     "FinalMutationGate",
     "FinalMutationResult",
     "MutationPermit",
+    "MutationSourceReceiptReader",
     "PreparedTargetMutation",
     "PromotionSourceReceiptReader",
     "ReceiptDispatchLease",

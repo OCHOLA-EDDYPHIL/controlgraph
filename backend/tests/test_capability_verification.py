@@ -407,17 +407,9 @@ def _verify(
     return asyncio.run(verifier.verify(payload, caller))
 
 
-@pytest.mark.parametrize(
-    ("role", "action"),
-    [
-        (ServiceRole.EXECUTOR, CapabilityAction.APPLY_CANARY),
-        (ServiceRole.RECOVERY, CapabilityAction.RECOVER_STABLE),
-    ],
-)
-def test_verifies_legacy_apply_and_recovery_for_both_protected_routes(
-    role: ServiceRole,
-    action: CapabilityAction,
-) -> None:
+def test_verifies_legacy_apply_on_the_standard_executor_route() -> None:
+    role = ServiceRole.EXECUTOR
+    action = CapabilityAction.APPLY_CANARY
     private_key = ec.generate_private_key(ec.SECP256R1())
     root_reader = _RootReader()
     claims = _claims(
@@ -446,6 +438,23 @@ def test_verifies_legacy_apply_and_recovery_for_both_protected_routes(
     assert root_reader.receipt_claims == 0
 
 
+def test_legacy_recovery_is_rejected_before_trusted_reads() -> None:
+    role = ServiceRole.RECOVERY
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    root_reader = _RootReader()
+    request = _task(_signed(_claims(role), private_key))
+
+    with pytest.raises(CapabilityVerificationError) as denied:
+        _verify(
+            _verifier(role, private_key, root_reader),
+            canonical_json_bytes(request),
+            _caller(role),
+        )
+
+    assert denied.value.code is ReasonCode.CLAIM_BINDING_MISMATCH
+    assert root_reader.reads == []
+
+
 def test_legacy_promotion_task_is_rejected_before_trusted_reads() -> None:
     private_key = ec.generate_private_key(ec.SECP256R1())
     root_reader = _RootReader()
@@ -471,10 +480,11 @@ def test_legacy_promotion_task_is_rejected_before_trusted_reads() -> None:
     assert root_reader.reads == []
 
 
-def test_verifier_configuration_has_no_action_key_or_resource_selector() -> None:
+def test_verifier_configuration_has_only_one_explicit_facade_selector() -> None:
     assert {field.name for field in fields(CapabilityVerifierConfiguration)} == {
         "target",
         "route_policy",
+        "recovery_executor_facade",
     }
 
 
@@ -1295,12 +1305,11 @@ _DENIAL_SCENARIOS = (
 )
 
 
-@pytest.mark.parametrize("role", [ServiceRole.EXECUTOR, ServiceRole.RECOVERY])
 @pytest.mark.parametrize("scenario", _DENIAL_SCENARIOS)
 def test_initial_and_retried_denials_never_enter_handler_or_claim_receipt(
-    role: ServiceRole,
     scenario: str,
 ) -> None:
+    role = ServiceRole.EXECUTOR
     private_key = ec.generate_private_key(ec.SECP256R1())
     payload, caller, root_reader, lineage_reader, expected = _denial_scenario(
         role,
@@ -1331,17 +1340,9 @@ def test_initial_and_retried_denials_never_enter_handler_or_claim_receipt(
     assert joined.authenticator.calls == 2
 
 
-@pytest.mark.parametrize(
-    ("role", "action"),
-    [
-        (ServiceRole.EXECUTOR, CapabilityAction.APPLY_CANARY),
-        (ServiceRole.RECOVERY, CapabilityAction.RECOVER_STABLE),
-    ],
-)
-def test_initial_and_retried_valid_tasks_share_the_verified_handler_gate(
-    role: ServiceRole,
-    action: CapabilityAction,
-) -> None:
+def test_initial_and_retried_valid_executor_tasks_share_the_verified_handler_gate() -> None:
+    role = ServiceRole.EXECUTOR
+    action = CapabilityAction.APPLY_CANARY
     private_key = ec.generate_private_key(ec.SECP256R1())
     root_reader = _RootReader()
     request = _task(_signed(_claims(role, action=action), private_key))

@@ -64,6 +64,10 @@ CAPABILITY_KEY_VERSION = (
     f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
 )
+EVIDENCE_KEY_VERSION = (
+    f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
+    "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
+)
 EXECUTOR_AUDIENCE = (
     f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
 )
@@ -93,6 +97,7 @@ def _environment() -> dict[str, str]:
         ),
         "CONTROLGRAPH_AUTH_CALLER_SUBJECT": SUBJECT,
         "CONTROLGRAPH_CAPABILITY_KEY_VERSION": CAPABILITY_KEY_VERSION,
+        "CONTROLGRAPH_EVIDENCE_KEY_VERSION": EVIDENCE_KEY_VERSION,
         "CONTROLGRAPH_COORDINATOR_URL": COORDINATOR_AUDIENCE,
         "CONTROLGRAPH_TARGET_NETWORK_RESOURCE": (
             f"projects/{PROJECT_ID}/global/networks/controlgraph-network"
@@ -101,6 +106,10 @@ def _environment() -> dict[str, str]:
             f"projects/{PROJECT_ID}/regions/us-central1/"
             "subnetworks/controlgraph-runtime"
         ),
+        "CONTROLGRAPH_RECOVERY_FACADE_CALLER_EMAIL": (
+            f"controlgraph-recovery@{PROJECT_ID}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_RECOVERY_FACADE_CALLER_SUBJECT": "123456789012345678902",
     }
 
 

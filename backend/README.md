@@ -14,27 +14,43 @@ Dependencies point inward toward `application`, `contracts`, and `authority`. In
 `authority/` cannot import HTTP, Google Cloud, model, or agent-framework packages. The CLI
 uses the authenticated API and never writes authority state or mutates Cloud Run directly.
 
-## M2 cloud boundaries
+## Cloud boundaries
 
 The Google adapters are deliberately narrower than the underlying APIs:
 
-- Firestore is fixed to the `controlgraph-authority` database in `us-central1`, four versioned
-  record families, deterministic document identities, strong reads, and transactional
-  compare-and-set operations.
+- Firestore is fixed to the `controlgraph-authority` database in `us-central1`, canonical
+  authority, receipt, health-chain, and recovery records, deterministic document identities,
+  strong reads, and transactional compare-and-set operations.
 - KMS signing is fixed to P-256/SHA-256, an explicit key version, and either the capability or
   evidence purpose. Private key material never enters application configuration. Capability and
   evidence signing use distinct identities; the verifier has no signing or authority-write grant.
 - Cloud Tasks derives its queue, handler origin and path, audience, and OIDC caller from startup
   configuration. It performs one create call and treats an exact deterministic task name as the
   duplicate boundary.
-- Terraform wires the `api`, `coordinator`, `issuer`, `executor`, `recovery`, and `verifier`
-  composition roots to separate Cloud Run identities. Their M2 protected routes return
-  `MUTATION_DISABLED`.
+- Terraform wires the `api`, `coordinator`, `issuer`, `executor`, `recovery`, `verifier`, and
+  `evidence_writer` composition roots to separate Cloud Run identities and exact authenticated
+  routes.
 
-Every service exposes identity-safe `GET /healthz` and `GET /v1/metadata` responses. Starting a
-role requires the complete validated environment shown in `.env.example`; `controlgraph-canary
-serve` refuses another project family, region, database, role, contract version, mutable build
-reference, or enabled M2 mutation flag.
+The verifier derives fixed candidate-revision Cloud Monitoring queries from the immutable root,
+canonicalizes the returned request-count and latency samples, applies the frozen health policy,
+and obtains a signed decision proof. A terminal healthy proof can authorize a 100 percent
+candidate promotion through the normal executor. A terminal unhealthy proof is appended in the
+same transaction that creates the root-owned recovery intent; the coordinator then owns its
+deterministic dispatch record and addressed recovery task.
+
+The recovery service validates the task caller and signed stable-only capability, then forwards
+the same canonical task once to a recovery-only executor facade. The executor independently
+reverifies the task, signed verifier prestate, root, epoch, and captured stable revision before
+claiming through the separate recovery receipt route. Its final gate then rereads the durable
+source receipt and current root and epoch before issuing one conditional traffic-only update
+naming only the captured stable revision at 100 percent. Provider uncertainty remains
+`AMBIGUOUS` and can advance only through exact readback, never a blind mutation retry.
+
+Every service exposes identity-safe `GET /healthz` and `GET /v1/metadata` responses. The
+`.env.example` file shows a non-mutating API baseline; each deployed role receives its complete
+validated configuration from Terraform. `controlgraph-canary serve` refuses another project
+family, region, database, role, contract version, mutable build reference, or inconsistent
+role-specific authority configuration.
 
 ## Firestore emulator acceptance
 

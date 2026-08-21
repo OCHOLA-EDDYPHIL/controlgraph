@@ -502,21 +502,17 @@ class _BlockingAdapter(_Adapter):
 
 
 @pytest.mark.parametrize(
-    ("role", "action"),
+    "action",
     [
-        (ServiceRole.EXECUTOR, CapabilityAction.APPLY_CANARY),
-        (ServiceRole.EXECUTOR, CapabilityAction.PROMOTE_CANDIDATE),
-        (ServiceRole.RECOVERY, CapabilityAction.RECOVER_STABLE),
+        CapabilityAction.APPLY_CANARY,
+        CapabilityAction.PROMOTE_CANDIDATE,
     ],
 )
-def test_exact_executor_and_recovery_actions_dispatch_once(
-    role: ServiceRole,
-    action: CapabilityAction,
-) -> None:
+def test_exact_standard_executor_actions_dispatch_once(action: CapabilityAction) -> None:
     async def scenario() -> None:
         verified = _verified(action=action)
         reader = _Reader(_snapshot())
-        adapter = _Adapter(role)
+        adapter = _Adapter(ServiceRole.EXECUTOR)
         gate = FinalMutationGate(
             authority_reader=reader,
             adapter=adapter,
@@ -538,21 +534,13 @@ def test_exact_executor_and_recovery_actions_dispatch_once(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    ("role", "action"),
-    [
-        (ServiceRole.EXECUTOR, CapabilityAction.RECOVER_STABLE),
-        (ServiceRole.RECOVERY, CapabilityAction.APPLY_CANARY),
-        (ServiceRole.RECOVERY, CapabilityAction.PROMOTE_CANDIDATE),
-    ],
-)
-def test_cross_role_action_is_denied_without_adapter_call(
-    role: ServiceRole,
-    action: CapabilityAction,
-) -> None:
+def test_generic_recovery_is_denied_on_the_standard_executor_gate() -> None:
     async def scenario() -> None:
-        verified = _verified(action=action, route_role=role)
-        adapter = _Adapter(role)
+        verified = _verified(
+            action=CapabilityAction.RECOVER_STABLE,
+            route_role=ServiceRole.EXECUTOR,
+        )
+        adapter = _Adapter(ServiceRole.EXECUTOR)
         result = await FinalMutationGate(
             authority_reader=_Reader(_snapshot()),
             adapter=adapter,
@@ -561,10 +549,32 @@ def test_cross_role_action_is_denied_without_adapter_call(
         ).execute(_lease(verified), verified)
 
         assert isinstance(result, FinalAuthorityDenial)
-        assert result.reason_code is ReasonCode.CLAIM_BINDING_MISMATCH
+        assert result.reason_code is ReasonCode.IDEMPOTENCY_CONFLICT
         assert adapter.calls == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "action",
+    [CapabilityAction.APPLY_CANARY, CapabilityAction.PROMOTE_CANDIDATE],
+)
+def test_direct_recovery_identity_adapter_is_structurally_rejected(
+    action: CapabilityAction,
+) -> None:
+    verified = _verified(action=action, route_role=ServiceRole.RECOVERY)
+    adapter = _Adapter(ServiceRole.RECOVERY)
+
+    with pytest.raises(ValueError, match="executor identity"):
+        FinalMutationGate(
+            authority_reader=_Reader(_snapshot()),
+            adapter=adapter,
+            route_policy=_route_policy(adapter.service_role),
+            clock=lambda: NOW,
+        )
+
+    assert verified.request.intent.action is action
+    assert adapter.calls == []
 
 
 @pytest.mark.parametrize(

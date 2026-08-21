@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from health_execution_test_data import make_health_root, make_healthy_chain
+from recovery_v2_test_data import make_revoked_v2_recovery_bundle
 from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
 from test_service_claim_release import _released_store
 
@@ -18,6 +19,7 @@ from controlgraph_canary.cli import (
     _run_apply_canary,
     _run_execution_receipt_read,
     _run_promotion,
+    _run_recovery,
     _run_root_creation,
     _run_service_claim_release,
     _run_stable_snapshot_capture,
@@ -62,6 +64,10 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionCommandV2,
     PromotionDispatchResultV2,
     create_promotion_authorization,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RECOVERY_DISPATCH_RESULT_V2,
+    RecoveryDispatchResultV2,
 )
 from controlgraph_canary.contracts.root_creation import (
     ROOT_CREATION_COMMAND_V1,
@@ -437,6 +443,29 @@ def test_parser_exposes_only_named_operator_commands_and_typed_fields() -> None:
         ]
     )
     assert parsed.action is CapabilityAction.APPLY_CANARY
+
+    recovery_receipt = parser.parse_args(
+        [
+            "read-execution-receipt",
+            "--project-number",
+            PROJECT_NUMBER,
+            "--root-id",
+            "root-cli-recovery-001",
+            "--expected-root-sha256",
+            "c" * 64,
+            "--expected-epoch",
+            "2",
+            "--action",
+            CapabilityAction.RECOVER_STABLE.value,
+            "--request-id",
+            "request-cli-recovery-001",
+            "--idempotency-key",
+            "intent-cli-recovery-001",
+            "--capability-sha256",
+            "d" * 64,
+        ]
+    )
+    assert recovery_receipt.action is CapabilityAction.RECOVER_STABLE
 
     release = parser.parse_args(
         [
@@ -1054,3 +1083,99 @@ def test_cli_has_no_direct_cloud_store_kms_run_or_raw_http_paths() -> None:
     assert "from urllib" not in source
     assert "import requests" not in source
     assert "from requests" not in source
+
+
+def _recovery_cli_fixture(
+    tmp_path: Path,
+) -> tuple[argparse.Namespace, object, RecoveryDispatchResultV2]:
+    bundle = make_revoked_v2_recovery_bundle()
+    command_file = tmp_path / "recovery-command.json"
+    command_file.write_bytes(canonical_json_bytes(bundle.command))
+    authorization = bundle.authorization
+    task = bundle.task
+    result = RecoveryDispatchResultV2(
+        schema_version=RECOVERY_DISPATCH_RESULT_V2,
+        request_id=authorization.request_id,
+        idempotency_key=authorization.idempotency_key,
+        target=authorization.target,
+        root_schema_version=authorization.root_schema_version,
+        root_id=authorization.root_id,
+        root_sha256=authorization.root_sha256,
+        epoch=authorization.epoch,
+        stable_revision=authorization.stable_revision,
+        stable_revision_configuration_sha256=(
+            authorization.stable_revision_configuration_sha256
+        ),
+        candidate_revision=authorization.candidate_revision,
+        candidate_revision_configuration_sha256=(
+            authorization.candidate_revision_configuration_sha256
+        ),
+        stable_percent=100,
+        candidate_percent=0,
+        concurrency=authorization.concurrency,
+        provider_etag=authorization.current_provider_etag,
+        verified_apply_receipt=authorization.verified_apply_receipt,
+        source_receipt_sha256=authorization.source_receipt_sha256,
+        trigger_basis=authorization.source.basis,
+        trigger_proof_sha256=authorization.trigger_proof_sha256,
+        prestate_attestation_sha256=authorization.prestate_attestation_sha256,
+        expected_prestate_sha256=authorization.expected_prestate_sha256,
+        desired_poststate_sha256=authorization.desired_poststate_sha256,
+        proof_valid_until=authorization.proof_valid_until,
+        recovery_authorization_sha256=canonical_sha256(authorization),
+        capability_id=authorization.capability_id,
+        capability_sha256=canonical_sha256(task.capability),
+        task_id=task.task_id,
+        task_name=(
+            f"projects/{authorization.target.project_id}/locations/us-central1/"
+            f"queues/controlgraph-recovery/tasks/cg-{canonical_sha256(task)}"
+        ),
+        enqueue_disposition="CREATED",
+        scheduled_at=task.scheduled_at,
+        expires_at=task.expires_at,
+    )
+    return (
+        argparse.Namespace(
+            project_number=PROJECT_NUMBER,
+            command_file=str(command_file),
+        ),
+        bundle.command,
+        result,
+    )
+
+
+def test_recovery_cli_posts_one_exact_revoked_v2_command(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args, command, result = _recovery_cli_fixture(tmp_path)
+    poster = _Poster(
+        InternalHttpResponse(
+            status_code=200,
+            content_type="application/json",
+            body=canonical_json_bytes(result),
+        )
+    )
+
+    assert _run_recovery(args, command_runner=_Runner(), http_poster=poster) == 0
+    assert len(poster.calls) == 1
+    assert poster.calls[0]["body"] == canonical_json_bytes(command)  # type: ignore[arg-type]
+    assert capsys.readouterr().out.strip() == canonical_json_bytes(result).decode()
+
+
+def test_recovery_cli_rejects_substituted_result(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args, _command, result = _recovery_cli_fixture(tmp_path)
+    substituted = result.model_copy(update={"request_id": "other-recovery-request"})
+    poster = _Poster(
+        InternalHttpResponse(
+            status_code=200,
+            content_type="application/json",
+            body=canonical_json_bytes(substituted),
+        )
+    )
+
+    assert _run_recovery(args, command_runner=_Runner(), http_poster=poster) == 6
+    assert capsys.readouterr().out.strip() == '{"code": "RECOVERY_RESPONSE_INVALID"}'

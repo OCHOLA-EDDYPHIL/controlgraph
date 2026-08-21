@@ -3,13 +3,13 @@
 ## Status and scope
 
 This document freezes the version 1 product vocabulary and acceptance boundary for
-ControlGraph Canary. It is a contract for implementation, not a statement that every
-described component is already deployed. The current repository provides strict versioned
-contracts, cross-language canonical fixtures, a pure reducer, root-scoped exact-match epoch
-transitions, a local service and CLI, a console shell, and Terraform input contracts. Hosted
-authority persistence, signing, task delivery, Cloud Run mutation, deterministic health
-evaluation, promotion, recovery, and rendered evidence views require later implementation and
-acceptance.
+ControlGraph Canary. It is a contract for implemented behavior, not evidence that any particular
+revision has passed hosted acceptance. The repository implements canonical contracts,
+root-scoped epoch authority, authenticated role composition, KMS signing, Firestore claims and
+receipts, addressed Cloud Tasks delivery, target-bound Cloud Run execution and readback,
+deterministic Monitoring health evaluation, healthy promotion, and captured-stable recovery.
+The current console remains read-only and static; a rendered operator evidence timeline is
+outside this implementation boundary.
 
 Version 1 controls one canary rollout for one Cloud Run service in one Google Cloud project and
 region. It is not a general deployment system, workflow engine, graph engine, or authorization
@@ -46,30 +46,31 @@ separate implementation concerns.
 | `controlgraph.console/v1` | Present read-only operator information obtained from the API. | Cannot hold cloud credentials, sign authority, or invoke cloud control-plane APIs. |
 | `controlgraph.coordinator/v1` | Reduce accepted events into deterministic next commands and request bounded issuance or delivery. | Cannot approve authority, mutate Cloud Run, or reinterpret model output as a decision. |
 | `controlgraph.issuer/v1` | Construct canonical, attenuated capability claims and request signatures from the configured KMS key version. | Cannot mutate Cloud Run or use a caller-selected key. |
-| `controlgraph.executor/v1` | Validate an execution request, recheck authority, claim a receipt, and invoke the narrow canary adapter once. | Cannot deploy images, retarget another service, or retry an ambiguous mutation blindly. |
-| `controlgraph.recovery/v1` | Restore only the captured stable configuration under separately scoped recovery authority. | Cannot promote a candidate or select an arbitrary revision. |
-| `controlgraph.verifier/v1` | Read the target independently and classify an observed postcondition. | Cannot mutate the target or grant authority. |
+| `controlgraph.executor/v1` | Independently validate normal execution or recovery-facade work, recheck authority, claim the matching receipt, and invoke the purpose-bound adapter once. | Cannot deploy images, retarget another service, or retry an ambiguous mutation blindly. |
+| `controlgraph.recovery/v1` | Validate a recovery delivery and forward its unchanged canonical task once to the executor's recovery-only facade. | Has no direct target update, target service-account impersonation, operation-read, or promotion authority. |
+| `controlgraph.verifier/v1` | Read Monitoring and target state independently, evaluate health, and produce signed health or recovery-prestate evidence through the evidence writer. | Cannot mutate the target or grant authority. |
 | `controlgraph.target/v1` | Provide the disposable Cloud Run service and immutable revisions used by acceptance. | Has no ControlGraph authority. |
 | `controlgraph.advisor/v1` | Optionally summarize already recorded facts through an integration boundary. | Cannot decide health, safety, authority, rollout, promotion, recovery, or revocation. |
 
 ## Versioned records
 
 Every record crossing a process, trust, persistence, or language boundary carries one exact
-schema version. The first implementation uses these logical record families:
+schema version. The implementation uses these logical record families:
 
 | Record | Required meaning |
 |---|---|
 | `controlgraph.target-binding/v1` | Exact project, region, service, and environment identity. |
 | `controlgraph.stable-snapshot/v1` | Captured stable revision, traffic, concurrency, provider resource version, and canonical configuration digest. |
-| `controlgraph.rollout-root/v1` | Immutable approved snapshot, candidate, plan, policies, recovery bounds, and maximum authority. |
+| `controlgraph.rollout-root/v2` and `/v3` | Immutable approved snapshot, candidate, plan, policies, recovery bounds, and maximum authority; V3 includes the frozen Monitoring health policy. |
 | `controlgraph.epoch-authority/v1` | Current epoch and monotonic transition metadata for one root. |
 | `controlgraph.capability-claims/v1` | Narrow action authority, identity bindings, lineage, times, request identity, plan digest, and provider precondition. |
 | `controlgraph.signed-capability/v1` | Claims plus the configured algorithm, exact KMS key version, and signature. |
-| `controlgraph.mutation-intent/v1` | One exact target change derived from the immutable root. |
-| `controlgraph.task-request/v1` | Addressed delivery of one signed mutation intent. |
+| `controlgraph.mutation-intent/v1`, `controlgraph.promotion-mutation-intent/v2`, and `controlgraph.recovery-mutation-intent/v2` | One exact target change derived from the immutable root. |
+| `controlgraph.task-request/v1`, `controlgraph.promotion-task-request/v2`, and `controlgraph.recovery-task-request/v2` | Addressed delivery of one signed mutation intent. |
 | `controlgraph.execution-receipt/v1` | Durable request binding and execution classification. |
-| `controlgraph.health-input/v1` | Bounded observations supplied to deterministic health policy. |
-| `controlgraph.recovery-plan/v1` | Restore-only plan bound to the captured stable snapshot. |
+| `controlgraph.monitoring-metric-query/v1` and related sample/observation records | Exact candidate-revision Monitoring queries and canonical one-minute observations. |
+| `controlgraph.health-decision/v1` and signed proof records | Deterministic decision, complete input citations, prior state, and signed chain linkage. |
+| Recovery intent, authorization, prestate, task, and dispatch records | Root-owned restore-only work bound to the captured stable snapshot, source receipt, trigger proof, current epoch, and addressed task. |
 | `controlgraph.evidence-event/v1` | Ordered, immutable statement about an authority or execution fact. |
 
 Canonical encodings and digests are version-bound. Unknown critical fields, duplicate keys,
@@ -88,7 +89,7 @@ method, URL, resource path, or arbitrary field mask in place of one of these com
 | `APPLY_CANARY_V1` | Set the approved stable/candidate revisions to the exact 90/10 plan. |
 | `EVALUATE_HEALTH_V1` | Apply deterministic policy to bounded, versioned health inputs. |
 | `PROMOTE_CANDIDATE_V1` | Set 100 percent traffic to the approved candidate. |
-| `RECOVER_STABLE_V1` | Restore only the captured stable traffic and approved concurrency. |
+| `RECOVER_STABLE_V1` | Route 100 percent of traffic only to the captured stable revision while requiring approved concurrency to remain unchanged. |
 | `REVOKE_EPOCH_V1` | Compare and advance the root epoch with an operator reason and request identity. |
 | `VERIFY_TARGET_V1` | Independently read and classify the target configuration. |
 
@@ -178,15 +179,22 @@ at epoch 1. Later steps refer to its then-current value as epoch N.
 
 The system issues an `APPLY_CANARY_V1` capability at epoch N, validates it at execution, rechecks
 epoch N immediately before the mutation, conditionally applies 90/10, and independently verifies
-the split. Versioned health inputs may then select `PROMOTE_CANDIDATE_V1`; completion requires an
-independent read proving 100 percent traffic on the approved candidate.
+the split. The verifier derives exact one-minute candidate-revision Monitoring queries from the
+root, canonicalizes their samples, and applies the frozen thresholds and consecutive-window
+rules. A signed terminal healthy proof may authorize `PROMOTE_CANDIDATE_V1`; completion requires
+an independent read proving 100 percent traffic on the approved candidate.
 
 ### Unhealthy branch
 
-Deterministic health policy may select `RECOVER_STABLE_V1`. Recovery authority is limited to the
-captured stable revision and configuration. Completion requires an independent read proving that
-the captured stable state was restored. No model or recovery worker may select a different
-revision or promote the candidate.
+A signed terminal unhealthy proof is appended atomically with the root-owned recovery intent.
+The coordinator derives one deterministic dispatch identity, obtains a KMS-signed recovery
+capability and signed verifier prestate, and addresses `RECOVER_STABLE_V1` to the recovery queue.
+The recovery service verifies and forwards the unchanged task once; it never mutates Cloud Run.
+The executor's separate recovery-only facade independently reverifies the task and uses a
+separate recovery receipt route before one conditional traffic-only update naming the captured
+stable revision at 100 percent. Completion requires exact independent readback, including
+unchanged approved concurrency. A model, recovery worker, or caller cannot select another revision
+or promote the candidate.
 
 ### Revocation branch
 
@@ -196,8 +204,8 @@ delayed capability issued at N may still pass caller and signature checks, but i
 `EPOCH_MISMATCH` at the fresh authority check and produce a `DENIED` receipt without calling the
 Cloud Run mutation adapter.
 
-These branches define acceptance targets. They do not claim that hosted health, promotion,
-recovery, or revocation is present in the current scaffold.
+These branches define acceptance targets. Their implementation in a source revision does not by
+itself claim that the same revision has passed hosted acceptance.
 
 ## Non-goals
 

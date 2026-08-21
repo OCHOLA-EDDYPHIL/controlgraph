@@ -15,6 +15,7 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunExecutionEnvironment,
     CloudRunHttpProbe,
     CloudRunMutationOutcome,
+    CloudRunMutationPurpose,
     CloudRunMutationReason,
     CloudRunMutationResult,
     CloudRunNetworkInterface,
@@ -48,8 +49,11 @@ from controlgraph_canary.application.reference_target_reset import (
 )
 from controlgraph_canary.contracts.models import CapabilityAction, MutationIntent, TargetBinding
 from controlgraph_canary.contracts.promotion_execution import PromotionMutationIntentV2
+from controlgraph_canary.contracts.recovery_execution import RecoveryMutationIntentV2
 
-type CloudRunMutationIntent = MutationIntent | PromotionMutationIntentV2
+type CloudRunMutationIntent = (
+    MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2
+)
 
 CLOUD_RUN_REGION: Final = "us-central1"
 CLOUD_RUN_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
@@ -302,16 +306,18 @@ class CloudRunV2Adapter:
         configuration: CloudRunTargetConfiguration,
         service_role: ServiceRole,
         configured_project_id: str,
+        mutation_purpose: CloudRunMutationPurpose = (
+            CloudRunMutationPurpose.STANDARD_EXECUTION
+        ),
         services_client_factory: ServicesClientFactory | None = None,
         revisions_client_factory: RevisionsClientFactory | None = None,
     ) -> None:
         if type(configuration) is not CloudRunTargetConfiguration:
             raise TypeError("an exact Cloud Run target configuration is required")
-        if type(service_role) is not ServiceRole or service_role not in {
-            ServiceRole.EXECUTOR,
-            ServiceRole.RECOVERY,
-        }:
-            raise ValueError("Cloud Run mutation role must be executor or recovery")
+        if type(service_role) is not ServiceRole or service_role is not ServiceRole.EXECUTOR:
+            raise ValueError("Cloud Run mutation is limited to the executor identity")
+        if type(mutation_purpose) is not CloudRunMutationPurpose:
+            raise TypeError("an exact Cloud Run mutation purpose is required")
         target = configuration.target
         if (
             type(configured_project_id) is not str
@@ -331,6 +337,7 @@ class CloudRunV2Adapter:
             raise TypeError("Cloud Run revisions client factory must be callable")
         self._configuration = configuration
         self._service_role = service_role
+        self._mutation_purpose = mutation_purpose
         self._services_client_factory = services_client_factory or _default_services_client_factory
         self._revisions_client_factory = (
             revisions_client_factory or _default_revisions_client_factory
@@ -347,6 +354,10 @@ class CloudRunV2Adapter:
     @property
     def service_role(self) -> ServiceRole:
         return self._service_role
+
+    @property
+    def mutation_purpose(self) -> CloudRunMutationPurpose:
+        return self._mutation_purpose
 
     async def read_service(self) -> CloudRunServiceState:
         """Read only the exact configured service resource."""
@@ -434,7 +445,11 @@ class CloudRunV2Adapter:
     ) -> _PreparedCloudRunV2Mutation:
         """Initialize the client and build the exact request before epoch fencing."""
 
-        if type(intent) not in (MutationIntent, PromotionMutationIntentV2):
+        if type(intent) not in (
+            MutationIntent,
+            PromotionMutationIntentV2,
+            RecoveryMutationIntentV2,
+        ):
             raise TypeError("Cloud Run mutation intent must be exact")
         requested, expected_concurrency, rejection = self._admit_intent(intent)
         if rejection is not None:
@@ -447,8 +462,24 @@ class CloudRunV2Adapter:
                 client=None,
                 request=None,
             )
-        request = self._update_request(intent, requested)
         client = await self._services_client()
+        if type(intent) is RecoveryMutationIntentV2:
+            rejection = await self._recovery_prestate_rejection(
+                client,
+                intent,
+                expected_concurrency=expected_concurrency,
+            )
+            if rejection is not None:
+                return _PreparedCloudRunV2Mutation(
+                    adapter=self,
+                    intent=intent,
+                    requested=requested,
+                    expected_concurrency=expected_concurrency,
+                    rejection=rejection,
+                    client=None,
+                    request=None,
+                )
+        request = self._update_request(intent, requested)
         return _PreparedCloudRunV2Mutation(
             adapter=self,
             intent=intent,
@@ -468,30 +499,45 @@ class CloudRunV2Adapter:
         CloudRunMutationReason | None,
     ]:
         configuration = self._configuration
-        requested = (
-            CloudRunTrafficAllocation(
-                revision=configuration.stable_revision,
-                percent=intent.stable_percent,
-                tag="stable",
-            ),
-            CloudRunTrafficAllocation(
-                revision=configuration.candidate_revision,
-                percent=intent.candidate_percent,
-                tag="candidate",
-            ),
-        )
+        requested: tuple[CloudRunTrafficAllocation, ...]
+        if type(intent) is RecoveryMutationIntentV2:
+            requested = (
+                CloudRunTrafficAllocation(
+                    revision=configuration.stable_revision,
+                    percent=100,
+                    tag="stable",
+                ),
+            )
+        else:
+            requested = (
+                CloudRunTrafficAllocation(
+                    revision=configuration.stable_revision,
+                    percent=intent.stable_percent,
+                    tag="stable",
+                ),
+                CloudRunTrafficAllocation(
+                    revision=configuration.candidate_revision,
+                    percent=intent.candidate_percent,
+                    tag="candidate",
+                ),
+            )
         expected_concurrency = configuration.stable_concurrency
-        exact_intent_type = type(intent) in (MutationIntent, PromotionMutationIntentV2)
+        exact_intent_type = type(intent) in (
+            MutationIntent,
+            PromotionMutationIntentV2,
+            RecoveryMutationIntentV2,
+        )
         exact_target = (
             intent.target == configuration.target
             and intent.stable_revision == configuration.stable_revision
             and intent.candidate_revision == configuration.candidate_revision
         )
         role_admits = (
-            self._service_role is ServiceRole.EXECUTOR
+            self._mutation_purpose is CloudRunMutationPurpose.STANDARD_EXECUTION
             and intent.action in {CapabilityAction.APPLY_CANARY, CapabilityAction.PROMOTE_CANDIDATE}
         ) or (
-            self._service_role is ServiceRole.RECOVERY
+            self._mutation_purpose is CloudRunMutationPurpose.STABLE_RECOVERY
+            and type(intent) is RecoveryMutationIntentV2
             and intent.action is CapabilityAction.RECOVER_STABLE
         )
         concurrency_is_exact = (
@@ -522,12 +568,49 @@ class CloudRunV2Adapter:
                 == expected_poststate_sha256
                 and intent.provider_etag == intent.authorization.provider_etag
             )
+        recovery_v2_is_exact = True
+        if type(intent) is RecoveryMutationIntentV2:
+            expected_prestate_sha256 = target_configuration_projection_sha256(
+                TargetConfigurationProjection(
+                    target=configuration.target,
+                    stable_revision=configuration.stable_revision,
+                    candidate_revision=configuration.candidate_revision,
+                    stable_percent=90,
+                    candidate_percent=10,
+                    concurrency=expected_concurrency,
+                )
+            )
+            desired_poststate_sha256 = target_configuration_projection_sha256(
+                TargetConfigurationProjection(
+                    target=configuration.target,
+                    stable_revision=configuration.stable_revision,
+                    candidate_revision=configuration.candidate_revision,
+                    stable_percent=100,
+                    candidate_percent=0,
+                    concurrency=expected_concurrency,
+                )
+            )
+            recovery_v2_is_exact = (
+                self._mutation_purpose is CloudRunMutationPurpose.STABLE_RECOVERY
+                and intent.stable_percent == 100
+                and intent.candidate_percent == 0
+                and intent.concurrency == expected_concurrency
+                and intent.expected_prestate_sha256 == expected_prestate_sha256
+                and intent.desired_poststate_sha256 == desired_poststate_sha256
+                and intent.authorization.expected_prestate_sha256
+                == expected_prestate_sha256
+                and intent.authorization.desired_poststate_sha256
+                == desired_poststate_sha256
+                and intent.provider_etag
+                == intent.authorization.current_provider_etag
+            )
         if (
             not exact_intent_type
             or not exact_target
             or not role_admits
             or not concurrency_is_exact
             or not promotion_v2_is_exact
+            or not recovery_v2_is_exact
         ):
             return (
                 requested,
@@ -535,6 +618,64 @@ class CloudRunV2Adapter:
                 CloudRunMutationReason.DECLARATION_MISMATCH,
             )
         return requested, expected_concurrency, None
+
+    async def _recovery_prestate_rejection(
+        self,
+        client: _ServicesClientPort,
+        intent: RecoveryMutationIntentV2,
+        *,
+        expected_concurrency: int,
+    ) -> CloudRunMutationReason | None:
+        """Read and bind the exact ready 90/10 state before final authority fencing."""
+
+        request = run_v2.GetServiceRequest(name=self._configuration.service_resource)
+        try:
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                response = await client.get_service(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+            service = self._decode_service(response)
+        except asyncio.CancelledError:
+            raise
+        except _KNOWN_SAFE_REJECTIONS:
+            return CloudRunMutationReason.PROVIDER_REJECTED
+        except Exception:
+            raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+
+        expected_traffic = (
+            CloudRunTrafficAllocation(
+                revision=self._configuration.stable_revision,
+                percent=90,
+                tag="stable",
+            ),
+            CloudRunTrafficAllocation(
+                revision=self._configuration.candidate_revision,
+                percent=10,
+                tag="candidate",
+            ),
+        )
+        expected_statuses = tuple(
+            (item.revision, item.percent, item.tag) for item in expected_traffic
+        )
+        observed_statuses = tuple(
+            (item.revision, item.percent, item.tag) for item in service.traffic_statuses
+        )
+        attested = intent.authorization.prestate_attestation.result
+        if (
+            service.etag != intent.provider_etag
+            or service.etag != attested.current_provider_etag
+            or service.generation != attested.service_generation
+            or service.reconciling
+            or service.ready_state is not CloudRunReadyState.READY
+            or service.generation != service.observed_generation
+            or service.template_concurrency != expected_concurrency
+            or service.traffic != expected_traffic
+            or observed_statuses != expected_statuses
+        ):
+            return CloudRunMutationReason.PRECONDITION_FAILED
+        return None
 
     def _update_request(
         self,
@@ -1134,6 +1275,9 @@ class CloudRunV2ReceiptReadback:
         *,
         configuration: CloudRunTargetConfiguration,
         configured_project_id: str,
+        mutation_purpose: CloudRunMutationPurpose = (
+            CloudRunMutationPurpose.STANDARD_EXECUTION
+        ),
         services_client_factory: ReadOnlyServicesClientFactory | None = None,
     ) -> None:
         if type(configuration) is not CloudRunTargetConfiguration:
@@ -1151,9 +1295,12 @@ class CloudRunV2ReceiptReadback:
             raise ValueError("Cloud Run receipt readback is sealed to the reference service")
         if configuration.stable_concurrency != configuration.candidate_concurrency:
             raise ValueError("declared revisions must share the approved concurrency")
+        if type(mutation_purpose) is not CloudRunMutationPurpose:
+            raise TypeError("an exact Cloud Run readback purpose is required")
         if services_client_factory is not None and not callable(services_client_factory):
             raise TypeError("Cloud Run services client factory must be callable")
         self._configuration = configuration
+        self._mutation_purpose = mutation_purpose
         self._services_client_factory = (
             services_client_factory or _default_read_only_services_client_factory
         )
@@ -1173,11 +1320,21 @@ class CloudRunV2ReceiptReadback:
         if type(expected) is not TargetConfigurationProjection:
             raise TypeError("Cloud Run receipt readback requires an exact expectation")
         configuration = self._configuration
+        recovery_readback = self._mutation_purpose is CloudRunMutationPurpose.STABLE_RECOVERY
         if (
             expected.target != configuration.target
             or expected.stable_revision != configuration.stable_revision
             or expected.candidate_revision != configuration.candidate_revision
             or expected.concurrency != configuration.stable_concurrency
+            or (
+                recovery_readback
+                and (expected.stable_percent != 100 or expected.candidate_percent != 0)
+            )
+            or (
+                not recovery_readback
+                and expected.stable_percent == 100
+                and expected.candidate_percent == 0
+            )
         ):
             return _closed_readback()
 
@@ -1209,22 +1366,39 @@ class CloudRunV2ReceiptReadback:
         ):
             return _closed_readback(service.etag)
 
-        traffic = {item.revision: item.percent for item in service.traffic}
-        observed_traffic = {
-            item.revision: item.percent for item in service.traffic_statuses
-        }
-        if traffic != observed_traffic or set(traffic) != {
-            configuration.stable_revision,
-            configuration.candidate_revision,
-        }:
+        traffic = tuple(
+            (item.revision, item.percent, item.tag) for item in service.traffic
+        )
+        observed_traffic = tuple(
+            (item.revision, item.percent, item.tag) for item in service.traffic_statuses
+        )
+        if recovery_readback:
+            required_traffic = ((configuration.stable_revision, 100, "stable"),)
+            if traffic != required_traffic or observed_traffic != required_traffic:
+                return _closed_readback(service.etag)
+            stable_percent = 100
+            candidate_percent = 0
+        else:
+            if (
+                traffic != observed_traffic
+                or tuple((revision, tag) for revision, _, tag in traffic)
+                != (
+                    (configuration.stable_revision, "stable"),
+                    (configuration.candidate_revision, "candidate"),
+                )
+            ):
+                return _closed_readback(service.etag)
+            stable_percent = traffic[0][1]
+            candidate_percent = traffic[1][1]
+        if stable_percent + candidate_percent != 100:
             return _closed_readback(service.etag)
         try:
             observed = TargetConfigurationProjection(
                 target=configuration.target,
                 stable_revision=configuration.stable_revision,
                 candidate_revision=configuration.candidate_revision,
-                stable_percent=traffic[configuration.stable_revision],
-                candidate_percent=traffic[configuration.candidate_revision],
+                stable_percent=stable_percent,
+                candidate_percent=candidate_percent,
                 concurrency=service.template_concurrency,
             )
         except (TypeError, ValueError):

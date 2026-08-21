@@ -146,6 +146,7 @@ class GoogleOneShotOidcTransport:
                 CallerRole.API,
                 CallerRole.COORDINATOR,
                 CallerRole.EXECUTOR,
+                CallerRole.RECOVERY,
                 CallerRole.VERIFIER,
             }
         ):

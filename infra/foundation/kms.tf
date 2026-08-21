@@ -22,7 +22,9 @@ locals {
     "api",
     "coordinator",
     "evidence_writer",
+    "executor",
     "issuer",
+    "recovery",
     "verifier",
   ])
 }
@@ -124,6 +126,18 @@ resource "google_kms_crypto_key_iam_member" "evidence_public_key_issuer" {
   crypto_key_id = google_kms_crypto_key.signing["evidence"].id
   role          = "roles/cloudkms.publicKeyViewer"
   member        = google_service_account.workloads["issuer"].member
+}
+
+resource "google_kms_crypto_key_iam_member" "evidence_public_key_executor" {
+  crypto_key_id = google_kms_crypto_key.signing["evidence"].id
+  role          = "roles/cloudkms.publicKeyViewer"
+  member        = google_service_account.workloads["executor"].member
+}
+
+resource "google_kms_crypto_key_iam_member" "evidence_public_key_recovery" {
+  crypto_key_id = google_kms_crypto_key.signing["evidence"].id
+  role          = "roles/cloudkms.publicKeyViewer"
+  member        = google_service_account.workloads["recovery"].member
 }
 
 resource "google_kms_crypto_key_iam_member" "evidence_public_key_evidence_writer" {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import re
@@ -28,6 +29,14 @@ from controlgraph_canary.application.health_orchestration import (
     verify_healthy_promotion_chain,
 )
 from controlgraph_canary.application.promotion_store import PromotionHealthChainReader
+from controlgraph_canary.application.recovery_execution import (
+    RecoveryHealthChainReader,
+    RecoveryPrestateAttestationVerifier,
+)
+from controlgraph_canary.application.recovery_store import RecoveryIntentReader
+from controlgraph_canary.application.revocation_proof import (
+    EpochRevocationEvidenceVerifier,
+)
 from controlgraph_canary.application.root_authority import (
     RootAuthorityBundleReader,
     TrustedRootAuthority,
@@ -67,6 +76,7 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     CapabilityClaims,
     EpochAuthorityRecord,
+    EpochChangeCause,
     ExecutionReceipt,
     ReceiptOutcome,
     SignedCapability,
@@ -77,6 +87,20 @@ from controlgraph_canary.contracts.promotion_execution import (
     VerifiedApplyReceiptLocatorV1,
     create_promotion_authorization,
     promotion_capability_id,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RECOVERY_CAPABILITY_ISSUANCE_RESULT_V2,
+    RecoveryCapabilityIssuanceCommandV2,
+    RecoveryCapabilityIssuanceResultV2,
+    RecoveryCommandV2,
+    RecoveryIntentV1,
+    RevokedV2RecoverySourceV1,
+    UnhealthyRecoverySourceV1,
+    create_recovery_apply_receipt_locator,
+    create_recovery_authorization,
+    create_recovery_health_chain_locator,
+    recovery_capability_issuance_command_sha256,
+    recovery_target_configuration_sha256,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
@@ -93,12 +117,13 @@ CAPABILITY_IDENTITY_DOMAIN = b"controlgraph.capability-identity/v1\0"
 DEFAULT_CAPABILITY_LIFETIME_SECONDS = 300
 MAX_CAPABILITY_LIFETIME_SECONDS = 900
 MIN_PROMOTION_EXECUTION_MARGIN_SECONDS: Final = 30
+MIN_RECOVERY_EXECUTION_MARGIN_SECONDS: Final = 120
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SERVICE_ACCOUNT = re.compile(
-    r"^controlgraph-(?:coordinator|issuer|executor)@"
+    r"^controlgraph-(?:coordinator|issuer|executor|recovery)@"
     r"controlgraph-canary-[a-z0-9]{6,10}\.iam\.gserviceaccount\.com$"
 )
 _FORBIDDEN_RESOURCE_NAME = "reconcile"
@@ -248,6 +273,7 @@ class CapabilityIssuerConfiguration:
     target: TargetBinding
     handler_audience: str
     lifetime_seconds: int = DEFAULT_CAPABILITY_LIFETIME_SECONDS
+    recovery_handler_audience: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.target) is not TargetBinding:
@@ -293,6 +319,33 @@ class CapabilityIssuerConfiguration:
             or not 1 <= self.lifetime_seconds <= MAX_CAPABILITY_LIFETIME_SECONDS
         ):
             raise ValueError("capability lifetime is invalid")
+        if self.recovery_handler_audience is not None:
+            if type(self.recovery_handler_audience) is not str or any(
+                character in self.recovery_handler_audience for character in "*?[]"
+            ):
+                raise ValueError("issuer recovery audience is invalid")
+            try:
+                self.recovery_handler_audience.encode("ascii")
+                recovery = urlsplit(self.recovery_handler_audience)
+                recovery_port = recovery.port
+            except (UnicodeEncodeError, ValueError) as error:
+                raise ValueError("issuer recovery audience is invalid") from error
+            if (
+                recovery.scheme != "https"
+                or recovery.username is not None
+                or recovery.password is not None
+                or recovery_port is not None
+                or recovery.hostname is None
+                or not recovery.hostname.startswith("controlgraph-recovery-")
+                or not recovery.hostname.endswith(".run.app")
+                or recovery.path
+                or recovery.query
+                or recovery.fragment
+                or _FORBIDDEN_RESOURCE_NAME in recovery.hostname
+            ):
+                raise ValueError(
+                    "issuer recovery audience must be the fixed recovery origin"
+                )
 
     @property
     def issuer_identity(self) -> str:
@@ -305,6 +358,10 @@ class CapabilityIssuerConfiguration:
     @property
     def subject_identity(self) -> str:
         return _service_account("executor", self.target.project_id)
+
+    @property
+    def recovery_subject_identity(self) -> str:
+        return _service_account("recovery", self.target.project_id)
 
 
 @runtime_checkable
@@ -377,10 +434,31 @@ class _TrustedIssuanceState:
     authority: EpochAuthorityRecord
 
 
+@dataclass(frozen=True, slots=True)
+class _TrustedRecoveryIssuanceInputs:
+    state: _TrustedIssuanceState
+    intent: StoredRecord[RecoveryIntentV1]
+    receipt: StoredRecord[ExecutionReceipt]
+    health_chain: SignedHealthDecisionChainV1 | None
+
+
 def _capability_id(claim_material: RestrictedJson) -> str:
     material = canonical_json_value_bytes(claim_material)
     digest = hashlib.sha256(CAPABILITY_IDENTITY_DOMAIN + material).hexdigest()
     return f"cgcap-{digest}"
+
+
+async def _read_recovery_records(
+    intent_reader: RecoveryIntentReader,
+    receipt_reader: VerifiedApplyReceiptReader,
+    command: RecoveryCommandV2,
+) -> tuple[object, object]:
+    if type(command) is not RecoveryCommandV2:
+        raise TypeError("recovery command is invalid")
+    return await asyncio.gather(
+        intent_reader.read_recovery_intent(command.expected_root_sha256),
+        receipt_reader.read_receipt(command.verified_apply_receipt.idempotency_key),
+    )
 
 
 class CapabilityIssuer:
@@ -397,6 +475,12 @@ class CapabilityIssuer:
         receipt_reader: VerifiedApplyReceiptReader | None = None,
         promotion_health_chain_reader: PromotionHealthChainReader | None = None,
         health_signature_verifier: HealthAttestationVerifier | None = None,
+        recovery_intent_reader: RecoveryIntentReader | None = None,
+        recovery_health_chain_reader: RecoveryHealthChainReader | None = None,
+        recovery_prestate_verifier: RecoveryPrestateAttestationVerifier
+        | None = None,
+        revocation_evidence_verifier: EpochRevocationEvidenceVerifier
+        | None = None,
     ) -> None:
         if type(configuration) is not CapabilityIssuerConfiguration:
             raise TypeError("an exact capability issuer configuration is required")
@@ -436,6 +520,41 @@ class CapabilityIssuer:
                 raise ValueError("health-chain reader target does not match issuer configuration")
             if not isinstance(health_signature_verifier, HealthAttestationVerifier):
                 raise TypeError("an exact health signature verifier is required")
+        recovery_dependencies = (
+            recovery_intent_reader,
+            recovery_health_chain_reader,
+            recovery_prestate_verifier,
+            revocation_evidence_verifier,
+        )
+        if any(value is not None for value in recovery_dependencies) and any(
+            value is None for value in recovery_dependencies
+        ):
+            raise ValueError("all recovery verification dependencies are required")
+        if recovery_intent_reader is not None:
+            if receipt_reader is None or configuration.recovery_handler_audience is None:
+                raise ValueError(
+                    "recovery issuance requires receipt reading and a fixed audience"
+                )
+            if (
+                not isinstance(recovery_intent_reader, RecoveryIntentReader)
+                or recovery_intent_reader.target != configuration.target
+                or not isinstance(
+                    recovery_health_chain_reader,
+                    RecoveryHealthChainReader,
+                )
+                or recovery_health_chain_reader.target != configuration.target
+                or not isinstance(
+                    recovery_prestate_verifier,
+                    RecoveryPrestateAttestationVerifier,
+                )
+                or recovery_prestate_verifier.project_id
+                != configuration.target.project_id
+                or not isinstance(
+                    revocation_evidence_verifier,
+                    EpochRevocationEvidenceVerifier,
+                )
+            ):
+                raise ValueError("recovery verification dependencies are not target-bound")
         self._store = store
         self._signer = signer
         self._configuration = configuration
@@ -444,6 +563,10 @@ class CapabilityIssuer:
         self._receipt_reader = receipt_reader
         self._promotion_health_chain_reader = promotion_health_chain_reader
         self._health_signature_verifier = health_signature_verifier
+        self._recovery_intent_reader = recovery_intent_reader
+        self._recovery_health_chain_reader = recovery_health_chain_reader
+        self._recovery_prestate_verifier = recovery_prestate_verifier
+        self._revocation_evidence_verifier = revocation_evidence_verifier
 
     async def issue(
         self,
@@ -556,11 +679,82 @@ class CapabilityIssuer:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return envelope
 
+    async def issue_recovery(
+        self,
+        request: RecoveryCapabilityIssuanceCommandV2,
+        *,
+        principal: AuthenticatedIssuancePrincipal | None,
+        now: datetime,
+    ) -> RecoveryCapabilityIssuanceResultV2:
+        """Issue RECOVER only after independently replaying every source twice."""
+
+        if type(request) is not RecoveryCapabilityIssuanceCommandV2:
+            raise TypeError("an exact recovery issuance command is required")
+        _, current_second = _utc_second(now)
+        self._authorize(principal)
+        authorization = request.authorization
+        issued_second = _parse_utc_second(authorization.issued_at)
+        scheduled_second = _parse_utc_second(request.scheduled_at)
+        proof_expiry = _parse_utc_second(authorization.proof_valid_until)
+        configured_expiry = min(
+            issued_second + self._configuration.lifetime_seconds,
+            proof_expiry,
+        )
+        if (
+            issued_second > current_second
+            or current_second > scheduled_second
+            or configured_expiry - scheduled_second
+            < MIN_RECOVERY_EXECUTION_MARGIN_SECONDS
+            or self._configuration.lifetime_seconds
+            > authorization.maximum_capability_lifetime_seconds
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.VALIDITY_EXHAUSTED)
+        initial = await self._read_verified_recovery_inputs(
+            request,
+            current_second,
+        )
+        envelope = self._issue_trusted(
+            state=initial.state,
+            request=request,
+            issued_at=authorization.issued_at,
+            not_before=request.scheduled_at,
+            issued_second=issued_second,
+            expires_second=proof_expiry,
+            lineage=(),
+            parent_digest=None,
+            action=CapabilityAction.RECOVER_STABLE,
+            provider_etag=authorization.current_provider_etag,
+        )
+        confirmed = await self._read_verified_recovery_inputs(
+            request,
+            current_second,
+        )
+        if confirmed != initial:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        try:
+            return RecoveryCapabilityIssuanceResultV2(
+                schema_version=RECOVERY_CAPABILITY_ISSUANCE_RESULT_V2,
+                issuance_command=request,
+                issuance_command_sha256=(
+                    recovery_capability_issuance_command_sha256(request)
+                ),
+                authorization_sha256=canonical_sha256(authorization),
+                capability_id=authorization.capability_id,
+                capability=envelope,
+                capability_sha256=canonical_sha256(envelope),
+                issued_at=envelope.claims.issued_at,
+                expires_at=envelope.claims.expires_at,
+            )
+        except (ContractError, TypeError, ValueError):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+
     def _issue_trusted(
         self,
         *,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequestV2,
+        request: CapabilityIssuanceRequest
+        | PromotionCapabilityIssuanceRequestV2
+        | RecoveryCapabilityIssuanceCommandV2,
         issued_at: str,
         not_before: str,
         issued_second: int,
@@ -630,7 +824,9 @@ class CapabilityIssuer:
     @staticmethod
     def _validate_expected_state(
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequestV2,
+        request: CapabilityIssuanceRequest
+        | PromotionCapabilityIssuanceRequestV2
+        | RecoveryCapabilityIssuanceCommandV2,
     ) -> None:
         if (
             state.root.root_sha256 != request.expected_root_sha256
@@ -826,6 +1022,190 @@ class CapabilityIssuer:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         return stored
 
+    async def _read_verified_recovery_inputs(
+        self,
+        request: RecoveryCapabilityIssuanceCommandV2,
+        issued_second: int,
+    ) -> _TrustedRecoveryIssuanceInputs:
+        intent_reader = self._recovery_intent_reader
+        chain_reader = self._recovery_health_chain_reader
+        prestate_verifier = self._recovery_prestate_verifier
+        revocation_verifier = self._revocation_evidence_verifier
+        receipt_reader = self._receipt_reader
+        health_verifier = self._health_signature_verifier
+        recovery_audience = self._configuration.recovery_handler_audience
+        if (
+            intent_reader is None
+            or chain_reader is None
+            or prestate_verifier is None
+            or revocation_verifier is None
+            or receipt_reader is None
+            or recovery_audience is None
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        authorization = request.authorization
+        prestate = authorization.prestate_attestation
+        command = prestate.result.request.command
+        state = await self._read_trusted_state(request.root_id, issued_second)
+        self._validate_expected_state(state, request)
+        bounds = state.root.content.authority_bounds
+        if (
+            authorization.root_id != request.root_id
+            or authorization.root_sha256 != request.expected_root_sha256
+            or authorization.epoch != request.expected_epoch
+            or authorization.request_id != request.request_id
+            or authorization.idempotency_key != request.idempotency_key
+            or authorization.scheduled_at != request.scheduled_at
+            or command.root_id != request.root_id
+            or command.expected_root_sha256 != request.expected_root_sha256
+            or command.expected_epoch != request.expected_epoch
+            or command.request_id != request.request_id
+            or command.idempotency_key != request.idempotency_key
+            or command.scheduled_at != request.scheduled_at
+            or bounds.recovery_identity
+            != self._configuration.recovery_subject_identity
+            or bounds.recovery_audience != recovery_audience
+            or bounds.recover_stable.subject_identity
+            != self._configuration.recovery_subject_identity
+            or bounds.recover_stable.audience != recovery_audience
+            or authorization.recovery_identity
+            != self._configuration.recovery_subject_identity
+            or authorization.recovery_audience != recovery_audience
+            or authorization.capability_signing_key_version
+            != self._signer.profile.key_version
+            or authorization.evidence_signing_key_version
+            != state.root.content.evidence_signing_key_version
+            or prestate_verifier.key_version
+            != state.root.content.evidence_signing_key_version
+            or _parse_utc_second(authorization.issued_at) > issued_second
+            or issued_second > _parse_utc_second(authorization.scheduled_at)
+            or issued_second >= _parse_utc_second(authorization.proof_valid_until)
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        try:
+            intent, receipt = await _read_recovery_records(
+                intent_reader,
+                receipt_reader,
+                command,
+            )
+        except AuthorityStoreCorruptRecord:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        except AuthorityStoreError:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
+        except Exception:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_UNAVAILABLE) from None
+        if (
+            type(intent) is not StoredRecord
+            or type(intent.value) is not RecoveryIntentV1
+            or intent.revision != 0
+            or intent.value.command != command
+            or type(receipt) is not StoredRecord
+            or type(receipt.value) is not ExecutionReceipt
+            or receipt.revision != command.verified_apply_receipt.storage_revision
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        stored_receipt = receipt.value
+        source = command.source
+        expected_receipt_epoch = (
+            command.expected_epoch
+            if type(source) is UnhealthyRecoverySourceV1
+            else 1
+        )
+        try:
+            locator = create_recovery_apply_receipt_locator(
+                stored_receipt,
+                storage_revision=receipt.revision,
+            )
+            expected_prestate = recovery_target_configuration_sha256(
+                state.root,
+                stable_percent=90,
+                candidate_percent=10,
+            )
+            expected_authorization = create_recovery_authorization(
+                root=state.root,
+                command=command,
+                prestate_attestation=prestate,
+            )
+        except (ContractError, TypeError, ValueError):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        if (
+            locator != command.verified_apply_receipt
+            or expected_authorization != authorization
+            or stored_receipt.target != self._configuration.target
+            or stored_receipt.root_id != command.root_id
+            or stored_receipt.root_sha256 != command.expected_root_sha256
+            or stored_receipt.epoch != expected_receipt_epoch
+            or stored_receipt.action is not CapabilityAction.APPLY_CANARY
+            or stored_receipt.outcome is not ReceiptOutcome.VERIFIED
+            or stored_receipt.reason_code is not None
+            or stored_receipt.expected_poststate_sha256 != expected_prestate
+            or stored_receipt.plan_sha256
+            != canonical_sha256(state.root.content.rollout_plan)
+            or stored_receipt.provider_etag
+            != state.root.content.stable_snapshot.provider_etag
+            or stored_receipt.observed_etag is None
+            or stored_receipt.observed_authority_epoch != expected_receipt_epoch
+            or _parse_utc_second(stored_receipt.updated_at) > issued_second
+            or prestate.result.retrieved_at != authorization.issued_at
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        try:
+            await prestate_verifier.verify(prestate)
+        except Exception:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+
+        chain: SignedHealthDecisionChainV1 | None = None
+        if type(source) is UnhealthyRecoverySourceV1:
+            if type(state.root) is not RolloutRootV3 or health_verifier is None:
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+            try:
+                chain = await chain_reader.read_recovery_health_chain(
+                    source.health_chain_locator
+                )
+                if chain is None:
+                    raise ValueError("health chain is missing")
+                for signed in chain.signed_proofs:
+                    await health_verifier.verify(signed)
+                health_locator = create_recovery_health_chain_locator(chain)
+            except Exception:
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+            if (
+                health_locator != source.health_chain_locator
+                or chain.anchor.apply_receipt != stored_receipt
+            ):
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        elif type(source) is RevokedV2RecoverySourceV1:
+            authority = state.authority
+            proof = source.revocation_proof
+            if (
+                type(state.root) is not RolloutRootV2
+                or state.snapshot.authority_revision != 1
+                or authority.revision != 1
+                or authority.current_epoch != 2
+                or authority.previous_epoch != 1
+                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+                or proof.authority != authority
+                or proof.result.previous_epoch != 1
+                or proof.result.new_epoch != 2
+                or proof.signed_evidence.signing_key_version
+                != state.root.content.evidence_signing_key_version
+                or revocation_verifier.evidence_key_version
+                != state.root.content.evidence_signing_key_version
+            ):
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+            try:
+                await revocation_verifier.verify(proof.signed_evidence)
+            except Exception:
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        else:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        return _TrustedRecoveryIssuanceInputs(
+            state=state,
+            intent=intent,
+            receipt=receipt,
+            health_chain=chain,
+        )
+
     async def _resolve_lineage(
         self,
         parent_capability_id: str | None,
@@ -938,7 +1318,9 @@ class CapabilityIssuer:
         self,
         *,
         state: _TrustedIssuanceState,
-        request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequestV2,
+        request: CapabilityIssuanceRequest
+        | PromotionCapabilityIssuanceRequestV2
+        | RecoveryCapabilityIssuanceCommandV2,
         issued_at: str,
         not_before: str,
         expires_at: str,
@@ -953,11 +1335,26 @@ class CapabilityIssuer:
             grant = content.authority_bounds.apply_canary
         elif action is CapabilityAction.PROMOTE_CANDIDATE:
             grant = content.authority_bounds.promote_candidate
+        elif action is CapabilityAction.RECOVER_STABLE:
+            grant = content.authority_bounds.recover_stable
         else:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+        recovery = type(request) is RecoveryCapabilityIssuanceCommandV2
+        subject = (
+            self._configuration.recovery_subject_identity
+            if recovery
+            else self._configuration.subject_identity
+        )
+        audience = (
+            self._configuration.recovery_handler_audience
+            if recovery
+            else self._configuration.handler_audience
+        )
+        if audience is None:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         identity_material: dict[str, RestrictedJson] = {
             "action": action.value,
-            "audience": self._configuration.handler_audience,
+            "audience": audience,
             "epoch": state.authority.current_epoch,
             "expires_at": expires_at,
             "idempotency_key": request.idempotency_key,
@@ -968,7 +1365,7 @@ class CapabilityIssuer:
             "root_sha256": root.root_sha256,
             "schema_version": CAPABILITY_IDENTITY_V1,
             "signing_key_version": self._signer.profile.key_version,
-            "subject": self._configuration.subject_identity,
+            "subject": subject,
             "target": content.target.model_dump(mode="json"),
         }
         if type(request) is PromotionCapabilityIssuanceRequestV2:
@@ -979,17 +1376,26 @@ class CapabilityIssuer:
                     request.verified_apply_receipt.model_dump(mode="json"),
                 )
             )
+        elif type(request) is RecoveryCapabilityIssuanceCommandV2:
+            identity_material["scheduled_at"] = request.scheduled_at
+            identity_material["recovery_authorization_sha256"] = (
+                request.authorization_sha256
+            )
         capability_id = (
             promotion_capability_id(request.authorization)
             if type(request) is PromotionCapabilityIssuanceRequestV2
-            else _capability_id(identity_material)
+            else (
+                request.authorization.capability_id
+                if type(request) is RecoveryCapabilityIssuanceCommandV2
+                else _capability_id(identity_material)
+            )
         )
         return CapabilityClaims(
             schema_version=CAPABILITY_CLAIMS_V1,
             capability_id=capability_id,
             issuer=self._configuration.issuer_identity,
-            subject=self._configuration.subject_identity,
-            audience=self._configuration.handler_audience,
+            subject=subject,
+            audience=audience,
             target=content.target,
             root_id=root.root_id,
             root_sha256=root.root_sha256,
@@ -999,7 +1405,7 @@ class CapabilityIssuer:
             candidate_revision=plan.candidate_revision,
             stable_percent=grant.stable_percent,
             candidate_percent=grant.candidate_percent,
-            concurrency=None,
+            concurrency=(content.authority_bounds.concurrency if recovery else None),
             plan_sha256=canonical_sha256(plan),
             provider_etag=provider_etag,
             request_id=request.request_id,
@@ -1019,6 +1425,7 @@ __all__ = [
     "DEFAULT_CAPABILITY_LIFETIME_SECONDS",
     "MAX_CAPABILITY_LIFETIME_SECONDS",
     "MIN_PROMOTION_EXECUTION_MARGIN_SECONDS",
+    "MIN_RECOVERY_EXECUTION_MARGIN_SECONDS",
     "AuthenticatedIssuancePrincipal",
     "CapabilityEnvelopeVerifier",
     "CapabilityIssuanceError",

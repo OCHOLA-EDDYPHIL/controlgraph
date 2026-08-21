@@ -31,7 +31,7 @@ from controlgraph_canary.contracts.codec import canonical_json_bytes, decode_con
 from controlgraph_canary.contracts.health_pipeline import (
     HealthEvaluationCommandV1,
     HealthEvaluationInvocationV1,
-    HealthEvaluationResultV1,
+    HealthEvaluationResultV2,
     VerifierHealthEvaluationRequestV1,
     VerifierHealthEvaluationResultV1,
     create_verifier_health_evaluation_request,
@@ -70,13 +70,13 @@ class _CapturingApiClient:
     def __init__(self, delegate: ApiHealthEvaluationClient) -> None:
         self.delegate = delegate
         self.calls: list[tuple[HealthEvaluationCommandV1, AuthenticationContext]] = []
-        self.results: list[HealthEvaluationResultV1] = []
+        self.results: list[HealthEvaluationResultV2] = []
 
     async def evaluate(
         self,
         command: HealthEvaluationCommandV1,
         caller: AuthenticationContext,
-    ) -> HealthEvaluationResultV1:
+    ) -> HealthEvaluationResultV2:
         self.calls.append((command, caller))
         result = await self.delegate.evaluate(command, caller)
         self.results.append(result)
@@ -89,13 +89,13 @@ class _CapturingCoordinatorService:
         self.calls: list[
             tuple[HealthEvaluationInvocationV1, AuthenticationContext]
         ] = []
-        self.results: list[HealthEvaluationResultV1] = []
+        self.results: list[HealthEvaluationResultV2] = []
 
     async def evaluate(
         self,
         invocation: HealthEvaluationInvocationV1,
         caller: AuthenticationContext,
-    ) -> HealthEvaluationResultV1:
+    ) -> HealthEvaluationResultV2:
         self.calls.append((invocation, caller))
         result = await self.delegate.evaluate(invocation, caller)
         self.results.append(result)
@@ -192,7 +192,7 @@ def test_api_health_route_decodes_and_dispatches_only_the_exact_command() -> Non
     )
 
     assert response.status_code == 200
-    result = decode_contract(response.content, HealthEvaluationResultV1)
+    result = decode_contract(response.content, HealthEvaluationResultV2)
     assert result == capturing.results[0]
     assert response.content == canonical_json_bytes(result)
     assert capturing.calls == [(command, operator)]
@@ -231,7 +231,7 @@ def test_coordinator_health_route_decodes_and_dispatches_only_exact_invocation()
     )
 
     assert response.status_code == 200
-    result = decode_contract(response.content, HealthEvaluationResultV1)
+    result = decode_contract(response.content, HealthEvaluationResultV2)
     assert result == capturing.results[0]
     assert response.content == canonical_json_bytes(result)
     assert capturing.calls == [(invocation, caller)]

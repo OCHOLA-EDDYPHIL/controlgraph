@@ -6,17 +6,14 @@ ControlGraph Canary addresses stale authority at execution time. A request can b
 authenticated, correctly signed, and intact yet no longer be authorized because it was queued
 before an operator revoked its rollout epoch.
 
-The current repository implements strict versioned contracts, cross-language canonical fixtures,
-a pure rollout reducer, root-scoped exact-match epochs, transactional Firestore authority and
-receipt adapters, purpose-separated KMS signing and verification, sealed Cloud Tasks delivery,
-mutation-disabled service shells, a static React console, and Terraform for their isolated cloud
-substrate. These boundaries have local and Firestore-emulator coverage. They have not yet been
-composed into the M3 enforcement path or accepted in the hosted environment, and the repository
-does not yet mutate Cloud Run, evaluate hosted health, recover a service, or render a hosted
-evidence timeline.
-
-The architecture below fixes the boundary that later numbered implementation work must satisfy.
-It must not be read as evidence that the hosted path has already been deployed or accepted.
+The repository implements strict versioned contracts, cross-language canonical fixtures, a pure
+rollout reducer, root-scoped exact-match epochs, transactional Firestore authority and receipt
+adapters, purpose-separated KMS signing and verification, sealed Cloud Tasks delivery,
+target-bound Cloud Run mutation and readback, deterministic Monitoring health evaluation,
+healthy promotion, and captured-stable recovery. Terraform defines the isolated cloud substrate,
+and the React console remains static and read-only. These implementation facts do not establish
+that a particular revision has passed hosted acceptance; operator timeline and advisory surfaces
+are not part of this implementation boundary.
 
 ## Control path
 
@@ -50,6 +47,12 @@ target-bound Cloud Run adapter with provider precondition
     v
 idempotent receipt, independent readback, and evidence
 ```
+
+After a verified 90/10 apply, the verifier derives the two fixed candidate-revision Monitoring
+queries from the immutable root, canonicalizes bounded results, applies the frozen policy, and
+obtains a signed health proof. Consecutive healthy windows authorize the normal promotion path.
+A terminal unhealthy proof is stored atomically with one root-owned recovery intent and then
+drives the separately addressed recovery path.
 
 No model appears in this path. An optional Gemini or ADK advisory integration may consume a
 narrow, read-only application view, but its output cannot approve authority, classify health,
@@ -85,7 +88,7 @@ Optional agent integrations belong under `integrations/` and receive no mutation
 
 ## Domain records
 
-The first contract contains exact, versioned records for:
+The contracts contain exact, versioned records for:
 
 - project, region, environment, and service target binding;
 - stable service snapshot and provider precondition;
@@ -94,7 +97,8 @@ The first contract contains exact, versioned records for:
 - capability claims, signatures, lineage, and attenuation;
 - mutation intent and addressed task request;
 - execution receipt and ambiguity classification;
-- deterministic health input and restore-only recovery plan; and
+- Monitoring queries, canonical observations, health decisions, and signed proof chains;
+- recovery intent, prestate, authorization, dispatch, and addressed task; and
 - ordered evidence events.
 
 The complete vocabulary and terminal semantics are defined in `product-contract.md`.
@@ -161,10 +165,12 @@ can sign approved canonical claims but cannot mutate Cloud Run. The evidence wri
 evidence and has no Firestore authority-write permission; the verifier remains read-only.
 
 Firestore server-client IAM is database-granular. The coordinator authority facade is the only
-runtime identity with database write permission. Executor and recovery identities retain strong
-read access but submit exact receipt claim and compare-and-set requests through narrow,
-authenticated coordinator operations. Canonical document families and transition checks remain
-enforced by the persistence adapter; they are not represented as collection-level IAM controls.
+runtime identity with database write permission. The executor retains strong authority reads and
+submits receipt claims and compare-and-set requests through narrow authenticated coordinator
+operations. Standard execution and recovery use distinct receipt routes. The recovery identity
+can read the authority needed to validate its task but does not write receipts or mutate the
+target. Canonical document families and transition checks remain enforced by the persistence
+adapter; they are not represented as collection-level IAM controls.
 
 ## Delivery and execution
 
@@ -187,6 +193,35 @@ The adapter accepts an internal mutation permit produced only after the final au
 does not accept an arbitrary project, region, service, image, revision, URL, API method, or field
 mask from a capability holder.
 
+### Health, promotion, and recovery
+
+The V3 rollout root freezes one Monitoring policy: exact Cloud Run request-count and latency
+metrics, one-minute aligned windows, a bounded observation delay, minimum request count, explicit
+healthy and unhealthy thresholds, deterministic rounding, missing-data handling, and consecutive
+window requirements. Only the verifier has Monitoring read authority. It binds queries to the
+exact project, region, service, configuration, candidate revision, root interval, and epoch;
+normalizes pages, duplicates, gaps, and provider numeric values; and feeds canonical observations
+to the pure evaluator. Each decision cites its policy, queries, samples, aggregates, predecessor,
+and next state before the evidence writer signs it. Only a signed terminal healthy chain can
+authorize candidate promotion through the normal executor and receipt path.
+
+For a signed terminal unhealthy decision, the health-chain append and recovery-intent creation
+share one Firestore transaction. A root-derived idempotency key, deterministic dispatch identity,
+and compare-and-set enqueue states ensure concurrent evaluators converge on one addressed task;
+an uncertain enqueue remains explicit and does not cause an application retry. The verifier reads
+the current 90/10 target and obtains a signed recovery-prestate attestation. The issuer then signs
+a recovery capability whose only action is 100 percent traffic to the captured stable revision.
+
+The recovery task identity invokes only the recovery service. That service independently checks
+the caller, capability, root, current epoch, signed prestate, and embedded source-receipt binding,
+then forwards the unchanged canonical task once to an executor-hosted recovery facade. The
+recovery identity has no Cloud Run service-update, reference-target `actAs`, or operation-read
+permission. The executor facade has its own caller policy, independently repeats the recovery
+validation, and uses the separate recovery receipt route. Its final gate rereads the exact durable
+source receipt and current root and epoch before permitting one traffic update containing the
+captured stable revision at 100 percent. Exact readback is required for `VERIFIED`; drift, a lost
+response, or a nonmatching observation remains `AMBIGUOUS` without blind mutation retry.
+
 ## Receipts, replay, and uncertain outcomes
 
 The deterministic idempotency identity binds request identity, capability digest, root, epoch,
@@ -208,7 +243,7 @@ effect becomes `FAILED_SAFE`; it does not restore dispatch authority.
 
 ## Cloud boundary
 
-The planned deployment is one isolated Google Cloud project and one compatible region. Terraform
+The deployment boundary is one isolated Google Cloud project and one compatible region. Terraform
 defines required APIs, immutable-image Artifact Registry inputs, Firestore, KMS, Cloud Tasks,
 private Cloud Run services, distinct identities, bounded resources, audit configuration, and a
 disposable reference target. Minimum instances remain zero where safe, and no long-lived service
@@ -231,9 +266,9 @@ The API is the authority-preserving operator boundary. A CLI mutation command ca
 an authenticated identity, versioned request, expected epoch, request identity, reason, and
 explicit confirmation; it does not write Firestore or invoke Cloud Run directly.
 
-The current console is static and read-only. Any later evidence presentation must obtain bounded
-data through the API and must not hold provider credentials or become a mutation surface. This
-architecture makes no claim that such hosted console behavior is currently implemented.
+The current console is static and read-only. Evidence presentation must obtain bounded data
+through the API and must not hold provider credentials or become a mutation surface. This
+architecture makes no claim that such hosted console behavior is implemented.
 
 ## Selective reuse and provenance
 

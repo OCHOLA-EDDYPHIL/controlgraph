@@ -102,6 +102,10 @@ locals {
       service = module.executor.service.name
       member  = "serviceAccount:${local.service_accounts.execution_task_caller}"
     }
+    executor_recovery_facade = {
+      service = module.executor.service.name
+      member  = "serviceAccount:${local.service_accounts.recovery}"
+    }
     recovery = {
       service = module.recovery.service.name
       member  = "serviceAccount:${local.service_accounts.recovery_task_caller}"
@@ -134,6 +138,7 @@ check "runtime_invoker_map_is_closed" {
         "coordinator_receipts",
         "issuer",
         "executor",
+        "executor_recovery_facade",
         "recovery",
         "verifier",
         "evidence_writer",
@@ -142,6 +147,8 @@ check "runtime_invoker_map_is_closed" {
       ]) &&
       local.run_invokers.coordinator_receipts.service == module.coordinator.service.name &&
       local.run_invokers.coordinator_receipts.member == "serviceAccount:${local.service_accounts.executor}" &&
+      local.run_invokers.executor_recovery_facade.service == module.executor.service.name &&
+      local.run_invokers.executor_recovery_facade.member == "serviceAccount:${local.service_accounts.recovery}" &&
       local.run_invokers.evidence_writer.service == module.evidence_writer.service.name &&
       local.run_invokers.evidence_writer.member == "serviceAccount:${local.service_accounts.coordinator}" &&
       local.run_invokers.evidence_writer_verifier.service == module.evidence_writer.service.name &&
@@ -214,5 +221,18 @@ check "executor_target_mutation_is_service_scoped" {
       length(google_project_iam_member.executor_operation_reader.condition) == 0
     )
     error_message = "The executor may mutate only the fixed reference service, act as only its fixed runtime identity, and read operation status only in the dedicated project."
+  }
+}
+
+check "recovery_has_no_direct_target_mutation_authority" {
+  assert {
+    condition = (
+      local.run_invokers.executor_recovery_facade.service == module.executor.service.name &&
+      local.run_invokers.executor_recovery_facade.member == "serviceAccount:${local.service_accounts.recovery}" &&
+      google_cloud_run_v2_service_iam_member.executor_target_traffic_mutator.member == "serviceAccount:${local.service_accounts.executor}" &&
+      google_service_account_iam_member.executor_reference_target_act_as.member == "serviceAccount:${local.service_accounts.executor}" &&
+      google_project_iam_member.executor_operation_reader.member == "serviceAccount:${local.service_accounts.executor}"
+    )
+    error_message = "Recovery must invoke the executor facade without receiving direct target update, reference actAs, or operation-read authority."
   }
 }

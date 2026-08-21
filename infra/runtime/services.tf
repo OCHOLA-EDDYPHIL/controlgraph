@@ -21,6 +21,7 @@ module "issuer" {
     CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
     CONTROLGRAPH_EVIDENCE_KEY_VERSION   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
     CONTROLGRAPH_SIGNING_ALGORITHM      = data.terraform_remote_state.foundation.outputs.signing_keys.capability.algorithm
+    CONTROLGRAPH_RECOVERY_URL           = local.service_audiences.recovery
   })
 }
 
@@ -41,14 +42,17 @@ module "executor" {
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "executor" })
   environment = merge(local.common_environment, local.identity_environment.executor, {
-    CONTROLGRAPH_ROLE                       = "executor"
-    CONTROLGRAPH_SERVICE_NAME               = local.service_names.executor
-    CONTROLGRAPH_CONTROLLER_ID              = "${var.project_id}:${var.region}:executor"
-    CONTROLGRAPH_MUTATIONS_ENABLED          = "true"
-    CONTROLGRAPH_CAPABILITY_KEY_VERSION     = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
-    CONTROLGRAPH_COORDINATOR_URL            = local.service_audiences.coordinator
-    CONTROLGRAPH_TARGET_NETWORK_RESOURCE    = data.terraform_remote_state.foundation.outputs.network.network_id
-    CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
+    CONTROLGRAPH_ROLE                           = "executor"
+    CONTROLGRAPH_SERVICE_NAME                   = local.service_names.executor
+    CONTROLGRAPH_CONTROLLER_ID                  = "${var.project_id}:${var.region}:executor"
+    CONTROLGRAPH_MUTATIONS_ENABLED              = "true"
+    CONTROLGRAPH_CAPABILITY_KEY_VERSION         = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION           = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_COORDINATOR_URL                = local.service_audiences.coordinator
+    CONTROLGRAPH_TARGET_NETWORK_RESOURCE        = data.terraform_remote_state.foundation.outputs.network.network_id
+    CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE     = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
+    CONTROLGRAPH_RECOVERY_FACADE_CALLER_EMAIL   = local.service_accounts.recovery
+    CONTROLGRAPH_RECOVERY_FACADE_CALLER_SUBJECT = tostring(local.service_subjects.recovery)
   })
 }
 
@@ -60,7 +64,7 @@ module "recovery" {
   project_id      = var.project_id
   region          = var.region
   service_name    = local.service_names.recovery
-  description     = "Private mutation-disabled ControlGraph recovery shell."
+  description     = "Private stable-only ControlGraph recovery worker."
   container_image = var.controller_image
   service_account = local.service_accounts.recovery
   ingress         = "INGRESS_TRAFFIC_INTERNAL_ONLY"
@@ -72,7 +76,10 @@ module "recovery" {
     CONTROLGRAPH_ROLE                   = "recovery"
     CONTROLGRAPH_SERVICE_NAME           = local.service_names.recovery
     CONTROLGRAPH_CONTROLLER_ID          = "${var.project_id}:${var.region}:recovery"
+    CONTROLGRAPH_MUTATIONS_ENABLED      = "true"
     CONTROLGRAPH_CAPABILITY_KEY_VERSION = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
+    CONTROLGRAPH_EVIDENCE_KEY_VERSION   = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
+    CONTROLGRAPH_EXECUTOR_URL           = local.service_audiences.executor
   })
 }
 
@@ -167,6 +174,8 @@ module "coordinator" {
     CONTROLGRAPH_RECOVERY_TASK_CALLER                    = local.service_accounts.recovery_task_caller
     CONTROLGRAPH_RECEIPT_AUTH_CALLER_EMAIL               = local.service_accounts.executor
     CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT             = tostring(local.service_subjects.executor)
+    CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL      = local.service_accounts.executor
+    CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT    = tostring(local.service_subjects.executor)
   })
 }
 

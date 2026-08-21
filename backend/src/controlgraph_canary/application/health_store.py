@@ -21,6 +21,12 @@ from controlgraph_canary.contracts.models import TargetBinding
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionHealthChainLocatorV1,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryIntentV1,
+    UnhealthyRecoverySourceV1,
+    create_recovery_apply_receipt_locator,
+    create_recovery_health_chain_locator,
+)
 
 
 class HealthChainWriteDisposition(StrEnum):
@@ -38,6 +44,7 @@ class HealthChainSnapshot:
     manifest: StoredRecord[HealthChainManifestV1] | None
     signed_proofs: tuple[StoredRecord[SignedHealthDecisionProofV1], ...]
     signed_chain: SignedHealthDecisionChainV1 | None
+    recovery_intent: StoredRecord[RecoveryIntentV1] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -48,7 +55,11 @@ class HealthChainSnapshot:
         ):
             raise TypeError("health-chain snapshot anchor is invalid")
         if self.manifest is None:
-            if self.signed_proofs or self.signed_chain is not None:
+            if (
+                self.signed_proofs
+                or self.signed_chain is not None
+                or self.recovery_intent is not None
+            ):
                 raise ValueError("anchor-only health snapshot contains chain state")
             return
         if (
@@ -74,6 +85,35 @@ class HealthChainSnapshot:
             or create_health_chain_manifest(chain) != self.manifest.value
         ):
             raise ValueError("health-chain snapshot reconstruction is inconsistent")
+        terminal = chain.signed_proofs[-1].proof.decision
+        if terminal.status.value != "unhealthy":
+            if self.recovery_intent is not None:
+                raise ValueError("non-unhealthy health snapshot contains recovery authority")
+            return
+        intent_record = self.recovery_intent
+        if (
+            type(intent_record) is not StoredRecord
+            or type(intent_record.value) is not RecoveryIntentV1
+            or intent_record.revision != 0
+        ):
+            raise ValueError("terminal unhealthy health snapshot lacks recovery authority")
+        intent = intent_record.value
+        command = intent.command
+        source = command.source
+        try:
+            expected_locator = create_recovery_health_chain_locator(chain)
+            expected_receipt = create_recovery_apply_receipt_locator(
+                self.anchor.value.apply_receipt,
+                storage_revision=command.verified_apply_receipt.storage_revision,
+            )
+        except (TypeError, ValueError):
+            raise ValueError("terminal unhealthy recovery authority is invalid") from None
+        if (
+            type(source) is not UnhealthyRecoverySourceV1
+            or source.health_chain_locator != expected_locator
+            or command.verified_apply_receipt != expected_receipt
+        ):
+            raise ValueError("terminal unhealthy recovery authority is inconsistent")
 
     @property
     def target(self) -> TargetBinding:
@@ -144,7 +184,6 @@ class HealthChainReader(Protocol):
         locator: PromotionHealthChainLocatorV1,
     ) -> SignedHealthDecisionChainV1 | None: ...
 
-
 @runtime_checkable
 class HealthChainStore(HealthChainReader, Protocol):
     """Coordinator-only immutable anchor creation and transactional proof append."""
@@ -158,6 +197,7 @@ class HealthChainStore(HealthChainReader, Protocol):
         self,
         expected: HealthChainSnapshot,
         signed_proof: SignedHealthDecisionProofV1,
+        recovery_intent: RecoveryIntentV1 | None = None,
     ) -> HealthChainAppendResult: ...
 
 
