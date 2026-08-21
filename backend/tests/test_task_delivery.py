@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
@@ -7,7 +8,11 @@ from typing import cast
 import pytest
 from google.api_core.exceptions import AlreadyExists, DeadlineExceeded
 from google.cloud import tasks_v2
+from recovery_v2_test_data import RecoveryV2Bundle, make_unhealthy_v3_recovery_bundle
+from test_recovery_execution import _DispatchStore
+from test_recovery_execution_contracts import _dispatch_record
 
+from controlgraph_canary.application.recovery_store import RecoveryEnqueuePermit
 from controlgraph_canary.application.tasks import (
     EXECUTION_HANDLER_PATH,
     MAX_SCHEDULE_DELAY_SECONDS,
@@ -34,6 +39,11 @@ from controlgraph_canary.contracts import (
     decode_contract,
     encode_base64url,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryDispatchRecordV2,
+    RecoveryDispatchState,
+    create_recovery_intent,
+)
 from controlgraph_canary.integrations.google.tasks import GoogleCloudTasksEnqueuer
 
 PROJECT_ID = "controlgraph-canary-abc123"
@@ -55,6 +65,55 @@ def delivery_settings() -> TaskDeliverySettings:
         execution_oidc_service_account=EXECUTION_CALLER,
         recovery_oidc_service_account=RECOVERY_CALLER,
     )
+
+
+def recovery_delivery_settings(bundle: RecoveryV2Bundle) -> TaskDeliverySettings:
+    project_id = bundle.root.content.target.project_id
+    return TaskDeliverySettings(
+        project_id=project_id,
+        execution_queue_id="controlgraph-execution",
+        recovery_queue_id="controlgraph-recovery",
+        executor_service_url=bundle.root.content.authority_bounds.executor_audience,
+        recovery_service_url=bundle.authorization.recovery_audience,
+        execution_oidc_service_account=(
+            f"cg-execution-task-caller@{project_id}.iam.gserviceaccount.com"
+        ),
+        recovery_oidc_service_account=(
+            f"cg-recovery-task-caller@{project_id}.iam.gserviceaccount.com"
+        ),
+    )
+
+
+def recovery_enqueue_permit(
+    bundle: RecoveryV2Bundle,
+    *,
+    started_at: str,
+) -> RecoveryEnqueuePermit:
+    async def begin() -> RecoveryEnqueuePermit:
+        store = _DispatchStore(bundle)
+        intent_value = create_recovery_intent(
+            bundle.command,
+            created_at=bundle.command.source.triggered_at,
+        )
+        intent = await store.create_or_adopt_recovery_intent(intent_value)
+        prepared_value = _dispatch_record(
+            bundle,
+            state=RecoveryDispatchState.PREPARED,
+        )
+        prepared = await store.prepare_or_adopt_recovery_dispatch(
+            intent,
+            prepared_value,
+        )
+        started_value = RecoveryDispatchRecordV2.model_validate(
+            {
+                **prepared.value.model_dump(mode="python"),
+                "state": RecoveryDispatchState.ENQUEUE_STARTED,
+                "enqueue_started_at": started_at,
+            }
+        )
+        return (await store.begin_recovery_enqueue(prepared, started_value)).permit
+
+    return asyncio.run(begin())
 
 
 @pytest.mark.parametrize("project_id", ["shared-project", "reconcile-production"])
@@ -228,6 +287,15 @@ class _DeadlineExceededClient:
         raise DeadlineExceeded("synthetic deadline")
 
 
+class _AlreadyExistsClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_task(self, *, request: dict[str, object]) -> object:
+        self.calls += 1
+        raise AlreadyExists("synthetic duplicate")
+
+
 class _UnexpectedResponseClient:
     def __init__(self) -> None:
         self.calls = 0
@@ -321,6 +389,182 @@ def test_actions_are_sealed_to_exact_addressed_routes(
     assert addressed.audience == origin
     assert addressed.oidc_service_account == caller
     assert decode_contract(addressed.body, TaskRequest) == request
+
+
+def test_generic_recovery_cannot_bypass_the_typed_one_use_enqueue_path() -> None:
+    addressor = TaskAddressor(delivery_settings())
+    client = _CapturingClient()
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+
+    with pytest.raises(TaskAddressingError, match="directly confirmed"):
+        dispatcher.dispatch(
+            task_request(action=CapabilityAction.RECOVER_STABLE),
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
+
+    assert client.requests == []
+
+
+def test_dispatch_prepared_recovery_submits_exact_provider_request() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    client = _CapturingClient()
+    addressor = TaskAddressor(recovery_delivery_settings(bundle))
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+    now = datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC)
+    addressed = dispatcher.prepare(bundle.task, now=now)
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:15Z")
+
+    result = dispatcher.dispatch_prepared_recovery(
+        addressed,
+        permit=permit,
+        now=now,
+    )
+
+    project_id = bundle.root.content.target.project_id
+    recovery_audience = bundle.authorization.recovery_audience
+    task_name = (
+        f"projects/{project_id}/locations/us-central1/queues/controlgraph-recovery/"
+        f"tasks/cg-{canonical_sha256(bundle.task)}"
+    )
+    assert result.disposition is TaskEnqueueDisposition.CREATED
+    assert result.task_name == task_name
+    assert client.requests == [
+        {
+            "parent": (
+                f"projects/{project_id}/locations/us-central1/queues/"
+                "controlgraph-recovery"
+            ),
+            "task": {
+                "name": task_name,
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": f"{recovery_audience}{RECOVERY_HANDLER_PATH}",
+                    "headers": {"Content-Type": "application/json"},
+                    "body": canonical_json_bytes(bundle.task),
+                    "oidc_token": {
+                        "service_account_email": (
+                            f"cg-recovery-task-caller@{project_id}.iam.gserviceaccount.com"
+                        ),
+                        "audience": recovery_audience,
+                    },
+                },
+                "schedule_time": datetime(2026, 8, 21, 12, 9, 30, tzinfo=UTC),
+                "dispatch_deadline": {"seconds": TASK_DISPATCH_DEADLINE_SECONDS},
+            },
+        }
+    ]
+
+
+def test_dispatch_prepared_recovery_accepts_delayed_valid_task() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    client = _CapturingClient()
+    addressor = TaskAddressor(recovery_delivery_settings(bundle))
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+    addressed = dispatcher.prepare(
+        bundle.task,
+        now=datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC),
+    )
+    delayed = datetime(2026, 8, 21, 12, 10, 30, tzinfo=UTC)
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:10:30Z")
+
+    result = dispatcher.dispatch_prepared_recovery(
+        addressed,
+        permit=permit,
+        now=delayed,
+    )
+
+    assert result.disposition is TaskEnqueueDisposition.CREATED
+    task = cast(dict[str, object], client.requests[0]["task"])
+    assert task["schedule_time"] == datetime(2026, 8, 21, 12, 9, 30, tzinfo=UTC)
+
+
+def test_dispatch_prepared_recovery_adopts_provider_duplicate_once() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    client = _AlreadyExistsClient()
+    addressor = TaskAddressor(recovery_delivery_settings(bundle))
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+    now = datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC)
+    addressed = dispatcher.prepare(bundle.task, now=now)
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:15Z")
+
+    result = dispatcher.dispatch_prepared_recovery(
+        addressed,
+        permit=permit,
+        now=now,
+    )
+    with pytest.raises(TaskAddressingError, match="permit is invalid"):
+        dispatcher.dispatch_prepared_recovery(
+            addressed,
+            permit=permit,
+            now=now,
+        )
+
+    assert result.disposition is TaskEnqueueDisposition.DUPLICATE
+    assert client.calls == 1
+
+
+def test_dispatch_prepared_recovery_timeout_is_ambiguous_and_one_shot() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    client = _DeadlineExceededClient()
+    addressor = TaskAddressor(recovery_delivery_settings(bundle))
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+    now = datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC)
+    addressed = dispatcher.prepare(bundle.task, now=now)
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:15Z")
+
+    result = dispatcher.dispatch_prepared_recovery(
+        addressed,
+        permit=permit,
+        now=now,
+    )
+    with pytest.raises(TaskAddressingError, match="permit is invalid"):
+        dispatcher.dispatch_prepared_recovery(
+            addressed,
+            permit=permit,
+            now=now,
+        )
+
+    assert result.disposition is TaskEnqueueDisposition.AMBIGUOUS
+    assert client.calls == 1
+
+
+def test_dispatch_prepared_recovery_rejects_expired_task_before_provider_call() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    client = _CapturingClient()
+    addressor = TaskAddressor(recovery_delivery_settings(bundle))
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+    addressed = dispatcher.prepare(
+        bundle.task,
+        now=datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC),
+    )
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:30Z")
+
+    with pytest.raises(TaskAddressingError, match="expired"):
+        dispatcher.dispatch_prepared_recovery(
+            addressed,
+            permit=permit,
+            now=datetime(2026, 8, 21, 12, 11, 30, tzinfo=UTC),
+        )
+
+    assert client.requests == []
 
 
 @pytest.mark.parametrize(

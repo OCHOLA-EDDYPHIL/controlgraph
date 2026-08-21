@@ -21,8 +21,13 @@ IDENTITY_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_AUTH_CALLER_SUBJECT",
 )
 RECEIPT_AUTHORITY_PATH = "/v1/internal/authority/receipts"
+RECOVERY_RECEIPT_AUTHORITY_PATH = "/v1/internal/authority/recovery-receipts"
+RECOVERY_EXECUTION_FACADE_PATH = "/v1/internal/execute/recovery"
 CLASSIFICATION_EVIDENCE_PATH = "/v1/internal/evidence/classifications/sign"
 HEALTH_ATTESTATION_PATH = "/v1/internal/evidence/health/attest"
+RECOVERY_PRESTATE_ATTESTATION_PATH = (
+    "/v1/internal/evidence/recovery-prestate/attest"
+)
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
@@ -112,9 +117,13 @@ class RouteAuthenticationPolicy:
         _validate_project_number(self.project_number)
         if type(self.service_role) is not ServiceRole:
             raise ValueError("service role is invalid")
-        receipt_authority_route = (
+        executor_receipt_authority_route = (
             self.service_role is ServiceRole.COORDINATOR
             and self.path == RECEIPT_AUTHORITY_PATH
+        )
+        recovery_receipt_authority_route = (
+            self.service_role is ServiceRole.COORDINATOR
+            and self.path == RECOVERY_RECEIPT_AUTHORITY_PATH
         )
         classification_evidence_route = (
             self.service_role is ServiceRole.EVIDENCE_WRITER
@@ -124,10 +133,21 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EVIDENCE_WRITER
             and self.path == HEALTH_ATTESTATION_PATH
         )
+        recovery_prestate_attestation_route = (
+            self.service_role is ServiceRole.EVIDENCE_WRITER
+            and self.path == RECOVERY_PRESTATE_ATTESTATION_PATH
+        )
+        recovery_execution_facade_route = (
+            self.service_role is ServiceRole.EXECUTOR
+            and self.path == RECOVERY_EXECUTION_FACADE_PATH
+        )
         if (
-            not receipt_authority_route
+            not executor_receipt_authority_route
+            and not recovery_receipt_authority_route
             and not classification_evidence_route
             and not health_attestation_route
+            and not recovery_prestate_attestation_route
+            and not recovery_execution_facade_route
             and self.path != protected_path(self.service_role)
         ):
             raise ValueError("protected path does not match the service role")
@@ -140,11 +160,23 @@ class RouteAuthenticationPolicy:
             raise ValueError("route audience does not match its project coordinates")
         expected_caller_role = (
             CallerRole.EXECUTOR
-            if receipt_authority_route
+            if executor_receipt_authority_route
             else (
-                CallerRole.VERIFIER
-                if classification_evidence_route or health_attestation_route
-                else expected_route_caller_role(self.service_role)
+                CallerRole.EXECUTOR
+                if recovery_receipt_authority_route
+                else (
+                    CallerRole.RECOVERY
+                    if recovery_execution_facade_route
+                    else (
+                        CallerRole.VERIFIER
+                        if (
+                            classification_evidence_route
+                            or health_attestation_route
+                            or recovery_prestate_attestation_route
+                        )
+                        else expected_route_caller_role(self.service_role)
+                    )
+                )
             )
         )
         if self.caller.role is not expected_caller_role:
@@ -409,6 +441,9 @@ __all__ = [
     "HEALTH_ATTESTATION_PATH",
     "IDENTITY_ENVIRONMENT_KEYS",
     "RECEIPT_AUTHORITY_PATH",
+    "RECOVERY_EXECUTION_FACADE_PATH",
+    "RECOVERY_PRESTATE_ATTESTATION_PATH",
+    "RECOVERY_RECEIPT_AUTHORITY_PATH",
     "AuthenticationContext",
     "AuthenticationDenialCode",
     "AuthenticationError",

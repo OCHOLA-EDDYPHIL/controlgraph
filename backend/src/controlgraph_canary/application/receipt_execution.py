@@ -16,9 +16,14 @@ from controlgraph_canary.application.authority_store import (
     ReceiptClaimResult,
     StoredRecord,
 )
-from controlgraph_canary.application.capability_verification import VerifiedMutation
+from controlgraph_canary.application.capability_verification import (
+    CapabilityVerificationError,
+    CapabilityVerifier,
+    VerifiedMutation,
+)
 from controlgraph_canary.application.cloud_run import (
     CloudRunMutationOutcome,
+    CloudRunMutationPurpose,
     CloudRunMutationReason,
     CloudRunMutationResult,
     TargetConfigurationProjection,
@@ -35,15 +40,21 @@ from controlgraph_canary.application.execution import (
     PreparedTargetMutation,
     TargetBoundMutationAdapter,
 )
-from controlgraph_canary.application.identity import ServiceRole
+from controlgraph_canary.application.identity import (
+    AuthenticationContext,
+    CallerRole,
+    RouteAuthenticationPolicy,
+    ServiceRole,
+)
 from controlgraph_canary.authority.replay import (
     MutationAction,
     MutationBinding,
     MutationTargetKey,
     mutation_identity,
 )
-from controlgraph_canary.contracts.codec import canonical_sha256
+from controlgraph_canary.contracts.codec import canonical_json_bytes, canonical_sha256
 from controlgraph_canary.contracts.models import (
+    CapabilityAction,
     ExecutionReceipt,
     MutationIntent,
     ReasonCode,
@@ -54,7 +65,12 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionMutationIntentV2,
     PromotionTaskRequestV2,
 )
-from controlgraph_canary.contracts.root_creation import RolloutRootV3
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryMutationIntentV2,
+    RecoveryTaskRequestV2,
+    recovery_target_configuration_sha256,
+)
+from controlgraph_canary.contracts.root_creation import RolloutRootV2, RolloutRootV3
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 
 RECEIPT_ORPHAN_GRACE_SECONDS: Final = 60
@@ -162,7 +178,9 @@ class _ReceiptClassifyingPreparedMutation:
         return self._service_role
 
     @property
-    def intent(self) -> MutationIntent | PromotionMutationIntentV2:
+    def intent(
+        self,
+    ) -> MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2:
         return self._intent
 
     async def mutate(self, permit: MutationPermit) -> ReceiptMutationResult:
@@ -187,6 +205,14 @@ class ReceiptClassifyingMutationAdapter:
         self._delegate = delegate
         self._target = target
         self._service_role = service_role
+        purpose = getattr(
+            delegate,
+            "mutation_purpose",
+            CloudRunMutationPurpose.STANDARD_EXECUTION,
+        )
+        if type(purpose) is not CloudRunMutationPurpose:
+            raise TypeError("receipt mutation delegate purpose is invalid")
+        self._mutation_purpose = purpose
 
     @property
     def target(self) -> TargetBinding:
@@ -196,9 +222,13 @@ class ReceiptClassifyingMutationAdapter:
     def service_role(self) -> ServiceRole:
         return self._service_role
 
+    @property
+    def mutation_purpose(self) -> CloudRunMutationPurpose:
+        return self._mutation_purpose
+
     async def prepare(
         self,
-        intent: MutationIntent | PromotionMutationIntentV2,
+        intent: MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2,
     ) -> PreparedTargetMutation[ReceiptMutationResult]:
         prepared = await self._delegate.prepare(intent)
         return _ReceiptClassifyingPreparedMutation(prepared)
@@ -302,6 +332,102 @@ class ReceiptExecutionDenied:
 type ReceiptExecutionResponse = ReceiptExecutionStored | ReceiptExecutionDenied
 
 
+@runtime_checkable
+class OneShotRecoveryExecutorClient(Protocol):
+    """Forward one canonical recovery task to the executor-hosted facade."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def execute(self, payload: bytes) -> ReceiptExecutionResponse: ...
+
+
+class RecoveryTaskForwarder:
+    """Forward only a task already verified at the recovery worker boundary."""
+
+    def __init__(
+        self,
+        *,
+        client: OneShotRecoveryExecutorClient,
+        route_policy: RouteAuthenticationPolicy,
+    ) -> None:
+        if not isinstance(client, OneShotRecoveryExecutorClient):
+            raise TypeError("an exact recovery executor client is required")
+        if (
+            type(route_policy) is not RouteAuthenticationPolicy
+            or route_policy.service_role is not ServiceRole.RECOVERY
+            or route_policy.caller.role is not CallerRole.RECOVERY_TASK_CALLER
+            or client.target.project_id != route_policy.project_id
+        ):
+            raise ValueError("recovery forwarding route is invalid")
+        self._client = client
+        self._route_policy = route_policy
+        self._target = client.target
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def forward(self, verified: VerifiedMutation) -> ReceiptExecutionResponse:
+        if type(verified) is not VerifiedMutation:
+            raise TypeError("recovery forwarding requires an exact verified mutation")
+        request = verified.request
+        caller = verified.caller
+        policy = self._route_policy
+        if (
+            type(request) is not RecoveryTaskRequestV2
+            or request.intent.target != self._target
+            or request.handler_audience != policy.audience
+            or type(caller) is not AuthenticationContext
+            or caller.role is not policy.caller.role
+            or caller.email != policy.caller.email
+            or caller.subject != policy.caller.subject
+            or caller.audience != policy.audience
+        ):
+            raise CapabilityVerificationError(ReasonCode.CLAIM_BINDING_MISMATCH)
+        result = await self._client.execute(canonical_json_bytes(request))
+        if type(result) not in (ReceiptExecutionStored, ReceiptExecutionDenied):
+            raise RuntimeError("recovery executor returned an invalid response")
+        return result
+
+
+class RecoveryExecutorFacade:
+    """Independently reverify and execute recovery inside the executor service."""
+
+    def __init__(
+        self,
+        *,
+        verifier: CapabilityVerifier,
+        coordinator: ReceiptExecutionCoordinator,
+    ) -> None:
+        if type(verifier) is not CapabilityVerifier:
+            raise TypeError("an exact recovery facade verifier is required")
+        if type(coordinator) is not ReceiptExecutionCoordinator:
+            raise TypeError("an exact recovery receipt coordinator is required")
+        if (
+            not verifier.recovery_executor_facade
+            or verifier.target != coordinator.target
+        ):
+            raise ValueError("recovery executor facade dependencies are invalid")
+        self._verifier = verifier
+        self._coordinator = coordinator
+        self._target = verifier.target
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def execute(
+        self,
+        payload: bytes,
+        caller: AuthenticationContext,
+    ) -> ReceiptExecutionResponse:
+        verified = await self._verifier.verify(payload, caller)
+        if type(verified.request) is not RecoveryTaskRequestV2:
+            raise CapabilityVerificationError(ReasonCode.CLAIM_BINDING_MISMATCH)
+        return await self._coordinator.execute(verified)
+
+
 class ReceiptExecutionCoordinator:
     """Claim once, run the final gate once, and recover only through readback."""
 
@@ -334,6 +460,10 @@ class ReceiptExecutionCoordinator:
         self._readback = readback
         self._target = store_target
         self._clock = clock or _now_utc_second
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
 
     async def execute(self, verified: VerifiedMutation) -> ReceiptExecutionResponse:
         """Execute one already verified mutation without granting replay dispatch."""
@@ -701,8 +831,34 @@ def _expected_target_state(verified: VerifiedMutation) -> TargetConfigurationPro
             or intent.desired_poststate_sha256 != desired_poststate_sha256
         ):
             raise ValueError("V2 promotion receipt state is outside the V3 root")
+    elif type(verified.request) is RecoveryTaskRequestV2:
+        if type(intent) is not RecoveryMutationIntentV2 or type(root) not in (
+            RolloutRootV3,
+            RolloutRootV2,
+        ):
+            raise TypeError("V2 recovery receipt execution requires an exact root")
+        expected_prestate_sha256 = recovery_target_configuration_sha256(
+            root,
+            stable_percent=90,
+            candidate_percent=10,
+        )
+        desired_poststate_sha256 = recovery_target_configuration_sha256(
+            root,
+            stable_percent=100,
+            candidate_percent=0,
+        )
+        if (
+            intent.expected_prestate_sha256 != expected_prestate_sha256
+            or intent.desired_poststate_sha256 != desired_poststate_sha256
+        ):
+            raise ValueError("V2 recovery receipt state is outside its root")
     elif type(intent) is PromotionMutationIntentV2:
         raise TypeError("V2 promotion intent requires the exact V2 task request")
+    elif (
+        type(intent) is RecoveryMutationIntentV2
+        or intent.action is CapabilityAction.RECOVER_STABLE
+    ):
+        raise TypeError("recovery requires the exact V2 recovery task request")
     projected = target_configuration_projection(
         intent,
         expected_concurrency=root.content.authority_bounds.concurrency,
@@ -716,6 +872,15 @@ def _expected_target_state(verified: VerifiedMutation) -> TargetConfigurationPro
         != intent.desired_poststate_sha256
     ):
         raise ValueError("V2 promotion receipt poststate is not authorized")
+    if (
+        type(intent) is RecoveryMutationIntentV2
+        and target_configuration_sha256(
+            intent,
+            expected_concurrency=projected.concurrency,
+        )
+        != intent.desired_poststate_sha256
+    ):
+        raise ValueError("V2 recovery receipt poststate is not authorized")
     return projected
 
 
@@ -1018,6 +1183,7 @@ def _now_utc_second() -> datetime:
 __all__ = [
     "RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS",
     "RECEIPT_ORPHAN_GRACE_SECONDS",
+    "OneShotRecoveryExecutorClient",
     "ReceiptClassifyingMutationAdapter",
     "ReceiptExecutionCoordinator",
     "ReceiptExecutionDenied",
@@ -1027,6 +1193,8 @@ __all__ = [
     "ReceiptMutationStatus",
     "ReceiptReadbackResult",
     "ReceiptStore",
+    "RecoveryExecutorFacade",
+    "RecoveryTaskForwarder",
     "TargetBoundReceiptReadback",
     "map_cloud_run_mutation_result",
 ]

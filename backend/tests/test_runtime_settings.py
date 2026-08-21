@@ -72,6 +72,11 @@ def test_enabled_executor_requires_and_binds_exact_mutation_configuration() -> N
                 "keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
                 "cryptoKeyVersions/1"
             ),
+            "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+                "projects/controlgraph-canary-abc123/locations/us-central1/"
+                "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
+                "cryptoKeyVersions/1"
+            ),
             "CONTROLGRAPH_COORDINATOR_URL": (
                 "https://controlgraph-coordinator-123456789012."
                 "us-central1.run.app"
@@ -84,6 +89,11 @@ def test_enabled_executor_requires_and_binds_exact_mutation_configuration() -> N
                 "projects/controlgraph-canary-abc123/regions/us-central1/"
                 "subnetworks/controlgraph-runtime"
             ),
+            "CONTROLGRAPH_RECOVERY_FACADE_CALLER_EMAIL": (
+                "controlgraph-recovery@controlgraph-canary-abc123."
+                "iam.gserviceaccount.com"
+            ),
+            "CONTROLGRAPH_RECOVERY_FACADE_CALLER_SUBJECT": "123456789012345678902",
         }
     )
 
@@ -99,6 +109,54 @@ def test_enabled_executor_requires_and_binds_exact_mutation_configuration() -> N
     ]
     assert settings.target_subnetwork_resource == environment[
         "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"
+    ]
+
+
+def test_enabled_recovery_requires_the_sealed_executor_facade() -> None:
+    environment = _environment()
+    environment.update(
+        {
+            "CONTROLGRAPH_SERVICE_NAME": "controlgraph-recovery",
+            "CONTROLGRAPH_CONTROLLER_ID": (
+                "controlgraph-canary-abc123:us-central1:recovery"
+            ),
+            "CONTROLGRAPH_ROLE": "recovery",
+            "CONTROLGRAPH_MUTATIONS_ENABLED": "true",
+            "CONTROLGRAPH_AUTH_AUDIENCE": (
+                "https://controlgraph-recovery-123456789012.us-central1.run.app"
+            ),
+            "CONTROLGRAPH_AUTH_CALLER_ROLE": "recovery_task_caller",
+            "CONTROLGRAPH_AUTH_CALLER_EMAIL": (
+                "cg-recovery-task-caller@controlgraph-canary-abc123."
+                "iam.gserviceaccount.com"
+            ),
+            "CONTROLGRAPH_CAPABILITY_KEY_VERSION": (
+                "projects/controlgraph-canary-abc123/locations/us-central1/"
+                "keyRings/controlgraph-signing/cryptoKeys/capability-signing/"
+                "cryptoKeyVersions/1"
+            ),
+            "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+                "projects/controlgraph-canary-abc123/locations/us-central1/"
+                "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
+                "cryptoKeyVersions/1"
+            ),
+            "CONTROLGRAPH_EXECUTOR_URL": (
+                "https://controlgraph-executor-123456789012."
+                "us-central1.run.app"
+            ),
+        }
+    )
+
+    settings = ControllerSettings.from_environment(environment)
+
+    assert settings.role == "recovery"
+    assert settings.mutations_enabled is True
+    assert settings.coordinator_url is None
+    assert settings.executor_url == environment["CONTROLGRAPH_EXECUTOR_URL"]
+    assert settings.target_network_resource is None
+    assert settings.target_subnetwork_resource is None
+    assert settings.capability_key_version == environment[
+        "CONTROLGRAPH_CAPABILITY_KEY_VERSION"
     ]
 
 

@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from fastapi.testclient import TestClient
 from health_execution_test_data import make_healthy_chain
+from recovery_v2_test_data import make_unhealthy_v3_recovery_bundle
 
 from controlgraph_canary.application.health_attestation import (
     HealthAttestationError,
@@ -44,9 +45,14 @@ from controlgraph_canary.contracts.health_execution import (
     create_health_decision_proof,
     health_attestation_signing_input_sha256,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    create_recovery_prestate_attestation,
+    recovery_prestate_signing_input_sha256,
+)
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.integrations.google.kms import (
     GoogleKmsHealthAttestationVerifier,
+    GoogleKmsRecoveryPrestateAttestationVerifier,
 )
 
 PROJECT = "controlgraph-canary-a1b2c3"
@@ -403,6 +409,53 @@ def test_health_verifier_rejects_roles_outside_read_only_trust_boundary(
 ) -> None:
     with pytest.raises(Exception, match="verification role is invalid"):
         GoogleKmsHealthAttestationVerifier(
+            project_id=PROJECT,
+            service_role=role,
+            key_version=KEY_VERSION,
+            client=object(),
+        )
+
+
+def test_recovery_prestate_verifier_accepts_only_exact_digest_signature() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    result = make_unhealthy_v3_recovery_bundle().prestate_result
+    digest = recovery_prestate_signing_input_sha256(result, KEY_VERSION)
+    attestation = create_recovery_prestate_attestation(
+        result=result,
+        signature=encode_base64url(
+            private_key.sign(
+                bytes.fromhex(digest),
+                ec.ECDSA(utils.Prehashed(hashes.SHA256())),
+            )
+        ),
+    )
+    kms = _KmsClient(private_key)
+    verifier = GoogleKmsRecoveryPrestateAttestationVerifier(
+        project_id=PROJECT,
+        service_role=ServiceRole.RECOVERY,
+        key_version=KEY_VERSION,
+        client=kms,
+    )
+
+    asyncio.run(verifier.verify(attestation))
+    assert (kms.version_calls, kms.public_calls) == (1, 1)
+
+    forged = attestation.model_copy(
+        update={"signature": encode_base64url(b"forged")}
+    )
+    with pytest.raises(Exception, match="signature verification failed"):
+        asyncio.run(verifier.verify(forged))
+
+
+@pytest.mark.parametrize(
+    "role",
+    [ServiceRole.API, ServiceRole.EVIDENCE_WRITER],
+)
+def test_recovery_prestate_verifier_rejects_unneeded_roles(
+    role: ServiceRole,
+) -> None:
+    with pytest.raises(Exception, match="verification role is invalid"):
+        GoogleKmsRecoveryPrestateAttestationVerifier(
             project_id=PROJECT,
             service_role=role,
             key_version=KEY_VERSION,

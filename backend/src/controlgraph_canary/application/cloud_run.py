@@ -17,6 +17,7 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
 )
 from controlgraph_canary.contracts.promotion_execution import PromotionMutationIntentV2
+from controlgraph_canary.contracts.recovery_execution import RecoveryMutationIntentV2
 from controlgraph_canary.contracts.root_creation import RolloutRootV2, RolloutRootV3
 
 TARGET_CONFIGURATION_DOMAIN: Final = b"controlgraph.target-configuration-sha256/v1\0"
@@ -27,7 +28,9 @@ CLOUD_RUN_REVISION_CONFIGURATION_DOMAIN: Final = (
 CLOUD_RUN_REVISION_CONFIGURATION_V1: Final = (
     "controlgraph.cloud-run-revision-configuration/v1"
 )
-type TargetMutationIntent = MutationIntent | PromotionMutationIntentV2
+type TargetMutationIntent = (
+    MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2
+)
 _CLOUD_RUN_NAME: Final = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _OPAQUE_TOKEN: Final = re.compile(
     r'^(?:[A-Za-z0-9._~:/+=-]+|"[A-Za-z0-9._~:/+=-]+")$'
@@ -90,6 +93,13 @@ class CloudRunReadyState(StrEnum):
     READY = "READY"
     NOT_READY = "NOT_READY"
     FAILED = "FAILED"
+
+
+class CloudRunMutationPurpose(StrEnum):
+    """Closed application purpose for an executor-owned mutation adapter."""
+
+    STANDARD_EXECUTION = "STANDARD_EXECUTION"
+    STABLE_RECOVERY = "STABLE_RECOVERY"
 
 
 class CloudRunExecutionEnvironment(StrEnum):
@@ -394,8 +404,17 @@ def target_configuration_projection(
 ) -> TargetConfigurationProjection:
     """Project only the exact poststate fields shared by receipts and readback."""
 
-    if type(intent) not in (MutationIntent, PromotionMutationIntentV2):
+    if type(intent) not in (
+        MutationIntent,
+        PromotionMutationIntentV2,
+        RecoveryMutationIntentV2,
+    ):
         raise TypeError("an exact mutation intent is required")
+    if (
+        type(intent) is MutationIntent
+        and intent.action is CapabilityAction.RECOVER_STABLE
+    ):
+        raise ValueError("legacy recovery intent is not admitted")
     if intent.concurrency is not None and intent.concurrency != expected_concurrency:
         raise ValueError("mutation intent concurrency does not match the expected concurrency")
     if type(intent) is PromotionMutationIntentV2 and (
@@ -405,6 +424,13 @@ def target_configuration_projection(
         or intent.concurrency is not None
     ):
         raise ValueError("V2 promotion intent does not describe exact candidate traffic")
+    if type(intent) is RecoveryMutationIntentV2 and (
+        intent.action is not CapabilityAction.RECOVER_STABLE
+        or intent.stable_percent != 100
+        or intent.candidate_percent != 0
+        or intent.concurrency != expected_concurrency
+    ):
+        raise ValueError("V2 recovery intent does not describe exact stable traffic")
     projected = TargetConfigurationProjection(
         target=intent.target,
         stable_revision=intent.stable_revision,
@@ -419,6 +445,22 @@ def target_configuration_projection(
         != intent.desired_poststate_sha256
     ):
         raise ValueError("V2 promotion intent does not bind its desired poststate")
+    if type(intent) is RecoveryMutationIntentV2:
+        expected_prestate = TargetConfigurationProjection(
+            target=intent.target,
+            stable_revision=intent.stable_revision,
+            candidate_revision=intent.candidate_revision,
+            stable_percent=90,
+            candidate_percent=10,
+            concurrency=expected_concurrency,
+        )
+        if (
+            target_configuration_projection_sha256(projected)
+            != intent.desired_poststate_sha256
+            or target_configuration_projection_sha256(expected_prestate)
+            != intent.expected_prestate_sha256
+        ):
+            raise ValueError("V2 recovery intent does not bind exact traffic states")
     return projected
 
 
@@ -774,9 +816,13 @@ class CloudRunMutationResult:
     def __post_init__(self) -> None:
         if type(self.outcome) is not CloudRunMutationOutcome:
             raise TypeError("an exact Cloud Run mutation outcome is required")
-        if len(self.requested_traffic) != 2:
-            raise ValueError("a mutation must bind both declared revisions")
-        if len({item.revision for item in self.requested_traffic}) != 2:
+        if len(self.requested_traffic) not in {1, 2}:
+            raise ValueError("a mutation must bind one or both declared revisions")
+        if len(self.requested_traffic) == 1:
+            stable = self.requested_traffic[0]
+            if stable.percent != 100 or stable.tag != "stable":
+                raise ValueError("single-target mutation traffic must be stable-only")
+        elif len({item.revision for item in self.requested_traffic}) != 2:
             raise ValueError("mutation traffic revisions must be distinct")
         if sum(item.percent for item in self.requested_traffic) != 100:
             raise ValueError("mutation traffic does not total one hundred percent")
@@ -834,6 +880,7 @@ __all__ = [
     "CloudRunExecutionEnvironment",
     "CloudRunHttpProbe",
     "CloudRunMutationOutcome",
+    "CloudRunMutationPurpose",
     "CloudRunMutationReason",
     "CloudRunMutationResult",
     "CloudRunNetworkInterface",

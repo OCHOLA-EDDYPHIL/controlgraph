@@ -3,8 +3,8 @@
 ## Status and evidence rule
 
 These cases define the reproducible outcomes against which the built product is evaluated. They
-are specifications, not records of completed hosted runs. The current scaffold does not satisfy
-the hosted cases.
+are specifications, not records of completed hosted runs. Implementing an execution path does not
+prove its hosted result.
 
 Local fakes and contract tests are required development evidence, but they do not replace a case
 that explicitly calls for Cloud Run, Cloud KMS, Firestore, Cloud Tasks, or Google-issued identity.
@@ -38,8 +38,7 @@ each case.
 
 ## Case A: healthy canary and promotion
 
-This is the normative positive journey for deterministic health and promotion. It does not claim
-that hosted health evaluation or promotion exists in the current scaffold.
+This is the normative positive journey for deterministic health and promotion.
 
 ### Initial state
 
@@ -64,9 +63,12 @@ plan, deterministic health policy, promotion bound, recovery bound, and initial 
    traffic update.
 6. Independent readback observes exactly 90 percent S and 10 percent C before health observation
    begins.
-7. Bounded health inputs satisfy deterministic policy.
-8. A separately scoped `PROMOTE_CANDIDATE_V1` command passes the same gates and independent
-   readback observes 100 percent C.
+7. The verifier derives the root's exact candidate-revision request-count and latency queries,
+   canonicalizes bounded Monitoring results, and evaluates the frozen one-minute-window policy.
+8. Two consecutive healthy windows produce a signed terminal proof whose complete chain
+   authorizes a separately scoped `PROMOTE_CANDIDATE_V1` command.
+9. The normal executor applies the promotion through its receipt path, and independent readback
+   observes 100 percent C.
 
 ### Expected evidence
 
@@ -90,15 +92,15 @@ execution-time epoch check, exact receipt, and deterministic state transition.
 
 ## Case B: unhealthy canary and stable recovery
 
-This is the normative recovery journey. It remains an acceptance specification until hosted
-deterministic health and recovery behavior is implemented and exercised.
+This is the normative recovery journey.
 
 ### Initial state
 
 - A root at epoch N has a verified 90/10 split between captured stable revision S and candidate C.
-- The root fixes the health policy and a recovery plan that can restore only the captured stable
-  traffic and approved concurrency.
-- The recovery identity has no candidate-promotion authority.
+- The root fixes the health policy and a recovery plan that can route traffic only to the captured
+  stable revision while requiring approved concurrency to remain unchanged.
+- The recovery identity has no target update, reference-target `actAs`, operation-read, receipt
+  write, or candidate-promotion authority.
 
 ### Operator action
 
@@ -107,20 +109,30 @@ operator text can select the outcome.
 
 ### Expected data path
 
-1. Bounded, versioned observations fail the deterministic health policy.
-2. The reducer emits `RECOVER_STABLE_V1` and no promotion command.
-3. The issuer creates a recovery capability bound to S, the captured configuration, root, current
-   epoch N, request identity, and provider precondition.
-4. The recovery handler verifies the dedicated caller and complete capability, claims its receipt,
-   and freshly confirms epoch N.
-5. The restore-only adapter performs one conditional update.
-6. Independent readback observes 100 percent traffic on S and the captured approved concurrency.
+1. Exact candidate-revision Monitoring observations produce two consecutive deterministic
+   unhealthy decisions, ending in a signed terminal proof.
+2. One Firestore transaction appends that terminal proof and creates one root-owned recovery
+   intent. Concurrent evaluators adopt the same intent rather than creating another command.
+3. The coordinator advances the deterministic recovery dispatch record, obtains a signed verifier
+   prestate and a KMS-signed capability bound to S, and addresses one canonical recovery task.
+4. The recovery handler verifies the dedicated task caller, capability, root, epoch, source
+   receipt binding, signed prestate, and exact target, then forwards the unchanged task once to
+   the executor's recovery-only facade.
+5. The executor facade independently reverifies those bindings and claims through the separate
+   recovery receipt route. Its final gate then rereads the exact durable source receipt, freshly
+   confirms root and epoch N, and permits one conditional traffic update containing only S at
+   100 percent.
+6. Independent readback observes only S at 100 percent traffic and confirms that the captured
+   approved concurrency is unchanged.
 
 ### Expected evidence
 
 - exact health inputs and `POLICY_UNHEALTHY` decision;
 - absence of any promotion capability or command;
-- restore-only capability, receipt, provider operation, and verified stable readback;
+- atomic health-proof and recovery-intent ownership, deterministic dispatch identity, and signed
+  recovery prestate;
+- restore-only capability, separate recovery receipt, provider operation, and verified stable
+  readback;
 - attempts to substitute C or another revision are separately denied with zero mutation.
 
 ### Terminal classification
@@ -132,8 +144,9 @@ not retried merely because the response was lost.
 ### Native and added guarantees
 
 Cloud Run provides conditional update and configuration readback. ControlGraph adds deterministic
-health-to-command reduction, a recovery-only authority scope, binding to the captured stable
-revision, execution-time epoch validation, and explicit ambiguity handling.
+health-to-command reduction, transactional single-intent ownership, recovery-to-executor privilege
+separation, binding to the captured stable revision, execution-time epoch validation, and explicit
+ambiguity handling.
 
 ## Case C: delayed stale task after manual revocation
 

@@ -16,7 +16,7 @@ from controlgraph_canary.cli import _build_parser, _run_health_evaluation
 from controlgraph_canary.contracts.codec import canonical_json_bytes, decode_contract
 from controlgraph_canary.contracts.health_pipeline import (
     HealthEvaluationCommandV1,
-    HealthEvaluationResultV1,
+    HealthEvaluationResultV2,
 )
 from controlgraph_canary.http.identity_headers import (
     CONTROLGRAPH_AUTHORIZATION_HEADER,
@@ -89,7 +89,7 @@ class _Poster:
 
 def _health_fixture(
     tmp_path: Path,
-) -> tuple[Path, HealthEvaluationCommandV1, HealthEvaluationResultV1]:
+) -> tuple[Path, HealthEvaluationCommandV1, HealthEvaluationResultV2]:
     clock = _Clock(datetime(2026, 8, 21, 12, 8, tzinfo=UTC))
     api, _, _, _, command, operator, _, _ = _pipeline(clock=clock)
     result = asyncio.run(api.evaluate(command, operator))
@@ -121,11 +121,11 @@ def _different_digest(value: str) -> str:
 
 
 def _validated_result(
-    result: HealthEvaluationResultV1,
+    result: HealthEvaluationResultV2,
     **updates: object,
-) -> HealthEvaluationResultV1:
+) -> HealthEvaluationResultV2:
     changed = result.model_copy(update=updates)
-    return HealthEvaluationResultV1.model_validate(changed.model_dump(mode="python"))
+    return HealthEvaluationResultV2.model_validate(changed.model_dump(mode="python"))
 
 
 def test_evaluate_health_parser_requires_the_exact_command_source() -> None:

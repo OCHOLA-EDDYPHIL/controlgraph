@@ -22,6 +22,9 @@ from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
     HEALTH_ATTESTATION_PATH,
     RECEIPT_AUTHORITY_PATH,
+    RECOVERY_EXECUTION_FACADE_PATH,
+    RECOVERY_PRESTATE_ATTESTATION_PATH,
+    RECOVERY_RECEIPT_AUTHORITY_PATH,
     AuthenticationContext,
     CallerRole,
     RouteAuthenticationPolicy,
@@ -168,8 +171,11 @@ class CoordinatorInternalRoute:
                 and self.override_path
                 not in {
                     RECEIPT_AUTHORITY_PATH,
+                    RECOVERY_RECEIPT_AUTHORITY_PATH,
                     CLASSIFICATION_EVIDENCE_PATH,
                     HEALTH_ATTESTATION_PATH,
+                    RECOVERY_PRESTATE_ATTESTATION_PATH,
+                    RECOVERY_EXECUTION_FACADE_PATH,
                 }
             )
             or (
@@ -178,13 +184,36 @@ class CoordinatorInternalRoute:
                 != (CallerRole.EXECUTOR, ServiceRole.COORDINATOR)
             )
             or (
+                self.override_path == RECOVERY_RECEIPT_AUTHORITY_PATH
+                and (self.caller_role, self.service_role)
+                != (CallerRole.EXECUTOR, ServiceRole.COORDINATOR)
+            )
+            or (
+                self.override_path == RECOVERY_EXECUTION_FACADE_PATH
+                and (self.caller_role, self.service_role)
+                != (CallerRole.RECOVERY, ServiceRole.EXECUTOR)
+            )
+            or (
                 (self.caller_role, self.service_role)
                 == (CallerRole.EXECUTOR, ServiceRole.COORDINATOR)
-                and self.override_path != RECEIPT_AUTHORITY_PATH
+                and self.override_path
+                not in {
+                    RECEIPT_AUTHORITY_PATH,
+                    RECOVERY_RECEIPT_AUTHORITY_PATH,
+                }
+            )
+            or (
+                (self.caller_role, self.service_role)
+                == (CallerRole.RECOVERY, ServiceRole.EXECUTOR)
+                and self.override_path != RECOVERY_EXECUTION_FACADE_PATH
             )
             or (
                 self.override_path
-                in {CLASSIFICATION_EVIDENCE_PATH, HEALTH_ATTESTATION_PATH}
+                in {
+                    CLASSIFICATION_EVIDENCE_PATH,
+                    HEALTH_ATTESTATION_PATH,
+                    RECOVERY_PRESTATE_ATTESTATION_PATH,
+                }
                 and (self.caller_role, self.service_role)
                 != (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER)
             )
@@ -192,7 +221,11 @@ class CoordinatorInternalRoute:
                 (self.caller_role, self.service_role)
                 == (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER)
                 and self.override_path
-                not in {CLASSIFICATION_EVIDENCE_PATH, HEALTH_ATTESTATION_PATH}
+                not in {
+                    CLASSIFICATION_EVIDENCE_PATH,
+                    HEALTH_ATTESTATION_PATH,
+                    RECOVERY_PRESTATE_ATTESTATION_PATH,
+                }
             )
         ):
             raise ValueError("coordinator internal route coordinates are invalid")
@@ -224,6 +257,7 @@ class CoordinatorInternalRoute:
             (CallerRole.COORDINATOR, ServiceRole.VERIFIER),
             (CallerRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER),
             (CallerRole.EXECUTOR, ServiceRole.COORDINATOR),
+            (CallerRole.RECOVERY, ServiceRole.EXECUTOR),
             (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER),
         }
 

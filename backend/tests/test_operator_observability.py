@@ -210,6 +210,12 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                     f"controlgraph-executor@{PROJECT}.iam.gserviceaccount.com"
                 ),
                 "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT": "456789012345678901234",
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL": (
+                    f"controlgraph-executor@{PROJECT}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT": (
+                    "456789012345678901234"
+                ),
             }
         )
     return environment
@@ -834,15 +840,15 @@ def test_receipt_absence_and_every_exact_binding_mismatch_share_one_denial(
     assert denied.value.code is OperatorObservationErrorCode.RECEIPT_NOT_FOUND
 
 
-def test_receipt_contract_rejects_recovery_and_misidentified_result() -> None:
+def test_receipt_contract_admits_recovery_and_rejects_misidentified_result() -> None:
     receipt = _receipt()
-    with pytest.raises(ValidationError):
-        ExecutionReceiptReadCommandV1(
-            **{
-                **_receipt_command(receipt).model_dump(mode="python"),
-                "action": CapabilityAction.RECOVER_STABLE,
-            }
-        )
+    recovery_command = ExecutionReceiptReadCommandV1(
+        **{
+            **_receipt_command(receipt).model_dump(mode="python"),
+            "action": CapabilityAction.RECOVER_STABLE,
+        }
+    )
+    assert recovery_command.action is CapabilityAction.RECOVER_STABLE
 
     result = asyncio.run(
         _relay(_Store(StoredRecord(receipt, 2))).read_receipt(

@@ -7,7 +7,7 @@ import hmac
 import re
 from collections.abc import Callable
 from threading import Lock
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 from uuid import uuid4
 
 from controlgraph_canary.application.authority_store import (
@@ -23,6 +23,8 @@ from controlgraph_canary.application.authority_store import (
 )
 from controlgraph_canary.application.identity import (
     RECEIPT_AUTHORITY_PATH,
+    RECOVERY_RECEIPT_AUTHORITY_PATH,
+    AuthenticationContext,
     CallerRole,
     ServiceRole,
 )
@@ -66,6 +68,13 @@ from controlgraph_canary.contracts.receipt_authority import (
 from controlgraph_canary.contracts.storage import ServiceClaimRecord
 
 _ATTEMPT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_STANDARD_RECEIPT_ACTIONS: Final = frozenset(
+    {
+        CapabilityAction.APPLY_CANARY,
+        CapabilityAction.PROMOTE_CANDIDATE,
+    }
+)
+_RECOVERY_RECEIPT_ACTIONS: Final = frozenset({CapabilityAction.RECOVER_STABLE})
 
 
 @runtime_checkable
@@ -126,7 +135,55 @@ class ReceiptAuthorityService:
         return self._target
 
     async def handle(self, payload: bytes) -> bytes:
-        """Execute one canonical request after route authentication by the HTTP layer."""
+        """Execute one canonical executor request after exact route authentication."""
+
+        return await self._handle(payload, admitted_actions=_STANDARD_RECEIPT_ACTIONS)
+
+    async def handle_authenticated(
+        self,
+        payload: bytes,
+        caller: AuthenticationContext,
+    ) -> bytes:
+        """Execute standard receipt writes from the authenticated executor."""
+
+        if (
+            type(caller) is not AuthenticationContext
+            or caller.role is not CallerRole.EXECUTOR
+        ):
+            raise AuthorityStoreCorruptRecord
+        return await self._handle(
+            payload,
+            admitted_actions=_STANDARD_RECEIPT_ACTIONS,
+        )
+
+    async def handle_recovery_authenticated(
+        self,
+        payload: bytes,
+        caller: AuthenticationContext,
+    ) -> bytes:
+        """Execute recovery-only receipt writes from the executor facade."""
+
+        if (
+            type(caller) is not AuthenticationContext
+            or caller.role is not CallerRole.EXECUTOR
+        ):
+            raise AuthorityStoreCorruptRecord
+        return await self._handle(
+            payload,
+            admitted_actions=_RECOVERY_RECEIPT_ACTIONS,
+        )
+
+    async def _handle(
+        self,
+        payload: bytes,
+        *,
+        admitted_actions: frozenset[CapabilityAction],
+    ) -> bytes:
+        if admitted_actions not in {
+            _STANDARD_RECEIPT_ACTIONS,
+            _RECOVERY_RECEIPT_ACTIONS,
+        }:
+            raise AuthorityStoreCorruptRecord
 
         try:
             request = decode_contract(payload, ReceiptAuthorityRequestV1)
@@ -136,13 +193,22 @@ class ReceiptAuthorityService:
             raise AuthorityStoreCorruptRecord
 
         if request.operation is ReceiptAuthorityOperation.CLAIM:
-            response = await self._claim(request)
+            response = await self._claim(
+                request,
+                admitted_actions=admitted_actions,
+            )
         elif request.operation is ReceiptAuthorityOperation.READ:
             response = await self._read(request)
         elif request.operation is ReceiptAuthorityOperation.COMPARE_AND_SET:
-            response = await self._compare_and_set(request)
+            response = await self._compare_and_set(
+                request,
+                admitted_actions=admitted_actions,
+            )
         elif request.operation is ReceiptAuthorityOperation.RESOLVE_AMBIGUOUS:
-            response = await self._resolve_ambiguous(request)
+            response = await self._resolve_ambiguous(
+                request,
+                admitted_actions=admitted_actions,
+            )
         else:
             raise AuthorityStoreCorruptRecord
         try:
@@ -150,7 +216,12 @@ class ReceiptAuthorityService:
         except (ContractError, TypeError, ValueError):
             raise AuthorityStoreCorruptRecord from None
 
-    async def _claim(self, request: ReceiptAuthorityRequestV1) -> ReceiptAuthorityResponseV1:
+    async def _claim(
+        self,
+        request: ReceiptAuthorityRequestV1,
+        *,
+        admitted_actions: frozenset[CapabilityAction],
+    ) -> ReceiptAuthorityResponseV1:
         claim = request.claim
         if claim is None:
             raise AuthorityStoreCorruptRecord
@@ -159,6 +230,7 @@ class ReceiptAuthorityService:
             validate_receipt_claim_binding(claim.receipt, binding)
         except (TypeError, ValueError):
             raise AuthorityStoreCorruptRecord from None
+        _require_worker_action(admitted_actions, claim.receipt.action)
         result = await self._store.claim_or_adopt_receipt(claim.receipt, binding)
         request_sha256 = canonical_sha256(request)
 
@@ -241,12 +313,16 @@ class ReceiptAuthorityService:
     async def _compare_and_set(
         self,
         request: ReceiptAuthorityRequestV1,
+        *,
+        admitted_actions: frozenset[CapabilityAction],
     ) -> ReceiptAuthorityResponseV1:
         compare_and_set = request.compare_and_set
         if compare_and_set is None:
             raise AuthorityStoreCorruptRecord
         expected = _domain_stored(compare_and_set.expected)
         replacement = compare_and_set.replacement
+        _require_worker_action(admitted_actions, expected.value.action)
+        _require_worker_action(admitted_actions, replacement.action)
         _require_target_receipt(expected, self._target, replacement.idempotency_key)
         if replacement.target != self._target:
             raise AuthorityStoreCorruptRecord
@@ -266,6 +342,8 @@ class ReceiptAuthorityService:
     async def _resolve_ambiguous(
         self,
         request: ReceiptAuthorityRequestV1,
+        *,
+        admitted_actions: frozenset[CapabilityAction],
     ) -> ReceiptAuthorityResponseV1:
         resolution = request.resolve_ambiguous
         if resolution is None or not isinstance(
@@ -279,6 +357,8 @@ class ReceiptAuthorityService:
             resolution.expected_service_claim
         )
         replacement = resolution.replacement
+        _require_worker_action(admitted_actions, expected.value.action)
+        _require_worker_action(admitted_actions, replacement.action)
         _require_target_receipt(expected, self._target, replacement.idempotency_key)
         if (
             replacement.target != self._target
@@ -325,7 +405,8 @@ class ReceiptAuthorityClient:
             or route.project_id != target.project_id
             or route.caller_role is not CallerRole.EXECUTOR
             or route.service_role is not ServiceRole.COORDINATOR
-            or route.path != RECEIPT_AUTHORITY_PATH
+            or route.path
+            not in {RECEIPT_AUTHORITY_PATH, RECOVERY_RECEIPT_AUTHORITY_PATH}
             or not isinstance(transport, CanonicalInternalTransport)
         ):
             raise ValueError("receipt authority client route is invalid")
@@ -333,6 +414,11 @@ class ReceiptAuthorityClient:
             raise TypeError("receipt authority attempt factory must be callable")
         self._target = target
         self._route = route
+        self._admitted_actions = (
+            _RECOVERY_RECEIPT_ACTIONS
+            if route.path == RECOVERY_RECEIPT_AUTHORITY_PATH
+            else _STANDARD_RECEIPT_ACTIONS
+        )
         self._transport = transport
         self._attempt_id_factory = attempt_id_factory or _new_attempt_id
         self._attempt_ids: set[str] = set()
@@ -348,6 +434,7 @@ class ReceiptAuthorityClient:
         binding: MutationBinding,
     ) -> ReceiptClaimResult:
         validate_receipt_claim_binding(receipt, binding)
+        self._require_action(receipt.action)
         if receipt.target != self._target or not _binding_targets(binding, self._target):
             raise ValueError("receipt claim is outside the configured target")
         request = ReceiptAuthorityRequestV1(
@@ -425,6 +512,8 @@ class ReceiptAuthorityClient:
         replacement: ExecutionReceipt,
     ) -> StoredRecord[ExecutionReceipt]:
         _require_target_receipt(expected, self._target, replacement.idempotency_key)
+        self._require_action(expected.value.action)
+        self._require_action(replacement.action)
         if replacement.target != self._target:
             raise ValueError("receipt replacement is outside the configured target")
         request = ReceiptAuthorityRequestV1(
@@ -457,6 +546,8 @@ class ReceiptAuthorityClient:
         expected_service_claim: StoredRecord[ServiceClaimRecord],
     ) -> StoredRecord[ExecutionReceipt]:
         _require_target_receipt(expected, self._target, replacement.idempotency_key)
+        self._require_action(expected.value.action)
+        self._require_action(replacement.action)
         if (
             replacement.target != self._target
             or expected_authority.value.target != self._target
@@ -491,6 +582,10 @@ class ReceiptAuthorityClient:
         if stored != StoredRecord(replacement, expected.revision + 1):
             raise AuthorityStoreCorruptRecord
         return stored
+
+    def _require_action(self, action: CapabilityAction) -> None:
+        if action not in self._admitted_actions:
+            raise ValueError("receipt action is outside the configured authority path")
 
     async def _exchange(
         self,
@@ -690,6 +785,14 @@ def _require_target_receipt(
         or stored.value.target != target
         or stored.value.idempotency_key != idempotency_key
     ):
+        raise AuthorityStoreCorruptRecord
+
+
+def _require_worker_action(
+    admitted_actions: frozenset[CapabilityAction],
+    action: CapabilityAction,
+) -> None:
+    if action not in admitted_actions:
         raise AuthorityStoreCorruptRecord
 
 

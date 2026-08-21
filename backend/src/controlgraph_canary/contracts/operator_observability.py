@@ -156,6 +156,7 @@ class ExecutionReceiptReadCommandV1(StrictContractModel):
         if self.action not in {
             CapabilityAction.APPLY_CANARY,
             CapabilityAction.PROMOTE_CANDIDATE,
+            CapabilityAction.RECOVER_STABLE,
         }:
             raise ValueError("receipt observation action is not operator-readable")
         return self

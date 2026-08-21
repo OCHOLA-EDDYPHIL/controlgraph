@@ -31,6 +31,11 @@ from controlgraph_canary.contracts.health_execution import (
     SignedHealthDecisionProofV1,
     health_attestation_signing_input_sha256,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RECOVERY_PRESTATE_ATTESTATION_PURPOSE,
+    RecoveryPrestateAttestationV1,
+    recovery_prestate_signing_input_sha256,
+)
 from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
@@ -221,10 +226,7 @@ def _load_public_key(client: _KmsClient, profile: SigningProfile) -> str:
             SigningErrorCode.PUBLIC_KEY_INVALID,
             "KMS public key PEM is invalid",
         ) from None
-    if (
-        type(public_key_crc32c) is not int
-        or public_key_crc32c != _crc32c(public_key_bytes)
-    ):
+    if type(public_key_crc32c) is not int or public_key_crc32c != _crc32c(public_key_bytes):
         raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
     return public_key_pem
 
@@ -301,10 +303,7 @@ async def _load_public_key_async(
             SigningErrorCode.PUBLIC_KEY_INVALID,
             "KMS public key PEM is invalid",
         ) from None
-    if (
-        type(public_key_crc32c) is not int
-        or public_key_crc32c != _crc32c(public_key_bytes)
-    ):
+    if type(public_key_crc32c) is not int or public_key_crc32c != _crc32c(public_key_bytes):
         raise _error(SigningErrorCode.CRC_MISMATCH, "KMS public key CRC32C is invalid")
     return public_key_pem
 
@@ -468,6 +467,12 @@ class GoogleKmsEvidenceSignatureVerifier:
     def key_version(self) -> str:
         return self._profile.key_version
 
+    @property
+    def evidence_key_version(self) -> str:
+        """Expose the fixed key through the revocation-evidence verifier protocol."""
+
+        return self._profile.key_version
+
     async def verify(self, signed: SignedEvidenceEventV1) -> None:
         """Load exact public material once and verify the canonical event signature."""
 
@@ -584,6 +589,91 @@ class GoogleKmsHealthAttestationVerifier:
             raise _error(
                 SigningErrorCode.SIGNATURE_INVALID,
                 "health attestation signature encoding is invalid",
+            ) from None
+        client = self._client
+        if client is None:
+            client = _default_async_client()
+            self._client = client
+        await _load_version_async(client, self._profile)
+        public_key_pem = await _load_public_key_async(client, self._profile)
+        _verify_p256_sha256_digest_signature(
+            public_key_pem=public_key_pem,
+            digest=bytes.fromhex(expected_digest),
+            signature=signature,
+        )
+
+
+class GoogleKmsRecoveryPrestateAttestationVerifier:
+    """Verify the recovery-prestate purpose with one exact evidence key."""
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        service_role: ServiceRole,
+        key_version: str,
+        client: object | None = None,
+    ) -> None:
+        if service_role not in {
+            ServiceRole.COORDINATOR,
+            ServiceRole.VERIFIER,
+            ServiceRole.ISSUER,
+            ServiceRole.EXECUTOR,
+            ServiceRole.RECOVERY,
+        }:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "recovery prestate verification role is invalid",
+            )
+        try:
+            profile = SigningProfile.evidence(project_id, key_version)
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "recovery prestate verification profile is invalid",
+            ) from None
+        self._profile = profile
+        self._client = None if client is None else cast(_AsyncKmsClient, client)
+
+    @property
+    def project_id(self) -> str:
+        return self._profile.project_id
+
+    @property
+    def key_version(self) -> str:
+        return self._profile.key_version
+
+    async def verify(self, attestation: RecoveryPrestateAttestationV1) -> None:
+        """Verify exact bindings and the canonical P-256 digest signature."""
+
+        if (
+            type(attestation) is not RecoveryPrestateAttestationV1
+            or attestation.purpose != RECOVERY_PRESTATE_ATTESTATION_PURPOSE
+            or attestation.signing_algorithm != P256_SIGNING_ALGORITHM
+            or attestation.signing_key_version != self._profile.key_version
+            or attestation.result.target.project_id != self._profile.project_id
+        ):
+            raise _error(
+                SigningErrorCode.KEY_VERSION_UNTRUSTED,
+                "recovery prestate key version is not trusted",
+            )
+        expected_digest = recovery_prestate_signing_input_sha256(
+            attestation.result,
+            self._profile.key_version,
+        )
+        if not hmac.compare_digest(expected_digest, attestation.signing_input_sha256):
+            raise _error(
+                SigningErrorCode.DIGEST_MISMATCH,
+                "recovery prestate signing digest is invalid",
+            )
+        try:
+            signature = decode_base64url(attestation.signature, maximum_bytes=72)
+        except ContractError:
+            raise _error(
+                SigningErrorCode.SIGNATURE_INVALID,
+                "recovery prestate signature encoding is invalid",
             ) from None
         client = self._client
         if client is None:
@@ -792,5 +882,6 @@ __all__ = [
     "GoogleKmsDigestSigner",
     "GoogleKmsEvidenceSignatureVerifier",
     "GoogleKmsHealthAttestationVerifier",
+    "GoogleKmsRecoveryPrestateAttestationVerifier",
     "GoogleKmsTrustBundlePublisher",
 ]

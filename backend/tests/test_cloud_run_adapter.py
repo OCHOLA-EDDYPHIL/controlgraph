@@ -1448,7 +1448,6 @@ async def test_service_read_ignores_display_aliases_and_decodes_not_ready_states
     [
         (CapabilityAction.APPLY_CANARY, ServiceRole.EXECUTOR, 90, 10),
         (CapabilityAction.PROMOTE_CANDIDATE, ServiceRole.EXECUTOR, 0, 100),
-        (CapabilityAction.RECOVER_STABLE, ServiceRole.RECOVERY, 100, 0),
     ],
 )
 @_async_test
@@ -1496,19 +1495,12 @@ async def test_mutation_uses_one_traffic_only_conditional_request(
     assert operation.calls == [30.0]
 
 
-@_async_test
-async def test_concurrency_change_intent_is_denied_without_provider_call() -> None:
+def test_recovery_identity_cannot_construct_a_cloud_run_mutation_adapter() -> None:
     services = _FakeServicesClient()
-    adapter = _adapter(services, role=ServiceRole.RECOVERY)
 
-    result = await _execute(
-        adapter,
-        action=CapabilityAction.RECOVER_STABLE,
-        root_concurrency=9,
-    )
+    with pytest.raises(ValueError, match="executor identity"):
+        _adapter(services, role=ServiceRole.RECOVERY)
 
-    assert result.outcome is CloudRunMutationOutcome.FAILED_SAFE
-    assert result.reason is CloudRunMutationReason.DECLARATION_MISMATCH
     assert services.update_calls == []
 
 
@@ -1815,14 +1807,10 @@ def test_target_configuration_digest_binds_every_poststate_field(
     )
 
 
-def test_target_configuration_projection_rejects_mismatched_declared_state() -> None:
+def test_target_configuration_projection_rejects_legacy_recovery_intent() -> None:
     recovery = _verified(action=CapabilityAction.RECOVER_STABLE).request.intent
-    with pytest.raises(ValueError, match="expected concurrency"):
+    with pytest.raises(ValueError, match="legacy recovery intent"):
         target_configuration_projection(recovery, expected_concurrency=9)
-
-    mismatched_revision = recovery.model_copy(update={"candidate_revision": "other-candidate-v1"})
-    with pytest.raises(ValueError, match="target service"):
-        target_configuration_projection(mismatched_revision, expected_concurrency=8)
 
 
 def test_reference_target_reset_configuration_is_exact_and_immutable() -> None:

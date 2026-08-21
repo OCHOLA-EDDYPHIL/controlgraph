@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Protocol, cast, runtime_checkable
 
@@ -35,6 +36,7 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     protected_path,
 )
+from controlgraph_canary.application.recovery_execution import RecoveryCoordinator
 from controlgraph_canary.application.root_authority import (
     RootAuthorityBundle,
     inspect_root_authority_bundle,
@@ -49,18 +51,21 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     decode_contract,
 )
+from controlgraph_canary.contracts.health import HealthDecisionStatus
 from controlgraph_canary.contracts.health_execution import (
     PostApplyHealthAnchorV1,
     SignedHealthDecisionProofV1,
     create_post_apply_health_anchor,
+    create_signed_health_decision_chain,
 )
 from controlgraph_canary.contracts.health_pipeline import (
     HEALTH_EVALUATION_INVOCATION_V1,
-    HEALTH_EVALUATION_RESULT_V1,
+    HEALTH_EVALUATION_RESULT_V2,
     VERIFIER_HEALTH_EVALUATION_RESULT_V1,
     HealthEvaluationCommandV1,
     HealthEvaluationInvocationV1,
     HealthEvaluationResultV1,
+    HealthEvaluationResultV2,
     VerifierHealthEvaluationRequestV1,
     VerifierHealthEvaluationResultV1,
     create_verifier_health_evaluation_request,
@@ -70,6 +75,13 @@ from controlgraph_canary.contracts.models import ExecutionReceipt, TargetBinding
 from controlgraph_canary.contracts.promotion_execution import (
     create_promotion_health_chain_locator,
     create_verified_apply_receipt_locator,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryDispatchResultV2,
+    RecoveryIntentV1,
+    create_recovery_apply_receipt_locator,
+    create_recovery_intent,
+    create_unhealthy_recovery_command,
 )
 from controlgraph_canary.contracts.root_creation import RolloutRootV3
 from controlgraph_canary.contracts.storage import ServiceClaimStatus
@@ -98,6 +110,7 @@ class HealthPipelineErrorCode(StrEnum):
     TRANSPORT_UNAVAILABLE = "HEALTH_PIPELINE_TRANSPORT_UNAVAILABLE"
     RESPONSE_INVALID = "HEALTH_PIPELINE_RESPONSE_INVALID"
     RESULT_INVALID = "HEALTH_PIPELINE_RESULT_INVALID"
+    RECOVERY_UNAVAILABLE = "HEALTH_PIPELINE_RECOVERY_UNAVAILABLE"
 
 
 class HealthPipelineError(RuntimeError):
@@ -375,6 +388,7 @@ class CoordinatorHealthEvaluationService:
         receipt_reader: HealthEvaluationReceiptReader,
         health_store: HealthChainStore,
         verifier: HealthEvaluationVerifier,
+        recovery_coordinator: RecoveryCoordinator,
     ) -> None:
         if (
             not _target_is_exact(target)
@@ -392,6 +406,7 @@ class CoordinatorHealthEvaluationService:
             or not isinstance(receipt_reader, HealthEvaluationReceiptReader)
             or not isinstance(health_store, HealthChainStore)
             or not isinstance(verifier, HealthEvaluationVerifier)
+            or not isinstance(recovery_coordinator, RecoveryCoordinator)
             or authority_reader.target != target
             or receipt_reader.target != target
             or health_store.target != target
@@ -405,12 +420,13 @@ class CoordinatorHealthEvaluationService:
         self._receipt_reader = receipt_reader
         self._health_store = health_store
         self._verifier = verifier
+        self._recovery_coordinator = recovery_coordinator
 
     async def evaluate(
         self,
         invocation: HealthEvaluationInvocationV1,
         caller: AuthenticationContext,
-    ) -> HealthEvaluationResultV1:
+    ) -> HealthEvaluationResultV2:
         """Advance one exact health chain or adopt an already terminal result."""
 
         if not _context_matches_policy(
@@ -482,11 +498,23 @@ class CoordinatorHealthEvaluationService:
         refreshed = await self._read_trusted_inputs(command)
         if not _trusted_inputs_unchanged(trusted, refreshed):
             raise HealthPipelineError(HealthPipelineErrorCode.AUTHORITY_STALE)
+        recovery_intent = _terminal_recovery_intent(
+            trusted=trusted,
+            snapshot=snapshot,
+            signed_proof=verifier_result.signed_proof,
+        )
         try:
-            appended = await self._health_store.append_signed_health_proof(
-                snapshot,
-                verifier_result.signed_proof,
-            )
+            if recovery_intent is None:
+                appended = await self._health_store.append_signed_health_proof(
+                    snapshot,
+                    verifier_result.signed_proof,
+                )
+            else:
+                appended = await self._health_store.append_signed_health_proof(
+                    snapshot,
+                    verifier_result.signed_proof,
+                    recovery_intent,
+                )
         except asyncio.CancelledError:
             raise
         except AuthorityStoreConflict:
@@ -507,7 +535,7 @@ class CoordinatorHealthEvaluationService:
             != verifier_result.signed_proof
         ):
             raise HealthPipelineError(HealthPipelineErrorCode.TRUSTED_STATE_INVALID)
-        return _health_result(
+        return await self._complete_result(
             command=command,
             snapshot=appended.snapshot,
             disposition=appended.disposition,
@@ -517,7 +545,7 @@ class CoordinatorHealthEvaluationService:
         self,
         command: HealthEvaluationCommandV1,
         trusted: _TrustedHealthInputs,
-    ) -> HealthEvaluationResultV1:
+    ) -> HealthEvaluationResultV2:
         try:
             snapshot = await self._health_store.read_health_chain(
                 trusted.anchor.anchor_id
@@ -540,7 +568,7 @@ class CoordinatorHealthEvaluationService:
         command: HealthEvaluationCommandV1,
         trusted: _TrustedHealthInputs,
         snapshot: HealthChainSnapshot,
-    ) -> HealthEvaluationResultV1:
+    ) -> HealthEvaluationResultV2:
         if not snapshot.signed_proofs:
             raise HealthPipelineError(HealthPipelineErrorCode.STORE_CONFLICT)
         try:
@@ -556,10 +584,48 @@ class CoordinatorHealthEvaluationService:
         refreshed = await self._read_trusted_inputs(command)
         if not _trusted_inputs_unchanged(trusted, refreshed):
             raise HealthPipelineError(HealthPipelineErrorCode.AUTHORITY_STALE)
-        return _health_result(
+        return await self._complete_result(
             command=command,
             snapshot=snapshot,
             disposition=HealthChainWriteDisposition.ADOPTED,
+        )
+
+    async def _complete_result(
+        self,
+        *,
+        command: HealthEvaluationCommandV1,
+        snapshot: HealthChainSnapshot,
+        disposition: HealthChainWriteDisposition,
+    ) -> HealthEvaluationResultV2:
+        recovery: RecoveryDispatchResultV2 | None = None
+        if (
+            snapshot.signed_proofs
+            and snapshot.signed_proofs[-1].value.proof.decision.status
+            is HealthDecisionStatus.UNHEALTHY
+        ):
+            intent = snapshot.recovery_intent
+            if (
+                type(intent) is not StoredRecord
+                or type(intent.value) is not RecoveryIntentV1
+            ):
+                raise HealthPipelineError(
+                    HealthPipelineErrorCode.TRUSTED_STATE_INVALID
+                )
+            try:
+                recovery = await self._recovery_coordinator.dispatch(
+                    intent.value.command
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise HealthPipelineError(
+                    HealthPipelineErrorCode.RECOVERY_UNAVAILABLE
+                ) from None
+        return _health_result(
+            command=command,
+            snapshot=snapshot,
+            disposition=disposition,
+            recovery_dispatch=recovery,
         )
 
     async def _read_trusted_inputs(
@@ -666,7 +732,7 @@ class ApiHealthEvaluationClient:
         self,
         command: HealthEvaluationCommandV1,
         principal: AuthenticationContext,
-    ) -> HealthEvaluationResultV1:
+    ) -> HealthEvaluationResultV2:
         """Forward the command once and accept only its exact compact result."""
 
         if (
@@ -708,7 +774,7 @@ class ApiHealthEvaluationClient:
                 HealthPipelineErrorCode.TRANSPORT_UNAVAILABLE
             ) from None
         try:
-            result = decode_contract(body, HealthEvaluationResultV1)
+            result = decode_contract(body, HealthEvaluationResultV2)
         except (ContractError, TypeError, ValueError):
             raise HealthPipelineError(HealthPipelineErrorCode.RESPONSE_INVALID) from None
         if not _health_result_matches_command(result, command):
@@ -839,7 +905,8 @@ def _health_result(
     command: HealthEvaluationCommandV1,
     snapshot: HealthChainSnapshot,
     disposition: HealthChainWriteDisposition,
-) -> HealthEvaluationResultV1:
+    recovery_dispatch: RecoveryDispatchResultV2 | None,
+) -> HealthEvaluationResultV2:
     manifest_record = snapshot.manifest
     chain = snapshot.signed_chain
     if (
@@ -857,8 +924,8 @@ def _health_result(
             if terminal.decision.status.value == "healthy"
             else None
         )
-        return HealthEvaluationResultV1(
-            schema_version=HEALTH_EVALUATION_RESULT_V1,
+        return HealthEvaluationResultV2(
+            schema_version=HEALTH_EVALUATION_RESULT_V2,
             request_id=command.request_id,
             idempotency_key=command.idempotency_key,
             command_sha256=health_evaluation_command_sha256(command),
@@ -881,6 +948,7 @@ def _health_result(
             next_evaluation_at=terminal.decision.next_evaluation_at,
             append_disposition=disposition.value,
             promotion_health_chain=locator,
+            recovery_dispatch=recovery_dispatch,
         )
     except HealthPipelineError:
         raise
@@ -893,7 +961,7 @@ def _health_result_matches_command(
     command: HealthEvaluationCommandV1,
 ) -> bool:
     return (
-        type(result) is HealthEvaluationResultV1
+        type(result) is HealthEvaluationResultV2
         and result.request_id == command.request_id
         and result.idempotency_key == command.idempotency_key
         and result.command_sha256 == health_evaluation_command_sha256(command)
@@ -906,6 +974,60 @@ def _health_result_matches_command(
         and result.expected_chain_head_sha256
         == command.expected_chain_head_sha256
     )
+
+
+def decode_health_evaluation_result(
+    body: bytes,
+) -> HealthEvaluationResultV1 | HealthEvaluationResultV2:
+    """Decode the current result while retaining explicit historical V1 reads."""
+
+    try:
+        return decode_contract(body, HealthEvaluationResultV2)
+    except ContractError:
+        return decode_contract(body, HealthEvaluationResultV1)
+
+
+def _terminal_recovery_intent(
+    *,
+    trusted: _TrustedHealthInputs,
+    snapshot: HealthChainSnapshot,
+    signed_proof: SignedHealthDecisionProofV1,
+) -> RecoveryIntentV1 | None:
+    decision = signed_proof.proof.decision
+    if decision.status is not HealthDecisionStatus.UNHEALTHY:
+        return None
+    try:
+        chain = create_signed_health_decision_chain(
+            anchor=trusted.anchor,
+            signed_proofs=(
+                *(record.value for record in snapshot.signed_proofs),
+                signed_proof,
+            ),
+        )
+        receipt = create_recovery_apply_receipt_locator(
+            trusted.receipt.value,
+            storage_revision=trusted.receipt.revision,
+        )
+        triggered = datetime.strptime(
+            decision.evaluated_at,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=UTC)
+        scheduled_at = (triggered + timedelta(seconds=120)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        command = create_unhealthy_recovery_command(
+            signed_health_chain=chain,
+            verified_apply_receipt=receipt,
+            request_id=f"recover-{trusted.root.root_sha256}",
+            idempotency_key=f"recover-once-{trusted.root.root_sha256}",
+            scheduled_at=scheduled_at,
+        )
+        return create_recovery_intent(
+            command,
+            created_at=decision.evaluated_at,
+        )
+    except (TypeError, ValueError):
+        raise HealthPipelineError(HealthPipelineErrorCode.TRUSTED_STATE_INVALID) from None
 
 
 def _invocation_operator_is_exact(
@@ -967,4 +1089,5 @@ __all__ = [
     "HealthPipelineErrorCode",
     "VerifierHealthEvaluationService",
     "VerifierHealthProofServiceFactory",
+    "decode_health_evaluation_result",
 ]

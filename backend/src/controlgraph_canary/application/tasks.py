@@ -13,6 +13,7 @@ from controlgraph_canary.application.promotion_store import (
     PromotionEnqueuePermit,
     PromotionEnqueuePermitV2,
 )
+from controlgraph_canary.application.recovery_store import RecoveryEnqueuePermit
 from controlgraph_canary.contracts.codec import (
     ContractError,
     ContractErrorCode,
@@ -22,6 +23,7 @@ from controlgraph_canary.contracts.codec import (
 )
 from controlgraph_canary.contracts.models import CapabilityAction, TaskRequest
 from controlgraph_canary.contracts.promotion_execution import PromotionTaskRequestV2
+from controlgraph_canary.contracts.recovery_execution import RecoveryTaskRequestV2
 
 TASK_REGION: Final = "us-central1"
 EXECUTION_QUEUE_ID: Final = "controlgraph-execution"
@@ -39,7 +41,9 @@ TASK_DISPATCH_DEADLINE_SECONDS: Final = 30
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
 
-type AddressableTaskRequest = TaskRequest | PromotionTaskRequestV2
+type AddressableTaskRequest = (
+    TaskRequest | PromotionTaskRequestV2 | RecoveryTaskRequestV2
+)
 
 
 class TaskRoute(StrEnum):
@@ -214,9 +218,12 @@ class TaskDispatcher:
         self._enqueuer = enqueuer
 
     def dispatch(self, request: TaskRequest, *, now: datetime) -> TaskEnqueueResult:
-        if request.intent.action is CapabilityAction.PROMOTE_CANDIDATE:
+        if request.intent.action in {
+            CapabilityAction.PROMOTE_CANDIDATE,
+            CapabilityAction.RECOVER_STABLE,
+        }:
             raise TaskAddressingError(
-                "promotion dispatch requires a directly confirmed enqueue permit"
+                "terminal dispatch requires a directly confirmed enqueue permit"
             )
         evaluation_time = _require_utc_second(now)
         addressed = self.prepare(request, now=evaluation_time)
@@ -285,6 +292,35 @@ class TaskDispatcher:
             raise TaskAddressingError("V2 promotion enqueue permit is invalid") from error
         return self._enqueuer.enqueue(task, now=evaluation_time)
 
+    def dispatch_prepared_recovery(
+        self,
+        task: AddressedTask,
+        *,
+        permit: RecoveryEnqueuePermit,
+        now: datetime,
+    ) -> TaskEnqueueResult:
+        """Submit one exactly sealed stable-recovery task with direct store authority."""
+
+        evaluation_time = _require_utc_second(now)
+        self._addressor.validate_seal(task, now=evaluation_time)
+        try:
+            request = decode_contract(task.body, RecoveryTaskRequestV2)
+        except ContractError as error:
+            raise TaskAddressingError("recovery task body is not canonical") from error
+        if (
+            type(permit) is not RecoveryEnqueuePermit
+            or request.intent.action is not CapabilityAction.RECOVER_STABLE
+        ):
+            raise TaskAddressingError("recovery enqueue permit is required")
+        try:
+            permit._take(
+                task_name=task.name,
+                task_sha256=canonical_sha256(request),
+            )
+        except (TypeError, ValueError) as error:
+            raise TaskAddressingError("recovery enqueue permit is invalid") from error
+        return self._enqueuer.enqueue(task, now=evaluation_time)
+
 
 def _route_for_action(action: CapabilityAction) -> TaskRoute:
     if action is CapabilityAction.RECOVER_STABLE:
@@ -299,6 +335,11 @@ def _deterministic_task_id(request: AddressableTaskRequest) -> str:
 
 
 def _decode_addressed_task(body: bytes) -> AddressableTaskRequest:
+    try:
+        return decode_contract(body, RecoveryTaskRequestV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     try:
         return decode_contract(body, PromotionTaskRequestV2)
     except ContractError as error:

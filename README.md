@@ -7,8 +7,10 @@ current epoch immediately before invoking its target-bound adapter. A capability
 other epoch fails closed even when its caller and signature are valid.
 
 The repository contains a Python 3.12 backend and CLI, a read-only React and TypeScript
-console, Terraform, shared contract fixtures, and CI checks. The first vertical is a 90/10
-Cloud Run canary followed by manual epoch revocation and denial of a delayed stale task.
+console, Terraform, shared contract fixtures, and CI checks. The implemented rollout vertical
+captures a stable Cloud Run revision, applies a 90/10 canary, deterministically evaluates its
+Cloud Monitoring signals, then either promotes the approved candidate or restores the captured
+stable revision. Manual epoch revocation makes delayed otherwise-valid work fail closed.
 
 ## Repository layout
 
@@ -31,13 +33,15 @@ uv run controlgraph-canary doctor
 uv run controlgraph-canary serve
 ```
 
-Each M2 service shell exposes only identity-safe read endpoints:
+Each controller exposes identity-safe read endpoints:
 
 - `GET /healthz`
 - `GET /v1/metadata`
 
-Role-specific protected POST routes exist for authenticated integration checks but return
-`MUTATION_DISABLED` until the M3 enforcement path is composed.
+Role-specific protected routes compose the authenticated API, coordinator, issuer, executor,
+recovery, verifier, and evidence-writer boundaries. Mutation routes require the complete
+role-specific environment and exact caller, capability, root, epoch, receipt, and target
+bindings; an ordinary local start does not bypass those gates.
 
 ### Web console
 
@@ -70,10 +74,16 @@ and applies are intentional operator actions and are never run by the local cons
 - Authority-bearing Python code has an enforced import boundary and cannot depend on HTTP,
   cloud, model, or agent-framework packages.
 - Mutation adapters are configured for one target and cannot accept arbitrary coordinates.
+- Cloud Monitoring health decisions are deterministic, root-bound, and signed; no model chooses
+  promotion or recovery.
+- The recovery identity can only verify and forward stable-only work to the executor's separate
+  recovery facade. It has no direct target-update, target service-account impersonation
+  (`actAs`), or operation-read authority.
 - The console remains read-only and never invokes a cloud control plane directly.
 - Unknown or ambiguous mutation outcomes remain explicit and are never blindly retried.
 
-See [docs/architecture.md](docs/architecture.md) for the boundary and threat model.
+See [docs/architecture.md](docs/architecture.md) and
+[docs/threat-model.md](docs/threat-model.md) for the security boundary.
 
 ## Development
 

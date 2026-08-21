@@ -35,6 +35,10 @@ from controlgraph_canary.contracts.promotion_execution import (
     VerifiedApplyReceiptLocatorV1,
     create_verified_apply_receipt_locator,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryDispatchResultV2,
+    RecoveryTriggerBasis,
+)
 from controlgraph_canary.contracts.root_creation import RolloutRootV3
 
 HEALTH_EVALUATION_COMMAND_V1: Final = "controlgraph.health-evaluation-command/v1"
@@ -46,6 +50,7 @@ VERIFIER_HEALTH_EVALUATION_RESULT_V1: Final = (
     "controlgraph.verifier-health-evaluation-result/v1"
 )
 HEALTH_EVALUATION_RESULT_V1: Final = "controlgraph.health-evaluation-result/v1"
+HEALTH_EVALUATION_RESULT_V2: Final = "controlgraph.health-evaluation-result/v2"
 
 _COMMAND_DIGEST_DOMAIN: Final = b"controlgraph.health-evaluation-command-sha256/v1\0"
 _VERIFIER_REQUEST_DIGEST_DOMAIN: Final = (
@@ -296,6 +301,90 @@ class HealthEvaluationResultV1(StrictContractModel):
         return self
 
 
+class HealthEvaluationResultV2(StrictContractModel):
+    """Current chain result, including the sole unhealthy recovery dispatch."""
+
+    schema_version: Literal["controlgraph.health-evaluation-result/v2"]
+    request_id: Identifier
+    idempotency_key: Identifier
+    command_sha256: Sha256Digest
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    epoch: PositiveSafeInteger
+    verified_apply_receipt: VerifiedApplyReceiptLocatorV1
+    expected_sequence: Annotated[int, Field(ge=0, le=19)]
+    expected_chain_head_sha256: Sha256Digest | None
+    anchor_id: Identifier
+    anchor_sha256: Sha256Digest
+    chain_id: Identifier
+    health_chain_sha256: Sha256Digest
+    chain_head_sha256: Sha256Digest
+    ordered_proof_chain_sha256: Sha256Digest
+    terminal_sequence: Annotated[int, Field(ge=1, le=20)]
+    terminal_status: HealthDecisionStatus
+    terminal_health_decision_sha256: Sha256Digest
+    next_evaluation_at: UtcSecond | None
+    append_disposition: Literal["CREATED", "ADOPTED"]
+    promotion_health_chain: PromotionHealthChainLocatorV1 | None
+    recovery_dispatch: RecoveryDispatchResultV2 | None
+
+    @model_validator(mode="after")
+    def validate_result(self) -> Self:
+        locator = self.promotion_health_chain
+        if (
+            not _target_is_exact(self.target)
+            or self.root_id != f"cgroot:{self.root_sha256}"
+            or self.chain_id != f"cghealthchain:{self.health_chain_sha256}"
+            or (self.expected_sequence == 0)
+            != (self.expected_chain_head_sha256 is None)
+            or self.terminal_sequence != self.expected_sequence + 1
+        ):
+            raise ValueError("health evaluation result bindings are invalid")
+        if self.terminal_status is HealthDecisionStatus.HEALTHY:
+            if (
+                self.next_evaluation_at is not None
+                or locator is None
+                or locator.anchor_id != self.anchor_id
+                or locator.anchor_sha256 != self.anchor_sha256
+                or locator.chain_id != self.chain_id
+                or locator.health_chain_sha256 != self.health_chain_sha256
+                or locator.chain_head_sha256 != self.chain_head_sha256
+                or locator.ordered_proof_chain_sha256
+                != self.ordered_proof_chain_sha256
+                or locator.terminal_sequence != self.terminal_sequence
+            ):
+                raise ValueError("healthy evaluation result lacks its exact chain locator")
+        elif locator is not None:
+            raise ValueError("non-healthy evaluation result cannot authorize promotion")
+
+        recovery = self.recovery_dispatch
+        if self.terminal_status is HealthDecisionStatus.UNHEALTHY:
+            if (
+                recovery is None
+                or recovery.target != self.target
+                or recovery.root_schema_version != "controlgraph.rollout-root/v3"
+                or recovery.root_id != self.root_id
+                or recovery.root_sha256 != self.root_sha256
+                or recovery.epoch != self.epoch
+                or recovery.trigger_basis
+                is not RecoveryTriggerBasis.TERMINAL_UNHEALTHY_V3
+                or recovery.source_receipt_sha256
+                != self.verified_apply_receipt.receipt_sha256
+                or recovery.expected_prestate_sha256
+                != self.verified_apply_receipt.expected_poststate_sha256
+            ):
+                raise ValueError(
+                    "unhealthy evaluation result lacks its exact recovery dispatch"
+                )
+        elif recovery is not None:
+            raise ValueError("non-unhealthy evaluation result cannot dispatch recovery")
+        canonical_json_value_bytes(
+            cast(RestrictedJson, self.model_dump(mode="json"))
+        )
+        return self
+
+
 def health_evaluation_command_sha256(command: HealthEvaluationCommandV1) -> str:
     """Hash every operator-selected health-evaluation binding."""
 
@@ -363,11 +452,13 @@ __all__ = [
     "HEALTH_EVALUATION_COMMAND_V1",
     "HEALTH_EVALUATION_INVOCATION_V1",
     "HEALTH_EVALUATION_RESULT_V1",
+    "HEALTH_EVALUATION_RESULT_V2",
     "VERIFIER_HEALTH_EVALUATION_REQUEST_V1",
     "VERIFIER_HEALTH_EVALUATION_RESULT_V1",
     "HealthEvaluationCommandV1",
     "HealthEvaluationInvocationV1",
     "HealthEvaluationResultV1",
+    "HealthEvaluationResultV2",
     "VerifierHealthEvaluationRequestV1",
     "VerifierHealthEvaluationResultV1",
     "create_verifier_health_evaluation_request",

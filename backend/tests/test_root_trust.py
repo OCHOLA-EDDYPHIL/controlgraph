@@ -853,6 +853,10 @@ def _coordinator_environment() -> dict[str, str]:
             f"controlgraph-executor@{PROJECT}.iam.gserviceaccount.com"
         ),
         "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
+        "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL": (
+            f"controlgraph-executor@{PROJECT}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
     }
 
 

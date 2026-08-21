@@ -5,6 +5,9 @@ from dataclasses import replace
 import pytest
 
 from controlgraph_canary.application.identity import (
+    RECEIPT_AUTHORITY_PATH,
+    RECOVERY_EXECUTION_FACADE_PATH,
+    RECOVERY_RECEIPT_AUTHORITY_PATH,
     AuthenticationDenialCode,
     AuthenticationError,
     CallerBinding,
@@ -143,6 +146,103 @@ def test_route_policy_rejects_service_name_and_path_substitution() -> None:
         replace(
             policy,
             audience=("https://controlgraph-executor-shadow-123456789012.us-central1.run.app"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "caller_role"),
+    [
+        (RECEIPT_AUTHORITY_PATH, CallerRole.EXECUTOR),
+        (RECOVERY_RECEIPT_AUTHORITY_PATH, CallerRole.EXECUTOR),
+    ],
+)
+def test_receipt_authority_routes_bind_distinct_execution_callers(
+    path: str,
+    caller_role: CallerRole,
+) -> None:
+    policy = RouteAuthenticationPolicy(
+        project_id=PROJECT_ID,
+        project_number=PROJECT_NUMBER,
+        service_role=ServiceRole.COORDINATOR,
+        path=path,
+        audience=(
+            f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+            "us-central1.run.app"
+        ),
+        caller=CallerBinding(
+            role=caller_role,
+            email=EXPECTED_CALLERS[caller_role],
+            subject=SUBJECT,
+        ),
+    )
+
+    assert policy.path == path
+    assert policy.caller.role is caller_role
+
+
+def test_recovery_cannot_use_either_executor_receipt_authority_route() -> None:
+    with pytest.raises(ValueError, match="caller role"):
+        RouteAuthenticationPolicy(
+            project_id=PROJECT_ID,
+            project_number=PROJECT_NUMBER,
+            service_role=ServiceRole.COORDINATOR,
+            path=RECEIPT_AUTHORITY_PATH,
+            audience=(
+                f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+                "us-central1.run.app"
+            ),
+            caller=CallerBinding(
+                role=CallerRole.RECOVERY,
+                email=EXPECTED_CALLERS[CallerRole.RECOVERY],
+                subject=SUBJECT,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="caller role"):
+        RouteAuthenticationPolicy(
+            project_id=PROJECT_ID,
+            project_number=PROJECT_NUMBER,
+            service_role=ServiceRole.COORDINATOR,
+            path=RECOVERY_RECEIPT_AUTHORITY_PATH,
+            audience=(
+                f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+                "us-central1.run.app"
+            ),
+            caller=CallerBinding(
+                role=CallerRole.RECOVERY,
+                email=EXPECTED_CALLERS[CallerRole.RECOVERY],
+                subject=SUBJECT,
+            ),
+        )
+
+
+def test_recovery_executor_facade_has_one_exact_caller_and_path() -> None:
+    policy = RouteAuthenticationPolicy(
+        project_id=PROJECT_ID,
+        project_number=PROJECT_NUMBER,
+        service_role=ServiceRole.EXECUTOR,
+        path=RECOVERY_EXECUTION_FACADE_PATH,
+        audience=(
+            f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
+        caller=CallerBinding(
+            role=CallerRole.RECOVERY,
+            email=EXPECTED_CALLERS[CallerRole.RECOVERY],
+            subject=SUBJECT,
+        ),
+    )
+
+    assert policy.path == RECOVERY_EXECUTION_FACADE_PATH
+    assert policy.caller.role is CallerRole.RECOVERY
+
+    with pytest.raises(ValueError, match="caller role"):
+        replace(
+            policy,
+            caller=CallerBinding(
+                role=CallerRole.EXECUTION_TASK_CALLER,
+                email=EXPECTED_CALLERS[CallerRole.EXECUTION_TASK_CALLER],
+                subject=SUBJECT,
+            ),
         )
 
 

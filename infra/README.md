@@ -10,8 +10,9 @@ foundation/  APIs, budget, audit policy, network, registry, authority data, keys
 runtime/     Private controller services and fixed authenticated task queues
 ```
 
-The disposable reference target is added by its numbered roadmap issue. No stack may use a
-shared project, a sibling repository state bucket, or credentials stored in this repository.
+The runtime stack includes the disposable reference target used by the closed canary contract.
+No stack may use a shared project, a sibling repository state bucket, or credentials stored in
+this repository.
 
 ## Bootstrap and state migration
 
@@ -67,21 +68,28 @@ a hard spending cap. The runtime definitions bound Cloud Run scaling, retain wor
 days, and limit Artifact Registry cleanup to old untagged artifacts when the stacks are applied.
 
 The definitions retain the project, state bucket, authority database, signing keys, network,
-registry, log bucket, runtime services, and acceptance evidence after M4. Deletion protection and
-`prevent_destroy` are deliberate. A future authorized bootstrap or foundation apply uses an
+registry, log bucket, runtime services, and evidence. Deletion protection and
+`prevent_destroy` are deliberate. An authorized bootstrap or foundation apply uses an
 authenticated human; the defined keyless CI Terraform identity is limited to its exact state
 bucket and dedicated signing key ring. Resource provisioning permissions are added only with a
 resource-specific deployment workflow.
 
 The foundation declares one Firestore Native database named `controlgraph-authority` and one
 regional KMS key ring containing exactly two asymmetric signing keys: capability and evidence.
-The runtime stack declares six Python service shells from one dedicated-registry image digest.
-Each definition has its own runtime identity, zero minimum and two maximum instances, concurrency
-eight, a 30-second request timeout, one CPU, 512 MiB memory, Direct VPC egress, authenticated
-invocation, and no enabled target mutation. The API binding admits only the explicit operator
-principal; all other service definitions use internal ingress. Execution and recovery queue
-definitions are separate, region-pinned, limited to one dispatch per second and one concurrent
-dispatch, and force their exact HTTPS path, OIDC caller, and audience.
+The runtime stack declares seven Python controller services and the disposable reference target
+from dedicated-registry image digests. Each controller has its own runtime identity, bounded
+scaling and resources, Direct VPC egress, and authenticated invocation. The API binding admits
+only the explicit operator principal; all other controller definitions use internal ingress.
+Execution and recovery queues are separate, region-pinned, limited to one dispatch per second
+and one concurrent dispatch, and force their exact HTTPS path, OIDC caller, and audience.
+
+Only the executor receives service-scoped target traffic-update, reference-target `actAs`, and
+project operation-read grants. Cloud Run IAM lets the recovery identity invoke the executor
+service, but application caller policy admits that identity only at the recovery facade and
+rejects it at the normal execution route. Recovery receives none of the direct target permissions.
+Only the verifier receives Monitoring time-series access, and its target-snapshot role is scoped
+to the reference service. The executor uses separate authenticated coordinator routes for
+standard and recovery receipt transitions.
 
 The IAM graph keeps the capability issuer and evidence writer as distinct identities with signer
 access to only their respective keys. It grants the evidence writer no Firestore authority write,
@@ -89,19 +97,21 @@ keeps the verifier read-only, and permits the API identity to read the two publi
 metadata for trust-bundle publication without signing or key administration.
 
 Firestore server-client IAM is database-granular. The coordinator authority facade is the only
-defined database writer; executor and recovery identities receive read access and must use narrow
-authenticated coordinator operations for receipt claim and compare-and-set writes. Collection
+defined database writer. The executor receives read access and must use narrow authenticated
+coordinator operations for receipt claim and compare-and-set writes; the recovery identity can
+read the authority needed to validate forwarding but receives no receipt-write path. Collection
 names are application contract boundaries, not claimed IAM boundaries.
 
 The keyless CI Terraform identity can administer objects in its exact state bucket and signing
-keys in the dedicated key ring; it does not yet have general runtime provisioning authority.
-Bootstrap, foundation, and runtime applies therefore remain authenticated human operations until
-a reviewed resource-specific deployment workflow grants narrower provisioning permissions.
+keys in the dedicated key ring; it is intentionally not granted general runtime provisioning
+authority. Bootstrap, foundation, and runtime applies therefore remain authenticated human
+operations until a reviewed resource-specific deployment workflow grants narrower provisioning
+permissions.
 
 ## Retained authority data and keys
 
 The authority database uses delete protection, an `ABANDON` deletion policy, and
-`prevent_destroy`. A separately authorized teardown must first decide whether the synthetic M4
+`prevent_destroy`. A separately authorized teardown must first decide whether the synthetic
 authority and receipt records require a Firestore managed export, record the export location and
 retention boundary, then review a change that disables database deletion protection. Removing the
 Terraform resource alone must not be represented as deleting the retained database.
@@ -129,4 +139,4 @@ Teardown requires a new explicit authorization. The reviewed order is:
    policy, and delete the now-empty state bucket and project from the migrated local state; and
 7. verify that no shared, RECONCILE, billing-account, organization, or unrelated resource changed.
 
-Do not disable protections or run teardown commands as part of M2–M4 acceptance.
+Do not disable protections or run teardown commands as part of normal acceptance.

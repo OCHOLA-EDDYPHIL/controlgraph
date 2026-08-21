@@ -70,7 +70,7 @@ locals {
     }
     run_executor_invoke = {
       api      = "run.googleapis.com"
-      boundary = "the fixed execution task handler"
+      boundary = "the internal executor service with application-separated task and recovery-facade routes"
     }
     run_evidence_writer_invoke = {
       api      = "run.googleapis.com"
@@ -99,10 +99,6 @@ locals {
     run_target_canary_or_promote = {
       api      = "run.googleapis.com"
       boundary = "traffic on the one bound target through the executor application contract"
-    }
-    run_target_restore_stable = {
-      api      = "run.googleapis.com"
-      boundary = "traffic on the one bound target through the restore-only recovery contract"
     }
     run_target_snapshot = {
       api      = "run.googleapis.com"
@@ -169,6 +165,8 @@ locals {
       "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
+      "kms_evidence_public_key_read",
+      "kms_evidence_version_read",
       "reference_target_act_as",
       "run_coordinator_invoke",
       "run_operation_read",
@@ -178,9 +176,9 @@ locals {
       "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
-      "reference_target_act_as",
-      "run_operation_read",
-      "run_target_restore_stable",
+      "kms_evidence_public_key_read",
+      "kms_evidence_version_read",
+      "run_executor_invoke",
     ])
     verifier = toset([
       "firestore_authority_read",
@@ -261,6 +259,8 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
+        "kms_evidence_public_key_read",
+        "kms_evidence_version_read",
         "reference_target_act_as",
         "run_coordinator_invoke",
         "run_operation_read",
@@ -270,6 +270,9 @@ locals {
         "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
+        "kms_evidence_public_key_read",
+        "kms_evidence_version_read",
+        "run_executor_invoke",
       ])
       verifier = toset([
         "firestore_authority_read",
@@ -447,26 +450,72 @@ check "operator_permissions_are_bounded" {
   }
 }
 
-check "reference_target_act_as_staging_is_closed" {
+check "reference_target_act_as_is_closed" {
   assert {
     condition = (
       toset([
         for identity, allows in local.identity_expected_allows : identity
         if contains(allows, "reference_target_act_as")
-      ]) == toset(["executor", "recovery"]) &&
+      ]) == toset(["executor"]) &&
       toset([
         for identity, allows in local.identity_implemented_allows : identity
         if contains(allows, "reference_target_act_as")
       ]) == toset(["executor"]) &&
-      contains(
-        setsubtract(
-          local.identity_expected_allows.recovery,
-          local.identity_implemented_allows.recovery,
-        ),
-        "reference_target_act_as",
-      )
+      contains(local.iam_permission_matrix.recovery.expected_denials, "reference_target_act_as")
     )
-    error_message = "Reference-target actAs authority must remain implemented for executor only, with recovery pending."
+    error_message = "Reference-target actAs authority must remain implemented only for the executor mutation facade."
+  }
+}
+
+check "recovery_permissions_are_implemented_and_bounded" {
+  assert {
+    condition = (
+      local.identity_implemented_allows.recovery == local.identity_expected_allows.recovery &&
+      contains(local.identity_implemented_allows.recovery, "run_executor_invoke") &&
+      contains(local.identity_implemented_allows.recovery, "kms_evidence_public_key_read") &&
+      contains(local.identity_implemented_allows.recovery, "kms_evidence_version_read") &&
+      !contains(local.identity_implemented_allows.recovery, "run_target_canary_or_promote") &&
+      !contains(local.identity_implemented_allows.recovery, "reference_target_act_as") &&
+      !contains(local.identity_implemented_allows.recovery, "run_operation_read") &&
+      !contains(local.identity_implemented_allows.recovery, "kms_evidence_sign") &&
+      !contains(local.identity_implemented_allows.recovery, "kms_capability_sign") &&
+      !contains(local.identity_implemented_allows.recovery, "firestore_authority_write") &&
+      !contains(local.identity_implemented_allows.recovery, "tasks_recovery_enqueue")
+    )
+    error_message = "Recovery may invoke only the sealed executor facade and verify evidence, with no direct target mutation, actAs, operation-read, signing, authority-write, or enqueue authority."
+  }
+}
+
+check "executor_service_invocation_is_closed_to_task_and_recovery_callers" {
+  assert {
+    condition = (
+      toset([
+        for identity, allows in local.identity_expected_allows : identity
+        if contains(allows, "run_executor_invoke")
+      ]) == toset(["execution_task_caller", "recovery"]) &&
+      toset([
+        for identity, allows in local.identity_implemented_allows : identity
+        if contains(allows, "run_executor_invoke")
+      ]) == toset(["execution_task_caller", "recovery"])
+    )
+    error_message = "Only the execution task caller and recovery worker may invoke the executor service; application policy separates their exact routes."
+  }
+}
+
+check "recovery_evidence_key_access_is_verification_only" {
+  assert {
+    condition = (
+      toset([
+        for identity, allows in local.identity_expected_allows : identity
+        if contains(allows, "kms_evidence_sign")
+      ]) == toset(["evidence_writer"]) &&
+      contains(local.identity_expected_allows.recovery, "kms_evidence_public_key_read") &&
+      contains(local.identity_expected_allows.recovery, "kms_evidence_version_read") &&
+      !contains(local.identity_expected_allows.recovery, "kms_evidence_sign") &&
+      !contains(local.iam_permission_matrix.recovery.pending_allows, "kms_evidence_public_key_read") &&
+      !contains(local.iam_permission_matrix.recovery.pending_allows, "kms_evidence_version_read")
+    )
+    error_message = "Recovery may verify the exact evidence key but only the evidence writer may sign with it."
   }
 }
 

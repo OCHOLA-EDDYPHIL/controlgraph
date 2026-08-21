@@ -43,9 +43,17 @@ def _environment() -> dict[str, str]:
             f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
             "cryptoKeys/capability-signing/cryptoKeyVersions/1"
         ),
+        "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
+            f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
+            "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
+        ),
         "CONTROLGRAPH_COORDINATOR_URL": (
             f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
         ),
+        "CONTROLGRAPH_RECOVERY_FACADE_CALLER_EMAIL": (
+            f"controlgraph-recovery@{PROJECT_ID}.iam.gserviceaccount.com"
+        ),
+        "CONTROLGRAPH_RECOVERY_FACADE_CALLER_SUBJECT": "123456789012345678901",
         "CONTROLGRAPH_TARGET_NETWORK_RESOURCE": (
             f"projects/{PROJECT_ID}/global/networks/controlgraph-network"
         ),

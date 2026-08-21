@@ -50,6 +50,10 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionCapabilityIssuanceCommandV2,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryCapabilityIssuanceCommandV2,
+    RecoveryCapabilityIssuanceResultV2,
+)
 
 
 class CanaryExecutionErrorCode(StrEnum):
@@ -119,9 +123,11 @@ class CapabilityIssuanceService:
 
     async def issue(
         self,
-        command: CapabilityIssuanceCommandV1 | PromotionCapabilityIssuanceCommandV2,
+        command: CapabilityIssuanceCommandV1
+        | PromotionCapabilityIssuanceCommandV2
+        | RecoveryCapabilityIssuanceCommandV2,
         caller: AuthenticationContext,
-    ) -> SignedCapability:
+    ) -> SignedCapability | RecoveryCapabilityIssuanceResultV2:
         """Return one signed envelope only to the configured coordinator."""
 
         if not _context_matches_policy(
@@ -133,6 +139,7 @@ class CapabilityIssuanceService:
         if type(command) not in {
             CapabilityIssuanceCommandV1,
             PromotionCapabilityIssuanceCommandV2,
+            RecoveryCapabilityIssuanceCommandV2,
         }:
             raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         try:
@@ -165,6 +172,33 @@ class CapabilityIssuanceService:
                     principal=principal,
                     now=now,
                 )
+            elif type(command) is RecoveryCapabilityIssuanceCommandV2:
+                recovery_result = await self._issuer.issue_recovery(
+                    command,
+                    principal=principal,
+                    now=now,
+                )
+                claims = recovery_result.capability.claims
+                if (
+                    recovery_result.issuance_command != command
+                    or claims.root_id != command.root_id
+                    or claims.root_sha256 != command.expected_root_sha256
+                    or claims.epoch != command.expected_epoch
+                    or claims.request_id != command.request_id
+                    or claims.idempotency_key != command.idempotency_key
+                    or claims.action is not CapabilityAction.RECOVER_STABLE
+                    or claims.subject != command.authorization.recovery_identity
+                    or claims.audience != command.authorization.recovery_audience
+                    or claims.concurrency != command.authorization.concurrency
+                    or claims.stable_percent != 100
+                    or claims.candidate_percent != 0
+                    or claims.parent_capability_sha256 is not None
+                    or claims.not_before != command.scheduled_at
+                ):
+                    raise CanaryExecutionError(
+                        CanaryExecutionErrorCode.ISSUANCE_DENIED
+                    )
+                return recovery_result
             else:
                 raise CanaryExecutionError(CanaryExecutionErrorCode.COMMAND_DENIED)
         except asyncio.CancelledError:

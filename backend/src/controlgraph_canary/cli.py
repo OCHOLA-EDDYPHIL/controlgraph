@@ -30,12 +30,14 @@ from controlgraph_canary.contracts.canary_execution import (
 )
 from controlgraph_canary.contracts.codec import (
     ContractError,
+    ContractErrorCode,
     canonical_json_bytes,
     decode_contract,
 )
 from controlgraph_canary.contracts.health_pipeline import (
     HealthEvaluationCommandV1,
     HealthEvaluationResultV1,
+    HealthEvaluationResultV2,
     health_evaluation_command_sha256,
 )
 from controlgraph_canary.contracts.models import CapabilityAction
@@ -53,6 +55,12 @@ from controlgraph_canary.contracts.operator_observability import (
 from controlgraph_canary.contracts.promotion_execution import (
     PromotionCommandV2,
     PromotionDispatchResultV2,
+)
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryCommandV2,
+    RecoveryDispatchResultV2,
+    RevokedV2RecoverySourceV1,
+    recovery_trigger_proof_sha256,
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_COMMAND_V1,
@@ -99,6 +107,7 @@ type OperatorApiCommand = (
     | TargetTrafficReadCommandV1
     | HealthEvaluationCommandV1
     | PromotionCommandV2
+    | RecoveryCommandV2
     | EpochRevocationCommandV1
     | EpochRevocationProofCommandV1
     | ServiceClaimReleaseCommandV1
@@ -111,7 +120,9 @@ type OperatorApiResult = (
     | ExecutionReceiptReadResultV1
     | TargetTrafficReadResultV1
     | HealthEvaluationResultV1
+    | HealthEvaluationResultV2
     | PromotionDispatchResultV2
+    | RecoveryDispatchResultV2
     | ServiceClaimReleaseResultV1
 )
 
@@ -123,6 +134,7 @@ _OPERATOR_API_COMMAND_TYPES = (
     TargetTrafficReadCommandV1,
     HealthEvaluationCommandV1,
     PromotionCommandV2,
+    RecoveryCommandV2,
     EpochRevocationCommandV1,
     EpochRevocationProofCommandV1,
     ServiceClaimReleaseCommandV1,
@@ -252,6 +264,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=(
             CapabilityAction.APPLY_CANARY,
             CapabilityAction.PROMOTE_CANDIDATE,
+            CapabilityAction.RECOVER_STABLE,
         ),
         required=True,
     )
@@ -284,6 +297,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--command-file",
         required=True,
         help="canonical health-evaluation command path, or '-' for stdin",
+    )
+
+    recovery_parser = subparsers.add_parser(
+        "recover-captured-stable",
+        help="dispatch one explicitly confirmed revoked-V2 stable recovery",
+    )
+    recovery_parser.add_argument("--project-number", required=True)
+    recovery_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical recovery command path, or '-' for stdin",
     )
 
     release_claim_parser = subparsers.add_parser(
@@ -409,6 +433,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "evaluate-health":
         return _run_health_evaluation(args)
+
+    if args.command == "recover-captured-stable":
+        return _run_recovery(args)
 
     if args.command == "release-service-claim":
         return _run_service_claim_release(args)
@@ -805,7 +832,7 @@ def _run_health_evaluation(
     except _OperatorApiError as error:
         return _report_operator_api_failure("HEALTH_EVALUATION", error)
     try:
-        result = decode_contract(response_body, HealthEvaluationResultV1)
+        result = _decode_health_evaluation_result(response_body)
     except ContractError:
         _print_cli_error("HEALTH_EVALUATION_RESPONSE_INVALID")
         return 6
@@ -823,6 +850,57 @@ def _run_health_evaluation(
         != command.expected_chain_head_sha256
     ):
         _print_cli_error("HEALTH_EVALUATION_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
+def _run_recovery(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Dispatch only the explicit revoked-V2 captured-stable command."""
+
+    try:
+        command = _read_recovery_command(args.command_file)
+        if type(command.source) is not RevokedV2RecoverySourceV1:
+            raise ValueError("operator recovery requires the revoked-V2 source")
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("RECOVERY_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("RECOVERY", error)
+    try:
+        result = decode_contract(response_body, RecoveryDispatchResultV2)
+    except ContractError:
+        _print_cli_error("RECOVERY_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.target != command.source.target
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.epoch != command.expected_epoch
+        or result.scheduled_at != command.scheduled_at
+        or result.verified_apply_receipt != command.verified_apply_receipt
+        or result.source_receipt_sha256
+        != command.verified_apply_receipt.receipt_sha256
+        or result.trigger_basis is not command.source.basis
+        or result.trigger_proof_sha256
+        != recovery_trigger_proof_sha256(command.source)
+        or result.stable_percent != 100
+        or result.candidate_percent != 0
+    ):
+        _print_cli_error("RECOVERY_RESPONSE_INVALID")
         return 6
     _print_contract_result(result)
     return 0
@@ -976,6 +1054,24 @@ def _read_health_evaluation_command(source: str) -> HealthEvaluationCommandV1:
     )
 
 
+def _read_recovery_command(source: str) -> RecoveryCommandV2:
+    return decode_contract(
+        _read_bounded_command_bytes(source),
+        RecoveryCommandV2,
+    )
+
+
+def _decode_health_evaluation_result(
+    payload: bytes,
+) -> HealthEvaluationResultV1 | HealthEvaluationResultV2:
+    try:
+        return decode_contract(payload, HealthEvaluationResultV2)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(payload, HealthEvaluationResultV1)
+
+
 def _read_service_claim_release_command(source: str) -> ServiceClaimReleaseCommandV1:
     return decode_contract(
         _read_bounded_command_bytes(source),
@@ -1090,7 +1186,9 @@ def _print_contract_result(result: OperatorApiResult) -> None:
         ExecutionReceiptReadResultV1,
         TargetTrafficReadResultV1,
         HealthEvaluationResultV1,
+        HealthEvaluationResultV2,
         PromotionDispatchResultV2,
+        RecoveryDispatchResultV2,
         ServiceClaimReleaseResultV1,
     ):
         raise TypeError("operator API result type is not admitted")
