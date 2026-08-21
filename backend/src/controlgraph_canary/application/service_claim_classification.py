@@ -214,8 +214,8 @@ class ServiceClaimClassificationService:
             or observed.latest_created_revision != request.candidate_revision
             or observed.latest_ready_revision != request.candidate_revision
             or observed.template_concurrency != request.concurrency
-            or traffic != expected_traffic
-            or statuses != expected_traffic
+            or not _traffic_matches_expected(traffic, expected_traffic)
+            or not _traffic_matches_expected(statuses, expected_traffic)
             or expected_digest != request.expected_target_configuration_sha256
         ):
             raise ServiceClaimClassificationError(
@@ -418,6 +418,18 @@ class CoordinatorServiceClaimClassificationClient:
                 ServiceClaimClassificationErrorCode.RESPONSE_INVALID
             ) from None
         return attestation
+
+
+def _traffic_matches_expected(
+    observed: dict[str, int],
+    expected: dict[str, int],
+) -> bool:
+    """Treat provider-omitted zero allocations as zero, but reject extra revisions."""
+
+    return set(observed).issubset(expected) and all(
+        observed.get(revision, 0) == percent
+        for revision, percent in expected.items()
+    )
 
 
 def _expected_traffic(
