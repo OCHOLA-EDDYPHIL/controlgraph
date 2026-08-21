@@ -9,6 +9,7 @@ from typing import Final, Protocol, cast
 
 from google.api_core import exceptions as api_exceptions
 from google.cloud import run_v2
+from google.longrunning import operations_pb2  # type: ignore[import-untyped]
 
 from controlgraph_canary.application.cloud_run import (
     CloudRunExecutionEnvironment,
@@ -114,6 +115,16 @@ class _ReadOnlyServicesClientPort(Protocol):
     ) -> run_v2.Service: ...
 
 
+class _ReadOnlyOperationsClientPort(Protocol):
+    async def get_operation(
+        self,
+        request: operations_pb2.GetOperationRequest,
+        *,
+        retry: object | None,
+        timeout: float,
+    ) -> operations_pb2.Operation: ...
+
+
 class _RevisionsClientPort(Protocol):
     async def get_revision(
         self,
@@ -126,6 +137,7 @@ class _RevisionsClientPort(Protocol):
 
 type ServicesClientFactory = Callable[[], _ServicesClientPort]
 type ReadOnlyServicesClientFactory = Callable[[], _ReadOnlyServicesClientPort]
+type ReadOnlyOperationsClientFactory = Callable[[], _ReadOnlyOperationsClientPort]
 type RevisionsClientFactory = Callable[[], _RevisionsClientPort]
 
 
@@ -135,6 +147,10 @@ def _default_services_client_factory() -> _ServicesClientPort:
 
 def _default_read_only_services_client_factory() -> _ReadOnlyServicesClientPort:
     return cast(_ReadOnlyServicesClientPort, run_v2.ServicesAsyncClient())
+
+
+def _default_read_only_operations_client_factory() -> _ReadOnlyOperationsClientPort:
+    return cast(_ReadOnlyOperationsClientPort, run_v2.ServicesAsyncClient())
 
 
 def _default_revisions_client_factory() -> _RevisionsClientPort:
@@ -883,6 +899,102 @@ class CloudRunV2ReferenceTargetResetter:
         return self._revisions
 
 
+class CloudRunV2OperationReadback:
+    """Read one exact target-project Cloud Run operation without mutation methods."""
+
+    def __init__(
+        self,
+        *,
+        target: TargetBinding,
+        configured_project_id: str,
+        operations_client_factory: ReadOnlyOperationsClientFactory | None = None,
+    ) -> None:
+        if type(target) is not TargetBinding:
+            raise TypeError("an exact Cloud Run operation target is required")
+        if (
+            type(configured_project_id) is not str
+            or _CONTROLGRAPH_PROJECT_ID.fullmatch(configured_project_id) is None
+            or target.project_id != configured_project_id
+            or target.region != CLOUD_RUN_REGION
+            or target.service_name != CLOUD_RUN_REFERENCE_SERVICE
+        ):
+            raise ValueError("Cloud Run operation readback target is not configured")
+        if operations_client_factory is not None and not callable(
+            operations_client_factory
+        ):
+            raise TypeError("Cloud Run operations client factory must be callable")
+        self._target = target
+        self._operation_name = re.compile(
+            rf"^projects/{re.escape(target.project_id)}/locations/"
+            rf"{re.escape(target.region)}/operations/[A-Za-z0-9._~-]{{1,512}}$"
+        )
+        self._operations_client_factory = (
+            operations_client_factory or _default_read_only_operations_client_factory
+        )
+        self._operations: _ReadOnlyOperationsClientPort | None = None
+        self._operations_lock = asyncio.Lock()
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def terminal_success(self, operation_name: str) -> bool:
+        """Confirm one exact operation is terminal and has no error result."""
+
+        if (
+            type(operation_name) is not str
+            or self._operation_name.fullmatch(operation_name) is None
+        ):
+            return False
+        request = operations_pb2.GetOperationRequest(name=operation_name)
+        try:
+            client = await self._operations_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                response = await client.get_operation(
+                    request,
+                    retry=None,
+                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        if (
+            type(response) is not operations_pb2.Operation
+            or response.name != operation_name
+            or response.done is not True
+            or response.WhichOneof("result") != "response"
+        ):
+            return False
+        try:
+            service_message = run_v2.Service.pb()()
+            if not response.response.Unpack(service_message):
+                return False
+            service = run_v2.Service.wrap(service_message)
+        except Exception:
+            return False
+        expected_service = (
+            f"projects/{self._target.project_id}/locations/{self._target.region}/"
+            f"services/{self._target.service_name}"
+        )
+        service_name = cast(object, service.name)
+        return type(service_name) is str and service_name == expected_service
+
+    async def _operations_client(self) -> _ReadOnlyOperationsClientPort:
+        if self._operations is not None:
+            return self._operations
+        async with self._operations_lock:
+            if self._operations is None:
+                try:
+                    client = self._operations_client_factory()
+                    if not callable(getattr(client, "get_operation", None)):
+                        raise TypeError("Cloud Run operations client is incomplete")
+                except Exception:
+                    raise CloudRunReadError(CloudRunReadErrorCode.UNAVAILABLE) from None
+                self._operations = client
+        return self._operations
+
+
 class CloudRunV2ReceiptReadback:
     """Fresh read-only receipt observation for one fixed reference service."""
 
@@ -1482,8 +1594,10 @@ __all__ = [
     "CLOUD_RUN_REGION",
     "CLOUD_RUN_RPC_TIMEOUT_SECONDS",
     "CloudRunV2Adapter",
+    "CloudRunV2OperationReadback",
     "CloudRunV2ReceiptReadback",
     "CloudRunV2SnapshotReader",
+    "ReadOnlyOperationsClientFactory",
     "ReadOnlyServicesClientFactory",
     "RevisionsClientFactory",
     "ServicesClientFactory",

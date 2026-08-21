@@ -44,6 +44,7 @@ from controlgraph_canary.contracts.codec import (
 )
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
+    EpochAuthorityRecord,
     ExecutionReceipt,
     TargetBinding,
 )
@@ -55,10 +56,14 @@ from controlgraph_canary.contracts.receipt_authority import (
     ReceiptAuthorityOperation,
     ReceiptAuthorityReadV1,
     ReceiptAuthorityRequestV1,
+    ReceiptAuthorityResolveAmbiguousV1,
     ReceiptAuthorityResponseV1,
     ReceiptMutationBindingV1,
+    StoredEpochAuthorityV1,
     StoredExecutionReceiptV1,
+    StoredServiceClaimV1,
 )
+from controlgraph_canary.contracts.storage import ServiceClaimRecord
 
 _ATTEMPT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -85,6 +90,22 @@ class ReceiptAuthorityBackingStore(Protocol):
         self,
         expected: StoredRecord[ExecutionReceipt],
         replacement: ExecutionReceipt,
+    ) -> StoredRecord[ExecutionReceipt]: ...
+
+
+@runtime_checkable
+class AmbiguousReceiptResolutionBackingStore(Protocol):
+    """Coordinator store operation that atomically fences one readback resolution."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def resolve_ambiguous_receipt(
+        self,
+        expected: StoredRecord[ExecutionReceipt],
+        replacement: ExecutionReceipt,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+        expected_service_claim: StoredRecord[ServiceClaimRecord],
     ) -> StoredRecord[ExecutionReceipt]: ...
 
 
@@ -120,6 +141,8 @@ class ReceiptAuthorityService:
             response = await self._read(request)
         elif request.operation is ReceiptAuthorityOperation.COMPARE_AND_SET:
             response = await self._compare_and_set(request)
+        elif request.operation is ReceiptAuthorityOperation.RESOLVE_AMBIGUOUS:
+            response = await self._resolve_ambiguous(request)
         else:
             raise AuthorityStoreCorruptRecord
         try:
@@ -234,6 +257,49 @@ class ReceiptAuthorityService:
             schema_version="controlgraph.receipt-authority-response/v1",
             operation=request.operation,
             disposition=ReceiptAuthorityDisposition.RECEIPT_UPDATED,
+            attempt_id=request.attempt_id,
+            request_sha256=canonical_sha256(request),
+            target=self._target,
+            stored_receipt=_wire_stored(stored),
+        )
+
+    async def _resolve_ambiguous(
+        self,
+        request: ReceiptAuthorityRequestV1,
+    ) -> ReceiptAuthorityResponseV1:
+        resolution = request.resolve_ambiguous
+        if resolution is None or not isinstance(
+            self._store,
+            AmbiguousReceiptResolutionBackingStore,
+        ):
+            raise AuthorityStoreCorruptRecord
+        expected = _domain_stored(resolution.expected)
+        expected_authority = _domain_authority(resolution.expected_authority)
+        expected_service_claim = _domain_service_claim(
+            resolution.expected_service_claim
+        )
+        replacement = resolution.replacement
+        _require_target_receipt(expected, self._target, replacement.idempotency_key)
+        if (
+            replacement.target != self._target
+            or expected_authority.value.target != self._target
+            or expected_service_claim.value.target != self._target
+        ):
+            raise AuthorityStoreCorruptRecord
+        stored = await self._store.resolve_ambiguous_receipt(
+            expected,
+            replacement,
+            expected_authority,
+            expected_service_claim,
+        )
+        if stored != StoredRecord(replacement, expected.revision + 1):
+            raise AuthorityStoreCorruptRecord
+        return ReceiptAuthorityResponseV1(
+            schema_version="controlgraph.receipt-authority-response/v1",
+            operation=request.operation,
+            disposition=(
+                ReceiptAuthorityDisposition.AMBIGUOUS_RECEIPT_RESOLVED
+            ),
             attempt_id=request.attempt_id,
             request_sha256=canonical_sha256(request),
             target=self._target,
@@ -383,6 +449,49 @@ class ReceiptAuthorityClient:
             raise AuthorityStoreCorruptRecord
         return stored
 
+    async def resolve_ambiguous_receipt(
+        self,
+        expected: StoredRecord[ExecutionReceipt],
+        replacement: ExecutionReceipt,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+        expected_service_claim: StoredRecord[ServiceClaimRecord],
+    ) -> StoredRecord[ExecutionReceipt]:
+        _require_target_receipt(expected, self._target, replacement.idempotency_key)
+        if (
+            replacement.target != self._target
+            or expected_authority.value.target != self._target
+            or expected_service_claim.value.target != self._target
+        ):
+            raise ValueError("ambiguous receipt resolution is outside the configured target")
+        request = ReceiptAuthorityRequestV1(
+            schema_version="controlgraph.receipt-authority-request/v1",
+            operation=ReceiptAuthorityOperation.RESOLVE_AMBIGUOUS,
+            attempt_id=self._next_attempt_id(),
+            target=self._target,
+            resolve_ambiguous=ReceiptAuthorityResolveAmbiguousV1(
+                schema_version=(
+                    "controlgraph.receipt-authority-resolve-ambiguous/v1"
+                ),
+                expected=_wire_stored(expected),
+                replacement=replacement,
+                expected_authority=_wire_authority(expected_authority),
+                expected_service_claim=_wire_service_claim(
+                    expected_service_claim
+                ),
+            ),
+        )
+        response = await self._exchange(request)
+        if (
+            response.disposition
+            is not ReceiptAuthorityDisposition.AMBIGUOUS_RECEIPT_RESOLVED
+            or response.stored_receipt is None
+        ):
+            raise AuthorityStoreCorruptRecord
+        stored = _domain_stored(response.stored_receipt)
+        if stored != StoredRecord(replacement, expected.revision + 1):
+            raise AuthorityStoreCorruptRecord
+        return stored
+
     async def _exchange(
         self,
         request: ReceiptAuthorityRequestV1,
@@ -488,10 +597,50 @@ def _wire_stored(stored: StoredRecord[ExecutionReceipt]) -> StoredExecutionRecei
     )
 
 
+def _wire_authority(
+    stored: StoredRecord[EpochAuthorityRecord],
+) -> StoredEpochAuthorityV1:
+    if type(stored) is not StoredRecord or type(stored.value) is not EpochAuthorityRecord:
+        raise AuthorityStoreCorruptRecord
+    return StoredEpochAuthorityV1(
+        schema_version="controlgraph.stored-epoch-authority/v1",
+        authority=stored.value,
+        storage_revision=stored.revision,
+    )
+
+
+def _wire_service_claim(
+    stored: StoredRecord[ServiceClaimRecord],
+) -> StoredServiceClaimV1:
+    if type(stored) is not StoredRecord or type(stored.value) is not ServiceClaimRecord:
+        raise AuthorityStoreCorruptRecord
+    return StoredServiceClaimV1(
+        schema_version="controlgraph.stored-service-claim/v1",
+        service_claim=stored.value,
+        storage_revision=stored.revision,
+    )
+
+
 def _domain_stored(stored: StoredExecutionReceiptV1) -> StoredRecord[ExecutionReceipt]:
     if type(stored) is not StoredExecutionReceiptV1:
         raise AuthorityStoreCorruptRecord
     return StoredRecord(stored.receipt, stored.storage_revision)
+
+
+def _domain_authority(
+    stored: StoredEpochAuthorityV1,
+) -> StoredRecord[EpochAuthorityRecord]:
+    if type(stored) is not StoredEpochAuthorityV1:
+        raise AuthorityStoreCorruptRecord
+    return StoredRecord(stored.authority, stored.storage_revision)
+
+
+def _domain_service_claim(
+    stored: StoredServiceClaimV1,
+) -> StoredRecord[ServiceClaimRecord]:
+    if type(stored) is not StoredServiceClaimV1:
+        raise AuthorityStoreCorruptRecord
+    return StoredRecord(stored.service_claim, stored.storage_revision)
 
 
 def _binding_targets(binding: MutationBinding, target: TargetBinding) -> bool:
@@ -545,6 +694,7 @@ def _require_target_receipt(
 
 
 __all__ = [
+    "AmbiguousReceiptResolutionBackingStore",
     "ReceiptAuthorityBackingStore",
     "ReceiptAuthorityClient",
     "ReceiptAuthorityService",

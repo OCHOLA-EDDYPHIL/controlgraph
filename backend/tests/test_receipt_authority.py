@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 import pytest
+from root_v2_support import root_records
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
@@ -37,6 +38,7 @@ from controlgraph_canary.authority.replay import (
 from controlgraph_canary.contracts.codec import canonical_json_bytes, decode_contract
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
+    EpochAuthorityRecord,
     ExecutionReceipt,
     ReasonCode,
     ReceiptOutcome,
@@ -45,9 +47,14 @@ from controlgraph_canary.contracts.models import (
 from controlgraph_canary.contracts.receipt_authority import (
     DirectReceiptCreateConfirmationV1,
     ReceiptAuthorityDisposition,
+    ReceiptAuthorityOperation,
+    ReceiptAuthorityRequestV1,
     ReceiptAuthorityResponseV1,
 )
-from controlgraph_canary.contracts.storage import execution_receipt_logical_id
+from controlgraph_canary.contracts.storage import (
+    ServiceClaimRecord,
+    execution_receipt_logical_id,
+)
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
@@ -133,6 +140,53 @@ def _denied_receipt() -> ExecutionReceipt:
     return ExecutionReceipt.model_validate(value)
 
 
+def _ambiguous_resolution_records() -> tuple[
+    StoredRecord[ExecutionReceipt],
+    ExecutionReceipt,
+    StoredRecord[EpochAuthorityRecord],
+    StoredRecord[ServiceClaimRecord],
+]:
+    root, _, claim, authority = root_records(
+        target=_target(),
+        concurrency=8,
+        project_number=PROJECT_NUMBER,
+    )
+    value = _claimed_receipt().model_dump(mode="python")
+    value.update(
+        {
+            "root_id": root.root_id,
+            "root_sha256": root.root_sha256,
+            "epoch": 1,
+            "outcome": ReceiptOutcome.AMBIGUOUS,
+            "reason_code": ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
+            "provider_operation": (
+                f"projects/{PROJECT_ID}/locations/us-central1/"
+                "operations/receipt-authority-resolution"
+            ),
+            "observed_etag": "etag-ambiguous-1",
+            "observed_authority_epoch": 1,
+            "updated_at": "2026-08-19T12:00:01Z",
+        }
+    )
+    ambiguous = ExecutionReceipt.model_validate(value)
+    replacement_value = ambiguous.model_dump(mode="python")
+    replacement_value.update(
+        {
+            "outcome": ReceiptOutcome.VERIFIED,
+            "reason_code": None,
+            "observed_etag": "etag-verified-2",
+            "updated_at": "2026-08-19T12:00:02Z",
+            "evidence_ids": ("cgrrb:" + "a" * 64,),
+        }
+    )
+    return (
+        StoredRecord(ambiguous, 2),
+        ExecutionReceipt.model_validate(replacement_value),
+        StoredRecord(authority, 0),
+        StoredRecord(claim, 0),
+    )
+
+
 def _route() -> CoordinatorInternalRoute:
     return CoordinatorInternalRoute(
         project_id=PROJECT_ID,
@@ -152,6 +206,9 @@ class _BackingStore:
         self.stored: StoredRecord[ExecutionReceipt] | None = None
         self.claim_calls = 0
         self.cas_calls = 0
+        self.resolution_calls = 0
+        self.authority: StoredRecord[EpochAuthorityRecord] | None = None
+        self.service_claim: StoredRecord[ServiceClaimRecord] | None = None
 
     async def claim_or_adopt_receipt(
         self,
@@ -185,6 +242,23 @@ class _BackingStore:
     ) -> StoredRecord[ExecutionReceipt]:
         self.cas_calls += 1
         if self.stored != expected:
+            raise AuthorityStoreConflict
+        self.stored = StoredRecord(replacement, expected.revision + 1)
+        return self.stored
+
+    async def resolve_ambiguous_receipt(
+        self,
+        expected: StoredRecord[ExecutionReceipt],
+        replacement: ExecutionReceipt,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+        expected_service_claim: StoredRecord[ServiceClaimRecord],
+    ) -> StoredRecord[ExecutionReceipt]:
+        self.resolution_calls += 1
+        if (
+            self.stored != expected
+            or self.authority != expected_authority
+            or self.service_claim != expected_service_claim
+        ):
             raise AuthorityStoreConflict
         self.stored = StoredRecord(replacement, expected.revision + 1)
         return self.stored
@@ -352,6 +426,102 @@ def test_client_implements_remote_read_and_compare_and_set_without_new_authority
     assert updated == StoredRecord(_denied_receipt(), 1)
     assert readback == updated
     assert store.cas_calls == 1
+
+
+def test_client_resolves_ambiguous_receipt_through_exact_fenced_operation() -> None:
+    expected, replacement, authority, service_claim = _ambiguous_resolution_records()
+    store = _BackingStore()
+    store.stored = expected
+    store.authority = authority
+    store.service_claim = service_claim
+    client, transport = _client(store)
+
+    updated = asyncio.run(
+        client.resolve_ambiguous_receipt(
+            expected,
+            replacement,
+            authority,
+            service_claim,
+        )
+    )
+
+    assert updated == StoredRecord(replacement, expected.revision + 1)
+    assert store.stored == updated
+    assert store.resolution_calls == 1
+    assert store.cas_calls == 0
+    request = decode_contract(transport.requests[0], ReceiptAuthorityRequestV1)
+    assert request.operation is ReceiptAuthorityOperation.RESOLVE_AMBIGUOUS
+    assert request.resolve_ambiguous is not None
+
+
+def test_lost_resolution_response_leaves_exact_marked_receipt_for_adoption() -> None:
+    expected, replacement, authority, service_claim = _ambiguous_resolution_records()
+    store = _BackingStore()
+    store.stored = expected
+    store.authority = authority
+    store.service_claim = service_claim
+    transport = _LoopbackTransport(
+        ReceiptAuthorityService(store),
+        lose_after_calls={1},
+    )
+    client, _ = _client(store, transport=transport)
+
+    with pytest.raises(AuthorityStoreUnavailable):
+        asyncio.run(
+            client.resolve_ambiguous_receipt(
+                expected,
+                replacement,
+                authority,
+                service_claim,
+            )
+        )
+
+    assert store.stored == StoredRecord(replacement, expected.revision + 1)
+    assert asyncio.run(client.read_receipt(expected.value.idempotency_key)) == store.stored
+    assert store.resolution_calls == 1
+
+
+@pytest.mark.parametrize("changed_fence", ["authority", "service_claim"])
+def test_resolution_fence_race_cannot_update_receipt(changed_fence: str) -> None:
+    expected, replacement, authority, service_claim = _ambiguous_resolution_records()
+    store = _BackingStore()
+    store.stored = expected
+    store.authority = authority
+    store.service_claim = service_claim
+    if changed_fence == "authority":
+        store.authority = StoredRecord(authority.value, authority.revision + 1)
+    else:
+        store.service_claim = StoredRecord(
+            service_claim.value,
+            service_claim.revision + 1,
+        )
+    client, _ = _client(store)
+
+    with pytest.raises(AuthorityStoreUnavailable):
+        asyncio.run(
+            client.resolve_ambiguous_receipt(
+                expected,
+                replacement,
+                authority,
+                service_claim,
+            )
+        )
+
+    assert store.stored == expected
+    assert store.resolution_calls == 1
+
+
+def test_generic_compare_and_set_cannot_append_readback_resolution_marker() -> None:
+    expected, replacement, _, _ = _ambiguous_resolution_records()
+    store = _BackingStore()
+    store.stored = expected
+    client, _ = _client(store)
+
+    with pytest.raises(ValueError, match="dedicated operation"):
+        asyncio.run(client.compare_and_set_receipt(expected, replacement))
+
+    assert store.stored == expected
+    assert store.cas_calls == 0
 
 
 def test_attempt_identifier_cannot_be_reused_even_if_the_factory_repeats() -> None:
