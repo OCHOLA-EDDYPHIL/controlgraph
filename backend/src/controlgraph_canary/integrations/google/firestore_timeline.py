@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Protocol, cast
 from uuid import uuid4
 
@@ -19,9 +19,11 @@ from controlgraph_canary.application.timeline import (
     TimelineAppendCreated,
     TimelineAppendResult,
     TimelineCursorInvalid,
+    TimelineRawReadSlice,
     TimelineReadSlice,
     TimelineStoreConflict,
     TimelineStoreCorruptRecord,
+    TimelineStoreError,
     TimelineStoreOutcomeUnknown,
     TimelineStoreUnavailable,
 )
@@ -38,13 +40,20 @@ from controlgraph_canary.contracts.timeline import (
     TIMELINE_HEAD_V1,
     TIMELINE_IDENTITY_COLLECTION,
     TIMELINE_IDENTITY_V1,
+    TIMELINE_PAGE_COMMAND_V1,
+    TIMELINE_RAW_COLLECTION,
+    TIMELINE_RAW_EVIDENCE_V1,
     TIMELINE_STORAGE_DOCUMENT_V1,
+    TimelineAudience,
     TimelineEntryV1,
     TimelineEventV1,
     TimelineEvidencePolicySetV1,
     TimelineHeadV1,
     TimelineIdentityV1,
     TimelinePageCommandV1,
+    TimelineRawEvidenceV1,
+    TimelineRawExportCommandV1,
+    TimelineRawSourceV1,
     TimelineStorageDocumentV1,
     TimelineStorageKind,
     timeline_entry,
@@ -54,6 +63,7 @@ from controlgraph_canary.contracts.timeline import (
     timeline_head_logical_id,
     timeline_identity_document_id,
     timeline_identity_logical_id,
+    timeline_raw_document_id,
 )
 
 FIRESTORE_TIMELINE_DATABASE: Final = "controlgraph-authority"
@@ -63,6 +73,19 @@ FIRESTORE_TIMELINE_MAX_TRANSACTION_ATTEMPTS: Final = 3
 
 _CONTROLGRAPH_PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _DOCUMENT_FIELDS = frozenset(TimelineStorageDocumentV1.model_fields)
+_RAW_STORAGE_VERSION: Final = "controlgraph.timeline-raw-storage/v1"
+_RAW_DOCUMENT_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "logical_id",
+        "entry_id",
+        "entry_sha256",
+        "sequence",
+        "canonical_payload",
+        "payload_sha256",
+        "expires_at",
+    }
+)
 _KNOWN_CONTENTION = (
     api_exceptions.Aborted,
     api_exceptions.AlreadyExists,
@@ -277,6 +300,54 @@ def _document_data(document: TimelineStorageDocumentV1) -> dict[str, Any]:
     return data
 
 
+def _raw_logical_id(target: TargetBinding, source_id: str) -> str:
+    return f"cgtimeline-raw:{timeline_raw_document_id(target, source_id)}"
+
+
+def _parse_utc_second(value: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except (TypeError, ValueError) as error:
+        raise TimelineStoreCorruptRecord from error
+
+
+def _raw_evidence(
+    *,
+    entry: TimelineEntryV1,
+    raw_source: TimelineRawSourceV1,
+) -> TimelineRawEvidenceV1:
+    recorded = _parse_utc_second(entry.content.recorded_at)
+    expires = recorded + timedelta(days=entry.content.event.raw_retention_days)
+    return TimelineRawEvidenceV1(
+        schema_version=TIMELINE_RAW_EVIDENCE_V1,
+        target=entry.content.target,
+        sequence=entry.content.sequence,
+        entry_id=entry.entry_id,
+        entry_sha256=entry.entry_sha256,
+        source_id=entry.content.event.source_id,
+        raw_source=raw_source,
+        recorded_at=entry.content.recorded_at,
+        expires_at=_utc_second(expires),
+        deletion_policy="EXPIRE_RAW_PRESERVE_DIGEST_V1",
+    )
+
+
+def _raw_document_data(raw: TimelineRawEvidenceV1) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "schema_version": _RAW_STORAGE_VERSION,
+        "logical_id": _raw_logical_id(raw.target, raw.source_id),
+        "entry_id": raw.entry_id,
+        "entry_sha256": raw.entry_sha256,
+        "sequence": raw.sequence,
+        "canonical_payload": canonical_json_bytes(raw).decode("utf-8"),
+        "payload_sha256": canonical_sha256(raw),
+        "expires_at": _parse_utc_second(raw.expires_at),
+    }
+    if set(data) != _RAW_DOCUMENT_FIELDS:
+        raise TimelineStoreCorruptRecord
+    return data
+
+
 def _is_contention(error: BaseException) -> bool:
     current: BaseException | None = error
     visited: set[int] = set()
@@ -470,6 +541,72 @@ class FirestoreTimelineStore:
         except Exception:
             raise TimelineStoreCorruptRecord from None
 
+    def _decode_raw_snapshot(
+        self,
+        snapshot: object,
+        *,
+        reference: TimelineDocumentReferencePort,
+        source_id: str,
+    ) -> TimelineRawEvidenceV1 | None:
+        try:
+            provider = cast(TimelineProviderSnapshotPort, snapshot)
+            _aware_utc(provider.read_time)
+            if provider.reference.path != reference.path or type(provider.exists) is not bool:
+                raise ValueError("timeline raw snapshot metadata is invalid")
+            if not provider.exists:
+                if provider.to_dict() is not None or provider.update_time is not None:
+                    raise ValueError("missing timeline raw snapshot contains data")
+                return None
+            if provider.update_time is None:
+                raise ValueError("timeline raw snapshot update time is absent")
+            _aware_utc(provider.update_time)
+            data = provider.to_dict()
+            if type(data) is not dict or set(data) != _RAW_DOCUMENT_FIELDS:
+                raise ValueError("timeline raw wrapper shape is invalid")
+            expires_at = _aware_utc(data.get("expires_at"))
+            if (
+                data.get("schema_version") != _RAW_STORAGE_VERSION
+                or data.get("logical_id") != _raw_logical_id(self._target, source_id)
+                or type(data.get("canonical_payload")) is not str
+                or type(data.get("payload_sha256")) is not str
+            ):
+                raise ValueError("timeline raw wrapper identity is invalid")
+            raw = decode_contract(data["canonical_payload"], TimelineRawEvidenceV1)
+            if (
+                raw.target != self._target
+                or raw.source_id != source_id
+                or raw.entry_id != data.get("entry_id")
+                or raw.entry_sha256 != data.get("entry_sha256")
+                or raw.sequence != data.get("sequence")
+                or raw.expires_at != _utc_second(expires_at)
+                or canonical_sha256(raw) != data["payload_sha256"]
+            ):
+                raise ValueError("timeline raw wrapper digest or binding is invalid")
+            return raw
+        except TimelineStoreCorruptRecord:
+            raise
+        except Exception:
+            raise TimelineStoreCorruptRecord from None
+
+    async def _read_raw_one(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        transaction: TimelineTransactionPort | None,
+        source_id: str,
+    ) -> TimelineRawEvidenceV1 | None:
+        reference = self._reference(
+            client,
+            TIMELINE_RAW_COLLECTION,
+            timeline_raw_document_id(self._target, source_id),
+        )
+        snapshot = await self._snapshot(reference, transaction=transaction)
+        return self._decode_raw_snapshot(
+            snapshot,
+            reference=reference,
+            source_id=source_id,
+        )
+
     async def _read_one[ModelT: StrictContractModel](
         self,
         *,
@@ -563,8 +700,49 @@ class FirestoreTimelineStore:
             raise TimelineStoreCorruptRecord
         return entry.value
 
+    async def _require_existing_raw(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        transaction: TimelineTransactionPort | None,
+        entry: TimelineEntryV1,
+        raw_source: TimelineRawSourceV1,
+    ) -> None:
+        current = await self._read_raw_one(
+            client=client,
+            transaction=transaction,
+            source_id=entry.content.event.source_id,
+        )
+        expected = _raw_evidence(entry=entry, raw_source=raw_source)
+        if current is None:
+            if self._clock() < _parse_utc_second(expected.expires_at):
+                raise TimelineStoreCorruptRecord
+            return
+        if current != expected:
+            raise TimelineStoreConflict
+
     async def append(self, event: TimelineEventV1) -> TimelineAppendResult:
         """Append once by immutable source identity or adopt an exact replay."""
+
+        return await self._append(event, raw_source=None)
+
+    async def append_with_raw(
+        self,
+        event: TimelineEventV1,
+        raw_source: TimelineRawSourceV1,
+    ) -> TimelineAppendResult:
+        """Atomically append one summary and its finite-lifecycle raw source."""
+
+        if type(raw_source) is not TimelineRawSourceV1:
+            raise TypeError("timeline raw source must be exact")
+        return await self._append(event, raw_source=raw_source)
+
+    async def _append(
+        self,
+        event: TimelineEventV1,
+        *,
+        raw_source: TimelineRawSourceV1 | None,
+    ) -> TimelineAppendResult:
 
         if (
             type(event) is not TimelineEventV1
@@ -574,6 +752,19 @@ class FirestoreTimelineStore:
             != self._retention_by_class[event.evidence_class]
         ):
             raise ValueError("timeline event does not match configured target and policy")
+        signature_sha256 = (
+            None if event.signature is None else event.signature.signature_sha256
+        )
+        if raw_source is not None and (
+            raw_source.raw_source_id != event.raw_source_id
+            or raw_source.source_schema_version != event.source_schema_version
+            or raw_source.target != event.target
+            or raw_source.evidence_class is not event.evidence_class
+            or raw_source.payload_sha256 != event.payload_sha256
+            or raw_source.record_sha256 != event.raw_record_sha256
+            or raw_source.signature_sha256 != signature_sha256
+        ):
+            raise ValueError("timeline raw source does not match its event")
         try:
             existing = await self._read_existing_append(event)
         except TimelineStoreConflict:
@@ -583,6 +774,13 @@ class FirestoreTimelineStore:
         except TimelineStoreUnavailable:
             existing = None
         if existing is not None:
+            if raw_source is not None:
+                await self._require_existing_raw(
+                    client=await self._client(),
+                    transaction=None,
+                    entry=existing,
+                    raw_source=raw_source,
+                )
             return TimelineAppendAdopted(existing)
 
         client = await self._client()
@@ -627,6 +825,13 @@ class FirestoreTimelineStore:
                     event,
                 ):
                     raise TimelineStoreConflict
+                if raw_source is not None:
+                    await self._require_existing_raw(
+                        client=client,
+                        transaction=transaction,
+                        entry=current_entry.value,
+                        raw_source=raw_source,
+                    )
                 raise _ReplayDetected(current_entry.value)
 
             head_document_id = timeline_head_document_id(self._target)
@@ -662,6 +867,14 @@ class FirestoreTimelineStore:
                 model_type=TimelineEntryV1,
             )
             if current_entry is not None:
+                raise TimelineStoreCorruptRecord
+
+            current_raw = await self._read_raw_one(
+                client=client,
+                transaction=transaction,
+                source_id=event.source_id,
+            )
+            if current_raw is not None:
                 raise TimelineStoreCorruptRecord
 
             entry = timeline_entry(
@@ -725,6 +938,16 @@ class FirestoreTimelineStore:
                 self._reference(client, prepared_entry.collection, prepared_entry.document_id),
                 _document_data(prepared_entry.wrapper),
             )
+            if raw_source is not None:
+                raw = _raw_evidence(entry=entry, raw_source=raw_source)
+                transaction.create(
+                    self._reference(
+                        client,
+                        TIMELINE_RAW_COLLECTION,
+                        timeline_raw_document_id(self._target, event.source_id),
+                    ),
+                    _raw_document_data(raw),
+                )
             head_reference = self._reference(
                 client,
                 prepared_head.collection,
@@ -741,7 +964,7 @@ class FirestoreTimelineStore:
                 await self._transaction_runner(
                     client,
                     FIRESTORE_TIMELINE_MAX_TRANSACTION_ATTEMPTS,
-                    3,
+                    4 if raw_source is not None else 3,
                     write,
                 )
         except asyncio.CancelledError:
@@ -760,6 +983,13 @@ class FirestoreTimelineStore:
             except TimelineStoreUnavailable:
                 raise TimelineStoreOutcomeUnknown from None
             if winner is not None:
+                if raw_source is not None:
+                    await self._require_existing_raw(
+                        client=await self._client(),
+                        transaction=None,
+                        entry=winner,
+                        raw_source=raw_source,
+                    )
                 return TimelineAppendAdopted(winner)
             if _is_contention(error):
                 raise TimelineStoreConflict from None
@@ -902,6 +1132,49 @@ class FirestoreTimelineStore:
             head=head.value,
             entries=tuple(entries),
         )
+
+    async def read_raw_export(
+        self,
+        command: TimelineRawExportCommandV1,
+    ) -> TimelineRawReadSlice:
+        """Read a bounded raw page only by target-derived immutable document IDs."""
+
+        if type(command) is not TimelineRawExportCommandV1 or command.target != self._target:
+            raise ValueError("timeline raw export command does not match the configured target")
+        summary_command = TimelinePageCommandV1(
+            schema_version=TIMELINE_PAGE_COMMAND_V1,
+            target=command.target,
+            after_sequence=command.after_sequence,
+            after_entry_sha256=command.after_entry_sha256,
+            limit=command.limit,
+            audience=TimelineAudience.RESTRICTED,
+        )
+        summary = await self.read_page(summary_command)
+        client = await self._client()
+        try:
+            raw_evidence = await asyncio.gather(
+                *(
+                    self._read_raw_one(
+                        client=client,
+                        transaction=None,
+                        source_id=entry.content.event.source_id,
+                    )
+                    for entry in summary.entries
+                )
+            )
+            return TimelineRawReadSlice(
+                command=command,
+                head=summary.head,
+                entries=summary.entries,
+                raw_evidence=tuple(raw_evidence),
+                evaluated_at=_utc_second(self._clock()),
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreError:
+            raise
+        except Exception:
+            raise TimelineStoreCorruptRecord from None
 
 
 __all__ = [

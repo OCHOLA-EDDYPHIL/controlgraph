@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
@@ -15,6 +16,8 @@ from controlgraph_canary.contracts.timeline import (
     TIMELINE_DISPLAY_FIELD_V1,
     TIMELINE_ENTRY_PROJECTION_V1,
     TIMELINE_PAGE_V1,
+    TIMELINE_RAW_EXPORT_ITEM_V1,
+    TIMELINE_RAW_EXPORT_V1,
     TimelineActorRole,
     TimelineAudience,
     TimelineCorrelationV1,
@@ -26,6 +29,12 @@ from controlgraph_canary.contracts.timeline import (
     TimelineHeadV1,
     TimelinePageCommandV1,
     TimelinePageV1,
+    TimelineRawEvidenceV1,
+    TimelineRawExportCommandV1,
+    TimelineRawExportItemV1,
+    TimelineRawExportV1,
+    TimelineRawLifecycleStatus,
+    TimelineRawSourceV1,
 )
 
 REDACTED_DISPLAY_VALUE = "[REDACTED]"
@@ -132,6 +141,25 @@ class TimelineWriteError(RuntimeError):
         super().__init__(code.value)
 
 
+class TimelineRawExportErrorCode(StrEnum):
+    CONFIGURATION_INVALID = "TIMELINE_RAW_EXPORT_CONFIGURATION_INVALID"
+    ACCESS_DENIED = "TIMELINE_RAW_EXPORT_ACCESS_DENIED"
+    TARGET_DENIED = "TIMELINE_RAW_EXPORT_TARGET_DENIED"
+    CURSOR_INVALID = "TIMELINE_RAW_EXPORT_CURSOR_INVALID"
+    STORE_UNAVAILABLE = "TIMELINE_RAW_EXPORT_STORE_UNAVAILABLE"
+    RESPONSE_INVALID = "TIMELINE_RAW_EXPORT_RESPONSE_INVALID"
+
+
+class TimelineRawExportError(RuntimeError):
+    """Bounded failure for the separately gated raw-record surface."""
+
+    def __init__(self, code: TimelineRawExportErrorCode) -> None:
+        if type(code) is not TimelineRawExportErrorCode:
+            raise TypeError("an exact timeline raw export error code is required")
+        self.code = code
+        super().__init__(code.value)
+
+
 @dataclass(frozen=True, slots=True)
 class TimelineAppendCreated:
     entry: TimelineEntryV1
@@ -199,6 +227,73 @@ class TimelineReadSlice:
 
 
 @dataclass(frozen=True, slots=True)
+class TimelineRawReadSlice:
+    """Full entries and exact-ID raw records behind one strongly observed head."""
+
+    command: TimelineRawExportCommandV1
+    head: TimelineHeadV1 | None
+    entries: tuple[TimelineEntryV1, ...]
+    raw_evidence: tuple[TimelineRawEvidenceV1 | None, ...]
+    evaluated_at: str
+
+    def __post_init__(self) -> None:
+        if type(self.command) is not TimelineRawExportCommandV1:
+            raise TypeError("timeline raw read slice requires an exact command")
+        try:
+            evaluated = datetime.strptime(self.evaluated_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=UTC
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("timeline raw read evaluation time is invalid") from error
+        if self.head is None:
+            if (
+                self.command.after_sequence != 0
+                or self.entries
+                or self.raw_evidence
+            ):
+                raise ValueError("an empty timeline cannot satisfy a raw export cursor")
+            return
+        if (
+            type(self.head) is not TimelineHeadV1
+            or self.head.target != self.command.target
+            or len(self.raw_evidence) != len(self.entries)
+        ):
+            raise ValueError("timeline raw read head or record count is invalid")
+        expected_count = min(
+            self.command.limit,
+            self.head.sequence - self.command.after_sequence,
+        )
+        if expected_count < 0 or len(self.entries) != expected_count:
+            raise ValueError("timeline raw read slice is not omission-free")
+        sequence = self.command.after_sequence + 1
+        predecessor = self.command.after_entry_sha256
+        for entry, raw in zip(self.entries, self.raw_evidence, strict=True):
+            if (
+                type(entry) is not TimelineEntryV1
+                or entry.content.target != self.command.target
+                or entry.content.sequence != sequence
+                or entry.content.previous_entry_sha256 != predecessor
+            ):
+                raise ValueError("timeline raw read slice is not contiguous")
+            expires = _raw_expires_at(entry)
+            if raw is None:
+                if evaluated < expires:
+                    raise ValueError("unexpired timeline raw evidence is absent")
+            elif not _raw_matches_entry(raw, entry, expires_at=_utc_second(expires)):
+                raise ValueError("timeline raw evidence does not match its entry")
+            sequence += 1
+            predecessor = entry.entry_sha256
+        if self.command.after_sequence == self.head.sequence:
+            if self.command.after_entry_sha256 != self.head.entry_sha256:
+                raise ValueError("timeline raw cursor does not identify the observed head")
+        elif (
+            self.entries[-1].content.sequence == self.head.sequence
+            and self.entries[-1].entry_sha256 != self.head.entry_sha256
+        ):
+            raise ValueError("timeline raw entries do not terminate at the observed head")
+
+
+@dataclass(frozen=True, slots=True)
 class TimelineReadGrant:
     """Audience ceiling derived by a trusted authenticated composition boundary."""
 
@@ -236,6 +331,23 @@ class TimelineWriteGrant:
             raise ValueError("timeline write grant is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class TimelineRawExportGrant:
+    """Separate restricted-export authority derived at an authenticated route."""
+
+    target: TargetBinding
+    principal_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target) is not TargetBinding
+            or type(self.principal_id) is not str
+            or not self.principal_id
+            or len(self.principal_id) > 128
+        ):
+            raise ValueError("timeline raw export grant is invalid")
+
+
 @runtime_checkable
 class TimelineStore(Protocol):
     """Exact get/create/update surface; no list, query, delete, or raw export."""
@@ -246,6 +358,25 @@ class TimelineStore(Protocol):
     async def append(self, event: TimelineEventV1) -> TimelineAppendResult: ...
 
     async def read_page(self, command: TimelinePageCommandV1) -> TimelineReadSlice: ...
+
+
+@runtime_checkable
+class TimelineRawStore(Protocol):
+    """Atomic raw append and exact-ID export surface; never list or delete."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def append_with_raw(
+        self,
+        event: TimelineEventV1,
+        raw_source: TimelineRawSourceV1,
+    ) -> TimelineAppendResult: ...
+
+    async def read_raw_export(
+        self,
+        command: TimelineRawExportCommandV1,
+    ) -> TimelineRawReadSlice: ...
 
 
 def _is_visible(data_class: TimelineAudience, audience: TimelineAudience) -> bool:
@@ -356,6 +487,119 @@ def project_timeline_page(read: TimelineReadSlice) -> TimelinePageV1:
     )
 
 
+def _parse_utc_second(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def _utc_second(value: datetime) -> str:
+    return value.astimezone(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _raw_expires_at(entry: TimelineEntryV1) -> datetime:
+    return _parse_utc_second(entry.content.recorded_at) + timedelta(
+        days=entry.content.event.raw_retention_days
+    )
+
+
+def _raw_matches_entry(
+    raw: TimelineRawEvidenceV1,
+    entry: TimelineEntryV1,
+    *,
+    expires_at: str,
+) -> bool:
+    event = entry.content.event
+    source = raw.raw_source
+    signature_sha256 = None if event.signature is None else event.signature.signature_sha256
+    return (
+        raw.target == entry.content.target
+        and raw.sequence == entry.content.sequence
+        and raw.entry_id == entry.entry_id
+        and raw.entry_sha256 == entry.entry_sha256
+        and raw.source_id == event.source_id
+        and raw.recorded_at == entry.content.recorded_at
+        and raw.expires_at == expires_at
+        and source.raw_source_id == event.raw_source_id
+        and source.source_schema_version == event.source_schema_version
+        and source.target == event.target
+        and source.evidence_class is event.evidence_class
+        and source.payload_sha256 == event.payload_sha256
+        and source.record_sha256 == event.raw_record_sha256
+        and source.signature_sha256 == signature_sha256
+    )
+
+
+def project_timeline_raw_export(read: TimelineRawReadSlice) -> TimelineRawExportV1:
+    """Project a validated raw slice while honoring expiration before TTL cleanup."""
+
+    if type(read) is not TimelineRawReadSlice:
+        raise TypeError("timeline raw export projection requires an exact read slice")
+    evaluated = _parse_utc_second(read.evaluated_at)
+    items: list[TimelineRawExportItemV1] = []
+    for entry, raw in zip(read.entries, read.raw_evidence, strict=True):
+        content = entry.content
+        event = content.event
+        expires = _raw_expires_at(entry)
+        expired = evaluated >= expires
+        if raw is None and not expired:
+            raise ValueError("unexpired timeline raw evidence is absent")
+        source = None if raw is None else raw.raw_source
+        items.append(
+            TimelineRawExportItemV1(
+                schema_version=TIMELINE_RAW_EXPORT_ITEM_V1,
+                sequence=content.sequence,
+                entry_id=entry.entry_id,
+                entry_sha256=entry.entry_sha256,
+                previous_entry_sha256=content.previous_entry_sha256,
+                source_id=event.source_id,
+                raw_source_id=event.raw_source_id,
+                source_schema_version=event.source_schema_version,
+                event_type=event.event_type,
+                evidence_class=event.evidence_class,
+                payload_sha256=event.payload_sha256,
+                record_sha256=event.raw_record_sha256,
+                signature_sha256=(
+                    None if event.signature is None else event.signature.signature_sha256
+                ),
+                recorded_at=content.recorded_at,
+                expires_at=_utc_second(expires),
+                lifecycle_status=(
+                    TimelineRawLifecycleStatus.EXPIRED_BY_POLICY
+                    if expired
+                    else TimelineRawLifecycleStatus.AVAILABLE
+                ),
+                canonical_record=(
+                    None
+                    if expired
+                    else source.canonical_record
+                    if source is not None
+                    else None
+                ),
+                deletion_policy="EXPIRE_RAW_PRESERVE_DIGEST_V1",
+            )
+        )
+    head_sequence = 0 if read.head is None else read.head.sequence
+    head_digest = None if read.head is None else read.head.entry_sha256
+    next_digest: str | None
+    if items:
+        next_sequence = items[-1].sequence
+        next_digest = items[-1].entry_sha256
+    else:
+        next_sequence = read.command.after_sequence
+        next_digest = read.command.after_entry_sha256
+    return TimelineRawExportV1(
+        schema_version=TIMELINE_RAW_EXPORT_V1,
+        command=read.command,
+        command_sha256=canonical_sha256(read.command),
+        evaluated_at=read.evaluated_at,
+        entries=tuple(items),
+        next_after_sequence=next_sequence,
+        next_after_entry_sha256=next_digest,
+        head_sequence=head_sequence,
+        head_entry_sha256=head_digest,
+        has_more=next_sequence < head_sequence,
+    )
+
+
 class TimelineReadService:
     """Enforce target and audience scope before returning a projection."""
 
@@ -395,6 +639,54 @@ class TimelineReadService:
             raise TimelineReadError(TimelineReadErrorCode.STORE_UNAVAILABLE) from None
         except (TypeError, ValueError):
             raise TimelineReadError(TimelineReadErrorCode.RESPONSE_INVALID) from None
+
+
+class TimelineRawExportService:
+    """Enforce the separate restricted-export grant before exact-ID raw reads."""
+
+    def __init__(self, *, target: TargetBinding, store: TimelineRawStore) -> None:
+        if (
+            type(target) is not TargetBinding
+            or not isinstance(store, TimelineRawStore)
+            or store.target != target
+        ):
+            raise TimelineRawExportError(
+                TimelineRawExportErrorCode.CONFIGURATION_INVALID
+            )
+        self._target = target
+        self._store = store
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def export(
+        self,
+        command: TimelineRawExportCommandV1,
+        grant: TimelineRawExportGrant,
+    ) -> TimelineRawExportV1:
+        if (
+            type(command) is not TimelineRawExportCommandV1
+            or type(grant) is not TimelineRawExportGrant
+        ):
+            raise TimelineRawExportError(TimelineRawExportErrorCode.ACCESS_DENIED)
+        if command.target != self._target or grant.target != self._target:
+            raise TimelineRawExportError(TimelineRawExportErrorCode.TARGET_DENIED)
+        try:
+            read = await self._store.read_raw_export(command)
+            return project_timeline_raw_export(read)
+        except asyncio.CancelledError:
+            raise
+        except TimelineCursorInvalid:
+            raise TimelineRawExportError(TimelineRawExportErrorCode.CURSOR_INVALID) from None
+        except TimelineStoreError:
+            raise TimelineRawExportError(
+                TimelineRawExportErrorCode.STORE_UNAVAILABLE
+            ) from None
+        except (TypeError, ValueError):
+            raise TimelineRawExportError(
+                TimelineRawExportErrorCode.RESPONSE_INVALID
+            ) from None
 
 
 class TimelineWriteService:
@@ -453,6 +745,51 @@ class TimelineWriteService:
         except TimelineStoreError:
             raise TimelineWriteError(TimelineWriteErrorCode.STORE_UNAVAILABLE) from None
 
+    async def append_with_raw(
+        self,
+        event: TimelineEventV1,
+        raw_source: TimelineRawSourceV1,
+        grant: TimelineWriteGrant,
+    ) -> TimelineAppendResult:
+        if (
+            type(event) is not TimelineEventV1
+            or type(raw_source) is not TimelineRawSourceV1
+            or type(grant) is not TimelineWriteGrant
+        ):
+            raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
+        if (
+            event.target != self._target
+            or raw_source.target != self._target
+            or grant.target != self._target
+        ):
+            raise TimelineWriteError(TimelineWriteErrorCode.TARGET_DENIED)
+        policy = self._policies[event.evidence_class]
+        signature_sha256 = (
+            None if event.signature is None else event.signature.signature_sha256
+        )
+        if grant.writer_role not in policy.writer_roles:
+            raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
+        if (
+            event.policy_sha256 != self._policy_sha256
+            or event.raw_retention_days != policy.raw_retention_days
+            or raw_source.raw_source_id != event.raw_source_id
+            or raw_source.source_schema_version != event.source_schema_version
+            or raw_source.evidence_class is not event.evidence_class
+            or raw_source.payload_sha256 != event.payload_sha256
+            or raw_source.record_sha256 != event.raw_record_sha256
+            or raw_source.signature_sha256 != signature_sha256
+            or not isinstance(self._store, TimelineRawStore)
+        ):
+            raise TimelineWriteError(TimelineWriteErrorCode.POLICY_DENIED)
+        try:
+            return await self._store.append_with_raw(event, raw_source)
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreConflict:
+            raise TimelineWriteError(TimelineWriteErrorCode.CONFLICT) from None
+        except TimelineStoreError:
+            raise TimelineWriteError(TimelineWriteErrorCode.STORE_UNAVAILABLE) from None
+
 
 __all__ = [
     "REDACTED_DISPLAY_VALUE",
@@ -460,6 +797,12 @@ __all__ = [
     "TimelineAppendCreated",
     "TimelineAppendResult",
     "TimelineCursorInvalid",
+    "TimelineRawExportError",
+    "TimelineRawExportErrorCode",
+    "TimelineRawExportGrant",
+    "TimelineRawExportService",
+    "TimelineRawReadSlice",
+    "TimelineRawStore",
     "TimelineReadError",
     "TimelineReadErrorCode",
     "TimelineReadGrant",
@@ -478,4 +821,5 @@ __all__ = [
     "TimelineWriteService",
     "project_timeline_entry",
     "project_timeline_page",
+    "project_timeline_raw_export",
 ]

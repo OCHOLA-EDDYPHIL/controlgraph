@@ -4,30 +4,47 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
 
 import pytest
-from timeline_test_data import OTHER_TARGET, TARGET, timeline_event
+from timeline_test_data import (
+    OTHER_TARGET,
+    TARGET,
+    timeline_event,
+    timeline_event_with_raw,
+)
 
 from controlgraph_canary.application.timeline import (
     TimelineAppendAdopted,
     TimelineAppendCreated,
     TimelineCursorInvalid,
+    TimelineRawExportGrant,
+    TimelineRawExportService,
     TimelineStoreConflict,
     TimelineStoreCorruptRecord,
+    TimelineWriteError,
+    TimelineWriteErrorCode,
+    TimelineWriteGrant,
+    TimelineWriteService,
 )
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_DISPLAY_FIELD_V1,
     TIMELINE_ENTRY_COLLECTION,
     TIMELINE_PAGE_COMMAND_V1,
+    TIMELINE_RAW_COLLECTION,
+    TIMELINE_RAW_EXPORT_COMMAND_V1,
+    TimelineActorRole,
     TimelineAudience,
     TimelineDisplayFieldName,
     TimelineDisplayFieldV1,
     TimelinePageCommandV1,
+    TimelineRawExportCommandV1,
+    TimelineRawLifecycleStatus,
     standard_timeline_evidence_policy_set,
     timeline_entry_document_id,
+    timeline_raw_document_id,
 )
 from controlgraph_canary.integrations.google.firestore_timeline import (
     FIRESTORE_TIMELINE_DATABASE,
@@ -201,14 +218,18 @@ async def _run_transaction(
             raise TimeoutError("synthetic lost commit response")
 
 
-def _store(client: _Client) -> FirestoreTimelineStore:
+def _store(
+    client: _Client,
+    *,
+    clock: Callable[[], datetime] = lambda: NOW,
+) -> FirestoreTimelineStore:
     return FirestoreTimelineStore(
         target=TARGET,
         configured_project_id=TARGET.project_id,
         policy_set=standard_timeline_evidence_policy_set(TARGET),
         client_factory=lambda: client,
         transaction_runner=_run_transaction,
-        clock=lambda: NOW,
+        clock=clock,
     )
 
 
@@ -396,3 +417,137 @@ async def test_missing_or_duplicate_exact_get_results_are_corruption() -> None:
     client.duplicate_batch = True
     with pytest.raises(TimelineStoreCorruptRecord):
         await store.read_page(_command())
+
+
+@_async_test
+async def test_raw_append_is_atomic_replay_safe_and_exact_id_exported() -> None:
+    client = _Client()
+    store = _store(client)
+    event, raw_source = timeline_event_with_raw(32)
+
+    policy_set = standard_timeline_evidence_policy_set(TARGET)
+    writer = TimelineWriteService(target=TARGET, policy_set=policy_set, store=store)
+    grant = TimelineWriteGrant(
+        target=TARGET,
+        writer_role=TimelineActorRole.COORDINATOR,
+        principal_id="coordinator:synthetic",
+    )
+    created = await writer.append_with_raw(event, raw_source, grant)
+    replay = await writer.append_with_raw(event, raw_source, grant)
+
+    assert isinstance(created, TimelineAppendCreated)
+    assert isinstance(replay, TimelineAppendAdopted)
+    assert replay.entry == created.entry
+    assert client.write_count == 4
+    assert client.transaction_count == 1
+    raw_path = (
+        f"{TIMELINE_RAW_COLLECTION}/"
+        f"{timeline_raw_document_id(TARGET, event.source_id)}"
+    )
+    stored_raw = client.documents[raw_path]
+    assert stored_raw["expires_at"] == NOW + timedelta(days=30)
+
+    command = TimelineRawExportCommandV1(
+        schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,
+        target=TARGET,
+        after_sequence=0,
+        after_entry_sha256=None,
+        limit=1,
+    )
+    exported = await TimelineRawExportService(target=TARGET, store=store).export(
+        command,
+        TimelineRawExportGrant(target=TARGET, principal_id="operator:synthetic"),
+    )
+    assert len(exported.entries) == 1
+    assert exported.entries[0].lifecycle_status is TimelineRawLifecycleStatus.AVAILABLE
+    assert exported.entries[0].canonical_record == raw_source.canonical_record
+    assert client.batch_calls[-1] == (
+        f"{TIMELINE_ENTRY_COLLECTION}/{timeline_entry_document_id(TARGET, 1)}",
+    )
+    assert raw_path in client.get_calls
+
+    _, unrelated_raw = timeline_event_with_raw(35)
+    with pytest.raises(TimelineWriteError) as denied:
+        await writer.append_with_raw(event, unrelated_raw, grant)
+    assert denied.value.code is TimelineWriteErrorCode.POLICY_DENIED
+
+
+@_async_test
+async def test_raw_export_hides_ttl_lag_and_accepts_policy_expiration_deletion() -> None:
+    now = [NOW]
+    client = _Client()
+    store = _store(client, clock=lambda: now[0])
+    event, raw_source = timeline_event_with_raw(33)
+    await store.append_with_raw(event, raw_source)
+    command = TimelineRawExportCommandV1(
+        schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,
+        target=TARGET,
+        after_sequence=0,
+        after_entry_sha256=None,
+        limit=1,
+    )
+
+    now[0] = NOW + timedelta(days=30)
+    lagging = await store.read_raw_export(command)
+    lagging_export = await TimelineRawExportService(target=TARGET, store=store).export(
+        command,
+        TimelineRawExportGrant(target=TARGET, principal_id="operator:synthetic"),
+    )
+    assert lagging.raw_evidence[0] is not None
+    assert lagging_export.entries[0].lifecycle_status is (
+        TimelineRawLifecycleStatus.EXPIRED_BY_POLICY
+    )
+    assert lagging_export.entries[0].canonical_record is None
+    assert lagging_export.entries[0].record_sha256 == raw_source.record_sha256
+
+    raw_path = (
+        f"{TIMELINE_RAW_COLLECTION}/"
+        f"{timeline_raw_document_id(TARGET, event.source_id)}"
+    )
+    del client.documents[raw_path]
+    deleted = await store.read_raw_export(command)
+    assert deleted.raw_evidence == (None,)
+
+
+@_async_test
+async def test_raw_export_fails_closed_for_early_deletion_cursor_and_target() -> None:
+    client = _Client()
+    store = _store(client)
+    event, raw_source = timeline_event_with_raw(34)
+    created = await store.append_with_raw(event, raw_source)
+    raw_path = (
+        f"{TIMELINE_RAW_COLLECTION}/"
+        f"{timeline_raw_document_id(TARGET, event.source_id)}"
+    )
+    del client.documents[raw_path]
+    initial = TimelineRawExportCommandV1(
+        schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,
+        target=TARGET,
+        after_sequence=0,
+        after_entry_sha256=None,
+        limit=1,
+    )
+    with pytest.raises(TimelineStoreCorruptRecord):
+        await store.read_raw_export(initial)
+
+    bad_cursor = TimelineRawExportCommandV1(
+        schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,
+        target=TARGET,
+        after_sequence=1,
+        after_entry_sha256="f" * 64,
+        limit=1,
+    )
+    with pytest.raises(TimelineCursorInvalid):
+        await store.read_raw_export(bad_cursor)
+
+    cross_target = TimelineRawExportCommandV1(
+        schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,
+        target=OTHER_TARGET,
+        after_sequence=0,
+        after_entry_sha256=None,
+        limit=1,
+    )
+    with pytest.raises(ValueError):
+        await store.read_raw_export(cross_target)
+
+    assert created.entry.content.sequence == 1

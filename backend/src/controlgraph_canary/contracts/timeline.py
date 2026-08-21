@@ -35,12 +35,19 @@ TIMELINE_HEAD_V1: Final = "controlgraph.timeline-head/v1"
 TIMELINE_PAGE_COMMAND_V1: Final = "controlgraph.timeline-page-command/v1"
 TIMELINE_ENTRY_PROJECTION_V1: Final = "controlgraph.timeline-entry-projection/v1"
 TIMELINE_PAGE_V1: Final = "controlgraph.timeline-page/v1"
+TIMELINE_RAW_SOURCE_V1: Final = "controlgraph.timeline-raw-source/v1"
+TIMELINE_RAW_EVIDENCE_V1: Final = "controlgraph.timeline-raw-evidence/v1"
+TIMELINE_RAW_EXPORT_COMMAND_V1: Final = "controlgraph.timeline-raw-export-command/v1"
+TIMELINE_RAW_EXPORT_ITEM_V1: Final = "controlgraph.timeline-raw-export-item/v1"
+TIMELINE_RAW_EXPORT_V1: Final = "controlgraph.timeline-raw-export/v1"
 TIMELINE_STORAGE_DOCUMENT_V1: Final = "controlgraph.timeline-storage-document/v1"
 
 TIMELINE_HEAD_COLLECTION: Final = "controlgraph_timeline_heads"
 TIMELINE_IDENTITY_COLLECTION: Final = "controlgraph_timeline_identities"
 TIMELINE_ENTRY_COLLECTION: Final = "controlgraph_timeline_entries"
+TIMELINE_RAW_COLLECTION: Final = "controlgraph_timeline_raw"
 TIMELINE_MAX_PAGE_SIZE: Final = 100
+TIMELINE_MAX_RAW_EXPORT_SIZE: Final = 25
 TIMELINE_DEFAULT_RAW_RETENTION_DAYS: Final = 30
 
 ContractVersion = Annotated[
@@ -170,6 +177,13 @@ class TimelineStorageKind(StrEnum):
     ENTRY = "ENTRY"
 
 
+class TimelineRawLifecycleStatus(StrEnum):
+    """Honest raw-record availability at one export evaluation instant."""
+
+    AVAILABLE = "AVAILABLE"
+    EXPIRED_BY_POLICY = "EXPIRED_BY_POLICY"
+
+
 _AUDIENCE_ORDER: Final[dict[TimelineAudience, int]] = {
     TimelineAudience.PUBLIC_DEMO: 0,
     TimelineAudience.OPERATOR: 1,
@@ -252,7 +266,13 @@ class TimelineSignatureMetadataV1(StrictContractModel):
     """Non-secret signature bindings retained in every audience projection."""
 
     schema_version: Literal["controlgraph.timeline-signature-metadata/v1"]
-    purpose: Literal["EVIDENCE"]
+    purpose: Literal[
+        "CAPABILITY",
+        "EVIDENCE",
+        "HEALTH_ATTESTATION",
+        "RECOVERY_PRESTATE",
+        "CLASSIFICATION_EVIDENCE",
+    ]
     signing_key_version: KeyVersionResource
     signing_algorithm: Literal["EC_SIGN_P256_SHA256"]
     payload_sha256: Sha256Digest
@@ -293,6 +313,7 @@ class TimelineEventV1(StrictContractModel):
     occurred_at: UtcSecond
     correlations: Annotated[tuple[TimelineCorrelationV1, ...], Field(min_length=1, max_length=16)]
     payload_sha256: Sha256Digest
+    raw_record_sha256: Sha256Digest
     policy_sha256: Sha256Digest
     raw_retention_days: Annotated[int, Field(ge=1, le=3_650)]
     signature: TimelineSignatureMetadataV1 | None
@@ -537,6 +558,174 @@ class TimelinePageV1(StrictContractModel):
         return self
 
 
+class TimelineRawSourceV1(StrictContractModel):
+    """A bounded canonical source record supplied with one timeline event."""
+
+    schema_version: Literal["controlgraph.timeline-raw-source/v1"]
+    raw_source_id: Identifier
+    source_schema_version: ContractVersion
+    target: TargetBinding
+    evidence_class: TimelineEvidenceClass
+    payload_sha256: Sha256Digest
+    record_sha256: Sha256Digest
+    canonical_record: CanonicalPayload
+    signature_sha256: Sha256Digest | None
+
+    @model_validator(mode="after")
+    def validate_record_digest(self) -> Self:
+        try:
+            encoded = self.canonical_record.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("timeline raw source is not UTF-8") from error
+        if hashlib.sha256(encoded).hexdigest() != self.record_sha256:
+            raise ValueError("timeline raw source digest is invalid")
+        return self
+
+
+class TimelineRawEvidenceV1(StrictContractModel):
+    """Immutable raw source plus its exact timeline and lifecycle bindings."""
+
+    schema_version: Literal["controlgraph.timeline-raw-evidence/v1"]
+    target: TargetBinding
+    sequence: PositiveSafeInteger
+    entry_id: Identifier
+    entry_sha256: Sha256Digest
+    source_id: Identifier
+    raw_source: TimelineRawSourceV1
+    recorded_at: UtcSecond
+    expires_at: UtcSecond
+    deletion_policy: Literal["EXPIRE_RAW_PRESERVE_DIGEST_V1"]
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> Self:
+        if (
+            self.entry_id != f"cgtimeline:{self.entry_sha256}"
+            or self.target != self.raw_source.target
+            or self.recorded_at >= self.expires_at
+        ):
+            raise ValueError("timeline raw evidence bindings are invalid")
+        return self
+
+
+class TimelineRawExportCommandV1(StrictContractModel):
+    """Exclusive exact cursor for a separately authorized raw export."""
+
+    schema_version: Literal["controlgraph.timeline-raw-export-command/v1"]
+    target: TargetBinding
+    after_sequence: NonNegativeSafeInteger
+    after_entry_sha256: Sha256Digest | None
+    limit: Annotated[int, Field(ge=1, le=TIMELINE_MAX_RAW_EXPORT_SIZE)]
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> Self:
+        if (self.after_sequence == 0) != (self.after_entry_sha256 is None):
+            raise ValueError("timeline raw export cursor digest does not match its sequence")
+        return self
+
+
+class TimelineRawExportItemV1(StrictContractModel):
+    """One bounded raw record or its preserved policy-expiration evidence."""
+
+    schema_version: Literal["controlgraph.timeline-raw-export-item/v1"]
+    sequence: PositiveSafeInteger
+    entry_id: Identifier
+    entry_sha256: Sha256Digest
+    previous_entry_sha256: Sha256Digest | None
+    source_id: Identifier
+    raw_source_id: Identifier
+    source_schema_version: ContractVersion
+    event_type: TimelineEventType
+    evidence_class: TimelineEvidenceClass
+    payload_sha256: Sha256Digest
+    record_sha256: Sha256Digest
+    signature_sha256: Sha256Digest | None
+    recorded_at: UtcSecond
+    expires_at: UtcSecond
+    lifecycle_status: TimelineRawLifecycleStatus
+    canonical_record: CanonicalPayload | None
+    deletion_policy: Literal["EXPIRE_RAW_PRESERVE_DIGEST_V1"]
+
+    @model_validator(mode="after")
+    def validate_item(self) -> Self:
+        if (
+            self.entry_id != f"cgtimeline:{self.entry_sha256}"
+            or (self.sequence == 1) != (self.previous_entry_sha256 is None)
+            or (self.lifecycle_status is TimelineRawLifecycleStatus.AVAILABLE)
+            != (self.canonical_record is not None)
+        ):
+            raise ValueError("timeline raw export item is invalid")
+        if self.canonical_record is not None:
+            try:
+                encoded = self.canonical_record.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("timeline raw export is not UTF-8") from error
+            if hashlib.sha256(encoded).hexdigest() != self.record_sha256:
+                raise ValueError("timeline raw export record digest is invalid")
+        return self
+
+
+class TimelineRawExportV1(StrictContractModel):
+    """Omission-free raw export bound to one target, cursor, and evaluation time."""
+
+    schema_version: Literal["controlgraph.timeline-raw-export/v1"]
+    command: TimelineRawExportCommandV1
+    command_sha256: Sha256Digest
+    evaluated_at: UtcSecond
+    entries: Annotated[
+        tuple[TimelineRawExportItemV1, ...],
+        Field(max_length=TIMELINE_MAX_RAW_EXPORT_SIZE),
+    ]
+    next_after_sequence: NonNegativeSafeInteger
+    next_after_entry_sha256: Sha256Digest | None
+    head_sequence: NonNegativeSafeInteger
+    head_entry_sha256: Sha256Digest | None
+    has_more: bool
+
+    @model_validator(mode="after")
+    def validate_export(self) -> Self:
+        command = self.command
+        if self.command_sha256 != canonical_sha256(command):
+            raise ValueError("timeline raw export does not bind its command")
+        if len(self.entries) > command.limit or self.head_sequence < command.after_sequence:
+            raise ValueError("timeline raw export bounds are invalid")
+        if (self.head_sequence == 0) != (self.head_entry_sha256 is None):
+            raise ValueError("timeline raw export head digest is invalid")
+        expected_sequence = command.after_sequence + 1
+        predecessor = command.after_entry_sha256
+        for item in self.entries:
+            if item.sequence != expected_sequence or item.previous_entry_sha256 != predecessor:
+                raise ValueError("timeline raw export is not contiguous")
+            if (
+                item.lifecycle_status is TimelineRawLifecycleStatus.AVAILABLE
+                and self.evaluated_at >= item.expires_at
+            ) or (
+                item.lifecycle_status is TimelineRawLifecycleStatus.EXPIRED_BY_POLICY
+                and self.evaluated_at < item.expires_at
+            ):
+                raise ValueError("timeline raw lifecycle status is invalid")
+            expected_sequence += 1
+            predecessor = item.entry_sha256
+        next_digest: str | None
+        if self.entries:
+            next_sequence = self.entries[-1].sequence
+            next_digest = self.entries[-1].entry_sha256
+        else:
+            next_sequence = command.after_sequence
+            next_digest = command.after_entry_sha256
+        if (
+            self.next_after_sequence != next_sequence
+            or self.next_after_entry_sha256 != next_digest
+            or self.has_more != (next_sequence < self.head_sequence)
+            or (self.head_sequence > command.after_sequence and not self.entries)
+            or (
+                next_sequence == self.head_sequence
+                and next_digest != self.head_entry_sha256
+            )
+        ):
+            raise ValueError("timeline raw export cursor is invalid")
+        return self
+
+
 class TimelineStorageDocumentV1(StrictContractModel):
     """Canonical Firestore wrapper for timeline records."""
 
@@ -641,6 +830,16 @@ def timeline_entry_document_id(target: TargetBinding, sequence: int) -> str:
     )
 
 
+def timeline_raw_document_id(target: TargetBinding, source_id: str) -> str:
+    if type(source_id) is not str or not source_id:
+        raise TypeError("timeline raw source identity must be exact")
+    return _document_digest(
+        "controlgraph.timeline-raw-document/v1",
+        timeline_target_sha256(target),
+        source_id,
+    )
+
+
 def timeline_entry(
     event: TimelineEventV1,
     *,
@@ -683,8 +882,15 @@ __all__ = [
     "TIMELINE_IDENTITY_COLLECTION",
     "TIMELINE_IDENTITY_V1",
     "TIMELINE_MAX_PAGE_SIZE",
+    "TIMELINE_MAX_RAW_EXPORT_SIZE",
     "TIMELINE_PAGE_COMMAND_V1",
     "TIMELINE_PAGE_V1",
+    "TIMELINE_RAW_COLLECTION",
+    "TIMELINE_RAW_EVIDENCE_V1",
+    "TIMELINE_RAW_EXPORT_COMMAND_V1",
+    "TIMELINE_RAW_EXPORT_ITEM_V1",
+    "TIMELINE_RAW_EXPORT_V1",
+    "TIMELINE_RAW_SOURCE_V1",
     "TIMELINE_SIGNATURE_METADATA_V1",
     "TIMELINE_STORAGE_DOCUMENT_V1",
     "TimelineActorRole",
@@ -705,6 +911,12 @@ __all__ = [
     "TimelineIdentityV1",
     "TimelinePageCommandV1",
     "TimelinePageV1",
+    "TimelineRawEvidenceV1",
+    "TimelineRawExportCommandV1",
+    "TimelineRawExportItemV1",
+    "TimelineRawExportV1",
+    "TimelineRawLifecycleStatus",
+    "TimelineRawSourceV1",
     "TimelineSignatureMetadataV1",
     "TimelineStorageDocumentV1",
     "TimelineStorageKind",
@@ -718,5 +930,6 @@ __all__ = [
     "timeline_head_logical_id",
     "timeline_identity_document_id",
     "timeline_identity_logical_id",
+    "timeline_raw_document_id",
     "timeline_target_sha256",
 ]

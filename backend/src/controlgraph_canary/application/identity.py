@@ -31,6 +31,8 @@ INDEPENDENT_VERIFICATION_EVIDENCE_PATH = (
 RECOVERY_PRESTATE_ATTESTATION_PATH = (
     "/v1/internal/evidence/recovery-prestate/attest"
 )
+TIMELINE_READ_PATH = "/v1/operator/timeline"
+TIMELINE_RAW_EXPORT_PATH = "/v1/operator/timeline/raw-export"
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
@@ -148,6 +150,10 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EXECUTOR
             and self.path == RECOVERY_EXECUTION_FACADE_PATH
         )
+        timeline_api_route = (
+            self.service_role is ServiceRole.API
+            and self.path in {TIMELINE_READ_PATH, TIMELINE_RAW_EXPORT_PATH}
+        )
         if (
             not executor_receipt_authority_route
             and not recovery_receipt_authority_route
@@ -156,6 +162,7 @@ class RouteAuthenticationPolicy:
             and not independent_verification_evidence_route
             and not recovery_prestate_attestation_route
             and not recovery_execution_facade_route
+            and not timeline_api_route
             and self.path != protected_path(self.service_role)
         ):
             raise ValueError("protected path does not match the service role")
@@ -176,7 +183,9 @@ class RouteAuthenticationPolicy:
                     CallerRole.RECOVERY
                     if recovery_execution_facade_route
                     else (
-                        CallerRole.VERIFIER
+                        CallerRole.OPERATOR
+                        if timeline_api_route
+                        else CallerRole.VERIFIER
                         if (
                             classification_evidence_route
                             or health_attestation_route
@@ -454,6 +463,8 @@ __all__ = [
     "RECOVERY_EXECUTION_FACADE_PATH",
     "RECOVERY_PRESTATE_ATTESTATION_PATH",
     "RECOVERY_RECEIPT_AUTHORITY_PATH",
+    "TIMELINE_RAW_EXPORT_PATH",
+    "TIMELINE_READ_PATH",
     "AuthenticationContext",
     "AuthenticationDenialCode",
     "AuthenticationError",

@@ -45,6 +45,7 @@ from controlgraph_canary.application.root_trust import (
     CanonicalInternalTransport,
     CoordinatorInternalRoute,
 )
+from controlgraph_canary.application.timeline_recording import TimelineProjectionRecorder
 from controlgraph_canary.contracts.codec import (
     ContractError,
     canonical_json_bytes,
@@ -389,6 +390,7 @@ class CoordinatorHealthEvaluationService:
         health_store: HealthChainStore,
         verifier: HealthEvaluationVerifier,
         recovery_coordinator: RecoveryCoordinator,
+        timeline_recorder: TimelineProjectionRecorder | None = None,
     ) -> None:
         if (
             not _target_is_exact(target)
@@ -407,6 +409,13 @@ class CoordinatorHealthEvaluationService:
             or not isinstance(health_store, HealthChainStore)
             or not isinstance(verifier, HealthEvaluationVerifier)
             or not isinstance(recovery_coordinator, RecoveryCoordinator)
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(timeline_recorder, TimelineProjectionRecorder)
+                    or timeline_recorder.target != target
+                )
+            )
             or authority_reader.target != target
             or receipt_reader.target != target
             or health_store.target != target
@@ -421,6 +430,7 @@ class CoordinatorHealthEvaluationService:
         self._health_store = health_store
         self._verifier = verifier
         self._recovery_coordinator = recovery_coordinator
+        self._timeline_recorder = timeline_recorder
 
     async def evaluate(
         self,
@@ -535,6 +545,7 @@ class CoordinatorHealthEvaluationService:
             != verifier_result.signed_proof
         ):
             raise HealthPipelineError(HealthPipelineErrorCode.TRUSTED_STATE_INVALID)
+        await self._record_timeline_proof(verifier_result.signed_proof)
         return await self._complete_result(
             command=command,
             snapshot=appended.snapshot,
@@ -584,6 +595,7 @@ class CoordinatorHealthEvaluationService:
         refreshed = await self._read_trusted_inputs(command)
         if not _trusted_inputs_unchanged(trusted, refreshed):
             raise HealthPipelineError(HealthPipelineErrorCode.AUTHORITY_STALE)
+        await self._record_timeline_proof(snapshot.signed_proofs[-1].value)
         return await self._complete_result(
             command=command,
             snapshot=snapshot,
@@ -611,6 +623,7 @@ class CoordinatorHealthEvaluationService:
                 raise HealthPipelineError(
                     HealthPipelineErrorCode.TRUSTED_STATE_INVALID
                 )
+            await self._record_timeline_recovery_intent(intent.value)
             try:
                 recovery = await self._recovery_coordinator.dispatch(
                     intent.value.command
@@ -627,6 +640,34 @@ class CoordinatorHealthEvaluationService:
             disposition=disposition,
             recovery_dispatch=recovery,
         )
+
+    async def _record_timeline_proof(
+        self,
+        signed_proof: SignedHealthDecisionProofV1,
+    ) -> None:
+        recorder = self._timeline_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.record_signed_health_proof(signed_proof)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise HealthPipelineError(HealthPipelineErrorCode.STORE_UNAVAILABLE) from None
+
+    async def _record_timeline_recovery_intent(
+        self,
+        intent: RecoveryIntentV1,
+    ) -> None:
+        recorder = self._timeline_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.record_recovery_intent(intent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise HealthPipelineError(HealthPipelineErrorCode.STORE_UNAVAILABLE) from None
 
     async def _read_trusted_inputs(
         self,

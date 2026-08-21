@@ -53,6 +53,8 @@ from controlgraph_canary.application.identity import (
     RECOVERY_EXECUTION_FACADE_PATH,
     RECOVERY_PRESTATE_ATTESTATION_PATH,
     RECOVERY_RECEIPT_AUTHORITY_PATH,
+    TIMELINE_RAW_EXPORT_PATH,
+    TIMELINE_READ_PATH,
     CallerBinding,
     CallerRole,
     RouteAuthenticationPolicy,
@@ -169,6 +171,13 @@ from controlgraph_canary.application.tasks import (
     TaskDispatcher,
     TaskEnqueuer,
 )
+from controlgraph_canary.application.timeline import (
+    TimelineRawExportService,
+    TimelineReadService,
+    TimelineWriteGrant,
+    TimelineWriteService,
+)
+from controlgraph_canary.application.timeline_recording import TimelineRecorder
 from controlgraph_canary.contracts.health import (
     RolloutHealthPolicyV2,
     create_rollout_health_policy_v2,
@@ -188,6 +197,10 @@ from controlgraph_canary.contracts.root_creation import RolloutRootV3
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimClassificationRequestV1,
+)
+from controlgraph_canary.contracts.timeline import (
+    TimelineActorRole,
+    standard_timeline_evidence_policy_set,
 )
 from controlgraph_canary.http.receipt import (
     RecoveryExecutorClient,
@@ -334,6 +347,9 @@ def create_runtime_service_app(
     verified_task_handler = None
     recovery_executor_facade_handler: RecoveryExecutorFacadeHandler | None = None
     recovery_executor_facade_authentication_policy = None
+    timeline_read_service = None
+    timeline_raw_export_service = None
+    timeline_recorder = None
     if role is ServiceRole.EVIDENCE_WRITER:
         if settings.evidence_key_version is None or settings.signing_algorithm is None:
             raise ValueError("evidence-writer signing configuration is incomplete")
@@ -672,8 +688,27 @@ def create_runtime_service_app(
             clock=preflight_clock,
         )
     elif role is ServiceRole.API:
+        from controlgraph_canary.integrations.google.firestore_timeline import (
+            FirestoreTimelineStore,
+        )
+
         if settings.coordinator_url is None:
             raise ValueError("API root-creation relay configuration is incomplete")
+        timeline_target = _reference_target(settings)
+        timeline_policy_set = standard_timeline_evidence_policy_set(timeline_target)
+        timeline_store = FirestoreTimelineStore.production(
+            target=timeline_target,
+            configured_project_id=settings.project_id,
+            policy_set=timeline_policy_set,
+        )
+        timeline_read_service = TimelineReadService(
+            target=timeline_target,
+            store=timeline_store,
+        )
+        timeline_raw_export_service = TimelineRawExportService(
+            target=timeline_target,
+            store=timeline_store,
+        )
         selected_transport = (
             internal_transport
             if internal_transport is not None
@@ -1098,6 +1133,9 @@ def create_runtime_service_app(
         from controlgraph_canary.integrations.google.firestore_recovery_abandonment import (
             FirestoreRecoveryAbandonmentStore,
         )
+        from controlgraph_canary.integrations.google.firestore_timeline import (
+            FirestoreTimelineStore,
+        )
 
         if (
             settings.issuer_url is None
@@ -1179,6 +1217,27 @@ def create_runtime_service_app(
             region=settings.region,
             environment=settings.environment,
             service_name="controlgraph-reference-target",
+        )
+        timeline_policy_set = standard_timeline_evidence_policy_set(target)
+        timeline_store = FirestoreTimelineStore.production(
+            target=target,
+            configured_project_id=settings.project_id,
+            policy_set=timeline_policy_set,
+        )
+        timeline_recorder = TimelineRecorder(
+            service=TimelineWriteService(
+                target=target,
+                policy_set=timeline_policy_set,
+                store=timeline_store,
+            ),
+            grant=TimelineWriteGrant(
+                target=target,
+                writer_role=TimelineActorRole.COORDINATOR,
+                principal_id=(
+                    f"controlgraph-coordinator@{settings.project_id}.iam.gserviceaccount.com"
+                ),
+            ),
+            policy_set=timeline_policy_set,
         )
         selected_store = (
             authority_store
@@ -1405,6 +1464,7 @@ def create_runtime_service_app(
                 signature_verifier=health_signature_verifier,
             ),
             recovery_coordinator=recovery_coordinator,
+            timeline_recorder=timeline_recorder,
         )
         coordinator_canary_relay = CoordinatorCanaryRelay(
             authentication_policy=policy,
@@ -1417,6 +1477,7 @@ def create_runtime_service_app(
                     selected_task_enqueuer,
                 ),
                 clock=canary_clock,
+                timeline_recorder=timeline_recorder,
             ),
         )
         coordinator_promotion_relay = CoordinatorPromotionRelay(
@@ -1561,6 +1622,19 @@ def create_runtime_service_app(
         recovery_executor_facade_authentication_policy=(
             recovery_executor_facade_authentication_policy
         ),
+        timeline_read_service=timeline_read_service,
+        timeline_read_authentication_policy=(
+            _operator_timeline_policy(policy, TIMELINE_READ_PATH)
+            if timeline_read_service is not None
+            else None
+        ),
+        timeline_raw_export_service=timeline_raw_export_service,
+        timeline_raw_export_authentication_policy=(
+            _operator_timeline_policy(policy, TIMELINE_RAW_EXPORT_PATH)
+            if timeline_raw_export_service is not None
+            else None
+        ),
+        timeline_recorder=timeline_recorder,
         mutation_enabled=settings.mutations_enabled,
     )
     if coordinator_clients is not None:
@@ -1641,6 +1715,12 @@ def create_runtime_service_app(
         app.state.controlgraph_receipt_execution = verified_task_handler
     if recovery_executor_facade_handler is not None:
         app.state.controlgraph_recovery_executor_facade = recovery_executor_facade_handler
+    if timeline_read_service is not None:
+        app.state.controlgraph_timeline_read = timeline_read_service
+    if timeline_raw_export_service is not None:
+        app.state.controlgraph_timeline_raw_export = timeline_raw_export_service
+    if timeline_recorder is not None:
+        app.state.controlgraph_timeline_recorder = timeline_recorder
     return app
 
 
@@ -1672,6 +1752,27 @@ def _operator_api_policy(settings: ControllerSettings) -> RouteAuthenticationPol
             email=settings.operator_identity,
             subject=settings.operator_subject,
         ),
+    )
+
+
+def _operator_timeline_policy(
+    base: RouteAuthenticationPolicy,
+    path: str,
+) -> RouteAuthenticationPolicy:
+    if (
+        type(base) is not RouteAuthenticationPolicy
+        or base.service_role is not ServiceRole.API
+        or base.caller.role is not CallerRole.OPERATOR
+        or path not in {TIMELINE_READ_PATH, TIMELINE_RAW_EXPORT_PATH}
+    ):
+        raise ValueError("operator timeline path is invalid")
+    return RouteAuthenticationPolicy(
+        project_id=base.project_id,
+        project_number=base.project_number,
+        service_role=base.service_role,
+        path=path,
+        audience=base.audience,
+        caller=base.caller,
     )
 
 

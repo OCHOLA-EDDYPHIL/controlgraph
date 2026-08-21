@@ -76,6 +76,12 @@ output "firestore_authority" {
     database_id      = google_firestore_database.authority.name
     location         = google_firestore_database.authority.location_id
     concurrency_mode = google_firestore_database.authority.concurrency_mode
+    timeline_raw = {
+      collection     = local.timeline_raw_collection
+      expiry_field   = local.timeline_raw_expiry_field
+      retention_days = local.timeline_raw_retention_days
+      ttl_field_id   = google_firestore_field.timeline_raw_expiry.id
+    }
   }
 }
 

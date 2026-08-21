@@ -136,6 +136,7 @@ locals {
 
   identity_expected_allows = {
     api = toset([
+      "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
       "kms_evidence_public_key_read",
@@ -230,6 +231,7 @@ locals {
     { for identity in keys(local.identity_expected_allows) : identity => toset([]) },
     {
       api = toset([
+        "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
         "kms_evidence_public_key_read",

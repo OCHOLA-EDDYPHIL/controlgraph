@@ -1,9 +1,12 @@
-from controlgraph_canary.contracts.codec import canonical_sha256
+import hashlib
+
+from controlgraph_canary.contracts.codec import canonical_json_value_bytes, canonical_sha256
 from controlgraph_canary.contracts.models import TARGET_BINDING_V1, TargetBinding
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_CORRELATION_V1,
     TIMELINE_DISPLAY_FIELD_V1,
     TIMELINE_EVENT_V1,
+    TIMELINE_RAW_SOURCE_V1,
     TIMELINE_SIGNATURE_METADATA_V1,
     TimelineActorRole,
     TimelineAudience,
@@ -14,6 +17,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineEventType,
     TimelineEventV1,
     TimelineEvidenceClass,
+    TimelineRawSourceV1,
     TimelineSignatureMetadataV1,
     TimelineTerminalClassification,
     TimelineVerificationStatus,
@@ -133,6 +137,7 @@ def timeline_event(
         occurred_at=f"2026-08-21T00:00:{index % 60:02d}Z",
         correlations=correlations,
         payload_sha256=payload_sha256,
+        raw_record_sha256="d" * 64,
         policy_sha256=canonical_sha256(policy_set),
         raw_retention_days=30,
         signature=signature,
@@ -140,3 +145,40 @@ def timeline_event(
         terminal_classification=terminal,
         display_fields=display_fields,
     )
+
+
+def timeline_event_with_raw(
+    index: int,
+    *,
+    target: TargetBinding = TARGET,
+    event_type: TimelineEventType = TimelineEventType.HEALTH_OBSERVED,
+) -> tuple[TimelineEventV1, TimelineRawSourceV1]:
+    canonical_record = canonical_json_value_bytes(
+        {
+            "schema_version": "controlgraph.synthetic-timeline-source/v1",
+            "source_id": f"source:{index}",
+            "target": target.model_dump(mode="json"),
+        }
+    ).decode("utf-8")
+    record_sha256 = hashlib.sha256(canonical_record.encode("utf-8")).hexdigest()
+    event = timeline_event(index, target=target, event_type=event_type).model_copy(
+        update={
+            "source_schema_version": "controlgraph.synthetic-timeline-source/v1",
+            "raw_source_id": f"cgraw:{record_sha256}",
+            "raw_record_sha256": record_sha256,
+        }
+    )
+    raw_source = TimelineRawSourceV1(
+        schema_version=TIMELINE_RAW_SOURCE_V1,
+        raw_source_id=event.raw_source_id,
+        source_schema_version=event.source_schema_version,
+        target=target,
+        evidence_class=event.evidence_class,
+        payload_sha256=event.payload_sha256,
+        record_sha256=record_sha256,
+        canonical_record=canonical_record,
+        signature_sha256=(
+            None if event.signature is None else event.signature.signature_sha256
+        ),
+    )
+    return event, raw_source
