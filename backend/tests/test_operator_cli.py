@@ -570,7 +570,7 @@ def test_all_operator_commands_use_one_fixed_shell_free_api_post(
         call = poster.calls[0]
         assert call["url"] == f"{origin}/v1/operator/commands"
         assert call["body"] == canonical_json_bytes(command)  # type: ignore[arg-type]
-        assert call["timeout"] == 30.0
+        assert call["timeout"] == 60.0
         assert call["headers"] == {
             "Accept": "application/json",
             "Content-Type": "application/json",

@@ -578,6 +578,7 @@ def create_runtime_service_app(
             else GoogleOneShotOidcTransport(
                 project_id=settings.project_id,
                 caller_role=CallerRole.API,
+                timeout_seconds=45.0,
             )
         )
         api_root_creation_client = ApiRootCreationClient(
@@ -1009,6 +1010,7 @@ def create_runtime_service_app(
             else GoogleOneShotOidcTransport(
                 project_id=settings.project_id,
                 caller_role=CallerRole.COORDINATOR,
+                timeout_seconds=30.0,
             )
         )
         verifier_route = CoordinatorInternalRoute(

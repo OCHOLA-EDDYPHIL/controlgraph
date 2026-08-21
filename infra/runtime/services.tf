@@ -150,6 +150,7 @@ module "coordinator" {
   container_image = var.controller_image
   service_account = local.service_accounts.coordinator
   ingress         = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  timeout         = "60s"
   network         = data.terraform_remote_state.foundation.outputs.network.network_id
   subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress      = "ALL_TRAFFIC"
@@ -191,6 +192,7 @@ module "api" {
   container_image = var.controller_image
   service_account = local.service_accounts.api
   ingress         = "INGRESS_TRAFFIC_ALL"
+  timeout         = "60s"
   network         = data.terraform_remote_state.foundation.outputs.network.network_id
   subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress      = "ALL_TRAFFIC"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import urllib.error
 import urllib.request
@@ -16,7 +17,8 @@ from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _OIDC_TOKEN = re.compile(r"^[A-Za-z0-9._~-]{16,16384}$")
-_REQUEST_TIMEOUT_SECONDS = 10.0
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+_MAXIMUM_REQUEST_TIMEOUT_SECONDS = 45.0
 
 
 class InternalTransportError(RuntimeError):
@@ -136,6 +138,7 @@ class GoogleOneShotOidcTransport:
         caller_role: CallerRole,
         token_provider: IdTokenProvider | None = None,
         http_poster: OneShotHttpPoster | None = None,
+        timeout_seconds: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         if (
             type(project_id) is not str
@@ -149,12 +152,16 @@ class GoogleOneShotOidcTransport:
                 CallerRole.RECOVERY,
                 CallerRole.VERIFIER,
             }
+            or type(timeout_seconds) not in {int, float}
+            or not math.isfinite(timeout_seconds)
+            or not 1 <= timeout_seconds <= _MAXIMUM_REQUEST_TIMEOUT_SECONDS
         ):
             raise InternalTransportError("internal transport configuration is invalid")
         self._project_id = project_id
         self._caller_role = caller_role
         self._token_provider = token_provider or GoogleIdTokenProvider()
         self._http_poster = http_poster or UrllibOneShotHttpPoster()
+        self._timeout_seconds = float(timeout_seconds)
 
     async def post(self, route: CoordinatorInternalRoute, body: bytes) -> bytes:
         """Make one authenticated attempt and admit only one canonical JSON response."""
@@ -187,7 +194,7 @@ class GoogleOneShotOidcTransport:
                 url=route.url,
                 headers=headers,
                 body=body,
-                timeout=_REQUEST_TIMEOUT_SECONDS,
+                timeout=self._timeout_seconds,
             )
         except asyncio.CancelledError:
             raise

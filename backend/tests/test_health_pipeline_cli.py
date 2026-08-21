@@ -184,7 +184,7 @@ def test_evaluate_health_posts_and_prints_the_exact_bound_result(
                 SERVERLESS_AUTHORIZATION_HEADER: f"Bearer {_TOKEN}",
             },
             "body": canonical_json_bytes(command),
-            "timeout": 30.0,
+            "timeout": 60.0,
         }
     ]
     assert decode_contract(
