@@ -13,6 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from controlgraph_canary.application.completion_classification import classify_completion
 from controlgraph_canary.application.queue_control import (
     EXECUTION_QUEUE_ID,
     EXECUTION_QUEUE_REGION,
@@ -39,6 +40,9 @@ from controlgraph_canary.contracts.health_pipeline import (
     HealthEvaluationResultV1,
     HealthEvaluationResultV2,
     health_evaluation_command_sha256,
+)
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionEvidenceBundleV1,
 )
 from controlgraph_canary.contracts.models import CapabilityAction
 from controlgraph_canary.contracts.operator_observability import (
@@ -345,6 +349,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonical recovery-abandonment command path, or '-' for stdin",
     )
 
+    classify_parser = subparsers.add_parser(
+        "classify-completion",
+        help="classify one canonical verified evidence bundle without cloud access",
+    )
+    classify_parser.add_argument(
+        "--bundle-file",
+        required=True,
+        help="canonical completion evidence bundle path, or '-' for stdin",
+    )
+
     queue_parser = subparsers.add_parser(
         "execution-queue",
         help="inspect, hold, or release the fixed execution queue",
@@ -466,6 +480,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "abandon-ambiguous-recovery":
         return _run_recovery_abandonment(args)
+
+    if args.command == "classify-completion":
+        return _run_completion_classification(args)
 
     if args.command == "execution-queue":
         return _run_execution_queue_command(args)
@@ -1155,6 +1172,22 @@ def _read_recovery_abandonment_command(source: str) -> RecoveryAbandonmentComman
         _read_bounded_command_bytes(source),
         RecoveryAbandonmentCommandV1,
     )
+
+
+def _run_completion_classification(args: argparse.Namespace) -> int:
+    """Run the pure fail-closed classifier over one canonical verified bundle."""
+
+    try:
+        bundle = decode_contract(
+            _read_bounded_command_bytes(args.bundle_file),
+            CompletionEvidenceBundleV1,
+        )
+        result = classify_completion(bundle)
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("COMPLETION_EVIDENCE_INVALID")
+        return 2
+    print(canonical_json_bytes(result).decode("utf-8"))
+    return 0
 
 
 def _read_bounded_command_bytes(source: str) -> bytes:

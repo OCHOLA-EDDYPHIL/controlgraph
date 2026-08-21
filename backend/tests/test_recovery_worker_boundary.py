@@ -1024,7 +1024,7 @@ def test_cloud_run_recovery_is_exact_traffic_only_and_timeout_is_not_retried() -
     verified, reader, _, now = _verify(bundle, events=events, facade=True)
     events.clear()
     after = _stable_only_cloud_service(bundle)
-    operation = _FakeOperation(after, name="operations/recover-stable-v3")
+    operation = _FakeOperation(after, name="operations/recover-stable-v4")
     services = _TrackingServicesClient(
         events,
         service=_cloud_service(bundle, 90, 10),

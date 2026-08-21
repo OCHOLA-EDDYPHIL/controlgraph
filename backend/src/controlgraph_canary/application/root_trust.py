@@ -21,6 +21,7 @@ from controlgraph_canary.application.candidate_revision import (
 from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
     HEALTH_ATTESTATION_PATH,
+    INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
     RECEIPT_AUTHORITY_PATH,
     RECOVERY_EXECUTION_FACADE_PATH,
     RECOVERY_PRESTATE_ATTESTATION_PATH,
@@ -174,6 +175,7 @@ class CoordinatorInternalRoute:
                     RECOVERY_RECEIPT_AUTHORITY_PATH,
                     CLASSIFICATION_EVIDENCE_PATH,
                     HEALTH_ATTESTATION_PATH,
+                    INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
                     RECOVERY_PRESTATE_ATTESTATION_PATH,
                     RECOVERY_EXECUTION_FACADE_PATH,
                 }
@@ -212,6 +214,7 @@ class CoordinatorInternalRoute:
                 in {
                     CLASSIFICATION_EVIDENCE_PATH,
                     HEALTH_ATTESTATION_PATH,
+                    INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
                     RECOVERY_PRESTATE_ATTESTATION_PATH,
                 }
                 and (self.caller_role, self.service_role)
@@ -224,6 +227,7 @@ class CoordinatorInternalRoute:
                 not in {
                     CLASSIFICATION_EVIDENCE_PATH,
                     HEALTH_ATTESTATION_PATH,
+                    INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
                     RECOVERY_PRESTATE_ATTESTATION_PATH,
                 }
             )

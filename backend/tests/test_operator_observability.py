@@ -36,6 +36,12 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     runtime_route_policy,
 )
+from controlgraph_canary.application.independent_verification import (
+    IndependentVerificationService,
+)
+from controlgraph_canary.application.independent_verification_signing import (
+    CoordinatorIndependentVerificationClient,
+)
 from controlgraph_canary.application.operator_observability import (
     ApiOperatorObservationClient,
     CoordinatorOperatorObservationRelay,
@@ -182,6 +188,10 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                     "subnetworks/controlgraph-runtime"
                 ),
                 "CONTROLGRAPH_EVIDENCE_WRITER_URL": EVIDENCE_WRITER_AUDIENCE,
+                "CONTROLGRAPH_REFERENCE_TARGET_URL": (
+                    f"https://controlgraph-reference-target-{PROJECT_NUMBER}"
+                    ".us-central1.run.app"
+                ),
                 "CONTROLGRAPH_EVIDENCE_KEY_VERSION": _evidence_key_version(),
             }
         )
@@ -1035,6 +1045,14 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
     assert isinstance(
         verifier.state.controlgraph_target_traffic_observation,
         TargetTrafficObservationService,
+    )
+    assert isinstance(
+        verifier.state.controlgraph_independent_verification,
+        IndependentVerificationService,
+    )
+    assert isinstance(
+        coordinator.state.controlgraph_independent_verification_client,
+        CoordinatorIndependentVerificationClient,
     )
     assert isinstance(
         coordinator.state.controlgraph_operator_observation_relay,

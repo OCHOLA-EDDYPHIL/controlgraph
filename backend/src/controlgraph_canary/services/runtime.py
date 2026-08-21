@@ -48,6 +48,7 @@ from controlgraph_canary.application.health_pipeline import (
 from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
     HEALTH_ATTESTATION_PATH,
+    INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
     RECEIPT_AUTHORITY_PATH,
     RECOVERY_EXECUTION_FACADE_PATH,
     RECOVERY_PRESTATE_ATTESTATION_PATH,
@@ -59,6 +60,14 @@ from controlgraph_canary.application.identity import (
     protected_path,
     runtime_route_policy,
     runtime_service_name,
+)
+from controlgraph_canary.application.independent_verification import (
+    IndependentVerificationService,
+)
+from controlgraph_canary.application.independent_verification_signing import (
+    CoordinatorIndependentVerificationClient,
+    IndependentVerificationSigningService,
+    VerifierIndependentVerificationEvidenceClient,
 )
 from controlgraph_canary.application.operator_observability import (
     ApiOperatorObservationClient,
@@ -165,6 +174,7 @@ from controlgraph_canary.contracts.health import (
     create_rollout_health_policy_v2,
 )
 from controlgraph_canary.contracts.health_execution import PostApplyHealthAnchorV1
+from controlgraph_canary.contracts.independent_verification import VerificationRequestV1
 from controlgraph_canary.contracts.models import TargetBinding
 from controlgraph_canary.contracts.operator_observability import (
     STABLE_SNAPSHOT_CAPTURE_REQUEST_V1,
@@ -200,7 +210,11 @@ from controlgraph_canary.integrations.google.kms import (
     GoogleKmsDigestSigner,
     GoogleKmsEvidenceSignatureVerifier,
     GoogleKmsHealthAttestationVerifier,
+    GoogleKmsIndependentVerificationEvidenceVerifier,
     GoogleKmsRecoveryPrestateAttestationVerifier,
+)
+from controlgraph_canary.integrations.google.probe_transport import (
+    GoogleSealedProbeTransport,
 )
 from controlgraph_canary.integrations.google.tasks import GoogleCloudTasksEnqueuer
 from controlgraph_canary.settings import ControllerSettings
@@ -277,6 +291,8 @@ def create_runtime_service_app(
     evidence_signing_service = None
     classification_evidence_signing_service = None
     classification_evidence_authentication_policy = None
+    independent_verification_signing_service = None
+    independent_verification_evidence_authentication_policy = None
     health_attestation_signing_service = None
     health_attestation_authentication_policy = None
     recovery_prestate_signing_service = None
@@ -285,7 +301,9 @@ def create_runtime_service_app(
     stable_snapshot_capture_service = None
     target_traffic_observation_service = None
     service_claim_classification_service = None
+    independent_verification_service = None
     coordinator_clients = None
+    coordinator_independent_verification_client = None
     api_root_creation_client = None
     coordinator_root_creation_relay = None
     api_operator_observation_client = None
@@ -338,6 +356,18 @@ def create_runtime_service_app(
             authentication_policy=(classification_evidence_authentication_policy),
             signer=evidence_signer,
         )
+        independent_verification_evidence_authentication_policy = (
+            _independent_verification_evidence_policy(settings)
+        )
+        independent_verification_signing_service = (
+            IndependentVerificationSigningService(
+                project_id=settings.project_id,
+                authentication_policy=(
+                    independent_verification_evidence_authentication_policy
+                ),
+                signer=evidence_signing_backend,
+            )
+        )
         health_attestation_authentication_policy = _health_attestation_policy(settings)
         health_attestation_signing_service = HealthAttestationSigningService(
             project_id=settings.project_id,
@@ -369,6 +399,7 @@ def create_runtime_service_app(
             or settings.target_subnetwork_resource is None
             or settings.evidence_writer_url is None
             or settings.evidence_key_version is None
+            or settings.reference_target_url is None
         ):
             raise ValueError("verifier preflight configuration is incomplete")
         target_network_resource = settings.target_network_resource
@@ -415,8 +446,8 @@ def create_runtime_service_app(
             return CloudRunV2SnapshotReader(
                 configuration=CloudRunTargetConfiguration(
                     target=target,
-                    stable_revision="controlgraph-reference-target-stable-v3",
-                    candidate_revision="controlgraph-reference-target-candidate-v3",
+                    stable_revision="controlgraph-reference-target-stable-v4",
+                    candidate_revision="controlgraph-reference-target-candidate-v4",
                     stable_concurrency=8,
                     candidate_concurrency=8,
                     network_resource=target_network_resource,
@@ -440,8 +471,8 @@ def create_runtime_service_app(
         ) -> CloudRunV2SnapshotReader:
             if (
                 request.target != target
-                or request.stable_revision != "controlgraph-reference-target-stable-v3"
-                or request.candidate_revision != "controlgraph-reference-target-candidate-v3"
+                or request.stable_revision != "controlgraph-reference-target-stable-v4"
+                or request.candidate_revision != "controlgraph-reference-target-candidate-v4"
                 or request.concurrency != 8
             ):
                 raise ValueError("target traffic request is not configured")
@@ -534,8 +565,8 @@ def create_runtime_service_app(
             reader=CloudRunV2SnapshotReader(
                 configuration=CloudRunTargetConfiguration(
                     target=target,
-                    stable_revision="controlgraph-reference-target-stable-v3",
-                    candidate_revision="controlgraph-reference-target-candidate-v3",
+                    stable_revision="controlgraph-reference-target-stable-v4",
+                    candidate_revision="controlgraph-reference-target-candidate-v4",
                     stable_concurrency=8,
                     candidate_concurrency=8,
                     network_resource=target_network_resource,
@@ -588,6 +619,57 @@ def create_runtime_service_app(
                 transport=selected_transport,
             ),
             clock=classification_clock,
+        )
+
+        def independent_reader_factory(
+            request: VerificationRequestV1,
+        ) -> CloudRunV2SnapshotReader:
+            if (
+                request.target != target
+                or request.stable_revision
+                != "controlgraph-reference-target-stable-v4"
+                or request.candidate_revision
+                != "controlgraph-reference-target-candidate-v4"
+                or request.concurrency != 8
+            ):
+                raise ValueError("independent verification request is not configured")
+            return CloudRunV2SnapshotReader(
+                configuration=CloudRunTargetConfiguration(
+                    target=target,
+                    stable_revision=request.stable_revision,
+                    candidate_revision=request.candidate_revision,
+                    stable_concurrency=request.concurrency,
+                    candidate_concurrency=request.concurrency,
+                    network_resource=target_network_resource,
+                    subnetwork_resource=target_subnetwork_resource,
+                ),
+                service_role=ServiceRole.VERIFIER,
+                configured_project_id=settings.project_id,
+                services_client_factory=services_client_factory,
+                revisions_client_factory=revisions_client_factory,
+            )
+
+        independent_verification_service = IndependentVerificationService(
+            target=target,
+            authentication_policy=policy,
+            reader_factory=independent_reader_factory,
+            probe_transport=GoogleSealedProbeTransport(
+                target=target,
+                endpoint=f"{settings.reference_target_url}/v1/probe",
+            ),
+            evidence_client=VerifierIndependentVerificationEvidenceClient(
+                route=CoordinatorInternalRoute(
+                    project_id=settings.project_id,
+                    project_number=settings.project_number,
+                    caller_role=CallerRole.VERIFIER,
+                    service_role=ServiceRole.EVIDENCE_WRITER,
+                    audience=settings.evidence_writer_url,
+                    override_path=INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
+                ),
+                transport=selected_transport,
+                signing_key_version=settings.evidence_key_version,
+            ),
+            clock=preflight_clock,
         )
     elif role is ServiceRole.API:
         if settings.coordinator_url is None:
@@ -828,8 +910,8 @@ def create_runtime_service_app(
         )
         cloud_run_configuration = CloudRunTargetConfiguration(
             target=target,
-            stable_revision="controlgraph-reference-target-stable-v3",
-            candidate_revision="controlgraph-reference-target-candidate-v3",
+            stable_revision="controlgraph-reference-target-stable-v4",
+            candidate_revision="controlgraph-reference-target-candidate-v4",
             stable_concurrency=8,
             candidate_concurrency=8,
             network_resource=settings.target_network_resource,
@@ -1077,6 +1159,20 @@ def create_runtime_service_app(
                 signature_verifier=evidence_signature_verifier,
             ),
         )
+        coordinator_independent_verification_client = (
+            CoordinatorIndependentVerificationClient(
+                route=verifier_route,
+                transport=selected_transport,
+                signature_verifier=(
+                    GoogleKmsIndependentVerificationEvidenceVerifier(
+                        project_id=settings.project_id,
+                        service_role=ServiceRole.COORDINATOR,
+                        key_version=settings.evidence_key_version,
+                        client=kms_client,
+                    )
+                ),
+            )
+        )
         target = TargetBinding(
             schema_version="controlgraph.target-binding/v1",
             project_id=settings.project_id,
@@ -1107,8 +1203,8 @@ def create_runtime_service_app(
             ),
             traffic_client=CoordinatorTargetTrafficClient(
                 target=target,
-                stable_revision="controlgraph-reference-target-stable-v3",
-                candidate_revision="controlgraph-reference-target-candidate-v3",
+                stable_revision="controlgraph-reference-target-stable-v4",
+                candidate_revision="controlgraph-reference-target-candidate-v4",
                 concurrency=8,
                 route=verifier_route,
                 transport=selected_transport,
@@ -1163,7 +1259,7 @@ def create_runtime_service_app(
                 verifier_identity=(
                     f"controlgraph-verifier@{settings.project_id}.iam.gserviceaccount.com"
                 ),
-                candidate_revision="controlgraph-reference-target-candidate-v3",
+                candidate_revision="controlgraph-reference-target-candidate-v4",
                 candidate_revision_configuration_sha256=(
                     settings.candidate_revision_configuration_sha256
                 ),
@@ -1420,6 +1516,12 @@ def create_runtime_service_app(
         classification_evidence_authentication_policy=(
             classification_evidence_authentication_policy
         ),
+        independent_verification_signing_service=(
+            independent_verification_signing_service
+        ),
+        independent_verification_evidence_authentication_policy=(
+            independent_verification_evidence_authentication_policy
+        ),
         health_attestation_signing_service=health_attestation_signing_service,
         health_attestation_authentication_policy=(health_attestation_authentication_policy),
         recovery_prestate_signing_service=recovery_prestate_signing_service,
@@ -1428,6 +1530,7 @@ def create_runtime_service_app(
         stable_snapshot_capture_service=stable_snapshot_capture_service,
         target_traffic_observation_service=target_traffic_observation_service,
         service_claim_classification_service=(service_claim_classification_service),
+        independent_verification_service=independent_verification_service,
         api_root_creation_client=api_root_creation_client,
         coordinator_root_creation_relay=coordinator_root_creation_relay,
         api_operator_observation_client=api_operator_observation_client,
@@ -1462,6 +1565,10 @@ def create_runtime_service_app(
     )
     if coordinator_clients is not None:
         app.state.controlgraph_trust_clients = coordinator_clients
+    if coordinator_independent_verification_client is not None:
+        app.state.controlgraph_independent_verification_client = (
+            coordinator_independent_verification_client
+        )
     if api_root_creation_client is not None:
         app.state.controlgraph_root_creation_client = api_root_creation_client
     if coordinator_root_creation_relay is not None:
@@ -1492,6 +1599,12 @@ def create_runtime_service_app(
         app.state.controlgraph_classification_evidence_signing = (
             classification_evidence_signing_service
         )
+    if independent_verification_signing_service is not None:
+        app.state.controlgraph_independent_verification_signing = (
+            independent_verification_signing_service
+        )
+    if independent_verification_service is not None:
+        app.state.controlgraph_independent_verification = independent_verification_service
     if health_attestation_signing_service is not None:
         app.state.controlgraph_health_attestation_signing = health_attestation_signing_service
     if api_canary_client is not None:
@@ -1675,6 +1788,31 @@ def _health_attestation_policy(
         project_number=settings.project_number,
         service_role=ServiceRole.EVIDENCE_WRITER,
         path=HEALTH_ATTESTATION_PATH,
+        audience=_service_audience(
+            ServiceRole.EVIDENCE_WRITER,
+            settings.project_number,
+        ),
+        caller=CallerBinding(
+            role=CallerRole.VERIFIER,
+            email=settings.classification_evidence_caller_identity,
+            subject=settings.classification_evidence_caller_subject,
+        ),
+    )
+
+
+def _independent_verification_evidence_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    if (
+        settings.classification_evidence_caller_identity is None
+        or settings.classification_evidence_caller_subject is None
+    ):
+        raise ValueError("independent verification evidence policy is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.EVIDENCE_WRITER,
+        path=INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
         audience=_service_audience(
             ServiceRole.EVIDENCE_WRITER,
             settings.project_number,

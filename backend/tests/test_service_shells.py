@@ -229,6 +229,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     "https://controlgraph-evidence-writer-"
                     f"{PROJECT_NUMBER}.us-central1.run.app"
                 ),
+                "CONTROLGRAPH_REFERENCE_TARGET_URL": (
+                    "https://controlgraph-reference-target-"
+                    f"{PROJECT_NUMBER}.us-central1.run.app"
+                ),
                 "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
                     f"projects/{PROJECT_ID}/locations/us-central1/"
                     "keyRings/controlgraph-signing/cryptoKeys/evidence-signing/"
@@ -538,6 +542,35 @@ def test_runtime_composition_uses_startup_policy_for_google_verification() -> No
     assert response.status_code == 400
     assert response.json()["code"] == "CONTRACT_INVALID"
     assert calls == [("exact.test.credential", expected_audience)]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://controlgraph-reference-target-123456789012.us-central1.run.app",
+        "https://controlgraph-reference-target-999999999999.us-central1.run.app",
+        "https://controlgraph-reference-target-123456789012.us-central1.run.app/",
+        (
+            "https://controlgraph-reference-target-123456789012.us-central1.run.app"
+            "/v1/probe"
+        ),
+        (
+            "https://controlgraph-reference-target-123456789012.us-central1.run.app"
+            "?destination=https://example.test"
+        ),
+        "https://example.test",
+    ],
+)
+def test_verifier_runtime_rejects_reference_target_url_substitution(url: str) -> None:
+    environment = _environment(ServiceRole.VERIFIER)
+    environment["CONTROLGRAPH_REFERENCE_TARGET_URL"] = url
+
+    with pytest.raises(ValueError, match="reference target URL is invalid"):
+        create_runtime_service_app(
+            ServiceRole.VERIFIER,
+            environment=environment,
+            kms_client=object(),
+        )
 
 
 def test_api_runtime_verifies_operator_token_against_oauth_client_audience() -> None:

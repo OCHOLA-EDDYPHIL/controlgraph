@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import os
+import re
 from enum import StrEnum
 from typing import Final, Literal
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
+
+from controlgraph_canary.contracts.codec import canonical_json_bytes
+from controlgraph_canary.contracts.independent_verification import (
+    SEALED_REFERENCE_PROBE_V1,
+    SealedReferenceProbeV1,
+)
 
 REFERENCE_PROBE_VERSION: Final = "controlgraph.reference-probe/v1"
 REFERENCE_SERVICE_NAME: Final = "controlgraph-reference-target"
-STABLE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-stable-v3"
-CANDIDATE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-candidate-v3"
+STABLE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-stable-v4"
+CANDIDATE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-candidate-v4"
 STABLE_MARKER: Final = "controlgraph-stable-v1"
 CANDIDATE_MARKER: Final = "controlgraph-candidate-v1"
+_NONCE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
+_CORRELATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class ReferenceVariant(StrEnum):
@@ -89,14 +98,41 @@ def create_reference_app(
         _set_read_only_headers(response)
         return ReferenceHealth(status="ok")
 
-    @app.get("/v1/probe", response_model=ReferenceProbe)
-    def probe(response: Response) -> ReferenceProbe:
-        _set_read_only_headers(response)
-        return ReferenceProbe(
-            schema_version=REFERENCE_PROBE_VERSION,
-            revision=required_revision,
-            marker=marker,
+    @app.get("/v1/probe", response_model=None)
+    def probe(
+        nonce: str | None = None,
+        correlation_id: str | None = None,
+    ) -> Response:
+        body: bytes | str
+        if nonce is None and correlation_id is None:
+            body = ReferenceProbe(
+                schema_version=REFERENCE_PROBE_VERSION,
+                revision=required_revision,
+                marker=marker,
+            ).model_dump_json()
+        elif (
+            nonce is None
+            or correlation_id is None
+            or _NONCE.fullmatch(nonce) is None
+            or _CORRELATION.fullmatch(correlation_id) is None
+        ):
+            raise HTTPException(status_code=400, detail="probe seal invalid")
+        else:
+            body = canonical_json_bytes(
+                SealedReferenceProbeV1(
+                    schema_version=SEALED_REFERENCE_PROBE_V1,
+                    revision=required_revision,
+                    marker=marker,
+                    nonce=nonce,
+                    correlation_id=correlation_id,
+                )
+            )
+        response = Response(
+            content=body,
+            media_type="application/json",
         )
+        _set_read_only_headers(response)
+        return response
 
     return app
 
