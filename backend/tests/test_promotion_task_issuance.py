@@ -27,6 +27,7 @@ from controlgraph_canary.application.canary_execution import (
     CapabilityIssuanceService,
 )
 from controlgraph_canary.application.capability_issuance import (
+    MIN_PROMOTION_EXECUTION_MARGIN_SECONDS,
     AuthenticatedIssuancePrincipal,
     CapabilityIssuanceError,
     CapabilityIssuanceErrorCode,
@@ -55,6 +56,7 @@ from controlgraph_canary.application.identity import (
 )
 from controlgraph_canary.application.promotion_execution import (
     ApiPromotionClient,
+    CoordinatorPromotionCapabilityClient,
     CoordinatorPromotionRelay,
     PromotionRolloutCoordinator,
 )
@@ -115,6 +117,7 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionCommandV1,
     PromotionDispatchRecordV1,
     PromotionDispatchState,
+    PromotionInvocationV1,
     VerifiedApplyReceiptLocatorV1,
     promotion_command_sha256,
     promotion_dispatch_id,
@@ -219,6 +222,7 @@ class _DirectPromotionCapabilityClient:
                 expected_epoch=command.expected_epoch,
                 request_id=command.request_id,
                 idempotency_key=command.idempotency_key,
+                scheduled_at=command.scheduled_at,
                 verified_apply_receipt=command.verified_apply_receipt,
             ),
             self._context,
@@ -333,6 +337,16 @@ class _NeverTransport:
         del route, body
         self.calls += 1
         raise AssertionError("malformed promotion must not reach internal transport")
+
+
+class _StaticTransport:
+    def __init__(self, response: bytes) -> None:
+        self._response = response
+        self.calls: list[tuple[CoordinatorInternalRoute, bytes]] = []
+
+    async def post(self, route: CoordinatorInternalRoute, body: bytes) -> bytes:
+        self.calls.append((route, body))
+        return self._response
 
 
 class _StaticAuthenticator:
@@ -494,6 +508,7 @@ def _promotion_command(
         "expected_epoch": 1,
         "request_id": "request-promote-001",
         "idempotency_key": "intent-promote-001",
+        "scheduled_at": "2026-08-19T12:06:00Z",
         "verified_apply_receipt": _locator(receipt),
     }
     values.update(changes)
@@ -737,6 +752,7 @@ def _promotion_request(command: PromotionCommandV1) -> PromotionCapabilityIssuan
         expected_epoch=command.expected_epoch,
         request_id=command.request_id,
         idempotency_key=command.idempotency_key,
+        scheduled_at=command.scheduled_at,
         verified_apply_receipt=command.verified_apply_receipt,
     )
 
@@ -780,6 +796,7 @@ def test_promotion_command_binds_only_authority_and_exact_verified_receipt() -> 
             "expected_epoch",
             "request_id",
             "idempotency_key",
+            "scheduled_at",
             "verified_apply_receipt",
         )
         assert (
@@ -789,6 +806,17 @@ def test_promotion_command_binds_only_authority_and_exact_verified_receipt() -> 
             )
             == command
         )
+        missing_schedule = command.model_dump(mode="python")
+        del missing_schedule["scheduled_at"]
+        with pytest.raises(ValidationError):
+            PromotionCommandV1.model_validate(missing_schedule)
+        with pytest.raises(ValidationError):
+            PromotionCommandV1.model_validate(
+                {
+                    **command.model_dump(mode="python"),
+                    "scheduled_at": "2026-08-19T12:06:00.000Z",
+                }
+            )
         for injected in (
             {"target": records.root.content.target.model_dump(mode="json")},
             {"action": CapabilityAction.PROMOTE_CANDIDATE.value},
@@ -828,10 +856,138 @@ def test_issuer_derives_root_scoped_promotion_from_verified_canary_receipt() -> 
         assert claims.provider_etag == source.value.observed_etag
         assert claims.request_id == command.request_id
         assert claims.idempotency_key == command.idempotency_key
+        assert claims.not_before == command.scheduled_at
+        assert claims.expires_at == "2026-08-19T12:09:00Z"
         assert claims.parent_capability_sha256 is None
         assert claims.plan_sha256 == canonical_sha256(records.root.content.rollout_plan)
         assert claims.stable_revision == records.root.content.rollout_plan.stable_revision
         assert claims.candidate_revision == records.root.content.rollout_plan.candidate_revision
+
+    asyncio.run(scenario())
+
+
+def test_promotion_schedule_binds_capability_identity_and_exact_margin_boundary() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        issuer = _issuer(store, records, private_key)
+        first_command = _promotion_command(records, source.value)
+        boundary_schedule = (
+            ISSUE_TIME
+            + timedelta(seconds=300 - MIN_PROMOTION_EXECUTION_MARGIN_SECONDS)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        boundary_command = first_command.model_copy(
+            update={"scheduled_at": boundary_schedule}
+        )
+        principal = AuthenticatedIssuancePrincipal(
+            identity=f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
+        )
+
+        first = await issuer.issue_promotion(
+            _promotion_request(first_command),
+            principal=principal,
+            now=ISSUE_TIME,
+        )
+        boundary = await issuer.issue_promotion(
+            _promotion_request(boundary_command),
+            principal=principal,
+            now=ISSUE_TIME,
+        )
+
+        assert MIN_PROMOTION_EXECUTION_MARGIN_SECONDS == 30
+        assert first.claims.not_before == first_command.scheduled_at
+        assert boundary.claims.not_before == boundary_schedule
+        assert boundary.claims.expires_at == "2026-08-19T12:09:00Z"
+        assert first.claims.capability_id != boundary.claims.capability_id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "scheduled_at",
+    [
+        "2026-08-19T12:03:59Z",
+        "2026-08-19T12:08:31Z",
+    ],
+)
+def test_issuer_rejects_past_or_insufficient_margin_promotion_schedule(
+    scheduled_at: str,
+) -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        issuer = _issuer(
+            store,
+            records,
+            ec.generate_private_key(ec.SECP256R1()),
+        )
+        command = _promotion_command(
+            records,
+            source.value,
+            scheduled_at=scheduled_at,
+        )
+
+        with pytest.raises(CapabilityIssuanceError) as denied:
+            await issuer.issue_promotion(
+                _promotion_request(command),
+                principal=AuthenticatedIssuancePrincipal(
+                    identity=(
+                        f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
+                    )
+                ),
+                now=ISSUE_TIME,
+            )
+
+        assert denied.value.code is CapabilityIssuanceErrorCode.VALIDITY_EXHAUSTED
+
+    asyncio.run(scenario())
+
+
+def test_internal_client_rejects_signed_schedule_substitution() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        issuer = _issuer(
+            store,
+            records,
+            ec.generate_private_key(ec.SECP256R1()),
+        )
+        command = _promotion_command(records, source.value)
+        substituted = command.model_copy(
+            update={"scheduled_at": "2026-08-19T12:07:00Z"}
+        )
+        capability = await issuer.issue_promotion(
+            _promotion_request(substituted),
+            principal=AuthenticatedIssuancePrincipal(
+                identity=f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
+            ),
+            now=ISSUE_TIME,
+        )
+        transport = _StaticTransport(canonical_json_bytes(capability))
+        client = CoordinatorPromotionCapabilityClient(
+            route=CoordinatorInternalRoute(
+                project_id=PROJECT,
+                project_number=PROJECT_NUMBER,
+                caller_role=CallerRole.COORDINATOR,
+                service_role=ServiceRole.ISSUER,
+                audience=(
+                    f"https://controlgraph-issuer-{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+            ),
+            transport=transport,
+        )
+
+        with pytest.raises(CanaryExecutionError) as denied:
+            await client.issue(command)
+
+        assert denied.value.code is CanaryExecutionErrorCode.RESPONSE_INVALID
+        assert len(transport.calls) == 1
+        issuance = decode_contract(
+            transport.calls[0][1],
+            PromotionCapabilityIssuanceCommandV1,
+        )
+        assert issuance.scheduled_at == command.scheduled_at
 
     asyncio.run(scenario())
 
@@ -1060,6 +1216,88 @@ def test_cross_instance_exact_replay_adopts_original_result_without_reissuing() 
         assert replay_clients[0].calls == []
         first_request = decode_contract(enqueuer.attempts[0].body, TaskRequest)
         assert first_request.capability.claims.capability_id == first.capability_id
+        assert first_request.capability.claims.not_before == command.scheduled_at
+        assert first_request.scheduled_at == command.scheduled_at
+        assert enqueuer.attempts[0].scheduled_for == EXECUTE_TIME
+
+    asyncio.run(scenario())
+
+
+def test_changed_schedule_under_same_identities_conflicts_without_reissue() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        enqueuer = _HoldingEnqueuer()
+        clients: list[_DirectPromotionCapabilityClient] = []
+        coordinator = _rollout_coordinator(
+            store,
+            _issuer(store, records, private_key),
+            records,
+            enqueuer,
+            client_capture=clients,
+        )
+        first_command = _promotion_command(records, source.value)
+        conflicting_command = first_command.model_copy(
+            update={"scheduled_at": "2026-08-19T12:07:00Z"}
+        )
+
+        first = await coordinator.dispatch(first_command)
+        with pytest.raises(CanaryExecutionError) as conflicting:
+            await coordinator.dispatch(conflicting_command)
+
+        assert first.scheduled_at == first_command.scheduled_at
+        assert promotion_command_sha256(first_command) != promotion_command_sha256(
+            conflicting_command
+        )
+        assert conflicting.value.code is CanaryExecutionErrorCode.IDENTITY_CONFLICT
+        assert clients[0].calls == [first_command]
+        assert len(enqueuer.attempts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_api_client_rejects_dispatch_result_schedule_substitution() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        coordinator = _rollout_coordinator(
+            store,
+            _issuer(
+                store,
+                records,
+                ec.generate_private_key(ec.SECP256R1()),
+            ),
+            records,
+            _HoldingEnqueuer(),
+        )
+        command = _promotion_command(records, source.value)
+        result = await coordinator.dispatch(command)
+        substituted = result.model_copy(
+            update={"scheduled_at": "2026-08-19T12:06:01Z"}
+        )
+        transport = _StaticTransport(canonical_json_bytes(substituted))
+        client = ApiPromotionClient(
+            route=CoordinatorInternalRoute(
+                project_id=PROJECT,
+                project_number=PROJECT_NUMBER,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=(
+                    f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+            ),
+            authentication_policy=_operator_policy(),
+            transport=transport,
+        )
+
+        with pytest.raises(CanaryExecutionError) as denied:
+            await client.dispatch(command, _operator_context())
+
+        assert denied.value.code is CanaryExecutionErrorCode.RESPONSE_INVALID
+        assert len(transport.calls) == 1
+        invocation = decode_contract(transport.calls[0][1], PromotionInvocationV1)
+        assert invocation.command.scheduled_at == command.scheduled_at
 
     asyncio.run(scenario())
 
@@ -1340,7 +1578,7 @@ def test_legacy_dispatch_cannot_bypass_promotion_enqueue_permit() -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("corruption", ["task_name", "task_sha256"])
+@pytest.mark.parametrize("corruption", ["task_name", "task_sha256", "scheduled_at"])
 def test_dispatch_record_rejects_non_deterministic_task_identity(corruption: str) -> None:
     async def scenario() -> None:
         store, records = await _created_store()
@@ -1359,6 +1597,7 @@ def test_dispatch_record_rejects_non_deterministic_task_identity(corruption: str
                 f"controlgraph-execution/tasks/cg-{'0' * 64}"
             ),
             "task_sha256": "f" * 64,
+            "scheduled_at": "2026-08-19T12:07:00Z",
         }
 
         with pytest.raises(ValidationError):
@@ -1366,6 +1605,35 @@ def test_dispatch_record_rejects_non_deterministic_task_identity(corruption: str
                 {
                     **prepared.value.model_dump(mode="python"),
                     corruption: changed[corruption],
+                }
+            )
+
+    asyncio.run(scenario())
+
+
+def test_task_contract_rejects_promotion_schedule_substitution() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        coordinator = _rollout_coordinator(
+            store,
+            _issuer(
+                store,
+                records,
+                ec.generate_private_key(ec.SECP256R1()),
+            ),
+            records,
+            _HoldingEnqueuer(),
+        )
+        prepared = await coordinator._prepare(
+            _promotion_command(records, source.value)
+        )
+
+        with pytest.raises(ValidationError):
+            TaskRequest.model_validate(
+                {
+                    **prepared.value.task.model_dump(mode="python"),
+                    "scheduled_at": "2026-08-19T12:06:01Z",
                 }
             )
 

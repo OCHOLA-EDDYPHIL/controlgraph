@@ -73,7 +73,7 @@ class VerifiedApplyReceiptLocatorV1(StrictContractModel):
 
 
 class PromotionCommandV1(StrictContractModel):
-    """Operator-selected authority and trusted receipt locator, without a target."""
+    """Operator-selected authority, schedule, and trusted receipt locator."""
 
     schema_version: Literal["controlgraph.promotion-command/v1"]
     root_id: Identifier
@@ -81,6 +81,7 @@ class PromotionCommandV1(StrictContractModel):
     expected_epoch: PositiveSafeInteger
     request_id: Identifier
     idempotency_key: Identifier
+    scheduled_at: UtcSecond
     verified_apply_receipt: VerifiedApplyReceiptLocatorV1
 
 
@@ -118,6 +119,7 @@ class PromotionCapabilityIssuanceCommandV1(StrictContractModel):
     expected_epoch: PositiveSafeInteger
     request_id: Identifier
     idempotency_key: Identifier
+    scheduled_at: UtcSecond
     verified_apply_receipt: VerifiedApplyReceiptLocatorV1
 
 
@@ -149,6 +151,7 @@ class PromotionDispatchIdentityV1(StrictContractModel):
     root_id: Identifier
     root_sha256: Sha256Digest
     epoch: PositiveSafeInteger
+    scheduled_at: UtcSecond
     source_receipt_sha256: Sha256Digest
     claimed_at: UtcSecond
 
@@ -212,6 +215,7 @@ class PromotionDispatchRecordV1(StrictContractModel):
     root_id: Identifier
     root_sha256: Sha256Digest
     epoch: PositiveSafeInteger
+    scheduled_at: UtcSecond
     verified_apply_receipt: VerifiedApplyReceiptLocatorV1
     source_receipt_sha256: Sha256Digest
     task_sha256: Sha256Digest
@@ -232,6 +236,7 @@ class PromotionDispatchRecordV1(StrictContractModel):
             expected_epoch=self.epoch,
             request_id=self.request_id,
             idempotency_key=self.idempotency_key,
+            scheduled_at=self.scheduled_at,
             verified_apply_receipt=self.verified_apply_receipt,
         )
         claims = self.task.capability.claims
@@ -259,6 +264,8 @@ class PromotionDispatchRecordV1(StrictContractModel):
             or claims.epoch != self.epoch
             or claims.request_id != self.request_id
             or claims.idempotency_key != self.idempotency_key
+            or claims.not_before != self.scheduled_at
+            or self.task.scheduled_at != self.scheduled_at
             or claims.action is not CapabilityAction.PROMOTE_CANDIDATE
             or claims.stable_percent != 0
             or claims.candidate_percent != 100
@@ -300,7 +307,7 @@ class PromotionDispatchRecordV1(StrictContractModel):
             or self.result.capability_sha256 != canonical_sha256(self.task.capability)
             or self.result.task_id != self.task.task_id
             or self.result.task_name != self.task_name
-            or self.result.scheduled_at != self.task.scheduled_at
+            or self.result.scheduled_at != self.scheduled_at
             or self.result.expires_at != self.task.expires_at
         ):
             raise ValueError("terminal promotion dispatch shape is invalid")

@@ -246,6 +246,7 @@ def _success_fixtures(tmp_path: Path) -> list[tuple[Any, argparse.Namespace, obj
         expected_epoch=1,
         request_id="promote-cli-001",
         idempotency_key="promote-cli-intent-001",
+        scheduled_at="2026-08-19T12:06:00Z",
         verified_apply_receipt=locator,
     )
     promotion_file = tmp_path / "promotion-command.json"
@@ -837,6 +838,9 @@ def test_every_result_is_bound_to_the_exact_command(
             "idempotency_key": "other-promotion-intent",
         }
     )
+    other_promotion_schedule = promotion_result.model_copy(  # type: ignore[union-attr]
+        update={"scheduled_at": "2026-08-19T12:06:01Z"}
+    )
 
     substitutions = (
         (*fixtures[0][:2], other_snapshot_result, "SNAPSHOT_RESPONSE_INVALID"),
@@ -849,6 +853,7 @@ def test_every_result_is_bound_to_the_exact_command(
         (*fixtures[3][:2], other_receipt_result, "RECEIPT_READ_RESPONSE_INVALID"),
         (*fixtures[4][:2], other_traffic_result, "TRAFFIC_READ_RESPONSE_INVALID"),
         (*fixtures[5][:2], other_promotion_result, "PROMOTION_RESPONSE_INVALID"),
+        (*fixtures[5][:2], other_promotion_schedule, "PROMOTION_RESPONSE_INVALID"),
     )
     for run, args, result, code in substitutions:
         status = run(

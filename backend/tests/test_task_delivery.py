@@ -154,7 +154,11 @@ def task_request(
         idempotency_key=idempotency_key,
         parent_capability_sha256=None,
         issued_at="2026-08-19T12:00:00Z",
-        not_before="2026-08-19T12:00:00Z",
+        not_before=(
+            scheduled_at
+            if action is CapabilityAction.PROMOTE_CANDIDATE
+            else "2026-08-19T12:00:00Z"
+        ),
         expires_at="2026-08-19T12:15:00Z",
         signing_algorithm="EC_SIGN_P256_SHA256",
         signing_key_version=(

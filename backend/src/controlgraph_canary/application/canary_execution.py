@@ -158,6 +158,7 @@ class CapabilityIssuanceService:
                         expected_epoch=command.expected_epoch,
                         request_id=command.request_id,
                         idempotency_key=command.idempotency_key,
+                        scheduled_at=command.scheduled_at,
                         verified_apply_receipt=command.verified_apply_receipt,
                     ),
                     principal=principal,
@@ -189,8 +190,11 @@ class CapabilityIssuanceService:
             or claims.stable_percent != expected_traffic[0]
             or claims.candidate_percent != expected_traffic[1]
             or (
-                expected_action is CapabilityAction.PROMOTE_CANDIDATE
-                and claims.parent_capability_sha256 is not None
+                type(command) is PromotionCapabilityIssuanceCommandV1
+                and (
+                    claims.parent_capability_sha256 is not None
+                    or claims.not_before != command.scheduled_at
+                )
             )
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
