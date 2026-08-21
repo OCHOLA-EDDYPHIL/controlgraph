@@ -69,6 +69,7 @@ from controlgraph_canary.contracts.models import (
     EpochChangeCause,
     EvidenceKind,
     ExecutionReceipt,
+    ReasonCode,
     ReceiptOutcome,
     RolloutRoot,
     TargetBinding,
@@ -154,6 +155,7 @@ FIRESTORE_MAX_TRANSACTION_ATTEMPTS: Final = 3
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _SHA256_DIGEST: Final = re.compile(r"^[0-9a-f]{64}$")
+_READBACK_RESOLUTION_MARKER: Final = re.compile(r"^cgrrb:[0-9a-f]{64}$")
 _DOCUMENT_FIELDS: Final = frozenset(AuthorityStorageDocument.model_fields)
 _KNOWN_CONTENTION = (
     api_exceptions.Aborted,
@@ -1787,6 +1789,52 @@ def _validate_receipt_replacement(
         raise ValueError("receipt replacement changes its provider operation")
     if replacement == current:
         raise ValueError("receipt replacement does not change durable state")
+
+
+def _reject_generic_readback_resolution_marker(
+    replacement: ExecutionReceipt,
+) -> None:
+    if any(evidence_id.startswith("cgrrb:") for evidence_id in replacement.evidence_ids):
+        raise ValueError("readback resolution evidence requires its dedicated operation")
+
+
+def _validate_ambiguous_receipt_resolution(
+    configured_target: TargetBinding,
+    expected: StoredRecord[ExecutionReceipt],
+    replacement: ExecutionReceipt,
+    expected_authority: StoredRecord[EpochAuthorityRecord],
+    expected_service_claim: StoredRecord[ServiceClaimRecord],
+) -> None:
+    _validate_receipt_replacement(configured_target, expected, replacement)
+    before = expected.value
+    authority = expected_authority.value
+    claim = expected_service_claim.value
+    if (
+        type(authority) is not EpochAuthorityRecord
+        or type(claim) is not ServiceClaimRecord
+        or before.outcome is not ReceiptOutcome.AMBIGUOUS
+        or before.reason_code is not ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS
+        or before.provider_operation is None
+        or before.observed_etag is None
+        or before.observed_authority_epoch != before.epoch
+        or replacement.outcome is not ReceiptOutcome.VERIFIED
+        or replacement.reason_code is not None
+        or replacement.observed_etag is None
+        or len(replacement.evidence_ids) != len(before.evidence_ids) + 1
+        or replacement.evidence_ids[:-1] != before.evidence_ids
+        or _READBACK_RESOLUTION_MARKER.fullmatch(replacement.evidence_ids[-1]) is None
+        or authority.target != configured_target
+        or authority.root_id != before.root_id
+        or authority.root_sha256 != before.root_sha256
+        or authority.current_epoch != before.epoch
+        or authority.revision != expected_authority.revision
+        or claim.status is not ServiceClaimStatus.ACTIVE
+        or expected_service_claim.revision % 3 != 0
+        or claim.target != configured_target
+        or claim.root_id != before.root_id
+        or claim.root_sha256 != before.root_sha256
+    ):
+        raise ValueError("ambiguous receipt resolution fence is invalid")
 
 
 def _validate_promotion_record(
@@ -5340,6 +5388,7 @@ class FirestoreAuthorityStore:
         replacement: ExecutionReceipt,
     ) -> StoredRecord[ExecutionReceipt]:
         _validate_receipt_replacement(self._target, expected, replacement)
+        _reject_generic_readback_resolution_marker(replacement)
         logical_id = execution_receipt_logical_id(
             self._target,
             replacement.idempotency_key,
@@ -5380,6 +5429,102 @@ class FirestoreAuthorityStore:
 
         await self._run_transaction(documents, update)
         return _stored(document)
+
+    async def resolve_ambiguous_receipt(
+        self,
+        expected: StoredRecord[ExecutionReceipt],
+        replacement: ExecutionReceipt,
+        expected_authority: StoredRecord[EpochAuthorityRecord],
+        expected_service_claim: StoredRecord[ServiceClaimRecord],
+    ) -> StoredRecord[ExecutionReceipt]:
+        """Resolve one receipt only while its exact active authority remains current."""
+
+        _validate_ambiguous_receipt_resolution(
+            self._target,
+            expected,
+            replacement,
+            expected_authority,
+            expected_service_claim,
+        )
+        receipt_logical_id = execution_receipt_logical_id(
+            self._target,
+            replacement.idempotency_key,
+        )
+        receipt_document = _prepared_document(
+            kind=AuthorityStorageKind.EXECUTION_RECEIPT,
+            logical_id=receipt_logical_id,
+            document_id=execution_receipt_document_id(
+                self._target,
+                replacement.idempotency_key,
+            ),
+            revision=expected.revision + 1,
+            value=replacement,
+        )
+        documents: tuple[_PreparedDocument[StrictContractModel], ...] = (
+            receipt_document,
+        )
+        before = expected.value
+
+        async def update(transaction: _TransactionPort) -> None:
+            client = await self._client()
+            receipt_reference = self._reference(
+                client,
+                AuthorityStorageKind.EXECUTION_RECEIPT,
+                receipt_document.document_id,
+            )
+            authority_document_id = epoch_authority_document_id(before.root_id)
+            authority_reference = self._reference(
+                client,
+                AuthorityStorageKind.EPOCH_AUTHORITY,
+                authority_document_id,
+            )
+            claim_logical_id = service_claim_logical_id(self._target)
+            claim_document_id = service_claim_document_id(self._target)
+            claim_reference = self._reference(
+                client,
+                AuthorityStorageKind.SERVICE_CLAIM,
+                claim_document_id,
+            )
+            current_receipt = await self._transaction_read(
+                transaction,
+                reference=receipt_reference,
+                kind=AuthorityStorageKind.EXECUTION_RECEIPT,
+                logical_id=receipt_logical_id,
+                document_id=receipt_document.document_id,
+                model_type=ExecutionReceipt,
+            )
+            current_authority = await self._transaction_read(
+                transaction,
+                reference=authority_reference,
+                kind=AuthorityStorageKind.EPOCH_AUTHORITY,
+                logical_id=before.root_id,
+                document_id=authority_document_id,
+                model_type=EpochAuthorityRecord,
+            )
+            current_claim = await self._transaction_read(
+                transaction,
+                reference=claim_reference,
+                kind=AuthorityStorageKind.SERVICE_CLAIM,
+                logical_id=claim_logical_id,
+                document_id=claim_document_id,
+                model_type=ServiceClaimRecord,
+            )
+            if (
+                current_receipt is None
+                or current_receipt.stored != expected
+                or current_authority is None
+                or current_authority.stored != expected_authority
+                or current_claim is None
+                or current_claim.stored != expected_service_claim
+            ):
+                raise _ExpectedStateMismatch
+            transaction.update(
+                receipt_reference,
+                _document_data(receipt_document.wrapper),
+            )
+
+        await self._run_transaction(documents, update)
+        return _stored(receipt_document)
 
 
 def _stored[ModelT: StrictContractModel](

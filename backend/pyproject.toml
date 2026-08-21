@@ -34,6 +34,7 @@ dev = [
 
 [project.scripts]
 controlgraph-canary = "controlgraph_canary.cli:main"
+controlgraph-ambiguous-receipt-readback = "controlgraph_canary.ambiguous_receipt_readback_cli:main"
 controlgraph-reference-target-reset = "controlgraph_canary.reference_target_reset_cli:main"
 
 [tool.setuptools.packages.find]

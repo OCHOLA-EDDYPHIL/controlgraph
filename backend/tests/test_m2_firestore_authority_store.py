@@ -410,6 +410,41 @@ def ambiguous_receipt(current: ExecutionReceipt, *, suffix: str) -> ExecutionRec
     )
 
 
+def resolvable_ambiguous_receipt(current: ExecutionReceipt) -> ExecutionReceipt:
+    return ExecutionReceipt(
+        **{
+            **current.model_dump(mode="python"),
+            "outcome": ReceiptOutcome.AMBIGUOUS,
+            "reason_code": ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
+            "provider_operation": (
+                f"projects/{current.target.project_id}/locations/{current.target.region}/"
+                "operations/readback-resolution"
+            ),
+            "observed_etag": "etag-ambiguous-12",
+            "observed_authority_epoch": current.epoch,
+            "updated_at": "2026-08-19T12:02:01Z",
+            "evidence_ids": (*current.evidence_ids, "evidence-attempt-readback"),
+        }
+    )
+
+
+def resolved_readback_receipt(
+    current: ExecutionReceipt,
+    *,
+    marker_digest: str = "a" * 64,
+) -> ExecutionReceipt:
+    return ExecutionReceipt(
+        **{
+            **current.model_dump(mode="python"),
+            "outcome": ReceiptOutcome.VERIFIED,
+            "reason_code": None,
+            "observed_etag": "etag-verified-13",
+            "updated_at": "2026-08-19T12:02:02Z",
+            "evidence_ids": (*current.evidence_ids, f"cgrrb:{marker_digest}"),
+        }
+    )
+
+
 @dataclass
 class _StoredDocument:
     data: dict[str, Any]
@@ -694,6 +729,29 @@ async def _create_rollout_after_release(
         verified_candidate_revision_configuration_sha256=(
             claim.candidate_revision_configuration_sha256
         ),
+    )
+
+
+async def _prepare_readback_resolution(
+    store: FirestoreAuthorityStore,
+) -> tuple[
+    StoredRecord[ExecutionReceipt],
+    ExecutionReceipt,
+    StoredRecord[EpochAuthorityRecord],
+    StoredRecord[ServiceClaimRecord],
+]:
+    root, claim, authority = initial_records()
+    created = await _create_rollout(store, root, claim, authority)
+    receipt = claimed_receipt("readback-resolution")
+    claimed = await claim_or_adopt(store, receipt)
+    assert type(claimed) is ReceiptClaimCreated
+    ambiguous = resolvable_ambiguous_receipt(receipt)
+    expected = await store.compare_and_set_receipt(claimed.receipt, ambiguous)
+    return (
+        expected,
+        resolved_readback_receipt(ambiguous),
+        created.authority,
+        created.service_claim,
     )
 
 
@@ -1170,6 +1228,175 @@ def test_receipt_cas_cannot_replace_a_recorded_provider_operation() -> None:
             await store.compare_and_set_receipt(stored, substituted)
 
         assert await store.read_receipt(receipt.idempotency_key) == stored
+
+    asyncio.run(scenario())
+
+
+def test_readback_resolution_atomically_reads_three_fences_and_writes_only_receipt() -> None:
+    async def scenario() -> None:
+        store, client, runner = store_fixture()
+        expected, replacement, authority, service_claim = (
+            await _prepare_readback_resolution(store)
+        )
+        authority_path = (
+            f"{AuthorityStorageKind.EPOCH_AUTHORITY.value}/"
+            f"{epoch_authority_document_id(expected.value.root_id)}"
+        )
+        claim_path = (
+            f"{AuthorityStorageKind.SERVICE_CLAIM.value}/"
+            f"{service_claim_document_id(expected.value.target)}"
+        )
+        receipt_path = (
+            f"{AuthorityStorageKind.EXECUTION_RECEIPT.value}/"
+            f"{execution_receipt_document_id(
+                expected.value.target,
+                expected.value.idempotency_key,
+            )}"
+        )
+        authority_before = deepcopy(client.documents[authority_path])
+        claim_before = deepcopy(client.documents[claim_path])
+        receipt_before = deepcopy(client.documents[receipt_path])
+        transaction_count = len(runner.maximum_attempts)
+        transaction_reads = client.transaction_read_count
+
+        resolved = await store.resolve_ambiguous_receipt(
+            expected,
+            replacement,
+            authority,
+            service_claim,
+        )
+
+        assert resolved == StoredRecord(replacement, expected.revision + 1)
+        assert len(runner.maximum_attempts) == transaction_count + 1
+        assert runner.expected_writes[-1] == 1
+        assert runner.write_result_counts[-1] == 1
+        assert client.transaction_read_count == transaction_reads + 3
+        assert client.documents[authority_path] == authority_before
+        assert client.documents[claim_path] == claim_before
+        assert client.documents[receipt_path] != receipt_before
+        assert await store.read_receipt(expected.value.idempotency_key) == resolved
+
+    asyncio.run(scenario())
+
+
+def test_readback_resolution_rejects_advanced_authority_without_receipt_write() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        expected, replacement, authority, service_claim = (
+            await _prepare_readback_resolution(store)
+        )
+        advanced = advanced_authority(authority.value, suffix="readback-race")
+        await store.advance_authority(authority, advanced)
+
+        with pytest.raises(AuthorityStoreConflict):
+            await store.resolve_ambiguous_receipt(
+                expected,
+                replacement,
+                authority,
+                service_claim,
+            )
+
+        assert await store.read_receipt(expected.value.idempotency_key) == expected
+
+    asyncio.run(scenario())
+
+
+def test_readback_resolution_rejects_nonactive_changed_claim_without_receipt_write() -> None:
+    async def scenario() -> None:
+        store, client, _ = store_fixture()
+        expected, replacement, authority, service_claim = (
+            await _prepare_readback_resolution(store)
+        )
+        authority_path = (
+            f"{AuthorityStorageKind.EPOCH_AUTHORITY.value}/"
+            f"{epoch_authority_document_id(expected.value.root_id)}"
+        )
+        authority_before = deepcopy(client.documents[authority_path])
+        fenced_claim, _, replacement_authority = release_transition(
+            service_claim.value,
+            authority.value,
+            suffix="readback-claim-race",
+        )
+        await store.fence_service_claim(
+            service_claim,
+            fenced_claim,
+            authority,
+            replacement_authority,
+        )
+        client.documents[authority_path] = authority_before
+        changed_claim = await store.read_service_claim()
+        assert changed_claim is not None
+        assert changed_claim.value.status is ServiceClaimStatus.RELEASING
+
+        with pytest.raises(AuthorityStoreConflict):
+            await store.resolve_ambiguous_receipt(
+                expected,
+                replacement,
+                authority,
+                service_claim,
+            )
+
+        assert await store.read_receipt(expected.value.idempotency_key) == expected
+
+    asyncio.run(scenario())
+
+
+def test_readback_resolution_rejects_competing_receipt_revision() -> None:
+    async def scenario() -> None:
+        store, _, _ = store_fixture()
+        expected, replacement, authority, service_claim = (
+            await _prepare_readback_resolution(store)
+        )
+        competing = ambiguous_receipt(expected.value, suffix="readback-race")
+        winner = await store.compare_and_set_receipt(expected, competing)
+
+        with pytest.raises(AuthorityStoreConflict):
+            await store.resolve_ambiguous_receipt(
+                expected,
+                replacement,
+                authority,
+                service_claim,
+            )
+
+        assert await store.read_receipt(expected.value.idempotency_key) == winner
+
+    asyncio.run(scenario())
+
+
+def test_readback_resolution_adopts_exact_unknown_commit() -> None:
+    async def scenario() -> None:
+        store, _, runner = store_fixture()
+        expected, replacement, authority, service_claim = (
+            await _prepare_readback_resolution(store)
+        )
+        runner.mode = "commit-then-timeout"
+
+        resolved = await store.resolve_ambiguous_receipt(
+            expected,
+            replacement,
+            authority,
+            service_claim,
+        )
+
+        assert resolved == StoredRecord(replacement, expected.revision + 1)
+        assert await store.read_receipt(expected.value.idempotency_key) == resolved
+
+    asyncio.run(scenario())
+
+
+def test_generic_receipt_cas_cannot_append_readback_resolution_marker() -> None:
+    async def scenario() -> None:
+        store, client, runner = store_fixture()
+        expected, replacement, _, _ = await _prepare_readback_resolution(store)
+        documents_before = deepcopy(client.documents)
+        transaction_count = len(runner.maximum_attempts)
+
+        with pytest.raises(ValueError, match="dedicated operation"):
+            await store.compare_and_set_receipt(expected, replacement)
+
+        assert len(runner.maximum_attempts) == transaction_count
+        assert client.documents == documents_before
+        assert await store.read_receipt(expected.value.idempotency_key) == expected
 
     asyncio.run(scenario())
 
