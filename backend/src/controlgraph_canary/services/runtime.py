@@ -30,6 +30,9 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunMutationPurpose,
     CloudRunTargetConfiguration,
 )
+from controlgraph_canary.application.completion_classification import (
+    CoordinatorCompletionClassificationService,
+)
 from controlgraph_canary.application.evidence_signing import EvidenceSigningService
 from controlgraph_canary.application.execution import FinalMutationGate
 from controlgraph_canary.application.health_attestation import (
@@ -317,6 +320,7 @@ def create_runtime_service_app(
     independent_verification_service = None
     coordinator_clients = None
     coordinator_independent_verification_client = None
+    coordinator_completion_classification_service = None
     api_root_creation_client = None
     coordinator_root_creation_relay = None
     api_operator_observation_client = None
@@ -1197,20 +1201,6 @@ def create_runtime_service_app(
                 signature_verifier=evidence_signature_verifier,
             ),
         )
-        coordinator_independent_verification_client = (
-            CoordinatorIndependentVerificationClient(
-                route=verifier_route,
-                transport=selected_transport,
-                signature_verifier=(
-                    GoogleKmsIndependentVerificationEvidenceVerifier(
-                        project_id=settings.project_id,
-                        service_role=ServiceRole.COORDINATOR,
-                        key_version=settings.evidence_key_version,
-                        client=kms_client,
-                    )
-                ),
-            )
-        )
         target = TargetBinding(
             schema_version="controlgraph.target-binding/v1",
             project_id=settings.project_id,
@@ -1238,6 +1228,27 @@ def create_runtime_service_app(
                 ),
             ),
             policy_set=timeline_policy_set,
+        )
+        coordinator_independent_verification_client = (
+            CoordinatorIndependentVerificationClient(
+                route=verifier_route,
+                transport=selected_transport,
+                signature_verifier=(
+                    GoogleKmsIndependentVerificationEvidenceVerifier(
+                        project_id=settings.project_id,
+                        service_role=ServiceRole.COORDINATOR,
+                        key_version=settings.evidence_key_version,
+                        client=kms_client,
+                    )
+                ),
+                timeline_recorder=timeline_recorder,
+            )
+        )
+        coordinator_completion_classification_service = (
+            CoordinatorCompletionClassificationService(
+                target=target,
+                timeline_recorder=timeline_recorder,
+            )
         )
         selected_store = (
             authority_store
@@ -1642,6 +1653,10 @@ def create_runtime_service_app(
     if coordinator_independent_verification_client is not None:
         app.state.controlgraph_independent_verification_client = (
             coordinator_independent_verification_client
+        )
+    if coordinator_completion_classification_service is not None:
+        app.state.controlgraph_completion_classification = (
+            coordinator_completion_classification_service
         )
     if api_root_creation_client is not None:
         app.state.controlgraph_root_creation_client = api_root_creation_client

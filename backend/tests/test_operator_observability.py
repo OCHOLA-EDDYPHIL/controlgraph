@@ -29,6 +29,9 @@ from controlgraph_canary.application.cloud_run import (
     TargetConfigurationProjection,
     target_configuration_projection_sha256,
 )
+from controlgraph_canary.application.completion_classification import (
+    CoordinatorCompletionClassificationService,
+)
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     CallerRole,
@@ -1053,6 +1056,18 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
     assert isinstance(
         coordinator.state.controlgraph_independent_verification_client,
         CoordinatorIndependentVerificationClient,
+    )
+    assert isinstance(
+        coordinator.state.controlgraph_completion_classification,
+        CoordinatorCompletionClassificationService,
+    )
+    assert (
+        coordinator.state.controlgraph_independent_verification_client._timeline_recorder
+        is coordinator.state.controlgraph_timeline_recorder
+    )
+    assert (
+        coordinator.state.controlgraph_completion_classification._timeline_recorder
+        is coordinator.state.controlgraph_timeline_recorder
     )
     assert isinstance(
         coordinator.state.controlgraph_operator_observation_relay,

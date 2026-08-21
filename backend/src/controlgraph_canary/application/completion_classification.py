@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from controlgraph_canary.application.timeline_recording import (
+    CompletionClassificationTimelineRecorder,
+)
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.independent_verification import (
     COMPLETION_CLASSIFICATION_V1,
@@ -24,6 +27,7 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     ReasonCode,
     ReceiptOutcome,
+    TargetBinding,
 )
 
 _MAX_EVIDENCE_ASSESSMENT_LAG_SECONDS = 300
@@ -58,6 +62,45 @@ def classify_completion(bundle: CompletionEvidenceBundleV1) -> CompletionClassif
         follow_up_attempt_limit=(3 if status is CompletionStatus.AMBIGUOUS else None),
         classified_at=bundle.request.assessed_at,
     )
+
+
+class CoordinatorCompletionClassificationService:
+    """Run the pure classifier and durably record its exact result before return."""
+
+    def __init__(
+        self,
+        *,
+        target: TargetBinding,
+        timeline_recorder: CompletionClassificationTimelineRecorder,
+    ) -> None:
+        if (
+            type(target) is not TargetBinding
+            or not isinstance(
+                timeline_recorder,
+                CompletionClassificationTimelineRecorder,
+            )
+            or timeline_recorder.target != target
+        ):
+            raise ValueError("completion classification service configuration is invalid")
+        self._target = target
+        self._timeline_recorder = timeline_recorder
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def classify(
+        self,
+        bundle: CompletionEvidenceBundleV1,
+    ) -> CompletionClassificationV1:
+        if (
+            type(bundle) is not CompletionEvidenceBundleV1
+            or bundle.request.verification.target != self._target
+        ):
+            raise ValueError("completion classification bundle is outside the configured target")
+        classification = classify_completion(bundle)
+        await self._timeline_recorder.record_completion_classification(classification)
+        return classification
 
 
 def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReason:
@@ -259,4 +302,4 @@ def _parse_utc(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
 
-__all__ = ["classify_completion"]
+__all__ = ["CoordinatorCompletionClassificationService", "classify_completion"]

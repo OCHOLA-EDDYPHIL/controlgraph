@@ -11,8 +11,10 @@ from controlgraph_canary.application.timeline import (
 from controlgraph_canary.application.timeline_projectors import (
     TimelineProjection,
     project_canary_dispatch,
+    project_completion_classification,
     project_epoch_revocation,
     project_execution_receipt,
+    project_independent_verification,
     project_promotion_dispatch,
     project_recovery_dispatch,
     project_recovery_intent,
@@ -23,6 +25,10 @@ from controlgraph_canary.application.timeline_projectors import (
 )
 from controlgraph_canary.contracts.canary_execution import CanaryDispatchResultV1
 from controlgraph_canary.contracts.health_execution import SignedHealthDecisionProofV1
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionClassificationV1,
+    VerifiedIndependentVerificationEvidenceV1,
+)
 from controlgraph_canary.contracts.models import (
     ExecutionReceipt,
     SignedCapability,
@@ -57,6 +63,32 @@ class TimelineProjectionRecorder(Protocol):
     ) -> None: ...
 
     async def record_recovery_intent(self, intent: RecoveryIntentV1) -> None: ...
+
+
+@runtime_checkable
+class IndependentVerificationTimelineRecorder(Protocol):
+    """Coordinator-only persistence surface for verified target evidence."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def record_independent_verification(
+        self,
+        verified: VerifiedIndependentVerificationEvidenceV1,
+    ) -> None: ...
+
+
+@runtime_checkable
+class CompletionClassificationTimelineRecorder(Protocol):
+    """Coordinator-only persistence surface for pure terminal classifications."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def record_completion_classification(
+        self,
+        classification: CompletionClassificationV1,
+    ) -> None: ...
 
 
 class TimelineRecorder:
@@ -130,6 +162,25 @@ class TimelineRecorder:
     async def record_execution_receipt(self, receipt: ExecutionReceipt) -> None:
         await self.record(project_execution_receipt(receipt, policy_set=self._policy_set))
 
+    async def record_independent_verification(
+        self,
+        verified: VerifiedIndependentVerificationEvidenceV1,
+    ) -> None:
+        await self.record(
+            project_independent_verification(verified, policy_set=self._policy_set)
+        )
+
+    async def record_completion_classification(
+        self,
+        classification: CompletionClassificationV1,
+    ) -> None:
+        await self.record(
+            project_completion_classification(
+                classification,
+                policy_set=self._policy_set,
+            )
+        )
+
     async def record_signed_capability(
         self,
         signed: SignedCapability,
@@ -160,4 +211,9 @@ class TimelineRecorder:
         await self.record(project_service_claim_release(result, policy_set=self._policy_set))
 
 
-__all__ = ["TimelineProjectionRecorder", "TimelineRecorder"]
+__all__ = [
+    "CompletionClassificationTimelineRecorder",
+    "IndependentVerificationTimelineRecorder",
+    "TimelineProjectionRecorder",
+    "TimelineRecorder",
+]

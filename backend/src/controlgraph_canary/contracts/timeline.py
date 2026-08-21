@@ -270,6 +270,7 @@ class TimelineSignatureMetadataV1(StrictContractModel):
         "CAPABILITY",
         "EVIDENCE",
         "HEALTH_ATTESTATION",
+        "INDEPENDENT_VERIFICATION",
         "RECOVERY_PRESTATE",
         "CLASSIFICATION_EVIDENCE",
     ]

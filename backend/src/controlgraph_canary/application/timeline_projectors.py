@@ -14,6 +14,13 @@ from controlgraph_canary.contracts.codec import (
     decode_base64url,
 )
 from controlgraph_canary.contracts.health_execution import SignedHealthDecisionProofV1
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionClassificationV1,
+    CompletionKind,
+    CompletionStatus,
+    SignedIndependentVerificationEvidenceV1,
+    VerifiedIndependentVerificationEvidenceV1,
+)
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
@@ -241,7 +248,11 @@ def _projection(
 
 
 def _signature_metadata(
-    signed: SignedEvidenceEventV1 | SignedHealthDecisionProofV1,
+    signed: (
+        SignedEvidenceEventV1
+        | SignedHealthDecisionProofV1
+        | SignedIndependentVerificationEvidenceV1
+    ),
 ) -> TimelineSignatureMetadataV1:
     raw_signature = decode_base64url(signed.signature, maximum_bytes=256)
     return TimelineSignatureMetadataV1(
@@ -827,6 +838,178 @@ def project_signed_health_proof(
     return observed, decided
 
 
+def project_independent_verification(
+    verified: VerifiedIndependentVerificationEvidenceV1,
+    *,
+    policy_set: TimelineEvidencePolicySetV1,
+) -> TimelineProjection:
+    """Project only coordinator-verified, independently signed target evidence."""
+
+    if type(verified) is not VerifiedIndependentVerificationEvidenceV1:
+        raise TypeError("independent verification projection input must be exact")
+    signed = verified.signed_evidence
+    evidence = signed.evidence
+    source_sha256 = canonical_sha256(verified)
+    return _projection(
+        source=verified,
+        source_id=f"verification:{source_sha256}",
+        event_type=TimelineEventType.VERIFICATION_RECORDED,
+        target=evidence.target,
+        actor_role=TimelineActorRole.VERIFIER,
+        actor=evidence.verifier_identity,
+        root_id=evidence.root_id,
+        root_sha256=evidence.root_sha256,
+        epoch=evidence.epoch,
+        occurred_at=evidence.occurred_at,
+        correlations=_correlations(
+            (
+                (
+                    TimelineCorrelationKind.EVIDENCE,
+                    f"verification-evidence:{signed.payload_sha256}",
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.REQUEST,
+                    evidence.request_id,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.VERIFICATION,
+                    evidence.correlation_id,
+                    TimelineAudience.OPERATOR,
+                ),
+            )
+        ),
+        payload_sha256=signed.payload_sha256,
+        signature=_signature_metadata(signed),
+        verification_status=TimelineVerificationStatus.VERIFIED,
+        terminal_classification=TimelineTerminalClassification.NONE,
+        display_fields=_display(
+            (
+                (
+                    TimelineDisplayFieldName.OBSERVATION,
+                    evidence.kind.value,
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.OUTCOME,
+                    evidence.verdict.value,
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.REASON_CODE,
+                    evidence.reason_code,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineDisplayFieldName.SUMMARY,
+                    "Independent verification recorded",
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+            )
+        ),
+        policy_set=policy_set,
+    )
+
+
+def project_completion_classification(
+    classification: CompletionClassificationV1,
+    *,
+    policy_set: TimelineEvidencePolicySetV1,
+) -> TimelineProjection:
+    """Project the pure classifier result without inventing a signature."""
+
+    if type(classification) is not CompletionClassificationV1:
+        raise TypeError("completion classification projection input must be exact")
+    request = classification.request
+    verification = request.verification
+    terminal = (
+        TimelineTerminalClassification.AMBIGUOUS
+        if classification.status is CompletionStatus.AMBIGUOUS
+        else {
+            CompletionKind.PROMOTION: TimelineTerminalClassification.PROMOTED,
+            CompletionKind.RECOVERY: TimelineTerminalClassification.RECOVERED,
+            CompletionKind.REVOCATION: TimelineTerminalClassification.REVOKED,
+            CompletionKind.STALE_CAPABILITY_DENIAL: (
+                TimelineTerminalClassification.DENIED
+            ),
+        }[request.kind]
+    )
+    source_sha256 = canonical_sha256(classification)
+    return _projection(
+        source=classification,
+        source_id=f"classification:{source_sha256}",
+        event_type=TimelineEventType.TERMINAL_CLASSIFIED,
+        target=verification.target,
+        actor_role=TimelineActorRole.COORDINATOR,
+        actor=(
+            f"controlgraph-coordinator@{verification.target.project_id}"
+            ".iam.gserviceaccount.com"
+        ),
+        root_id=verification.root_id,
+        root_sha256=verification.root_sha256,
+        epoch=verification.epoch,
+        occurred_at=classification.classified_at,
+        correlations=_correlations(
+            (
+                (
+                    TimelineCorrelationKind.DECISION,
+                    f"completion:{source_sha256}",
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.EVIDENCE,
+                    f"completion-bundle:{classification.bundle_sha256}",
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.REQUEST,
+                    verification.request_id,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.VERIFICATION,
+                    verification.correlation_id,
+                    TimelineAudience.OPERATOR,
+                ),
+            )
+        ),
+        payload_sha256=source_sha256,
+        signature=None,
+        verification_status=(
+            TimelineVerificationStatus.VERIFIED
+            if classification.status is CompletionStatus.COMPLETE
+            else TimelineVerificationStatus.AMBIGUOUS
+        ),
+        terminal_classification=terminal,
+        display_fields=_display(
+            (
+                (
+                    TimelineDisplayFieldName.ACTION,
+                    request.kind.value,
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.OUTCOME,
+                    classification.status.value,
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.REASON_CODE,
+                    classification.reason.value,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineDisplayFieldName.SUMMARY,
+                    "Completion classified",
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+            )
+        ),
+        policy_set=policy_set,
+    )
+
+
 def project_epoch_revocation(
     outcome: EpochRevocationCallOutcomeV1,
     *,
@@ -1122,9 +1305,11 @@ def project_recovery_dispatch(
 __all__ = [
     "TimelineProjection",
     "project_canary_dispatch",
+    "project_completion_classification",
     "project_epoch_authority",
     "project_epoch_revocation",
     "project_execution_receipt",
+    "project_independent_verification",
     "project_promotion_dispatch",
     "project_recovery_dispatch",
     "project_recovery_intent",

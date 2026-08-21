@@ -851,6 +851,14 @@ class CompletionClassificationV1(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_terminal_shape(self) -> Self:
+        complete_reason = {
+            CompletionKind.PROMOTION: CompletionReason.PROMOTION_COMPLETE,
+            CompletionKind.RECOVERY: CompletionReason.RECOVERY_COMPLETE,
+            CompletionKind.REVOCATION: CompletionReason.REVOCATION_COMPLETE,
+            CompletionKind.STALE_CAPABILITY_DENIAL: (
+                CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE
+            ),
+        }[self.request.kind]
         if (
             self.classified_at != self.request.assessed_at
             or (self.status is CompletionStatus.AMBIGUOUS) != self.follow_up_required
@@ -860,15 +868,7 @@ class CompletionClassificationV1(StrictContractModel):
                 and self.follow_up_attempt_limit == 3
             )
             or (self.status is CompletionStatus.COMPLETE)
-            != (
-                self.reason
-                in {
-                    CompletionReason.PROMOTION_COMPLETE,
-                    CompletionReason.RECOVERY_COMPLETE,
-                    CompletionReason.REVOCATION_COMPLETE,
-                    CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE,
-                }
-            )
+            != (self.reason is complete_reason)
         ):
             raise ValueError("completion classification shape is invalid")
         return self

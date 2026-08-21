@@ -34,6 +34,7 @@ from controlgraph_canary.application.cloud_run import (
     target_configuration_projection_sha256,
 )
 from controlgraph_canary.application.completion_classification import (
+    CoordinatorCompletionClassificationService,
     classify_completion,
 )
 from controlgraph_canary.application.identity import (
@@ -46,6 +47,8 @@ from controlgraph_canary.application.identity import (
     protected_path,
 )
 from controlgraph_canary.application.independent_verification import (
+    IndependentVerificationError,
+    IndependentVerificationErrorCode,
     IndependentVerificationService,
     ProbeHttpResponse,
 )
@@ -72,6 +75,7 @@ from controlgraph_canary.contracts.independent_verification import (
     AuthorityCompletionEvidenceV1,
     AuthorityCompletionKind,
     CompletionAssessmentRequestV1,
+    CompletionClassificationV1,
     CompletionEvidenceBundleV1,
     CompletionKind,
     CompletionReason,
@@ -94,6 +98,7 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     ReasonCode,
     ReceiptOutcome,
+    TargetBinding,
 )
 from controlgraph_canary.http.service import create_service_app
 from controlgraph_canary.reference_target import (
@@ -1015,6 +1020,35 @@ class _SignatureVerifier:
             raise self.error
 
 
+class _TimelineRecorder:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        *,
+        target: TargetBinding | None = None,
+    ) -> None:
+        self.error = error
+        self.target = target or _target()
+        self.verifications: list[VerifiedIndependentVerificationEvidenceV1] = []
+        self.classifications: list[CompletionClassificationV1] = []
+
+    async def record_independent_verification(
+        self,
+        verified: VerifiedIndependentVerificationEvidenceV1,
+    ) -> None:
+        if self.error is not None:
+            raise self.error
+        self.verifications.append(verified)
+
+    async def record_completion_classification(
+        self,
+        classification: CompletionClassificationV1,
+    ) -> None:
+        if self.error is not None:
+            raise self.error
+        self.classifications.append(classification)
+
+
 def _writer_policy(*, verification_route: bool) -> RouteAuthenticationPolicy:
     return RouteAuthenticationPolicy(
         project_id=PROJECT,
@@ -1137,6 +1171,194 @@ def test_coordinator_exposes_only_signature_verified_verifier_evidence() -> None
     assert verified.signing_request == attestation.signing_request
     assert verifier.calls == [attestation.signed_evidence]
     assert len(transport.calls) == 1
+
+
+def test_coordinator_records_only_verified_evidence_and_exact_replay_is_stable() -> None:
+    service, _, _, _ = _service_with(_state())
+    attestation = _async(service.attest_configuration(_request(), _caller()))
+    assert isinstance(attestation, IndependentVerificationAttestationV1)
+    invocation = IndependentVerificationInvocationV1(
+        schema_version=INDEPENDENT_VERIFICATION_INVOCATION_V1,
+        kind=IndependentVerificationKind.CONFIGURATION,
+        verification=_request(),
+    )
+    recorder = _TimelineRecorder()
+    verifier = _SignatureVerifier()
+    client = CoordinatorIndependentVerificationClient(
+        route=CoordinatorInternalRoute(
+            project_id=PROJECT,
+            project_number=PROJECT_NUMBER,
+            caller_role=CallerRole.COORDINATOR,
+            service_role=ServiceRole.VERIFIER,
+            audience=VERIFIER_AUDIENCE,
+        ),
+        transport=_InternalTransport(canonical_json_bytes(attestation)),
+        signature_verifier=verifier,
+        clock=lambda: NOW.replace(minute=1, second=30),
+        timeline_recorder=recorder,
+    )
+
+    first = _async(client.attest(invocation))
+    second = _async(client.attest(invocation))
+
+    assert first == second
+    assert recorder.verifications == [first, first]
+    assert verifier.calls == [attestation.signed_evidence, attestation.signed_evidence]
+
+
+def test_coordinator_never_records_unverified_or_unpersistable_evidence() -> None:
+    service, _, _, _ = _service_with(_state())
+    attestation = _async(service.attest_configuration(_request(), _caller()))
+    assert isinstance(attestation, IndependentVerificationAttestationV1)
+    invocation = IndependentVerificationInvocationV1(
+        schema_version=INDEPENDENT_VERIFICATION_INVOCATION_V1,
+        kind=IndependentVerificationKind.CONFIGURATION,
+        verification=_request(),
+    )
+    route = CoordinatorInternalRoute(
+        project_id=PROJECT,
+        project_number=PROJECT_NUMBER,
+        caller_role=CallerRole.COORDINATOR,
+        service_role=ServiceRole.VERIFIER,
+        audience=VERIFIER_AUDIENCE,
+    )
+    recorder = _TimelineRecorder()
+    invalid_client = CoordinatorIndependentVerificationClient(
+        route=route,
+        transport=_InternalTransport(canonical_json_bytes(attestation)),
+        signature_verifier=_SignatureVerifier(ValueError("synthetic signature failure")),
+        timeline_recorder=recorder,
+    )
+
+    with pytest.raises(IndependentVerificationError) as invalid:
+        _async(invalid_client.attest(invocation))
+
+    assert invalid.value.code is IndependentVerificationErrorCode.RESPONSE_INVALID
+    assert recorder.verifications == []
+
+    unavailable_client = CoordinatorIndependentVerificationClient(
+        route=route,
+        transport=_InternalTransport(canonical_json_bytes(attestation)),
+        signature_verifier=_SignatureVerifier(),
+        timeline_recorder=_TimelineRecorder(RuntimeError("synthetic store failure")),
+    )
+    with pytest.raises(IndependentVerificationError) as unavailable:
+        _async(unavailable_client.attest(invocation))
+    assert unavailable.value.code is IndependentVerificationErrorCode.UNAVAILABLE
+
+
+def test_coordinator_rejects_timeline_target_substitution_before_transport() -> None:
+    other_target = TargetBinding.model_validate(
+        {**_request().target.model_dump(mode="python"), "environment": "acceptance"}
+    )
+    recorder = _TimelineRecorder(target=other_target)
+    transport = _InternalTransport(b"unused")
+    verifier = _SignatureVerifier()
+    client = CoordinatorIndependentVerificationClient(
+        route=CoordinatorInternalRoute(
+            project_id=PROJECT,
+            project_number=PROJECT_NUMBER,
+            caller_role=CallerRole.COORDINATOR,
+            service_role=ServiceRole.VERIFIER,
+            audience=VERIFIER_AUDIENCE,
+        ),
+        transport=transport,
+        signature_verifier=verifier,
+        timeline_recorder=recorder,
+    )
+    invocation = IndependentVerificationInvocationV1(
+        schema_version=INDEPENDENT_VERIFICATION_INVOCATION_V1,
+        kind=IndependentVerificationKind.CONFIGURATION,
+        verification=_request(),
+    )
+
+    with pytest.raises(IndependentVerificationError) as denied:
+        _async(client.attest(invocation))
+
+    assert denied.value.code is IndependentVerificationErrorCode.REQUEST_DENIED
+    assert transport.calls == []
+    assert verifier.calls == []
+    assert recorder.verifications == []
+
+
+def test_coordinator_completion_service_records_the_pure_result_before_return() -> None:
+    request = _request(
+        action=CapabilityAction.PROMOTE_CANDIDATE,
+        stable_percent=0,
+        candidate_percent=100,
+    )
+    service, _, _, _ = _service_with(_state(0, 100), ["candidate"] * 20)
+    configuration = _async(service.attest_configuration(request, _caller()))
+    probe = _async(service.attest_probe(request, _caller()))
+    assert isinstance(configuration, IndependentVerificationAttestationV1)
+    assert isinstance(probe, IndependentVerificationAttestationV1)
+    bundle = _bundle(request, configuration, probe)
+    recorder = _TimelineRecorder()
+    classifier = CoordinatorCompletionClassificationService(
+        target=request.target,
+        timeline_recorder=recorder,
+    )
+
+    first = _async(classifier.classify(bundle))
+    second = _async(classifier.classify(bundle))
+
+    assert isinstance(first, CompletionClassificationV1)
+    assert first == classify_completion(bundle)
+    assert second == first
+    assert recorder.classifications == [first, first]
+
+
+def test_coordinator_completion_service_rejects_another_target_before_recording() -> None:
+    request = _request(
+        action=CapabilityAction.PROMOTE_CANDIDATE,
+        stable_percent=0,
+        candidate_percent=100,
+    )
+    service, _, _, _ = _service_with(_state(0, 100), ["candidate"] * 20)
+    configuration = _async(service.attest_configuration(request, _caller()))
+    probe = _async(service.attest_probe(request, _caller()))
+    assert isinstance(configuration, IndependentVerificationAttestationV1)
+    assert isinstance(probe, IndependentVerificationAttestationV1)
+    bundle = _bundle(request, configuration, probe)
+    other_target = TargetBinding.model_validate(
+        {**request.target.model_dump(mode="python"), "environment": "acceptance"}
+    )
+    recorder = _TimelineRecorder(target=other_target)
+    classifier = CoordinatorCompletionClassificationService(
+        target=other_target,
+        timeline_recorder=recorder,
+    )
+
+    with pytest.raises(ValueError, match="outside the configured target"):
+        _async(classifier.classify(bundle))
+
+    assert recorder.classifications == []
+
+
+def test_completion_contract_rejects_complete_reason_for_another_kind() -> None:
+    request = CompletionAssessmentRequestV1(
+        schema_version=COMPLETION_ASSESSMENT_REQUEST_V1,
+        kind=CompletionKind.PROMOTION,
+        verification=_request(
+            action=CapabilityAction.PROMOTE_CANDIDATE,
+            stable_percent=0,
+            candidate_percent=100,
+        ),
+        assessed_at="2026-08-19T12:02:00Z",
+    )
+
+    with pytest.raises(ValidationError, match="classification shape"):
+        CompletionClassificationV1(
+            schema_version="controlgraph.completion-classification/v1",
+            request=request,
+            bundle_sha256="f" * 64,
+            status=CompletionStatus.COMPLETE,
+            reason=CompletionReason.RECOVERY_COMPLETE,
+            follow_up_required=False,
+            follow_up_after_seconds=None,
+            follow_up_attempt_limit=None,
+            classified_at=request.assessed_at,
+        )
 
 
 def test_cli_classifies_canonical_bundle_without_cloud_access(
