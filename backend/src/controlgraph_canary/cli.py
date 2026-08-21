@@ -749,6 +749,7 @@ def _run_promotion(
         or result.root_id != command.root_id
         or result.root_sha256 != command.expected_root_sha256
         or result.epoch != command.expected_epoch
+        or result.scheduled_at != command.scheduled_at
         or result.verified_apply_receipt != command.verified_apply_receipt
     ):
         _print_cli_error("PROMOTION_RESPONSE_INVALID")

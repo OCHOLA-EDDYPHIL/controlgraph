@@ -1854,6 +1854,7 @@ def _validate_promotion_record(
         or record.root_id != command.root_id
         or record.root_sha256 != command.expected_root_sha256
         or record.epoch != command.expected_epoch
+        or record.scheduled_at != command.scheduled_at
         or record.verified_apply_receipt != command.verified_apply_receipt
         or record.source_receipt_sha256 != command.verified_apply_receipt.receipt_sha256
     ):
@@ -1878,6 +1879,7 @@ def _promotion_dispatch_identity(
         root_id=record.root_id,
         root_sha256=record.root_sha256,
         epoch=record.epoch,
+        scheduled_at=record.scheduled_at,
         source_receipt_sha256=record.source_receipt_sha256,
         claimed_at=record.prepared_at,
     )
@@ -1915,6 +1917,7 @@ def _validate_promotion_replacement(
         "root_id",
         "root_sha256",
         "epoch",
+        "scheduled_at",
         "verified_apply_receipt",
         "source_receipt_sha256",
         "task_sha256",
@@ -5010,6 +5013,7 @@ class FirestoreAuthorityStore:
                 and identity.root_id == command.root_id
                 and identity.root_sha256 == command.expected_root_sha256
                 and identity.epoch == command.expected_epoch
+                and identity.scheduled_at == command.scheduled_at
                 and identity.source_receipt_sha256 == source_sha256
             )
 

@@ -310,6 +310,11 @@ class TaskRequest(StrictContractModel):
         if not claims.not_before <= self.scheduled_at < self.expires_at <= claims.expires_at:
             raise ValueError("task timestamps exceed the capability window")
         if (
+            claims.action is CapabilityAction.PROMOTE_CANDIDATE
+            and self.scheduled_at != claims.not_before
+        ):
+            raise ValueError("promotion schedule does not match capability not-before")
+        if (
             claims.target != intent.target
             or claims.root_id != intent.root_id
             or claims.root_sha256 != intent.root_sha256

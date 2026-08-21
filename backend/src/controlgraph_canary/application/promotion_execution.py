@@ -109,6 +109,7 @@ class CoordinatorPromotionCapabilityClient:
             expected_epoch=command.expected_epoch,
             request_id=command.request_id,
             idempotency_key=command.idempotency_key,
+            scheduled_at=command.scheduled_at,
             verified_apply_receipt=command.verified_apply_receipt,
         )
         try:
@@ -345,6 +346,7 @@ class PromotionRolloutCoordinator:
                 root_id=command.root_id,
                 root_sha256=command.expected_root_sha256,
                 epoch=command.expected_epoch,
+                scheduled_at=command.scheduled_at,
                 verified_apply_receipt=command.verified_apply_receipt,
                 source_receipt_sha256=(command.verified_apply_receipt.receipt_sha256),
                 task_sha256=canonical_sha256(request),
@@ -641,6 +643,7 @@ def _capability_matches_command(
         and claims.epoch == command.expected_epoch
         and claims.request_id == command.request_id
         and claims.idempotency_key == command.idempotency_key
+        and claims.not_before == command.scheduled_at
         and claims.action is CapabilityAction.PROMOTE_CANDIDATE
         and claims.concurrency is None
         and claims.stable_percent == 0
@@ -662,6 +665,7 @@ def _result_matches_command(
         and result.root_id == command.root_id
         and result.root_sha256 == command.expected_root_sha256
         and result.epoch == command.expected_epoch
+        and result.scheduled_at == command.scheduled_at
         and result.target.project_id == project_id
         and result.stable_percent == 0
         and result.candidate_percent == 100

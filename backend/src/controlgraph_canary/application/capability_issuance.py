@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, cast, runtime_checkable
+from typing import Final, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
 from controlgraph_canary.application.authority_store import (
@@ -45,7 +45,7 @@ from controlgraph_canary.authority.policy import (
     check_attenuation,
     validate_lineage,
 )
-from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
+from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER, validate_utc_second
 from controlgraph_canary.contracts.codec import (
     ContractError,
     RestrictedJson,
@@ -79,6 +79,7 @@ CAPABILITY_IDENTITY_V1 = "controlgraph.capability-identity/v1"
 CAPABILITY_IDENTITY_DOMAIN = b"controlgraph.capability-identity/v1\0"
 DEFAULT_CAPABILITY_LIFETIME_SECONDS = 300
 MAX_CAPABILITY_LIFETIME_SECONDS = 900
+MIN_PROMOTION_EXECUTION_MARGIN_SECONDS: Final = 30
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -189,6 +190,7 @@ class PromotionCapabilityIssuanceRequest:
     expected_epoch: int
     request_id: str
     idempotency_key: str
+    scheduled_at: str
     verified_apply_receipt: VerifiedApplyReceiptLocatorV1
 
     def __post_init__(self) -> None:
@@ -205,6 +207,9 @@ class PromotionCapabilityIssuanceRequest:
             raise ValueError("expected_epoch is invalid")
         _validate_identifier("request_id", self.request_id)
         _validate_identifier("idempotency_key", self.idempotency_key)
+        if type(self.scheduled_at) is not str:
+            raise ValueError("scheduled_at is invalid")
+        validate_utc_second(self.scheduled_at)
         if type(self.verified_apply_receipt) is not VerifiedApplyReceiptLocatorV1:
             raise ValueError("verified_apply_receipt is invalid")
 
@@ -417,6 +422,7 @@ class CapabilityIssuer:
             state=state,
             request=request,
             issued_at=issued_at,
+            not_before=issued_at,
             issued_second=issued_second,
             expires_second=expires_second,
             lineage=lineage,
@@ -443,6 +449,14 @@ class CapabilityIssuer:
             raise TypeError("an exact promotion issuance request is required")
         issued_at, issued_second = _utc_second(now)
         self._authorize(principal)
+        scheduled_second = _parse_utc_second(request.scheduled_at)
+        configured_expiry = issued_second + self._configuration.lifetime_seconds
+        if (
+            scheduled_second < issued_second
+            or configured_expiry - scheduled_second
+            < MIN_PROMOTION_EXECUTION_MARGIN_SECONDS
+        ):
+            raise _deny(CapabilityIssuanceErrorCode.VALIDITY_EXHAUSTED)
         state = await self._read_trusted_state(request.root_id, issued_second)
         self._validate_expected_state(state, request)
         source_receipt = await self._read_verified_apply_receipt(
@@ -457,6 +471,7 @@ class CapabilityIssuer:
             state=state,
             request=request,
             issued_at=issued_at,
+            not_before=request.scheduled_at,
             issued_second=issued_second,
             expires_second=None,
             lineage=(),
@@ -484,6 +499,7 @@ class CapabilityIssuer:
         state: _TrustedIssuanceState,
         request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
         issued_at: str,
+        not_before: str,
         issued_second: int,
         expires_second: int | None,
         lineage: tuple[SignedCapability, ...],
@@ -503,6 +519,7 @@ class CapabilityIssuer:
             state=state,
             request=request,
             issued_at=issued_at,
+            not_before=not_before,
             expires_at=expires_at,
             parent_digest=parent_digest,
             action=action,
@@ -802,6 +819,7 @@ class CapabilityIssuer:
         state: _TrustedIssuanceState,
         request: CapabilityIssuanceRequest | PromotionCapabilityIssuanceRequest,
         issued_at: str,
+        not_before: str,
         expires_at: str,
         parent_digest: str | None,
         action: CapabilityAction,
@@ -833,6 +851,7 @@ class CapabilityIssuer:
             "target": content.target.model_dump(mode="json"),
         }
         if type(request) is PromotionCapabilityIssuanceRequest:
+            identity_material["scheduled_at"] = request.scheduled_at
             identity_material["verified_apply_receipt"] = (
                 cast(
                     RestrictedJson,
@@ -861,7 +880,7 @@ class CapabilityIssuer:
             idempotency_key=request.idempotency_key,
             parent_capability_sha256=parent_digest,
             issued_at=issued_at,
-            not_before=issued_at,
+            not_before=not_before,
             expires_at=expires_at,
             signing_algorithm="EC_SIGN_P256_SHA256",
             signing_key_version=self._signer.profile.key_version,
@@ -873,6 +892,7 @@ __all__ = [
     "CAPABILITY_IDENTITY_V1",
     "DEFAULT_CAPABILITY_LIFETIME_SECONDS",
     "MAX_CAPABILITY_LIFETIME_SECONDS",
+    "MIN_PROMOTION_EXECUTION_MARGIN_SECONDS",
     "AuthenticatedIssuancePrincipal",
     "CapabilityEnvelopeVerifier",
     "CapabilityIssuanceError",
