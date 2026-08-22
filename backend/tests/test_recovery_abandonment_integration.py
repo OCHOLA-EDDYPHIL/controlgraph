@@ -16,6 +16,7 @@ from test_evidence_writer import _FakeKmsClient
 from test_m2_firestore_authority_store import (
     _FakeClient,
     _FakeTransactionRunner,
+    _Reference,
     _StoredDocument,
 )
 from test_operator_cli import _Poster, _Runner
@@ -865,13 +866,33 @@ def _changed_dispatch(dispatch: RecoveryDispatchRecordV2) -> RecoveryDispatchRec
     )
 
 
-def test_firestore_abandonment_read_has_a_dedicated_total_timeout(
+def test_firestore_abandonment_read_has_dedicated_total_and_rpc_timeouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     memory, _, _, _, _ = _run_first_stage()
     expected, _ = memory.fence_commits[0]
+    rpc_timeouts: list[float | None] = []
+    original_get = _Reference.get
+    delay_reads = True
+
+    async def recording_get(
+        reference: _Reference,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        timeout = kwargs.get("timeout")
+        should_delay = delay_reads and not rpc_timeouts
+        rpc_timeouts.append(timeout)
+        if should_delay:
+            assert type(timeout) is float
+            async with asyncio.timeout(timeout):
+                await asyncio.sleep(0.01)
+        return await original_get(reference, *args, **kwargs)
+
+    monkeypatch.setattr(_Reference, "get", recording_get)
 
     async def scenario() -> None:
+        nonlocal delay_reads
         client = _FakeClient()
         runner = _FakeTransactionRunner()
 
@@ -897,16 +918,29 @@ def test_firestore_abandonment_read_has_a_dedicated_total_timeout(
 
         assert observed == expected
         assert runner.expected_writes == [0]
+        assert len(rpc_timeouts) >= 20
+        assert set(rpc_timeouts) == {0.1}
+
+        delay_reads = False
+        rpc_timeouts.clear()
+        assert await store.read_service_claim() == expected.root_bundle.service_claim
+        assert rpc_timeouts == [0.005]
 
     monkeypatch.setattr(
         firestore_integration,
         "FIRESTORE_OPERATION_TIMEOUT_SECONDS",
         0.005,
     )
+
     monkeypatch.setattr(
         abandonment_integration,
         "_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS",
-        0.2,
+        15.0,
+    )
+    monkeypatch.setattr(
+        abandonment_integration,
+        "_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS",
+        0.1,
     )
     asyncio.run(scenario())
 
@@ -916,6 +950,18 @@ def test_firestore_abandonment_write_has_a_dedicated_total_timeout(
 ) -> None:
     memory, _, _, _, _ = _run_first_stage()
     expected, commit = memory.fence_commits[0]
+    rpc_timeouts: list[float | None] = []
+    original_get = _Reference.get
+
+    async def recording_get(
+        reference: _Reference,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        rpc_timeouts.append(kwargs.get("timeout"))
+        return await original_get(reference, *args, **kwargs)
+
+    monkeypatch.setattr(_Reference, "get", recording_get)
 
     async def scenario() -> None:
         client = _FakeClient()
@@ -942,6 +988,8 @@ def test_firestore_abandonment_write_has_a_dedicated_total_timeout(
 
         assert written.recovery_dispatch.value == commit.replacement_dispatch
         assert runner.expected_writes == [9]
+        assert rpc_timeouts
+        assert set(rpc_timeouts) == {0.1}
 
     monkeypatch.setattr(
         firestore_integration,
@@ -950,14 +998,13 @@ def test_firestore_abandonment_write_has_a_dedicated_total_timeout(
     )
     monkeypatch.setattr(
         abandonment_integration,
-        "FIRESTORE_OPERATION_TIMEOUT_SECONDS",
-        0.005,
-        raising=False,
+        "_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS",
+        15.0,
     )
     monkeypatch.setattr(
         abandonment_integration,
-        "_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS",
-        0.2,
+        "_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS",
+        0.1,
     )
     asyncio.run(scenario())
 
@@ -1114,8 +1161,27 @@ def _finalize_fixture() -> tuple[
     return memory, replace(fenced, recovery_receipt=late), commit, late
 
 
-def test_firestore_finalize_accepts_only_exact_late_epoch_denial() -> None:
+def test_firestore_finalize_accepts_only_exact_late_epoch_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _, expected, commit, late = _finalize_fixture()
+    rpc_timeouts: list[float | None] = []
+    original_get = _Reference.get
+
+    async def recording_get(
+        reference: _Reference,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        rpc_timeouts.append(kwargs.get("timeout"))
+        return await original_get(reference, *args, **kwargs)
+
+    monkeypatch.setattr(_Reference, "get", recording_get)
+    monkeypatch.setattr(
+        abandonment_integration,
+        "_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS",
+        0.1,
+    )
 
     async def scenario() -> None:
         client = _FakeClient()
@@ -1137,6 +1203,8 @@ def test_firestore_finalize_accepts_only_exact_late_epoch_denial() -> None:
         persisted = await store.read_recovery_abandonment_state(expected.invocation)
         assert persisted.recovery_receipt == late
         assert persisted.result == written.result
+        assert rpc_timeouts
+        assert set(rpc_timeouts) == {0.1}
 
     asyncio.run(scenario())
 
