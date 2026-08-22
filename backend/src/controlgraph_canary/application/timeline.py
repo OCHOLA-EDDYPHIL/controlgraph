@@ -378,7 +378,7 @@ class TimelineStore(Protocol):
 
 @runtime_checkable
 class TimelineRawStore(Protocol):
-    """Atomic raw append plus exact-ID export and policy-bound expiry deletion."""
+    """Atomic raw append, write-path expiry, and exact-ID read-only export."""
 
     @property
     def target(self) -> TargetBinding: ...

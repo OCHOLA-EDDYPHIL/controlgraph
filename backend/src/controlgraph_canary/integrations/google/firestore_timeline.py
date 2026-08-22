@@ -233,6 +233,12 @@ class _SignedIntentReplay(RuntimeError):
     pass
 
 
+class _RawDeletionReplay(RuntimeError):
+    def __init__(self, receipt: TimelineRawDeletionReceiptV1) -> None:
+        self.receipt = receipt
+        super().__init__("timeline raw deletion replay detected")
+
+
 def _default_client_factory(
     project_id: str,
     *,
@@ -452,7 +458,7 @@ def _is_contention(error: BaseException) -> bool:
 
 
 class FirestoreTimelineStore:
-    """Append/page one target and delete expired raw records only by exact ID."""
+    """Append/page one target and retire expired raw records on write replay."""
 
     @classmethod
     def production(
@@ -947,6 +953,32 @@ class FirestoreTimelineStore:
         if current != expected:
             raise TimelineStoreConflict
 
+    async def _require_or_retire_existing_raw(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        entry: TimelineEntryV1,
+        raw_source: TimelineRawSourceV1,
+    ) -> None:
+        expires_at = _parse_utc_second(
+            _raw_evidence(entry=entry, raw_source=raw_source).expires_at
+        )
+        evaluated_at = _utc_second(self._clock())
+        if _parse_utc_second(evaluated_at) < expires_at:
+            await self._require_existing_raw(
+                client=client,
+                transaction=None,
+                entry=entry,
+                raw_source=raw_source,
+            )
+            return
+        await self._delete_expired_raw(
+            client=client,
+            entry=entry,
+            raw_source=raw_source,
+            confirmed_at=evaluated_at,
+        )
+
     async def _adopt_exact_prefix(
         self,
         *,
@@ -967,9 +999,8 @@ class FirestoreTimelineStore:
             strict=True,
         ):
             assert entry is not None
-            await self._require_existing_raw(
+            await self._require_or_retire_existing_raw(
                 client=client,
-                transaction=None,
                 entry=entry,
                 raw_source=raw_source,
             )
@@ -1332,9 +1363,8 @@ class FirestoreTimelineStore:
             existing = None
         if existing is not None:
             if raw_source is not None:
-                await self._require_existing_raw(
+                await self._require_or_retire_existing_raw(
                     client=await self._client(),
-                    transaction=None,
                     entry=existing,
                     raw_source=raw_source,
                 )
@@ -1527,6 +1557,12 @@ class FirestoreTimelineStore:
         except asyncio.CancelledError:
             raise
         except _ReplayDetected as replay:
+            if raw_source is not None:
+                await self._require_or_retire_existing_raw(
+                    client=client,
+                    entry=replay.entry,
+                    raw_source=raw_source,
+                )
             return TimelineAppendAdopted(replay.entry)
         except TimelineStoreConflict:
             raise
@@ -1541,9 +1577,8 @@ class FirestoreTimelineStore:
                 raise TimelineStoreOutcomeUnknown from None
             if winner is not None:
                 if raw_source is not None:
-                    await self._require_existing_raw(
+                    await self._require_or_retire_existing_raw(
                         client=await self._client(),
-                        transaction=None,
                         entry=winner,
                         raw_source=raw_source,
                     )
@@ -1711,11 +1746,46 @@ class FirestoreTimelineStore:
             and receipt.expires_at == expected_expiry
         )
 
+    async def _read_deletion_receipt(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        transaction: TimelineTransactionPort | None,
+        entry: TimelineEntryV1,
+    ) -> TimelineRawDeletionReceiptV1 | None:
+        event = entry.content.event
+        receipt_id = timeline_raw_deletion_receipt_id(
+            self._target,
+            event.source_id,
+            event.raw_record_sha256,
+        )
+        stored = await self._read_one(
+            client=client,
+            transaction=transaction,
+            collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
+            document_id=timeline_raw_tombstone_document_id(
+                self._target,
+                event.source_id,
+            ),
+            kind=TimelineStorageKind.RAW_DELETION,
+            logical_id=receipt_id,
+            model_type=TimelineRawDeletionReceiptV1,
+        )
+        if stored is None:
+            return None
+        if (
+            stored.wrapper.revision != 0
+            or not self._deletion_receipt_matches_entry(stored.value, entry)
+        ):
+            raise TimelineStoreCorruptRecord
+        return stored.value
+
     async def _delete_expired_raw(
         self,
         *,
         client: AsyncFirestoreTimelineClientPort,
         entry: TimelineEntryV1,
+        raw_source: TimelineRawSourceV1,
         confirmed_at: str,
     ) -> TimelineRawDeletionReceiptV1:
         event = entry.content.event
@@ -1729,14 +1799,10 @@ class FirestoreTimelineStore:
 
         async def write(transaction: TimelineTransactionPort) -> None:
             nonlocal selected
-            current = await self._read_one(
+            current = await self._read_deletion_receipt(
                 client=client,
                 transaction=transaction,
-                collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
-                document_id=tombstone_document_id,
-                kind=TimelineStorageKind.RAW_DELETION,
-                logical_id=logical_id,
-                model_type=TimelineRawDeletionReceiptV1,
+                entry=entry,
             )
             raw = await self._read_raw_one(
                 client=client,
@@ -1745,32 +1811,22 @@ class FirestoreTimelineStore:
             )
             if raw is not None and raw != _raw_evidence(
                 entry=entry,
-                raw_source=raw.raw_source,
+                raw_source=raw_source,
             ):
-                raise TimelineStoreCorruptRecord
+                raise TimelineStoreConflict
             if current is not None:
-                if (
-                    current.wrapper.revision != 0
-                    or not self._deletion_receipt_matches_entry(current.value, entry)
-                ):
+                if raw is not None:
                     raise TimelineStoreCorruptRecord
-                selected = current.value
-                prepared = _PreparedDocument(
-                    wrapper=current.wrapper,
-                    value=current.value,
-                    collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
-                    document_id=tombstone_document_id,
-                )
-            else:
-                selected = expected
-                prepared = _prepared_document(
-                    kind=TimelineStorageKind.RAW_DELETION,
-                    logical_id=logical_id,
-                    collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
-                    document_id=tombstone_document_id,
-                    revision=0,
-                    value=expected,
-                )
+                raise _RawDeletionReplay(current)
+            selected = expected
+            prepared = _prepared_document(
+                kind=TimelineStorageKind.RAW_DELETION,
+                logical_id=logical_id,
+                collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
+                document_id=tombstone_document_id,
+                revision=0,
+                value=expected,
+            )
             transaction.delete(
                 self._reference(
                     client,
@@ -1783,10 +1839,7 @@ class FirestoreTimelineStore:
                 prepared.collection,
                 prepared.document_id,
             )
-            if current is None:
-                transaction.create(receipt_reference, _document_data(prepared.wrapper))
-            else:
-                transaction.update(receipt_reference, _document_data(prepared.wrapper))
+            transaction.create(receipt_reference, _document_data(prepared.wrapper))
 
         try:
             async with asyncio.timeout(FIRESTORE_TIMELINE_TIMEOUT_SECONDS):
@@ -1798,17 +1851,17 @@ class FirestoreTimelineStore:
                 )
         except asyncio.CancelledError:
             raise
+        except _RawDeletionReplay as replay:
+            return replay.receipt
         except TimelineStoreCorruptRecord:
             raise
+        except TimelineStoreConflict:
+            raise
         except Exception:
-            adopted = await self._read_one(
+            adopted = await self._read_deletion_receipt(
                 client=client,
                 transaction=None,
-                collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
-                document_id=tombstone_document_id,
-                kind=TimelineStorageKind.RAW_DELETION,
-                logical_id=logical_id,
-                model_type=TimelineRawDeletionReceiptV1,
+                entry=entry,
             )
             remaining = await self._read_raw_one(
                 client=client,
@@ -1818,10 +1871,10 @@ class FirestoreTimelineStore:
             if (
                 adopted is None
                 or remaining is not None
-                or not self._deletion_receipt_matches_entry(adopted.value, entry)
+                or not self._deletion_receipt_matches_entry(adopted, entry)
             ):
                 raise TimelineStoreOutcomeUnknown from None
-            return adopted.value
+            return adopted
         if selected is None:
             raise TimelineStoreOutcomeUnknown
         return selected
@@ -1845,27 +1898,23 @@ class FirestoreTimelineStore:
         summary = await self.read_page(summary_command)
         client = await self._client()
         evaluated_at = _utc_second(self._clock())
-        evaluated = _parse_utc_second(evaluated_at)
         try:
             async def read_lifecycle(
                 entry: TimelineEntryV1,
             ) -> tuple[TimelineRawEvidenceV1 | None, TimelineRawDeletionReceiptV1 | None]:
-                expires = _parse_utc_second(entry.content.recorded_at) + timedelta(
-                    days=entry.content.event.raw_retention_days
-                )
-                if evaluated >= expires:
-                    receipt = await self._delete_expired_raw(
+                raw, receipt = await asyncio.gather(
+                    self._read_raw_one(
                         client=client,
+                        transaction=None,
+                        source_id=entry.content.event.source_id,
+                    ),
+                    self._read_deletion_receipt(
+                        client=client,
+                        transaction=None,
                         entry=entry,
-                        confirmed_at=evaluated_at,
-                    )
-                    return None, receipt
-                raw = await self._read_raw_one(
-                    client=client,
-                    transaction=None,
-                    source_id=entry.content.event.source_id,
+                    ),
                 )
-                return raw, None
+                return raw, receipt
 
             lifecycle = await asyncio.gather(
                 *(read_lifecycle(entry) for entry in summary.entries)

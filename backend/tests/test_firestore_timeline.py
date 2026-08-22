@@ -694,7 +694,7 @@ async def test_signed_intent_is_read_by_receipt_bound_envelope_digest() -> None:
 
 
 @_async_test
-async def test_raw_export_deletes_expired_raw_and_returns_durable_receipt() -> None:
+async def test_write_replay_retires_expired_raw_and_export_replays_without_writes() -> None:
     now = [NOW]
     client = _Client()
     store = _store(client, clock=lambda: now[0])
@@ -709,6 +709,22 @@ async def test_raw_export_deletes_expired_raw_and_returns_durable_receipt() -> N
     )
 
     now[0] = NOW + timedelta(days=30)
+    retained = await store.append_with_raw(event, raw_source)
+    assert isinstance(retained, TimelineAppendAdopted)
+
+    raw_path = (
+        f"{TIMELINE_RAW_COLLECTION}/"
+        f"{timeline_raw_document_id(TARGET, event.source_id)}"
+    )
+    assert raw_path not in client.documents
+    tombstone_path = (
+        f"{TIMELINE_RAW_TOMBSTONE_COLLECTION}/"
+        f"{timeline_raw_tombstone_document_id(TARGET, event.source_id)}"
+    )
+    assert tombstone_path in client.documents
+    retained_write_count = client.write_count
+    retained_transaction_count = client.transaction_count
+
     deleted = await store.read_raw_export(command)
     deleted_export = await TimelineRawExportService(target=TARGET, store=store).export(
         command,
@@ -721,20 +737,10 @@ async def test_raw_export_deletes_expired_raw_and_returns_durable_receipt() -> N
     assert deleted_export.entries[0].record_sha256 == raw_source.record_sha256
     assert deleted_export.entries[0].deletion_receipt_id is not None
     assert deleted_export.entries[0].deletion_receipt_sha256 is not None
-
-    raw_path = (
-        f"{TIMELINE_RAW_COLLECTION}/"
-        f"{timeline_raw_document_id(TARGET, event.source_id)}"
-    )
-    assert raw_path not in client.documents
-    tombstone_path = (
-        f"{TIMELINE_RAW_TOMBSTONE_COLLECTION}/"
-        f"{timeline_raw_tombstone_document_id(TARGET, event.source_id)}"
-    )
-    assert tombstone_path in client.documents
     replay = await store.read_raw_export(command)
-    assert replay.raw_evidence == (None,)
-    assert replay.deletion_receipts == deleted.deletion_receipts
+    assert replay == deleted
+    assert client.write_count == retained_write_count
+    assert client.transaction_count == retained_transaction_count
 
 
 @_async_test
