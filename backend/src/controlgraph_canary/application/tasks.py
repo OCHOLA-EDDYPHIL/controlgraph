@@ -37,6 +37,7 @@ RECOVERY_HANDLER_PATH: Final = "/v1/internal/tasks/recover"
 MAX_SCHEDULE_DELAY_SECONDS: Final = 600
 MAX_TASK_AGE_SECONDS: Final = 900
 TASK_DISPATCH_DEADLINE_SECONDS: Final = 60
+MIN_RECOVERY_DELIVERY_MARGIN_SECONDS: Final = 120
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
@@ -148,6 +149,7 @@ class TaskAddressor:
         evaluation_time = _require_utc_second(now)
         scheduled_for = _parse_utc_second(request.scheduled_at)
         expires_at = _parse_utc_second(request.expires_at)
+        route = _route_for_action(request.intent.action)
         if request.queue_region != self._settings.region:
             raise TaskAddressingError("task queue region does not match configuration")
         if (
@@ -161,8 +163,15 @@ class TaskAddressor:
             raise TaskAddressingError("task schedule exceeds the delay bound")
         if (expires_at - scheduled_for).total_seconds() > MAX_TASK_AGE_SECONDS:
             raise TaskAddressingError("task lifetime exceeds the age bound")
+        if (
+            route is TaskRoute.RECOVERY
+            and (
+                expires_at - max(evaluation_time, scheduled_for)
+            ).total_seconds()
+            < MIN_RECOVERY_DELIVERY_MARGIN_SECONDS
+        ):
+            raise TaskAddressingError("recovery task delivery margin is exhausted")
 
-        route = _route_for_action(request.intent.action)
         queue_id, service_url, caller, handler_path = self._route_configuration(route)
         if request.handler_audience != service_url:
             raise TaskAddressingError("task audience does not match the service audience")
@@ -411,6 +420,7 @@ __all__ = [
     "EXECUTOR_SERVICE_NAME",
     "MAX_SCHEDULE_DELAY_SECONDS",
     "MAX_TASK_AGE_SECONDS",
+    "MIN_RECOVERY_DELIVERY_MARGIN_SECONDS",
     "RECOVERY_HANDLER_PATH",
     "RECOVERY_QUEUE_ID",
     "RECOVERY_SERVICE_NAME",

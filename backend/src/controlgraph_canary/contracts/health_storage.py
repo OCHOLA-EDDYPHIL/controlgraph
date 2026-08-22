@@ -820,10 +820,17 @@ class HealthStorageDocumentV1(StrictContractModel):
                 RecoveryDispatchState.DUPLICATE: 2,
                 RecoveryDispatchState.AMBIGUOUS: 2,
             }[dispatch.state]
+        revision_matches = self.revision == expected_revision
+        if (
+            self.record_kind is HealthStorageKind.RECOVERY_DISPATCH
+            and cast(RecoveryDispatchStorageRecordV2, payload).state
+            is RecoveryDispatchState.AMBIGUOUS
+        ):
+            revision_matches = self.revision in {2, 3}
         if (
             self.logical_id != expected_logical_id
             or self.target != expected_target
-            or self.revision != expected_revision
+            or not revision_matches
         ):
             raise ValueError("health storage wrapper binding is invalid")
         return self

@@ -22,6 +22,9 @@ from controlgraph_canary.contracts.codec import (
 )
 from controlgraph_canary.contracts.health import HealthDecisionStatus
 from controlgraph_canary.contracts.health_storage import (
+    HEALTH_STORAGE_DOCUMENT_V1,
+    HealthStorageDocumentV1,
+    HealthStorageKind,
     RecoveryDispatchStorageRecordV2,
     create_recovery_dispatch_storage_record,
     health_storage_payload_fits,
@@ -739,6 +742,37 @@ def test_revoked_v2_dispatch_storage_projection_is_bounded_and_lossless() -> Non
     )
     with pytest.raises(ValidationError, match="storage bindings"):
         _replace(storage_record, task_canonical_payload=tampered_payload)
+
+
+def test_health_storage_allows_revision_three_only_for_ambiguous_dispatch() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    ambiguous = create_recovery_dispatch_storage_record(
+        _dispatch_record(bundle, state=RecoveryDispatchState.AMBIGUOUS)
+    )
+    wrapper = HealthStorageDocumentV1(
+        schema_version=HEALTH_STORAGE_DOCUMENT_V1,
+        record_kind=HealthStorageKind.RECOVERY_DISPATCH,
+        target=ambiguous.target,
+        logical_id=ambiguous.dispatch_id,
+        revision=3,
+        mutation_id="abandon-terminal-dispatch-001",
+        canonical_payload=canonical_json_bytes(ambiguous).decode("utf-8"),
+        payload_sha256=canonical_sha256(ambiguous),
+    )
+
+    assert wrapper.revision == 3
+
+    created = create_recovery_dispatch_storage_record(
+        _dispatch_record(bundle, state=RecoveryDispatchState.CREATED)
+    )
+    with pytest.raises(ValidationError, match="wrapper binding"):
+        HealthStorageDocumentV1(
+            **{
+                **wrapper.model_dump(mode="python"),
+                "canonical_payload": canonical_json_bytes(created).decode("utf-8"),
+                "payload_sha256": canonical_sha256(created),
+            }
+        )
 
 
 def test_dispatch_state_machine_does_not_reconstruct_enqueue_authority() -> None:

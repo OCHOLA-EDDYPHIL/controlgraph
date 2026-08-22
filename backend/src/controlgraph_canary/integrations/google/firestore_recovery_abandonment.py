@@ -198,6 +198,34 @@ def _health_document_data(document: HealthStorageDocumentV1) -> dict[str, Any]:
     return data
 
 
+def _dispatch_state_is_abandonable(
+    stored: StoredRecord[RecoveryDispatchRecordV2],
+) -> bool:
+    expected_revision = {
+        RecoveryDispatchState.ENQUEUE_STARTED: 1,
+        RecoveryDispatchState.CREATED: 2,
+        RecoveryDispatchState.DUPLICATE: 2,
+    }
+    return stored.revision == expected_revision.get(stored.value.state)
+
+
+def _dispatch_epoch_is_abandonable(
+    authority: EpochAuthorityRecord,
+    *,
+    command_epoch: int,
+    dispatch_epoch: int,
+) -> bool:
+    if authority.current_epoch != command_epoch:
+        return False
+    if dispatch_epoch == command_epoch:
+        return True
+    return (
+        dispatch_epoch + 1 == command_epoch
+        and authority.previous_epoch == dispatch_epoch
+        and authority.cause is EpochChangeCause.OPERATOR_REVOCATION
+    )
+
+
 def _validate_abandonment_claim_fence_authority(
     configured_target: TargetBinding,
     expected_claim: StoredRecord[ServiceClaimRecord],
@@ -253,8 +281,7 @@ def _validate_recovery_abandonment_fence_commit(
         or type(expected.recovery_dispatch) is not StoredRecord
         or type(expected.recovery_dispatch.value) is not RecoveryDispatchRecordV2
         or expected.recovery_receipt is not None
-        or expected.recovery_dispatch.revision != 1
-        or expected.recovery_dispatch.value.state is not RecoveryDispatchState.ENQUEUE_STARTED
+        or not _dispatch_state_is_abandonable(expected.recovery_dispatch)
         or any(
             value is not None
             for value in (
@@ -310,6 +337,8 @@ def _validate_recovery_abandonment_fence_commit(
     abandonment_proof = replacement_claim.terminal_root_proof
     root = bundle.root.value
     authority = bundle.authority.value
+    previous_dispatch_revision = expected.recovery_dispatch.revision
+    ambiguous_dispatch_revision = previous_dispatch_revision + 1
     previous_head = current_evidence_chain_head(
         bundle,
         target=configured_target,
@@ -321,17 +350,32 @@ def _validate_recovery_abandonment_fence_commit(
         or type(abandonment_proof) is not ServiceClaimAbandonmentProofV1
         or intent.root_id != command.root_id
         or intent.root_sha256 != command.expected_root_sha256
-        or intent.epoch != command.expected_epoch
+        or intent.epoch != dispatch.epoch
         or intent.command_sha256 != dispatch.command_sha256
         or recovery_command_sha256(intent.command) != intent.command_sha256
         or replacement_dispatch.state is not RecoveryDispatchState.AMBIGUOUS
         or replacement_dispatch.result is None
         or replacement_dispatch.result.enqueue_disposition != "AMBIGUOUS"
-        or replacement_dispatch.terminal_at != progress.fenced_at
+        or (
+            previous_dispatch_revision == 1
+            and replacement_dispatch.terminal_at != progress.fenced_at
+        )
+        or (
+            previous_dispatch_revision == 2
+            and (
+                replacement_dispatch.terminal_at != dispatch.terminal_at
+                or replacement_dispatch.terminal_at is None
+                or replacement_dispatch.terminal_at > progress.fenced_at
+            )
+        )
         or recovery_dispatch_record_sha256(dispatch) != command.expected_dispatch_sha256
         or dispatch.dispatch_id != command.recovery_dispatch_id
         or dispatch.dispatch_id != recovery_dispatch_id(intent.command_sha256)
-        or dispatch.epoch != command.expected_epoch
+        or not _dispatch_epoch_is_abandonable(
+            authority,
+            command_epoch=command.expected_epoch,
+            dispatch_epoch=dispatch.epoch,
+        )
         or dispatch.root_id != command.root_id
         or dispatch.root_sha256 != command.expected_root_sha256
         or dispatch.target != configured_target
@@ -352,7 +396,7 @@ def _validate_recovery_abandonment_fence_commit(
         or abandonment_proof.recovery_dispatch_id != dispatch.dispatch_id
         or abandonment_proof.recovery_dispatch_sha256
         != recovery_dispatch_record_sha256(replacement_dispatch)
-        or abandonment_proof.recovery_dispatch_revision != 2
+        or abandonment_proof.recovery_dispatch_revision != ambiguous_dispatch_revision
         or abandonment_proof.recovery_receipt_id
         != execution_receipt_logical_id(configured_target, dispatch.idempotency_key)
         or abandonment_proof.receipt_absent_at_fence is not True
@@ -385,8 +429,8 @@ def _validate_recovery_abandonment_fence_commit(
         or abandonment_subject.previous_dispatch_sha256 != recovery_dispatch_record_sha256(dispatch)
         or abandonment_subject.ambiguous_dispatch_sha256
         != recovery_dispatch_record_sha256(replacement_dispatch)
-        or abandonment_subject.previous_dispatch_revision != 1
-        or abandonment_subject.ambiguous_dispatch_revision != 2
+        or abandonment_subject.previous_dispatch_revision != previous_dispatch_revision
+        or abandonment_subject.ambiguous_dispatch_revision != ambiguous_dispatch_revision
         or abandonment_subject.task_id != dispatch.task.task_id
         or abandonment_subject.task_name != dispatch.task_name
         or abandonment_subject.task_sha256 != dispatch.task_sha256
@@ -524,7 +568,8 @@ def _validate_recovery_abandonment_finalize_commit(
         or type(expected.recovery_intent.value) is not RecoveryIntentV1
         or type(expected.recovery_dispatch) is not StoredRecord
         or type(expected.recovery_dispatch.value) is not RecoveryDispatchRecordV2
-        or expected.recovery_dispatch.revision != 2
+        or expected.recovery_dispatch.revision
+        != expected.progress.value.abandonment_subject.ambiguous_dispatch_revision
         or expected.recovery_dispatch.value.state is not RecoveryDispatchState.AMBIGUOUS
         or expected.result is not None
         or expected.classification_evidence is not None
@@ -649,11 +694,20 @@ def _validate_recovery_abandonment_finalize_commit(
         or recovery_dispatch_record_sha256(dispatch) != progress.ambiguous_dispatch_sha256
         or dispatch.dispatch_id != progress.recovery_dispatch_id
         or dispatch.state is not RecoveryDispatchState.AMBIGUOUS
-        or dispatch.terminal_at != progress.fenced_at
+        or (
+            progress.abandonment_subject.previous_dispatch_revision == 1
+            and dispatch.terminal_at != progress.fenced_at
+        )
+        or (
+            progress.abandonment_subject.previous_dispatch_revision == 2
+            and (dispatch.terminal_at is None or dispatch.terminal_at > progress.fenced_at)
+        )
         or intent.command_sha256 != dispatch.command_sha256
         or intent.root_id != result.root_id
         or intent.root_sha256 != result.root_sha256
-        or intent.epoch + 1 != result.fenced_epoch
+        or intent.epoch != dispatch.epoch
+        or dispatch.epoch not in {command.expected_epoch, command.expected_epoch - 1}
+        or result.fenced_epoch != command.expected_epoch + 1
         or canonical_sha256(abandonment) != progress.abandonment_evidence_sha256
         or abandonment.event.evidence_id != progress.abandonment_evidence_id
         or canonical_sha256(fence) != progress.fence_evidence_sha256
@@ -1345,7 +1399,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 self._target,
                 commit.replacement_dispatch.dispatch_id,
             ),
-            revision=2,
+            revision=expected_dispatch.revision + 1,
             target=self._target,
             value=dispatch_storage,
         )
@@ -1637,7 +1691,10 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
             expected_writes=9,
         )
         return RecoveryAbandonmentFenceWriteResult(
-            recovery_dispatch=StoredRecord(commit.replacement_dispatch, 2),
+            recovery_dispatch=StoredRecord(
+                commit.replacement_dispatch,
+                expected_dispatch.revision + 1,
+            ),
             service_claim=_stored(claim_document),
             authority=_stored(authority_document),
             abandonment_evidence=_stored(abandonment_document),

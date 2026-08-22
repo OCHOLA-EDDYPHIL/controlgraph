@@ -176,7 +176,12 @@ class GoogleOneShotOidcTransport:
         ):
             raise InternalTransportError("internal request is outside its configured route")
         try:
-            token = self._token_provider.token(route.audience)
+            token = await asyncio.to_thread(
+                self._token_provider.token,
+                route.audience,
+            )
+        except asyncio.CancelledError:
+            raise
         except InternalTransportError:
             raise
         except Exception:

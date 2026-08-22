@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import re
+import threading
 from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
@@ -318,6 +321,55 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
     assert metadata.headers["x-controlgraph-correlation-id"] == metadata.json()["correlation_id"]
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 404
+
+
+def test_blocking_identity_checks_do_not_starve_the_asgi_event_loop() -> None:
+    role = ServiceRole.COORDINATOR
+    policy = runtime_route_policy(role, _environment(role))
+    authorization = "Bearer header.payload.signature"
+    rendezvous = threading.Barrier(4)
+    authentication_threads: list[int] = []
+
+    class ConcurrentAuthenticator(_ExactTestAuthenticator):
+        def authenticate(
+            self,
+            authorization_header: str | None,
+            route_policy: RouteAuthenticationPolicy,
+        ) -> AuthenticationContext:
+            authentication_threads.append(threading.get_ident())
+            rendezvous.wait(timeout=5)
+            return super().authenticate(authorization_header, route_policy)
+
+    authenticator = ConcurrentAuthenticator(authorization)
+    app = create_service_app(
+        role,
+        authenticator=authenticator,
+        authentication_policy=policy,
+    )
+
+    async def exercise() -> tuple[list[int], int]:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="https://controlgraph.test",
+        ) as client:
+            protected = await asyncio.gather(
+                *(
+                    client.post(
+                        protected_paths(role)[0],
+                        headers={"Authorization": authorization},
+                    )
+                    for _ in range(rendezvous.parties)
+                )
+            )
+            health = await client.get("/healthz")
+        return [response.status_code for response in protected], health.status_code
+
+    protected_statuses, health_status = asyncio.run(exercise())
+
+    assert protected_statuses == [503] * rendezvous.parties
+    assert health_status == 200
+    assert not rendezvous.broken
+    assert len(set(authentication_threads)) == rendezvous.parties
 
 
 @pytest.mark.parametrize("role", tuple(ServiceRole))

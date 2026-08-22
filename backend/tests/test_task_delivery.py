@@ -18,6 +18,7 @@ from controlgraph_canary.application.tasks import (
     EXECUTION_HANDLER_PATH,
     MAX_SCHEDULE_DELAY_SECONDS,
     MAX_TASK_AGE_SECONDS,
+    MIN_RECOVERY_DELIVERY_MARGIN_SECONDS,
     RECOVERY_HANDLER_PATH,
     TASK_DISPATCH_DEADLINE_SECONDS,
     TASK_REGION,
@@ -554,8 +555,8 @@ def test_dispatch_prepared_recovery_accepts_delayed_valid_task() -> None:
         bundle.task,
         now=datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC),
     )
-    delayed = datetime(2026, 8, 21, 12, 10, 30, tzinfo=UTC)
-    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:10:30Z")
+    delayed = datetime(2026, 8, 21, 12, 9, 30, tzinfo=UTC)
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:30Z")
 
     result = asyncio.run(
         dispatcher.dispatch_prepared_recovery(
@@ -568,6 +569,37 @@ def test_dispatch_prepared_recovery_accepts_delayed_valid_task() -> None:
     assert result.disposition is TaskEnqueueDisposition.CREATED
     task = cast(dict[str, object], client.requests[0]["task"])
     assert task["schedule_time"] == datetime(2026, 8, 21, 12, 9, 30, tzinfo=UTC)
+
+
+def test_dispatch_prepared_recovery_rejects_exhausted_delivery_margin() -> None:
+    bundle = make_unhealthy_v3_recovery_bundle()
+    client = _CapturingClient()
+    addressor = TaskAddressor(recovery_delivery_settings(bundle))
+    dispatcher = TaskDispatcher(
+        addressor,
+        GoogleCloudTasksEnqueuer(client, addressor),
+    )
+    addressed = dispatcher.prepare(
+        bundle.task,
+        now=datetime(2026, 8, 21, 12, 9, 15, tzinfo=UTC),
+    )
+    delayed = datetime(2026, 8, 21, 12, 10, 21, tzinfo=UTC)
+    permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:10:21Z")
+
+    with pytest.raises(TaskAddressingError, match="delivery margin"):
+        asyncio.run(
+            dispatcher.dispatch_prepared_recovery(
+                addressed,
+                permit=permit,
+                now=delayed,
+            )
+        )
+
+    assert (bundle.task.expires_at, MIN_RECOVERY_DELIVERY_MARGIN_SECONDS) == (
+        "2026-08-21T12:11:30Z",
+        120,
+    )
+    assert client.requests == []
 
 
 def test_dispatch_prepared_recovery_adopts_provider_duplicate_once() -> None:
