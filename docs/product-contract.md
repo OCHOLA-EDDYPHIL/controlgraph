@@ -70,6 +70,7 @@ schema version. The implementation uses these logical record families:
 | `controlgraph.execution-receipt/v1` | Durable request binding and execution classification. |
 | `controlgraph.monitoring-metric-query/v1` and related sample/observation records | Exact candidate-revision Monitoring queries and canonical one-minute observations. |
 | `controlgraph.health-decision/v1` and signed proof records | Deterministic decision, complete input citations, prior state, and signed chain linkage. |
+| `controlgraph.unhealthy-recovery-source/v1`, `controlgraph.revoked-v2-recovery-source/v1`, and `controlgraph.revoked-v3-recovery-source/v1` | Disjoint recovery triggers for automatic terminal-unhealthy V3 recovery and explicitly confirmed recovery of revoked V2 or V3 roots. |
 | Recovery intent, authorization, prestate, task, and dispatch records | Root-owned restore-only work bound to the captured stable snapshot, source receipt, trigger proof, current epoch, and addressed task. |
 | `controlgraph.evidence-event/v1` | Ordered, immutable statement about an authority or execution fact. |
 
@@ -195,6 +196,15 @@ separate recovery receipt route before one conditional traffic-only update namin
 stable revision at 100 percent. Completion requires exact independent readback, including
 unchanged approved concurrency. A model, recovery worker, or caller cannot select another revision
 or promote the candidate.
+
+A revoked V3 root has a separate, operator-only recovery source; the health pipeline never emits
+it automatically. It is admissible only when the current authority exactly equals a signed
+operator-revocation proof for N to N+1, an exact verified `APPLY_CANARY_V1` receipt is at the
+direct predecessor epoch N and is no later than the revocation commit, and a fresh signed prestate
+proves the exact root-derived 90/10 configuration at N+1. The operator must explicitly confirm
+`RECOVER_CAPTURED_STABLE` but cannot choose the recovery revision. The current N+1 authority is
+used to issue a new stable-only recovery capability; no capability from N is revived. After a
+verified recovery, service-claim release remains a separate authenticated operation.
 
 ### Revocation branch
 

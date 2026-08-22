@@ -56,6 +56,7 @@ RECOVERY_HEALTH_CHAIN_LOCATOR_V1: Final = "controlgraph.recovery-health-chain-lo
 RECOVERY_APPLY_RECEIPT_LOCATOR_V1: Final = "controlgraph.recovery-apply-receipt-locator/v1"
 UNHEALTHY_RECOVERY_SOURCE_V1: Final = "controlgraph.unhealthy-recovery-source/v1"
 REVOKED_V2_RECOVERY_SOURCE_V1: Final = "controlgraph.revoked-v2-recovery-source/v1"
+REVOKED_V3_RECOVERY_SOURCE_V1: Final = "controlgraph.revoked-v3-recovery-source/v1"
 RECOVERY_COMMAND_V2: Final = "controlgraph.recovery-command/v2"
 RECOVERY_INVOCATION_V2: Final = "controlgraph.recovery-invocation/v2"
 RECOVERY_INTENT_V1: Final = "controlgraph.recovery-intent/v1"
@@ -138,6 +139,7 @@ class RecoveryTriggerBasis(StrEnum):
 
     TERMINAL_UNHEALTHY_V3 = "TERMINAL_UNHEALTHY_V3"
     OPERATOR_CONFIRMED_REVOKED_V2 = "OPERATOR_CONFIRMED_REVOKED_V2"
+    OPERATOR_CONFIRMED_REVOKED_V3 = "OPERATOR_CONFIRMED_REVOKED_V3"
 
 
 class RecoveryDispatchIdentityKind(StrEnum):
@@ -430,8 +432,43 @@ class RevokedV2RecoverySourceV1(StrictContractModel):
         return self
 
 
+class RevokedV3RecoverySourceV1(StrictContractModel):
+    """Explicit operator trigger for a revoked current V3 rollout root."""
+
+    schema_version: Literal["controlgraph.revoked-v3-recovery-source/v1"]
+    basis: Literal[RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V3]
+    root_schema_version: Literal["controlgraph.rollout-root/v3"]
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    target: TargetBinding
+    epoch: PositiveSafeInteger
+    confirmation: Literal["RECOVER_CAPTURED_STABLE"]
+    revocation_proof: EpochRevocationProofV1
+    revocation_proof_sha256: Sha256Digest
+    triggered_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_source(self) -> Self:
+        proof = self.revocation_proof
+        result = proof.result
+        if (
+            not _target_is_exact(self.target)
+            or self.root_id != f"cgroot:{self.root_sha256}"
+            or result.root_id != self.root_id
+            or result.root_sha256 != self.root_sha256
+            or result.target != self.target
+            or result.new_epoch != self.epoch
+            or proof.authority.current_epoch != self.epoch
+            or proof.authority.previous_epoch != result.previous_epoch
+            or self.revocation_proof_sha256 != canonical_sha256(proof)
+            or self.triggered_at != result.committed_at
+        ):
+            raise ValueError("revoked V3 recovery source proof is invalid")
+        return self
+
+
 type RecoverySourceV1 = Annotated[
-    UnhealthyRecoverySourceV1 | RevokedV2RecoverySourceV1,
+    UnhealthyRecoverySourceV1 | RevokedV2RecoverySourceV1 | RevokedV3RecoverySourceV1,
     Field(discriminator="basis"),
 ]
 type RecoveryRolloutRoot = Annotated[
@@ -477,11 +514,14 @@ class RecoveryCommandV2(StrictContractModel):
                 != source.health_chain_locator.expected_prestate_sha256
             ):
                 raise ValueError("unhealthy recovery command receipt is invalid")
-        elif (
-            type(source) is not RevokedV2RecoverySourceV1
-            or receipt.epoch != source.revocation_proof.result.previous_epoch
-        ):
-            raise ValueError("revoked V2 recovery command receipt is invalid")
+        elif type(source) is RevokedV2RecoverySourceV1:
+            if receipt.epoch != source.revocation_proof.result.previous_epoch:
+                raise ValueError("revoked V2 recovery command receipt is invalid")
+        elif type(source) is RevokedV3RecoverySourceV1:
+            if receipt.epoch != source.revocation_proof.result.previous_epoch:
+                raise ValueError("revoked V3 recovery command receipt is invalid")
+        else:
+            raise ValueError("recovery command source is invalid")
         return self
 
 
@@ -524,7 +564,7 @@ class RecoveryIntentV1(StrictContractModel):
 
 
 class RecoveryInvocationV2(StrictContractModel):
-    """Authenticated operator invocation reserved for V2 compatibility recovery."""
+    """Authenticated operator invocation for explicit revoked-root recovery."""
 
     schema_version: Literal["controlgraph.recovery-invocation/v2"]
     command: RecoveryCommandV2
@@ -538,11 +578,18 @@ class RecoveryInvocationV2(StrictContractModel):
     @model_validator(mode="after")
     def validate_invocation(self) -> Self:
         source = self.command.source
+        if type(source) not in (RevokedV2RecoverySourceV1, RevokedV3RecoverySourceV1):
+            raise ValueError("recovery invocation bindings are invalid")
+        revoked_source = cast(
+            RevokedV2RecoverySourceV1 | RevokedV3RecoverySourceV1,
+            source,
+        )
         if (
-            type(source) is not RevokedV2RecoverySourceV1
-            or source.confirmation != RECOVER_CAPTURED_STABLE
-            or self.operator_identity != source.revocation_proof.result.operator_identity
-            or self.operator_subject != source.revocation_proof.result.operator_subject
+            revoked_source.confirmation != RECOVER_CAPTURED_STABLE
+            or self.operator_identity
+            != revoked_source.revocation_proof.result.operator_identity
+            or self.operator_subject
+            != revoked_source.revocation_proof.result.operator_subject
             or _HUMAN_EMAIL.fullmatch(self.operator_identity) is None
             or self.operator_identity.endswith(".iam.gserviceaccount.com")
             or _API_AUDIENCE.fullmatch(self.operator_audience) is None
@@ -627,7 +674,9 @@ class RecoveryPrestateRequestV1(StrictContractModel):
         ):
             raise ValueError("recovery prestate request bindings are invalid")
         if (
-            type(self.root) is RolloutRootV3 and type(self.source) is not UnhealthyRecoverySourceV1
+            type(self.root) is RolloutRootV3
+            and type(self.source)
+            not in (UnhealthyRecoverySourceV1, RevokedV3RecoverySourceV1)
         ) or (
             type(self.root) is RolloutRootV2 and type(self.source) is not RevokedV2RecoverySourceV1
         ):
@@ -1176,7 +1225,11 @@ class RecoveryDispatchResultV2(StrictContractModel):
             or not self.scheduled_at < self.expires_at <= self.proof_valid_until
             or (
                 self.root_schema_version == "controlgraph.rollout-root/v3"
-                and self.trigger_basis is not RecoveryTriggerBasis.TERMINAL_UNHEALTHY_V3
+                and self.trigger_basis
+                not in {
+                    RecoveryTriggerBasis.TERMINAL_UNHEALTHY_V3,
+                    RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V3,
+                }
             )
             or (
                 self.root_schema_version == "controlgraph.rollout-root/v2"
@@ -1364,7 +1417,11 @@ class RecoveryReceiptLocatorV1(StrictContractModel):
 def recovery_trigger_proof_sha256(source: RecoverySourceV1) -> str:
     """Hash one mode-separated recovery source under a fixed domain."""
 
-    if type(source) not in (UnhealthyRecoverySourceV1, RevokedV2RecoverySourceV1):
+    if type(source) not in (
+        UnhealthyRecoverySourceV1,
+        RevokedV2RecoverySourceV1,
+        RevokedV3RecoverySourceV1,
+    ):
         raise TypeError("recovery trigger hashing requires an exact recovery source")
     return hashlib.sha256(_TRIGGER_DIGEST_DOMAIN + canonical_json_bytes(source)).hexdigest()
 
@@ -1660,6 +1717,69 @@ def create_revoked_v2_recovery_command(
     if type(verified_apply_receipt) is not RecoveryApplyReceiptLocatorV1:
         raise TypeError("revoked V2 recovery requires an exact APPLY receipt locator")
     source = create_revoked_v2_recovery_source(
+        root=root,
+        revocation_proof=revocation_proof,
+        confirmation=confirmation,
+    )
+    return RecoveryCommandV2(
+        schema_version=RECOVERY_COMMAND_V2,
+        root_id=source.root_id,
+        expected_root_sha256=source.root_sha256,
+        expected_epoch=source.epoch,
+        request_id=request_id,
+        idempotency_key=idempotency_key,
+        scheduled_at=scheduled_at,
+        verified_apply_receipt=verified_apply_receipt,
+        source=source,
+    )
+
+
+def create_revoked_v3_recovery_source(
+    *,
+    root: RolloutRootV3,
+    revocation_proof: EpochRevocationProofV1,
+    confirmation: Literal["RECOVER_CAPTURED_STABLE"],
+) -> RevokedV3RecoverySourceV1:
+    """Create an explicit operator-confirmed recovery source for a revoked V3 root."""
+
+    if type(root) is not RolloutRootV3:
+        raise TypeError("revoked V3 recovery requires an exact RolloutRootV3")
+    if type(revocation_proof) is not EpochRevocationProofV1:
+        raise TypeError("revoked V3 recovery requires an exact revocation proof")
+    if confirmation != RECOVER_CAPTURED_STABLE:
+        raise ValueError("revoked V3 recovery requires explicit confirmation")
+    validated_root = RolloutRootV3.model_validate(root)
+    proof = EpochRevocationProofV1.model_validate(revocation_proof)
+    return RevokedV3RecoverySourceV1(
+        schema_version=REVOKED_V3_RECOVERY_SOURCE_V1,
+        basis=RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V3,
+        root_schema_version="controlgraph.rollout-root/v3",
+        root_id=validated_root.root_id,
+        root_sha256=validated_root.root_sha256,
+        target=validated_root.content.target,
+        epoch=proof.authority.current_epoch,
+        confirmation=confirmation,
+        revocation_proof=proof,
+        revocation_proof_sha256=canonical_sha256(proof),
+        triggered_at=proof.result.committed_at,
+    )
+
+
+def create_revoked_v3_recovery_command(
+    *,
+    root: RolloutRootV3,
+    revocation_proof: EpochRevocationProofV1,
+    verified_apply_receipt: RecoveryApplyReceiptLocatorV1,
+    request_id: str,
+    idempotency_key: str,
+    scheduled_at: str,
+    confirmation: Literal["RECOVER_CAPTURED_STABLE"],
+) -> RecoveryCommandV2:
+    """Derive an explicitly confirmed captured-stable command for a revoked V3 root."""
+
+    if type(verified_apply_receipt) is not RecoveryApplyReceiptLocatorV1:
+        raise TypeError("revoked V3 recovery requires an exact APPLY receipt locator")
+    source = create_revoked_v3_recovery_source(
         root=root,
         revocation_proof=revocation_proof,
         confirmation=confirmation,
@@ -1984,6 +2104,7 @@ __all__ = [
     "RECOVERY_TASK_REQUEST_V2",
     "RECOVER_CAPTURED_STABLE",
     "REVOKED_V2_RECOVERY_SOURCE_V1",
+    "REVOKED_V3_RECOVERY_SOURCE_V1",
     "UNHEALTHY_RECOVERY_SOURCE_V1",
     "RecoveryApplyReceiptLocatorV1",
     "RecoveryAuthorizationV1",
@@ -2009,6 +2130,7 @@ __all__ = [
     "RecoveryTaskRequestV2",
     "RecoveryTriggerBasis",
     "RevokedV2RecoverySourceV1",
+    "RevokedV3RecoverySourceV1",
     "UnhealthyRecoverySourceV1",
     "create_recovery_apply_receipt_locator",
     "create_recovery_authorization",
@@ -2021,6 +2143,8 @@ __all__ = [
     "create_recovery_receipt_locator",
     "create_revoked_v2_recovery_command",
     "create_revoked_v2_recovery_source",
+    "create_revoked_v3_recovery_command",
+    "create_revoked_v3_recovery_source",
     "create_unhealthy_recovery_command",
     "create_unhealthy_recovery_source",
     "recovery_capability_id",

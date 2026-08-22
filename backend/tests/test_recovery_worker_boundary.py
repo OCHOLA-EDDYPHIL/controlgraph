@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from recovery_v2_test_data import (
     RecoveryV2Bundle,
     make_revoked_v2_recovery_bundle,
+    make_revoked_v3_recovery_bundle,
     make_unhealthy_recovery_chain,
     make_unhealthy_v3_recovery_bundle,
     make_v2_verified_apply_receipt,
@@ -101,6 +102,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryMutationIntentV2,
     RecoveryPrestateAttestationV1,
     RecoveryTaskRequestV2,
+    RevokedV3RecoverySourceV1,
 )
 from controlgraph_canary.contracts.root_creation import (
     CapabilityLineageAnchorV1,
@@ -136,7 +138,11 @@ class _RootReader:
             authority = bundle.command.source.revocation_proof.authority
         else:
             records = make_root_v3_records()
-            authority = records.authority
+            authority = (
+                bundle.command.source.revocation_proof.authority
+                if type(bundle.command.source) is RevokedV3RecoverySourceV1
+                else records.authority
+            )
         assert records.root == bundle.root
         self.target = bundle.root.content.target
         self.events = events
@@ -495,7 +501,11 @@ class _MutationAdapter:
 
 @pytest.mark.parametrize(
     "bundle_factory",
-    [make_unhealthy_v3_recovery_bundle, make_revoked_v2_recovery_bundle],
+    [
+        make_unhealthy_v3_recovery_bundle,
+        make_revoked_v2_recovery_bundle,
+        make_revoked_v3_recovery_bundle,
+    ],
 )
 def test_exact_recovery_v2_verifies_and_dispatches_after_both_final_reads(
     bundle_factory: object,
@@ -578,8 +588,18 @@ def test_final_gate_denies_deleted_or_substituted_recovery_source_receipt() -> N
     assert substituted_adapter.calls == []
 
 
-def test_epoch_change_after_prepare_denies_recovery_before_mutation() -> None:
-    bundle = make_unhealthy_v3_recovery_bundle()
+@pytest.mark.parametrize(
+    "bundle_factory",
+    [
+        make_unhealthy_v3_recovery_bundle,
+        make_revoked_v2_recovery_bundle,
+        make_revoked_v3_recovery_bundle,
+    ],
+)
+def test_epoch_change_after_prepare_denies_recovery_before_mutation(
+    bundle_factory: object,
+) -> None:
+    bundle = bundle_factory()  # type: ignore[operator]
     events: list[str] = []
     verified, reader, _, now = _verify(bundle, events=events, facade=True)
     events.clear()
@@ -589,9 +609,9 @@ def test_epoch_change_after_prepare_denies_recovery_before_mutation() -> None:
         changed = EpochAuthorityRecord.model_validate(
             {
                 **before.model_dump(mode="python"),
-                "current_epoch": 2,
-                "previous_epoch": 1,
-                "revision": 1,
+                "current_epoch": before.current_epoch + 1,
+                "previous_epoch": before.current_epoch,
+                "revision": before.revision + 1,
                 "cause": EpochChangeCause.OPERATOR_REVOCATION,
                 "changed_by": "operator@example.test",
                 "request_id": "request-revoke-after-prepare",
@@ -602,7 +622,7 @@ def test_epoch_change_after_prepare_denies_recovery_before_mutation() -> None:
         reader.bundle = _AuthorityBundle(
             root=reader.bundle.root,
             service_claim=reader.bundle.service_claim,
-            authority=StoredRecord(changed, 1),
+            authority=StoredRecord(changed, changed.revision),
             lineage_anchor=reader.bundle.lineage_anchor,
         )
 
@@ -629,6 +649,7 @@ def test_epoch_change_after_prepare_denies_recovery_before_mutation() -> None:
     [
         (make_unhealthy_v3_recovery_bundle, make_root_v2_records),
         (make_revoked_v2_recovery_bundle, make_root_v3_records),
+        (make_revoked_v3_recovery_bundle, make_root_v2_records),
     ],
 )
 def test_final_gate_denies_recovery_request_with_cross_mode_root(

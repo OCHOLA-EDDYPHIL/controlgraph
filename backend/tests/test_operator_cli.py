@@ -9,7 +9,11 @@ from typing import Any
 
 import pytest
 from health_execution_test_data import make_health_root, make_healthy_chain
-from recovery_v2_test_data import make_revoked_v2_recovery_bundle
+from recovery_v2_test_data import (
+    make_revoked_v2_recovery_bundle,
+    make_revoked_v3_recovery_bundle,
+    make_unhealthy_v3_recovery_bundle,
+)
 from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
 from test_service_claim_release import _released_store
 
@@ -1087,8 +1091,9 @@ def test_cli_has_no_direct_cloud_store_kms_run_or_raw_http_paths() -> None:
 
 def _recovery_cli_fixture(
     tmp_path: Path,
+    bundle_factory: object = make_revoked_v2_recovery_bundle,
 ) -> tuple[argparse.Namespace, object, RecoveryDispatchResultV2]:
-    bundle = make_revoked_v2_recovery_bundle()
+    bundle = bundle_factory()  # type: ignore[operator]
     command_file = tmp_path / "recovery-command.json"
     command_file.write_bytes(canonical_json_bytes(bundle.command))
     authorization = bundle.authorization
@@ -1144,11 +1149,16 @@ def _recovery_cli_fixture(
     )
 
 
-def test_recovery_cli_posts_one_exact_revoked_v2_command(
+@pytest.mark.parametrize(
+    "bundle_factory",
+    [make_revoked_v2_recovery_bundle, make_revoked_v3_recovery_bundle],
+)
+def test_recovery_cli_posts_one_exact_revoked_root_command(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    bundle_factory: object,
 ) -> None:
-    args, command, result = _recovery_cli_fixture(tmp_path)
+    args, command, result = _recovery_cli_fixture(tmp_path, bundle_factory)
     poster = _Poster(
         InternalHttpResponse(
             status_code=200,
@@ -1161,6 +1171,23 @@ def test_recovery_cli_posts_one_exact_revoked_v2_command(
     assert len(poster.calls) == 1
     assert poster.calls[0]["body"] == canonical_json_bytes(command)  # type: ignore[arg-type]
     assert capsys.readouterr().out.strip() == canonical_json_bytes(result).decode()
+
+
+def test_recovery_cli_rejects_automatic_unhealthy_command(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command_file = tmp_path / "automatic-recovery-command.json"
+    command_file.write_bytes(canonical_json_bytes(make_unhealthy_v3_recovery_bundle().command))
+    args = argparse.Namespace(
+        project_number=PROJECT_NUMBER,
+        command_file=str(command_file),
+    )
+    poster = _Poster(InternalHttpResponse(status_code=200, content_type=None, body=b"{}"))
+
+    assert _run_recovery(args, command_runner=_Runner(), http_poster=poster) == 2
+    assert poster.calls == []
+    assert capsys.readouterr().out.strip() == '{"code": "RECOVERY_COMMAND_INVALID"}'
 
 
 def test_recovery_cli_rejects_substituted_result(

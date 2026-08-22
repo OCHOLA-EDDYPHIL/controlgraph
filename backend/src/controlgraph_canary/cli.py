@@ -60,6 +60,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryCommandV2,
     RecoveryDispatchResultV2,
     RevokedV2RecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     recovery_trigger_proof_sha256,
 )
 from controlgraph_canary.contracts.revocation import (
@@ -303,7 +304,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     recovery_parser = subparsers.add_parser(
         "recover-captured-stable",
-        help="dispatch one explicitly confirmed revoked-V2 stable recovery",
+        help="dispatch one explicitly confirmed revoked-root stable recovery",
     )
     recovery_parser.add_argument("--project-number", required=True)
     recovery_parser.add_argument(
@@ -863,12 +864,15 @@ def _run_recovery(
     command_runner: GcloudCommandRunner | None = None,
     http_poster: OneShotHttpPoster | None = None,
 ) -> int:
-    """Dispatch only the explicit revoked-V2 captured-stable command."""
+    """Dispatch only an explicit revoked-root captured-stable command."""
 
     try:
         command = _read_recovery_command(args.command_file)
-        if type(command.source) is not RevokedV2RecoverySourceV1:
-            raise ValueError("operator recovery requires the revoked-V2 source")
+        if type(command.source) not in (
+            RevokedV2RecoverySourceV1,
+            RevokedV3RecoverySourceV1,
+        ):
+            raise ValueError("operator recovery requires a revoked-root source")
         response_body = _post_operator_command(
             args.project_number,
             command,

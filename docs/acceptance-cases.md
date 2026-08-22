@@ -148,6 +148,43 @@ health-to-command reduction, transactional single-intent ownership, recovery-to-
 separation, binding to the captured stable revision, execution-time epoch validation, and explicit
 ambiguity handling.
 
+## Case B2: explicitly recover a revoked V3 canary
+
+This is the bounded recovery path for a V3 rollout that an operator revoked while its exact 90/10
+canary remained deployed. It is not an automatic consequence of revocation.
+
+### Initial state
+
+- The immutable V3 root captured stable revision S and candidate C, and an exact
+  `APPLY_CANARY_V1` receipt is `VERIFIED` at epoch N for the exact 90/10 configuration.
+- A signed operator-revocation proof records the direct N-to-N+1 transition and exactly matches the
+  current authority record.
+- Fresh verifier readback still observes the root-derived S/C revisions, approved concurrency, and
+  exact 90/10 traffic split.
+
+### Operator action
+
+The authenticated operator submits the root-bound recovery command and explicitly confirms
+`RECOVER_CAPTURED_STABLE`. The command contains no selectable recovery revision.
+
+### Expected data path and evidence
+
+1. The API admits only the explicit revoked-V3 source and preserves the operator identity bound by
+   the revocation proof; an automatic unhealthy command cannot enter this route.
+2. The coordinator claims or adopts one root-unique intent. The resolver and issuer each reread
+   current authority, require equality with the signed N-to-N+1 proof, verify its exact evidence
+   key and signature, and require the exact verified APPLY receipt at direct predecessor N to be
+   no later than the revocation commit.
+3. A fresh signed prestate attests the exact root-derived 90/10 configuration at N+1. The normal
+   stable-only recovery task, facade, separate receipt route, final authority read, conditional
+   target update, and independent readback then apply unchanged.
+4. Only captured stable revision S receives 100 percent traffic. The recovery receipt is
+   `VERIFIED`; the operator may then invoke the separate authenticated service-claim release flow.
+
+Stale or later authority, a non-predecessor or post-revocation receipt, wrong proof key or
+signature, missing confirmation, cross-root source, or any selected revision is denied before
+mutation. Epoch-N capability authority remains revoked throughout.
+
 ## Case C: delayed stale task after manual revocation
 
 This is the signature revocation case. The delayed action must be one that would visibly change

@@ -9,8 +9,10 @@ import pytest
 from recovery_v2_test_data import (
     RecoveryV2Bundle,
     make_revoked_v2_recovery_bundle,
+    make_revoked_v3_recovery_bundle,
     make_unhealthy_v3_recovery_bundle,
 )
+from root_v2_test_data import PROJECT_NUMBER
 from test_candidate_revision import _revision_configuration
 
 from controlgraph_canary.application.authority_store import (
@@ -26,7 +28,16 @@ from controlgraph_canary.application.cloud_run import (
     CloudRunTrafficStatus,
     cloud_run_revision_configuration_sha256,
 )
+from controlgraph_canary.application.identity import (
+    AuthenticationContext,
+    CallerBinding,
+    CallerRole,
+    RouteAuthenticationPolicy,
+    ServiceRole,
+    protected_path,
+)
 from controlgraph_canary.application.recovery_execution import (
+    ApiRecoveryClient,
     RecoveryExecutionError,
     RecoveryExecutionErrorCode,
     RecoveryRolloutCoordinator,
@@ -36,21 +47,29 @@ from controlgraph_canary.application.recovery_store import (
     DirectRecoveryEnqueueStart,
     RecoveryEnqueuePermit,
 )
+from controlgraph_canary.application.root_trust import CoordinatorInternalRoute
 from controlgraph_canary.application.tasks import (
     AddressedTask,
     TaskEnqueueDisposition,
     TaskEnqueueResult,
     TaskRoute,
 )
-from controlgraph_canary.contracts.codec import canonical_sha256
+from controlgraph_canary.contracts.codec import (
+    canonical_json_bytes,
+    canonical_sha256,
+    decode_contract,
+)
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryAuthorizationV1,
     RecoveryCapabilityIssuanceResultV2,
     RecoveryCommandV2,
     RecoveryDispatchRecordV2,
+    RecoveryDispatchResultV2,
     RecoveryDispatchState,
     RecoveryIntentV1,
+    RecoveryInvocationV2,
     RecoveryTaskRequestV2,
+    RevokedV3RecoverySourceV1,
     create_recovery_intent,
     recovery_command_sha256,
 )
@@ -229,6 +248,16 @@ class _TaskDispatcher:
         )
 
 
+class _RecoveryApiTransport:
+    def __init__(self, response: RecoveryDispatchResultV2) -> None:
+        self._response = canonical_json_bytes(response)
+        self.calls: list[tuple[CoordinatorInternalRoute, bytes]] = []
+
+    async def post(self, route: CoordinatorInternalRoute, body: bytes) -> bytes:
+        self.calls.append((route, body))
+        return self._response
+
+
 def _coordinator(
     store: _DispatchStore,
     bundle: RecoveryV2Bundle | None = None,
@@ -243,7 +272,10 @@ def _coordinator(
         capability_client=capability,
         dispatch_store=store,
         task_dispatcher=dispatcher,
-        clock=lambda: datetime(2026, 8, 19, 12, 5, 11, tzinfo=UTC),
+        clock=lambda: datetime.strptime(
+            selected_bundle.authorization.issued_at,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=UTC),
     )
     return coordinator, resolver, capability, dispatcher
 
@@ -362,11 +394,17 @@ def test_recovery_prestate_accepts_only_exact_hosted_tagged_traffic() -> None:
     assert not _prestate_matches(request, unsafe_uri, stable, candidate)
 
 
-def test_recovery_coordinator_dispatches_once_and_adopts_terminal_result() -> None:
+@pytest.mark.parametrize(
+    "bundle_factory",
+    [make_revoked_v2_recovery_bundle, make_revoked_v3_recovery_bundle],
+)
+def test_operator_recovery_coordinator_dispatches_once_and_adopts_terminal_result(
+    bundle_factory: object,
+) -> None:
     async def scenario() -> None:
-        bundle = _recovery_bundle()
+        bundle = bundle_factory()  # type: ignore[operator]
         store = _DispatchStore(bundle)
-        coordinator, resolver, capability, dispatcher = _coordinator(store)
+        coordinator, resolver, capability, dispatcher = _coordinator(store, bundle)
 
         created = await coordinator.dispatch(bundle.command)
         replay = await coordinator.dispatch(bundle.command)
@@ -380,6 +418,69 @@ def test_recovery_coordinator_dispatches_once_and_adopts_terminal_result() -> No
         assert store.dispatch_record is not None
         assert store.dispatch_record.revision == 2
         assert store.dispatch_record.value.state is RecoveryDispatchState.CREATED
+
+    asyncio.run(scenario())
+
+
+def test_api_recovery_client_admits_revoked_v3_and_rejects_unhealthy() -> None:
+    async def scenario() -> None:
+        bundle = make_revoked_v3_recovery_bundle()
+        store = _DispatchStore(bundle)
+        coordinator, _, _, _ = _coordinator(store, bundle)
+        expected = await coordinator.dispatch(bundle.command)
+        project_id = bundle.root.content.target.project_id
+        api_audience = (
+            f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
+        )
+        coordinator_audience = (
+            f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+        )
+        source = bundle.command.source
+        assert type(source) is RevokedV3RecoverySourceV1
+        transport = _RecoveryApiTransport(expected)
+        client = ApiRecoveryClient(
+            route=CoordinatorInternalRoute(
+                project_id=project_id,
+                project_number=PROJECT_NUMBER,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=coordinator_audience,
+            ),
+            authentication_policy=RouteAuthenticationPolicy(
+                project_id=project_id,
+                project_number=PROJECT_NUMBER,
+                service_role=ServiceRole.API,
+                path=protected_path(ServiceRole.API),
+                audience=api_audience,
+                caller=CallerBinding(
+                    role=CallerRole.OPERATOR,
+                    email=source.revocation_proof.result.operator_identity,
+                    subject=source.revocation_proof.result.operator_subject,
+                ),
+            ),
+            transport=transport,
+        )
+        principal = AuthenticationContext(
+            role=CallerRole.OPERATOR,
+            email=source.revocation_proof.result.operator_identity,
+            subject=source.revocation_proof.result.operator_subject,
+            issuer="https://accounts.google.com",
+            audience=api_audience,
+            issued_at=1_787_313_000,
+            expires_at=1_787_313_600,
+        )
+
+        assert await client.dispatch(bundle.command, principal) == expected
+        assert len(transport.calls) == 1
+        invocation = decode_contract(transport.calls[0][1], RecoveryInvocationV2)
+        assert invocation.command == bundle.command
+        assert invocation.operator_identity == principal.email
+
+        unhealthy = make_unhealthy_v3_recovery_bundle()
+        with pytest.raises(RecoveryExecutionError) as denied:
+            await client.dispatch(unhealthy.command, principal)
+        assert denied.value.code is RecoveryExecutionErrorCode.COMMAND_DENIED
+        assert len(transport.calls) == 1
 
     asyncio.run(scenario())
 

@@ -68,6 +68,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryPrestateAttestationV1,
     RecoveryTaskRequestV2,
     RevokedV2RecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     UnhealthyRecoverySourceV1,
     recovery_capability_id,
     recovery_target_configuration_sha256,
@@ -645,6 +646,15 @@ class CapabilityVerifier:
         ) or (
             type(root) is RolloutRootV2
             and type(source) is RevokedV2RecoverySourceV1
+            and authorization.root_schema_version == root.schema_version
+            and source.epoch == authorization.epoch
+            and source.revocation_proof.authority.current_epoch
+            == authorization.epoch
+            and source.revocation_proof.authority.previous_epoch
+            == authorization.verified_apply_receipt.epoch
+        ) or (
+            type(root) is RolloutRootV3
+            and type(source) is RevokedV3RecoverySourceV1
             and authorization.root_schema_version == root.schema_version
             and source.epoch == authorization.epoch
             and source.revocation_proof.authority.current_epoch

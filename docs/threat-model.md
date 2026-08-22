@@ -159,6 +159,7 @@ readback, immutable request bindings, and signed evidence make omission or alter
 | Ambiguous Firestore write | Mutation identity, canonical wrapper, exact readback, and explicit unknown outcome. | Lose the commit response; adopt only the exact stored poststate, otherwise return unknown. |
 | Concurrent root creation | Canonical service-claim key and transactional root/claim/authority creation. | Racing creates for one service produce exactly one active root. |
 | Recovery abuse | Separate task caller, recovery identity, executor facade, receipt route, signed verifier prestate, and restore-only adapter purpose; no direct recovery target permissions. | Substitute a prior APPLY receipt, candidate or arbitrary revision, prestate, root, epoch, or facade response and observe a fail-closed denial before mutation. |
+| Revoked-root recovery replay | Distinct revoked-V3 trigger; explicit operator confirmation; current signed N-to-N+1 revocation proof; direct-predecessor verified APPLY receipt; fresh exact-90/10 prestate; root-derived stable target. | Substitute stale or later authority, a non-predecessor or post-revocation receipt, a different evidence key or signature, an unhealthy source on the operator route, or an operator-selected revision and observe denial before mutation. |
 | Evidence tampering or omission | Canonical event identity, append-only records, signed evidence where required, and independent target readback. | Alter or remove a record and detect a digest, signature, or sequence discontinuity. |
 | Prompt injection or unsafe model output | Models remain outside authority packages and call only a read-only application facade. | Adversarial text cannot produce a capability, authority transition, task enqueue, or adapter call. |
 | Credential disclosure | Never log or persist authorization headers, tokens, signatures as secrets, private keys, or raw provider errors. | Secret-shaped fixtures are rejected or redacted and error chains expose no credential material. |
@@ -191,6 +192,13 @@ current prestate, claims only through the recovery receipt route, and uses the f
 the source receipt and current root and epoch before admitting a stable-only mutation. Duplicate
 deliveries can adopt or read back the exact receipt; they do not reconstruct dispatch authority or
 blindly repeat the provider call.
+
+Explicit recovery after a V3 operator revocation is not an exception to epoch fencing. The revoked
+epoch N remains invalid. A new recovery capability may be derived at N+1 only from the exact
+current signed revocation proof, an exact verified APPLY receipt at N, and fresh signed
+evidence that the same immutable root is still at its exact 90/10 prestate. The stable destination
+comes only from that root, not from the operator command, and recovery is never started
+automatically from the fact of revocation alone.
 
 ## Assumptions and non-goals
 

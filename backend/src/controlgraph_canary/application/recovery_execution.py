@@ -105,6 +105,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryPrestateSigningRequestV1,
     RecoveryTaskRequestV2,
     RevokedV2RecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     UnhealthyRecoverySourceV1,
     create_recovery_apply_receipt_locator,
     create_recovery_authorization,
@@ -948,6 +949,33 @@ class StoredRecoveryAuthorizationResolver:
                 raise
             except Exception:
                 raise _error(RecoveryExecutionErrorCode.TRIGGER_INVALID) from None
+        elif type(source) is RevokedV3RecoverySourceV1:
+            if type(trusted.root) is not RolloutRootV3:
+                raise _error(RecoveryExecutionErrorCode.TRIGGER_INVALID)
+            proof = source.revocation_proof
+            authority = trusted.authority
+            if (
+                trusted.authority_revision != authority.revision
+                or authority.revision < 1
+                or authority.current_epoch != source.epoch
+                or authority.previous_epoch != receipt.value.epoch
+                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+                or proof.authority != authority
+                or proof.result.previous_epoch != receipt.value.epoch
+                or proof.result.new_epoch != source.epoch
+                or _seconds(receipt.value.updated_at) > _seconds(proof.result.committed_at)
+                or proof.signed_evidence.signing_key_version
+                != trusted.root.content.evidence_signing_key_version
+                or self._revocation_evidence_verifier.evidence_key_version
+                != trusted.root.content.evidence_signing_key_version
+            ):
+                raise _error(RecoveryExecutionErrorCode.TRIGGER_INVALID)
+            try:
+                await self._revocation_evidence_verifier.verify(proof.signed_evidence)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise _error(RecoveryExecutionErrorCode.TRIGGER_INVALID) from None
         else:
             raise _error(RecoveryExecutionErrorCode.TRIGGER_INVALID)
         return _TrustedRecoveryInputs(
@@ -974,11 +1002,14 @@ class StoredRecoveryAuthorizationResolver:
         receipt = stored.value
         root = trusted.root
         source = command.source
-        expected_receipt_epoch = (
-            command.expected_epoch
-            if type(source) is UnhealthyRecoverySourceV1
-            else 1
-        )
+        if type(source) is UnhealthyRecoverySourceV1:
+            expected_receipt_epoch = command.expected_epoch
+        elif type(source) is RevokedV2RecoverySourceV1:
+            expected_receipt_epoch = 1
+        elif type(source) is RevokedV3RecoverySourceV1:
+            expected_receipt_epoch = source.revocation_proof.result.previous_epoch
+        else:
+            raise _error(RecoveryExecutionErrorCode.TRIGGER_INVALID)
         try:
             locator = create_recovery_apply_receipt_locator(
                 receipt,
@@ -1249,6 +1280,11 @@ class RecoveryRolloutCoordinator:
         if type(command.source) is UnhealthyRecoverySourceV1:
             # V3 intent must have been created in the terminal health append.
             raise _error(RecoveryExecutionErrorCode.TRUSTED_STATE_INVALID)
+        if type(command.source) not in (
+            RevokedV2RecoverySourceV1,
+            RevokedV3RecoverySourceV1,
+        ):
+            raise _error(RecoveryExecutionErrorCode.COMMAND_DENIED)
         try:
             proposed = create_recovery_intent(
                 command,
@@ -1503,7 +1539,7 @@ class RecoveryRolloutCoordinator:
 
 
 class ApiRecoveryClient:
-    """Forward only an explicitly confirmed revoked-V2 operator recovery."""
+    """Forward only an explicitly confirmed revoked-root operator recovery."""
 
     def __init__(
         self,
@@ -1535,7 +1571,8 @@ class ApiRecoveryClient:
     ) -> RecoveryDispatchResultV2:
         if (
             type(command) is not RecoveryCommandV2
-            or type(command.source) is not RevokedV2RecoverySourceV1
+            or type(command.source)
+            not in (RevokedV2RecoverySourceV1, RevokedV3RecoverySourceV1)
         ):
             raise _error(RecoveryExecutionErrorCode.COMMAND_DENIED)
         if not _context_matches_policy(
@@ -1587,7 +1624,7 @@ class ApiRecoveryClient:
 
 
 class CoordinatorRecoveryRelay:
-    """Authenticate API plus propagated operator before revoked-V2 recovery."""
+    """Authenticate API plus propagated operator before revoked-root recovery."""
 
     def __init__(
         self,
