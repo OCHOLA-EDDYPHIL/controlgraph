@@ -567,6 +567,52 @@ def test_nonempty_page_unit_must_match_the_exact_query_unit(unit: str) -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("query_index", [0, 1])
+def test_aggregated_page_accepts_empty_time_series_unit(query_index: int) -> None:
+    async def run() -> None:
+        query = _queries()[query_index]
+        series = (
+            _request_series(query, unit="")
+            if query_index == 0
+            else _latency_series(query, unit="")
+        )
+        response = _page(query, series, unit=query.unit)
+
+        result = await _collector(
+            FakeMetricServiceClient(FakePager((response,))),
+            query,
+        ).collect(query, timeout_seconds=10.0)
+
+        assert len(result.points) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("query_index, conflicting_unit", [(0, "ms"), (1, "1")])
+def test_conflicting_nonempty_time_series_unit_fails_closed(
+    query_index: int,
+    conflicting_unit: str,
+) -> None:
+    async def run() -> None:
+        query = _queries()[query_index]
+        series = (
+            _request_series(query, unit=conflicting_unit)
+            if query_index == 0
+            else _latency_series(query, unit=conflicting_unit)
+        )
+        response = _page(query, series, unit=query.unit)
+
+        with pytest.raises(MonitoringCollectionError) as failure:
+            await _collector(
+                FakeMetricServiceClient(FakePager((response,))),
+                query,
+            ).collect(query, timeout_seconds=10.0)
+
+        assert failure.value.code is MonitoringCollectionErrorCode.RESULT_INVALID
+
+    asyncio.run(run())
+
+
 @_async_test
 async def test_execution_errors_and_provider_failures_are_sanitized() -> None:
     query = _queries()[0]

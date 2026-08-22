@@ -318,6 +318,8 @@ def _decode_time_series(
 ) -> MonitoringCollectedPoint:
     if type(series) is not monitoring_v3.TimeSeries or len(series.points) != 1:
         raise MonitoringCollectionError(MonitoringCollectionErrorCode.RESULT_INVALID)
+    if series.unit not in {"", query.unit}:
+        raise MonitoringCollectionError(MonitoringCollectionErrorCode.RESULT_INVALID)
     _validate_series_labels(series, query)
     point = series.points[0]
     if type(point) is not monitoring_v3.Point:
@@ -330,7 +332,6 @@ def _decode_time_series(
         if (
             series.metric_kind != metric_pb2.MetricDescriptor.MetricKind.DELTA
             or series.value_type != metric_pb2.MetricDescriptor.ValueType.INT64
-            or series.unit != query.unit
             or value_kind != "int64_value"
         ):
             raise MonitoringCollectionError(
@@ -358,7 +359,6 @@ def _decode_time_series(
     if (
         series.metric_kind != metric_pb2.MetricDescriptor.MetricKind.GAUGE
         or series.value_type != metric_pb2.MetricDescriptor.ValueType.DOUBLE
-        or series.unit != query.unit
         or value_kind != "double_value"
     ):
         raise MonitoringCollectionError(MonitoringCollectionErrorCode.RESULT_INVALID)
