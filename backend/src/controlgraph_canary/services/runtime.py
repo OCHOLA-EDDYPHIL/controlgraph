@@ -87,6 +87,17 @@ from controlgraph_canary.application.receipt_execution import (
     RecoveryExecutorFacade,
     RecoveryTaskForwarder,
 )
+from controlgraph_canary.application.recovery_abandonment import (
+    RecoveryAbandoner,
+    RecoveryAbandonmentClassificationClient,
+)
+from controlgraph_canary.application.recovery_abandonment_relay import (
+    ApiRecoveryAbandonmentClient,
+    CoordinatorRecoveryAbandonmentRelay,
+)
+from controlgraph_canary.application.recovery_abandonment_store import (
+    RecoveryAbandonmentStore,
+)
 from controlgraph_canary.application.recovery_execution import (
     ApiRecoveryClient,
     CoordinatorRecoveryCapabilityClient,
@@ -160,6 +171,9 @@ from controlgraph_canary.contracts.operator_observability import (
     StableSnapshotCaptureRequestV1,
     TargetTrafficReadRequestV1,
 )
+from controlgraph_canary.contracts.recovery_abandonment import (
+    RecoveryAbandonmentClassificationRequestV1,
+)
 from controlgraph_canary.contracts.root_creation import RolloutRootV3
 from controlgraph_canary.contracts.root_trust import RootPreflightRequestV1
 from controlgraph_canary.contracts.service_claim_release import (
@@ -224,6 +238,7 @@ def create_runtime_service_app(
     authority_store: AuthorityStore | None = None,
     root_creation_clock: Callable[[], datetime] | None = None,
     service_claim_release_clock: Callable[[], datetime] | None = None,
+    recovery_abandonment_clock: Callable[[], datetime] | None = None,
     capability_issuance_clock: Callable[[], datetime] | None = None,
     canary_clock: Callable[[], datetime] | None = None,
     promotion_clock: Callable[[], datetime] | None = None,
@@ -278,6 +293,9 @@ def create_runtime_service_app(
     service_claim_releaser = None
     api_service_claim_release_client = None
     coordinator_service_claim_release_relay = None
+    recovery_abandoner = None
+    api_recovery_abandonment_client = None
+    coordinator_recovery_abandonment_relay = None
     api_canary_client = None
     coordinator_canary_relay = None
     api_promotion_client = None
@@ -534,7 +552,9 @@ def create_runtime_service_app(
         )
 
         def classification_reader_factory(
-            request: ServiceClaimClassificationRequestV1,
+            request: (
+                ServiceClaimClassificationRequestV1 | RecoveryAbandonmentClassificationRequestV1
+            ),
         ) -> CloudRunV2SnapshotReader:
             return CloudRunV2SnapshotReader(
                 configuration=CloudRunTargetConfiguration(
@@ -660,6 +680,17 @@ def create_runtime_service_app(
             attempt_id_factory=revocation_attempt_id_factory,
         )
         api_service_claim_release_client = ApiServiceClaimReleaseClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+        )
+        api_recovery_abandonment_client = ApiRecoveryAbandonmentClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
                 project_number=settings.project_number,
@@ -978,11 +1009,11 @@ def create_runtime_service_app(
             )
         )
     elif role is ServiceRole.COORDINATOR:
-        from controlgraph_canary.integrations.google.firestore import (
-            FirestoreAuthorityStore,
-        )
         from controlgraph_canary.integrations.google.firestore_health import (
             FirestoreHealthChainStore,
+        )
+        from controlgraph_canary.integrations.google.firestore_recovery_abandonment import (
+            FirestoreRecoveryAbandonmentStore,
         )
 
         if (
@@ -1055,7 +1086,7 @@ def create_runtime_service_app(
         selected_store = (
             authority_store
             if authority_store is not None
-            else FirestoreAuthorityStore(
+            else FirestoreRecoveryAbandonmentStore(
                 target=target,
                 configured_project_id=settings.project_id,
             )
@@ -1095,6 +1126,22 @@ def create_runtime_service_app(
             operator_policy=_operator_api_policy(settings),
             clock=service_claim_release_clock,
         )
+        if isinstance(selected_store, RecoveryAbandonmentStore):
+            recovery_abandoner = RecoveryAbandoner(
+                store=selected_store,
+                evidence_client=coordinator_clients.evidence,
+                classification_client=cast(
+                    RecoveryAbandonmentClassificationClient,
+                    CoordinatorServiceClaimClassificationClient(
+                        route=verifier_route,
+                        transport=selected_transport,
+                        evidence_key_version=settings.evidence_key_version,
+                        signature_verifier=evidence_signature_verifier,
+                    ),
+                ),
+                operator_policy=_operator_api_policy(settings),
+                clock=recovery_abandonment_clock,
+            )
         receipt_authority_service = ReceiptAuthorityService(selected_store)
         receipt_authority_authentication_policy = _receipt_authority_policy(settings)
         recovery_receipt_authority_authentication_policy = _recovery_receipt_authority_policy(
@@ -1171,6 +1218,12 @@ def create_runtime_service_app(
             operator_policy=_operator_api_policy(settings),
             releaser=service_claim_releaser,
         )
+        if recovery_abandoner is not None:
+            coordinator_recovery_abandonment_relay = CoordinatorRecoveryAbandonmentRelay(
+                authentication_policy=policy,
+                operator_policy=_operator_api_policy(settings),
+                abandoner=recovery_abandoner,
+            )
         capability_client = CoordinatorCapabilityClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -1337,6 +1390,8 @@ def create_runtime_service_app(
         raise ValueError("revocation attempt identities are API-limited")
     if service_claim_release_clock is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("service-claim release clocks are coordinator-limited")
+    if recovery_abandonment_clock is not None and role is not ServiceRole.COORDINATOR:
+        raise ValueError("recovery-abandonment clocks are coordinator-limited")
     if capability_issuance_clock is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability-issuance clocks are issuer-limited")
     if (
@@ -1390,6 +1445,8 @@ def create_runtime_service_app(
         coordinator_epoch_revocation_relay=coordinator_epoch_revocation_relay,
         api_service_claim_release_client=api_service_claim_release_client,
         coordinator_service_claim_release_relay=(coordinator_service_claim_release_relay),
+        api_recovery_abandonment_client=api_recovery_abandonment_client,
+        coordinator_recovery_abandonment_relay=(coordinator_recovery_abandonment_relay),
         capability_issuance_service=capability_issuance_service,
         receipt_authority_service=receipt_authority_service,
         receipt_authority_authentication_policy=(receipt_authority_authentication_policy),
@@ -1422,6 +1479,12 @@ def create_runtime_service_app(
         app.state.controlgraph_service_claim_release_client = api_service_claim_release_client
     if coordinator_service_claim_release_relay is not None:
         app.state.controlgraph_service_claim_release_relay = coordinator_service_claim_release_relay
+    if recovery_abandoner is not None:
+        app.state.controlgraph_recovery_abandoner = recovery_abandoner
+    if api_recovery_abandonment_client is not None:
+        app.state.controlgraph_recovery_abandonment_client = api_recovery_abandonment_client
+    if coordinator_recovery_abandonment_relay is not None:
+        app.state.controlgraph_recovery_abandonment_relay = coordinator_recovery_abandonment_relay
     if service_claim_classification_service is not None:
         app.state.controlgraph_service_claim_classification = service_claim_classification_service
     if classification_evidence_signing_service is not None:

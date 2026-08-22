@@ -341,6 +341,9 @@ class AmbiguousReceiptReadbackResolver:
         trusted = inspect_root_authority_bundle(bundle, target=self._target)
         if trusted is None:
             raise _error(AmbiguousReceiptReadbackErrorCode.ROOT_BINDING_MISMATCH)
+        claim = trusted.service_claim
+        if type(claim) is not ServiceClaimRecord:
+            raise _error(AmbiguousReceiptReadbackErrorCode.AUTHORITY_STALE)
         receipt = stored.value
         root = trusted.root
         plan = root.content.rollout_plan
@@ -366,7 +369,7 @@ class AmbiguousReceiptReadbackResolver:
         ):
             raise _error(AmbiguousReceiptReadbackErrorCode.ROOT_BINDING_MISMATCH)
         if (
-            trusted.service_claim.status is not ServiceClaimStatus.ACTIVE
+            claim.status is not ServiceClaimStatus.ACTIVE
             or trusted.authority.current_epoch != command.expected_epoch
             or receipt.epoch != trusted.authority.current_epoch
             or receipt.observed_authority_epoch != trusted.authority.current_epoch
@@ -380,7 +383,7 @@ class AmbiguousReceiptReadbackResolver:
                 trusted.authority_revision,
             ),
             service_claim=StoredRecord(
-                trusted.service_claim,
+                claim,
                 trusted.service_claim_revision,
             ),
         )

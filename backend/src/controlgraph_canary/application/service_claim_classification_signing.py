@@ -34,6 +34,9 @@ from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
     decode_contract,
 )
+from controlgraph_canary.contracts.recovery_abandonment import (
+    RecoveryAbandonmentClassificationSigningRequestV1,
+)
 from controlgraph_canary.contracts.root_creation import (
     SIGNED_EVIDENCE_EVENT_V1,
     SignedEvidenceEventV1,
@@ -84,17 +87,22 @@ class ClassificationEvidenceSigningService:
 
     async def sign(
         self,
-        request: ServiceClaimClassificationSigningRequestV1,
+        request: (
+            ServiceClaimClassificationSigningRequestV1
+            | RecoveryAbandonmentClassificationSigningRequestV1
+        ),
         caller: AuthenticationContext,
     ) -> SignedEvidenceEventV1:
         """Sign only when authenticated verifier identity and event actor coincide."""
 
         expected = self._authentication_policy.caller
-        expected_email = (
-            f"controlgraph-verifier@{self._project_id}.iam.gserviceaccount.com"
-        )
+        expected_email = f"controlgraph-verifier@{self._project_id}.iam.gserviceaccount.com"
         if (
-            type(request) is not ServiceClaimClassificationSigningRequestV1
+            type(request)
+            not in (
+                ServiceClaimClassificationSigningRequestV1,
+                RecoveryAbandonmentClassificationSigningRequestV1,
+            )
             or request.event.target.project_id != self._project_id
             or type(caller) is not AuthenticationContext
             or caller.role is not CallerRole.VERIFIER
@@ -106,9 +114,7 @@ class ClassificationEvidenceSigningService:
             or caller.issuer not in {"accounts.google.com", "https://accounts.google.com"}
             or caller.audience != self._authentication_policy.audience
         ):
-            raise ServiceClaimClassificationError(
-                ServiceClaimClassificationErrorCode.CALLER_DENIED
-            )
+            raise ServiceClaimClassificationError(ServiceClaimClassificationErrorCode.CALLER_DENIED)
         try:
             detached = await self._signer.sign(request.event)
         except asyncio.CancelledError:
@@ -125,9 +131,7 @@ class ClassificationEvidenceSigningService:
             or detached.algorithm != SIGNING_ALGORITHM
             or detached.payload_version != request.event.schema_version
         ):
-            raise ServiceClaimClassificationError(
-                ServiceClaimClassificationErrorCode.UNAVAILABLE
-            )
+            raise ServiceClaimClassificationError(ServiceClaimClassificationErrorCode.UNAVAILABLE)
         try:
             return SignedEvidenceEventV1(
                 schema_version=SIGNED_EVIDENCE_EVENT_V1,
@@ -176,12 +180,19 @@ class VerifierClassificationEvidenceClient:
 
     async def sign(
         self,
-        request: ServiceClaimClassificationSigningRequestV1,
+        request: (
+            ServiceClaimClassificationSigningRequestV1
+            | RecoveryAbandonmentClassificationSigningRequestV1
+        ),
     ) -> SignedEvidenceEventV1:
         """Return only the exact signed event requested by the verifier."""
 
         if (
-            type(request) is not ServiceClaimClassificationSigningRequestV1
+            type(request)
+            not in (
+                ServiceClaimClassificationSigningRequestV1,
+                RecoveryAbandonmentClassificationSigningRequestV1,
+            )
             or request.event.target.project_id != self._route.project_id
         ):
             raise ServiceClaimClassificationError(

@@ -346,6 +346,8 @@ class ServiceClaimReleaser:
         if request_sha256 != service_claim_release_request_sha256(state.invocation):
             return ServiceClaimReleaseFailureCode.TRUSTED_STATE_INVALID
         claim = trusted.service_claim
+        if type(claim) is not ServiceClaimRecord:
+            return ServiceClaimReleaseFailureCode.TRUSTED_STATE_INVALID
         authority = trusted.authority
         if progress is None:
             if any(
@@ -386,7 +388,7 @@ class ServiceClaimReleaser:
             raise ServiceClaimReleaseError(
                 ServiceClaimReleaseFailureCode.TERMINAL_RECEIPT_INVALID
             )
-        claim = trusted.service_claim
+        claim = self._legacy_claim(trusted)
         authority = trusted.authority
         invocation = state.invocation
         command = invocation.command
@@ -576,7 +578,7 @@ class ServiceClaimReleaser:
         request_sha256: str,
     ) -> ServiceClaimReleaseFinalizeCommitV1:
         trusted = self._trusted(state)
-        claim = trusted.service_claim
+        claim = self._legacy_claim(trusted)
         authority = trusted.authority
         invocation = state.invocation
         command = invocation.command
@@ -781,7 +783,7 @@ class ServiceClaimReleaser:
         invocation = state.invocation
         command = invocation.command
         trusted = self._trusted(state)
-        claim = trusted.service_claim
+        claim = self._legacy_claim(trusted)
         authority = trusted.authority
         terminal = _stored_evidence(
             state.terminal_evidence,
@@ -981,7 +983,7 @@ class ServiceClaimReleaser:
         result = stored.value
         progress = await self._exact_progress(state, request_sha256)
         trusted = self._trusted(state)
-        claim = trusted.service_claim
+        claim = self._legacy_claim(trusted)
         command = state.invocation.command
         fenced_claim = claim.model_copy(
             update={
@@ -1312,7 +1314,7 @@ class ServiceClaimReleaser:
             return False
         receipt = stored.value
         command = state.invocation.command
-        claim = trusted.service_claim
+        claim = self._legacy_claim(trusted)
         try:
             _terminal_mapping(receipt, claim)
         except (TypeError, ValueError):
@@ -1343,6 +1345,15 @@ class ServiceClaimReleaser:
                 ServiceClaimReleaseFailureCode.TRUSTED_STATE_INVALID
             )
         return trusted
+
+    @staticmethod
+    def _legacy_claim(trusted: TrustedRootAuthority) -> ServiceClaimRecord:
+        claim = trusted.service_claim
+        if type(claim) is not ServiceClaimRecord:
+            raise ServiceClaimReleaseError(
+                ServiceClaimReleaseFailureCode.TRUSTED_STATE_INVALID
+            )
+        return claim
 
     async def _sign(
         self,

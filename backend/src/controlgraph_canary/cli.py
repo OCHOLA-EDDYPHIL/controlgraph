@@ -56,6 +56,10 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionCommandV2,
     PromotionDispatchResultV2,
 )
+from controlgraph_canary.contracts.recovery_abandonment import (
+    RecoveryAbandonmentCommandV1,
+    RecoveryAbandonmentResultV1,
+)
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryCommandV2,
     RecoveryDispatchResultV2,
@@ -114,6 +118,7 @@ type OperatorApiCommand = (
     | EpochRevocationCommandV1
     | EpochRevocationProofCommandV1
     | ServiceClaimReleaseCommandV1
+    | RecoveryAbandonmentCommandV1
 )
 type OperatorApiResult = (
     StableSnapshotCaptureResultV1
@@ -127,6 +132,7 @@ type OperatorApiResult = (
     | PromotionDispatchResultV2
     | RecoveryDispatchResultV2
     | ServiceClaimReleaseResultV1
+    | RecoveryAbandonmentResultV1
 )
 
 _OPERATOR_API_COMMAND_TYPES = (
@@ -141,6 +147,7 @@ _OPERATOR_API_COMMAND_TYPES = (
     EpochRevocationCommandV1,
     EpochRevocationProofCommandV1,
     ServiceClaimReleaseCommandV1,
+    RecoveryAbandonmentCommandV1,
 )
 
 type ExecutionQueueControllerFactory = Callable[[ExecutionQueueTarget], ExecutionQueueController]
@@ -324,6 +331,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonical service-claim release command path, or '-' for stdin",
     )
 
+    abandon_recovery_parser = subparsers.add_parser(
+        "abandon-ambiguous-recovery",
+        help=(
+            "fence one expired ambiguous recovery without dispatching another mutation; "
+            "FENCED_RESET_REQUIRED requires separately audited break-glass reset"
+        ),
+    )
+    abandon_recovery_parser.add_argument("--project-number", required=True)
+    abandon_recovery_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical recovery-abandonment command path, or '-' for stdin",
+    )
+
     queue_parser = subparsers.add_parser(
         "execution-queue",
         help="inspect, hold, or release the fixed execution queue",
@@ -442,6 +463,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "release-service-claim":
         return _run_service_claim_release(args)
+
+    if args.command == "abandon-ambiguous-recovery":
+        return _run_recovery_abandonment(args)
 
     if args.command == "execution-queue":
         return _run_execution_queue_command(args)
@@ -957,6 +981,47 @@ def _run_service_claim_release(
     return 0
 
 
+def _run_recovery_abandonment(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Fence or verify abandonment; never dispatch a controller recovery mutation."""
+
+    try:
+        command = _read_recovery_abandonment_command(args.command_file)
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("RECOVERY_ABANDONMENT_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure("RECOVERY_ABANDONMENT", error)
+    try:
+        result = decode_contract(response_body, RecoveryAbandonmentResultV1)
+    except ContractError:
+        _print_cli_error("RECOVERY_ABANDONMENT_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.recovery_dispatch_id != command.recovery_dispatch_id
+        or result.fenced_epoch != command.expected_epoch + 1
+        or result.fenced_authority_revision != command.expected_epoch
+    ):
+        _print_cli_error("RECOVERY_ABANDONMENT_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
 def _run_execution_queue_command(
     args: argparse.Namespace,
     *,
@@ -1085,6 +1150,13 @@ def _read_service_claim_release_command(source: str) -> ServiceClaimReleaseComma
     )
 
 
+def _read_recovery_abandonment_command(source: str) -> RecoveryAbandonmentCommandV1:
+    return decode_contract(
+        _read_bounded_command_bytes(source),
+        RecoveryAbandonmentCommandV1,
+    )
+
+
 def _read_bounded_command_bytes(source: str) -> bytes:
     if type(source) is not str or not source:
         raise ValueError("command source is invalid")
@@ -1196,6 +1268,7 @@ def _print_contract_result(result: OperatorApiResult) -> None:
         PromotionDispatchResultV2,
         RecoveryDispatchResultV2,
         ServiceClaimReleaseResultV1,
+        RecoveryAbandonmentResultV1,
     ):
         raise TypeError("operator API result type is not admitted")
     print(canonical_json_bytes(result).decode("utf-8"))

@@ -44,6 +44,8 @@ from controlgraph_canary.contracts.root_trust import (
 )
 from controlgraph_canary.contracts.storage import (
     ServiceClaimRecord,
+    ServiceClaimRecordV3,
+    ServiceClaimRecordValue,
     ServiceClaimStatus,
 )
 
@@ -93,7 +95,7 @@ class RootEvidenceClient(Protocol):
 @dataclass(frozen=True, slots=True)
 class _ExistingClaimDecision:
     adopted: RootCreationWriteResult | None
-    released: StoredRecord[ServiceClaimRecord] | None
+    released: StoredRecord[ServiceClaimRecordValue] | None
 
 
 class RolloutRootCreator:
@@ -247,7 +249,7 @@ class RolloutRootCreator:
             return _ExistingClaimDecision(adopted=None, released=None)
         if (
             type(claim_record) is not StoredRecord
-            or type(claim_record.value) is not ServiceClaimRecord
+            or type(claim_record.value) not in (ServiceClaimRecord, ServiceClaimRecordV3)
         ):
             raise RootCreationError(RootCreationErrorCode.TRUSTED_STATE_INVALID)
         claim = claim_record.value
@@ -255,7 +257,10 @@ class RolloutRootCreator:
             raise RootCreationError(RootCreationErrorCode.TRUSTED_STATE_INVALID)
         if claim.status is ServiceClaimStatus.RELEASED:
             return _ExistingClaimDecision(adopted=None, released=claim_record)
-        if claim.status is not ServiceClaimStatus.ACTIVE:
+        if (
+            type(claim) is not ServiceClaimRecord
+            or claim.status is not ServiceClaimStatus.ACTIVE
+        ):
             raise RootCreationError(RootCreationErrorCode.ACTIVE_CLAIM_CONFLICT)
         if (
             claim.claim_request_id != command.request_id

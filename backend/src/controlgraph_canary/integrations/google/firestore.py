@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -127,6 +128,8 @@ from controlgraph_canary.contracts.storage import (
     AuthorityStorageDocument,
     AuthorityStorageKind,
     ServiceClaimRecord,
+    ServiceClaimRecordV3,
+    ServiceClaimRecordValue,
     ServiceClaimStatus,
     ServiceClaimTargetClassification,
     ServiceClaimTerminalRootState,
@@ -898,9 +901,13 @@ def _validate_service_claim_fence_commit(
         raise ValueError("service claim fence state is not pristine")
     bundle = expected.root_bundle
     _validate_read_root_creation_bundle(configured_target, bundle)
+    claim_value = bundle.service_claim.value
+    if type(claim_value) is not ServiceClaimRecord:
+        raise ValueError("normal service claim release requires a V2 claim")
+    claim_record = StoredRecord(claim_value, bundle.service_claim.revision)
     _validate_claim_fence_authority(
         configured_target,
-        bundle.service_claim,
+        claim_record,
         commit.replacement_claim,
         bundle.authority,
         commit.replacement_authority,
@@ -922,7 +929,7 @@ def _validate_service_claim_fence_commit(
     receipt_record = expected.terminal_receipt
     receipt = receipt_record.value
     root = bundle.root.value
-    claim = bundle.service_claim.value
+    claim = claim_value
     authority = bundle.authority.value
     terminal_state, _, target_configuration_sha256 = (
         _terminal_receipt_release_mapping(receipt, claim)
@@ -1143,9 +1150,13 @@ def _validate_service_claim_finalize_commit(
         raise ValueError("service claim finalize state is incomplete")
     bundle = expected.root_bundle
     _validate_read_root_creation_bundle(configured_target, bundle)
+    claim_value = bundle.service_claim.value
+    if type(claim_value) is not ServiceClaimRecord:
+        raise ValueError("normal service claim release requires a V2 claim")
+    claim_record = StoredRecord(claim_value, bundle.service_claim.revision)
     _validate_claim_release(
         configured_target,
-        bundle.service_claim,
+        claim_record,
         commit.replacement_claim,
         bundle.authority,
     )
@@ -1165,7 +1176,7 @@ def _validate_service_claim_finalize_commit(
     invocation = expected.invocation
     command = invocation.command
     root = bundle.root.value
-    claim = bundle.service_claim.value
+    claim = claim_value
     authority = bundle.authority.value
     terminal_receipt = expected.terminal_receipt.value
     terminal_evidence = expected.terminal_evidence.value
@@ -1469,7 +1480,7 @@ def _validate_service_claim_finalize_commit(
 
 def _validate_released_takeover(
     configured_target: TargetBinding,
-    expected_released_claim: StoredRecord[ServiceClaimRecord],
+    expected_released_claim: StoredRecord[ServiceClaimRecordValue],
     root: RolloutRoot,
     claim: ServiceClaimRecord,
     authority: EpochAuthorityRecord,
@@ -1486,7 +1497,7 @@ def _validate_released_takeover(
         ),
     )
     previous = expected_released_claim.value
-    if type(previous) is not ServiceClaimRecord:
+    if type(previous) not in (ServiceClaimRecord, ServiceClaimRecordV3):
         raise TypeError("released claim takeover requires an exact service claim")
     if (
         previous.target != configured_target
@@ -1522,12 +1533,12 @@ def _content_addressed_root_target_configuration_sha256(
 
 def _validate_released_takeover_content_addressed(
     configured_target: TargetBinding,
-    expected_released_claim: StoredRecord[ServiceClaimRecord],
+    expected_released_claim: StoredRecord[ServiceClaimRecordValue],
     root: RolloutRootV2 | RolloutRootV3,
     claim: ServiceClaimRecord,
 ) -> None:
     previous = expected_released_claim.value
-    if type(previous) is not ServiceClaimRecord:
+    if type(previous) not in (ServiceClaimRecord, ServiceClaimRecordV3):
         raise TypeError("released claim takeover requires an exact service claim")
     if (
         previous.target != configured_target
@@ -1549,7 +1560,7 @@ def _validate_initial_root_creation_bundle(
     lineage_anchor: CapabilityLineageAnchorV1,
     signed_evidence: SignedEvidenceEventV1,
     creation_result: RootCreationResultV2,
-    expected_released_claim: StoredRecord[ServiceClaimRecord] | None,
+    expected_released_claim: StoredRecord[ServiceClaimRecordValue] | None,
 ) -> None:
     exact_records = (
         (root, RolloutRootV3),
@@ -1665,6 +1676,8 @@ def _validate_read_root_creation_bundle(
             candidate_percent=100,
         )
         if type(root) is RolloutRootV2:
+            if type(claim) is not ServiceClaimRecord:
+                raise ValueError("V2 root requires a V2 service claim")
             claim_matches = service_claim_matches_root_v2(
                 claim,
                 root,
@@ -2325,6 +2338,112 @@ class FirestoreAuthorityStore:
         except Exception:
             raise AuthorityStoreCorruptRecord from None
 
+    @staticmethod
+    def _decode_service_claim_snapshot(
+        snapshot: object,
+        *,
+        reference: _DocumentReferencePort,
+        logical_id: str,
+        document_id: str,
+    ) -> _DecodedDocument[ServiceClaimRecordValue] | None:
+        """Decode only the explicitly supported service-claim schema versions."""
+
+        kind = AuthorityStorageKind.SERVICE_CLAIM
+        try:
+            provider_snapshot = cast(_ProviderSnapshotPort, snapshot)
+            snapshot_reference = provider_snapshot.reference
+            if snapshot_reference.path != reference.path:
+                raise ValueError("snapshot reference does not match")
+            exists = provider_snapshot.exists
+            if type(exists) is not bool:
+                raise ValueError("snapshot existence flag is invalid")
+            _aware_utc(provider_snapshot.read_time)
+            data = provider_snapshot.to_dict()
+            update_time = provider_snapshot.update_time
+            if not exists:
+                if data is not None or update_time is not None:
+                    raise ValueError("missing snapshot contains state")
+                return None
+            _aware_utc(update_time)
+            if type(data) is not dict or set(data) != _DOCUMENT_FIELDS:
+                raise ValueError("storage wrapper is not exact")
+            if data.get("record_kind") != kind.value:
+                raise ValueError("storage wrapper kind does not match")
+            normalized = dict(data)
+            normalized["record_kind"] = kind
+            wrapper = AuthorityStorageDocument.model_validate(normalized)
+            if wrapper.record_kind is not kind or wrapper.logical_id != logical_id:
+                raise ValueError("storage wrapper identity does not match")
+            if reference.path != _document_path(kind, document_id):
+                raise ValueError("storage document path does not match")
+            try:
+                raw_claim = json.loads(wrapper.canonical_payload)
+            except (TypeError, ValueError):
+                raise ValueError("service claim payload is invalid") from None
+            if type(raw_claim) is not dict:
+                raise ValueError("service claim payload is invalid")
+            schema_version = raw_claim.get("schema_version")
+            if schema_version == "controlgraph.service-claim/v2":
+                value: ServiceClaimRecordValue = decode_contract(
+                    wrapper.canonical_payload,
+                    ServiceClaimRecord,
+                )
+            elif schema_version == "controlgraph.service-claim/v3":
+                value = decode_contract(wrapper.canonical_payload, ServiceClaimRecordV3)
+            else:
+                raise ValueError("service claim schema version is unsupported")
+            if canonical_sha256(value) != wrapper.payload_sha256:
+                raise ValueError("storage payload digest does not match")
+            return _DecodedDocument(wrapper=wrapper, value=value)
+        except (AuthorityStoreCorruptRecord, asyncio.CancelledError):
+            raise
+        except Exception:
+            raise AuthorityStoreCorruptRecord from None
+
+    async def _strong_read_service_claim(
+        self,
+        *,
+        logical_id: str,
+        document_id: str,
+    ) -> _DecodedDocument[ServiceClaimRecordValue] | None:
+        client = await self._client()
+        reference = self._reference(
+            client,
+            AuthorityStorageKind.SERVICE_CLAIM,
+            document_id,
+        )
+        try:
+            async with asyncio.timeout(FIRESTORE_OPERATION_TIMEOUT_SECONDS):
+                snapshot = await self._get_snapshot(reference, transaction=None)
+        except asyncio.CancelledError:
+            raise
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception:
+            raise AuthorityStoreUnavailable from None
+        return self._decode_service_claim_snapshot(
+            snapshot,
+            reference=reference,
+            logical_id=logical_id,
+            document_id=document_id,
+        )
+
+    async def _transaction_read_service_claim(
+        self,
+        transaction: _TransactionPort,
+        *,
+        reference: _DocumentReferencePort,
+        logical_id: str,
+        document_id: str,
+    ) -> _DecodedDocument[ServiceClaimRecordValue] | None:
+        snapshot = await self._get_snapshot(reference, transaction=transaction)
+        return self._decode_service_claim_snapshot(
+            snapshot,
+            reference=reference,
+            logical_id=logical_id,
+            document_id=document_id,
+        )
+
     async def _strong_read[ModelT: StrictContractModel](
         self,
         *,
@@ -2634,7 +2753,7 @@ class FirestoreAuthorityStore:
 
     async def create_rollout_after_release(
         self,
-        expected_released_claim: StoredRecord[ServiceClaimRecord],
+        expected_released_claim: StoredRecord[ServiceClaimRecordValue],
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
@@ -2686,13 +2805,11 @@ class FirestoreAuthorityStore:
                 AuthorityStorageKind.SERVICE_CLAIM,
                 claim_document.document_id,
             )
-            current_claim = await self._transaction_read(
+            current_claim = await self._transaction_read_service_claim(
                 transaction,
                 reference=claim_reference,
-                kind=AuthorityStorageKind.SERVICE_CLAIM,
                 logical_id=claim_logical_id,
                 document_id=claim_document.document_id,
-                model_type=ServiceClaimRecord,
             )
             if current_claim is None or current_claim.stored != expected_released_claim:
                 raise _ExpectedStateMismatch
@@ -2729,7 +2846,7 @@ class FirestoreAuthorityStore:
         signed_evidence: SignedEvidenceEventV1,
         creation_result: RootCreationResultV2,
         *,
-        expected_released_claim: StoredRecord[ServiceClaimRecord] | None = None,
+        expected_released_claim: StoredRecord[ServiceClaimRecordValue] | None = None,
     ) -> RootCreationWriteResult:
         _validate_initial_root_creation_bundle(
             self._target,
@@ -2828,13 +2945,11 @@ class FirestoreAuthorityStore:
                 AuthorityStorageKind.SERVICE_CLAIM,
                 claim_document.document_id,
             )
-            current_claim = await self._transaction_read(
+            current_claim = await self._transaction_read_service_claim(
                 transaction,
                 reference=claim_reference,
-                kind=AuthorityStorageKind.SERVICE_CLAIM,
                 logical_id=claim_logical_id,
                 document_id=claim_document.document_id,
-                model_type=ServiceClaimRecord,
             )
             if current_claim is None or current_claim.stored != expected_released_claim:
                 raise _ExpectedStateMismatch
@@ -2942,17 +3057,15 @@ class FirestoreAuthorityStore:
             anchor_document_id = capability_lineage_anchor_document_id(result.lineage_anchor)
             evidence_logical_id = result.winner_evidence_id
             evidence_document_id = signed_evidence_event_document_id(evidence_logical_id)
-            claim = await self._transaction_read(
+            claim = await self._transaction_read_service_claim(
                 transaction,
                 reference=self._reference(
                     client,
                     AuthorityStorageKind.SERVICE_CLAIM,
                     claim_document_id,
                 ),
-                kind=AuthorityStorageKind.SERVICE_CLAIM,
                 logical_id=claim_logical_id,
                 document_id=claim_document_id,
-                model_type=ServiceClaimRecord,
             )
             anchor = await self._transaction_read(
                 transaction,
@@ -4719,13 +4832,11 @@ class FirestoreAuthorityStore:
             raise AuthorityStoreCorruptRecord
         return None if decoded is None else decoded.stored
 
-    async def read_service_claim(self) -> StoredRecord[ServiceClaimRecord] | None:
+    async def read_service_claim(self) -> StoredRecord[ServiceClaimRecordValue] | None:
         logical_id = service_claim_logical_id(self._target)
-        decoded = await self._strong_read(
-            kind=AuthorityStorageKind.SERVICE_CLAIM,
+        decoded = await self._strong_read_service_claim(
             logical_id=logical_id,
             document_id=service_claim_document_id(self._target),
-            model_type=ServiceClaimRecord,
         )
         if decoded is not None and decoded.value.target != self._target:
             raise AuthorityStoreCorruptRecord
