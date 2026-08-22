@@ -1310,7 +1310,15 @@ class RecoveryDispatchRecordV2(StrictContractModel):
             ):
                 raise ValueError("prepared recovery dispatch shape is invalid")
             return self
-        if self.enqueue_started_at is None or self.enqueue_started_at < self.prepared_at:
+        if self.enqueue_started_at is None:
+            if not (
+                self.state is RecoveryDispatchState.AMBIGUOUS
+                and self.terminal_at is not None
+                and self.terminal_at >= self.task.expires_at
+                and self.result is not None
+            ):
+                raise ValueError("recovery enqueue start is invalid")
+        elif self.enqueue_started_at < self.prepared_at:
             raise ValueError("recovery enqueue start is invalid")
         if self.state is RecoveryDispatchState.ENQUEUE_STARTED:
             if self.terminal_at is not None or self.result is not None:
@@ -1320,7 +1328,10 @@ class RecoveryDispatchRecordV2(StrictContractModel):
         if (
             not terminal
             or self.terminal_at is None
-            or self.terminal_at < self.enqueue_started_at
+            or (
+                self.enqueue_started_at is not None
+                and self.terminal_at < self.enqueue_started_at
+            )
             or result is None
             or result.enqueue_disposition != self.state.value
             or result.request_id != self.request_id

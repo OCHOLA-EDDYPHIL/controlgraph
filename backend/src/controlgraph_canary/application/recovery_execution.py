@@ -1513,13 +1513,26 @@ class RecoveryRolloutCoordinator:
             RecoveryDispatchState.ENQUEUE_STARTED: frozenset({1}),
             RecoveryDispatchState.CREATED: frozenset({2}),
             RecoveryDispatchState.DUPLICATE: frozenset({2}),
-            RecoveryDispatchState.AMBIGUOUS: frozenset({2, 3}),
+            RecoveryDispatchState.AMBIGUOUS: frozenset({1, 2, 3}),
         }
         if (
             type(stored) is not StoredRecord
             or type(stored.value) is not RecoveryDispatchRecordV2
             or stored.value.target != self._target
             or stored.revision not in expected_revisions.get(stored.value.state, frozenset())
+            or (
+                stored.value.state is RecoveryDispatchState.AMBIGUOUS
+                and (
+                    (
+                        stored.revision == 1
+                        and stored.value.enqueue_started_at is not None
+                    )
+                    or (
+                        stored.revision in {2, 3}
+                        and stored.value.enqueue_started_at is None
+                    )
+                )
+            )
             or stored.value.command_sha256 != recovery_command_sha256(command)
             or stored.value.task.intent.authorization.source != command.source
         ):

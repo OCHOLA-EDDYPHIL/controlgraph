@@ -316,6 +316,17 @@ def _initial_state() -> RecoveryAbandonmentState:
     )
 
 
+def _prepared_state() -> RecoveryAbandonmentState:
+    state = _initial_state()
+    recovery = make_revoked_v3_recovery_bundle()
+    prepared = _dispatch_record(recovery, state=RecoveryDispatchState.PREPARED)
+    return replace(
+        state,
+        invocation=_invocation(prepared),
+        recovery_dispatch=StoredRecord(prepared, 0),
+    )
+
+
 class _EvidenceClient:
     def __init__(self, key_version: str) -> None:
         self.evidence_key_version = key_version
@@ -749,6 +760,82 @@ def test_first_stage_atomically_fences_without_releasing_the_claim() -> None:
     assert dispatch.value.state is RecoveryDispatchState.AMBIGUOUS
     assert dispatch.value.result is not None
     assert dispatch.value.result.enqueue_disposition == "AMBIGUOUS"
+
+
+def test_expired_prepared_dispatch_is_fenced_without_inventing_an_enqueue_start() -> None:
+    store = _Store(_prepared_state())
+    abandoner, _, _ = _abandoner(store)
+
+    fenced = asyncio.run(
+        abandoner.abandon(store.state.invocation, principal=_principal())
+    )
+
+    assert fenced.phase is RecoveryAbandonmentPhase.FENCED_RESET_REQUIRED
+    assert store.state.root_bundle is not None
+    assert store.state.root_bundle.authority.value.current_epoch == 3
+    dispatch = store.state.recovery_dispatch
+    progress = store.state.progress
+    assert dispatch is not None and progress is not None
+    assert dispatch.revision == 1
+    assert dispatch.value.state is RecoveryDispatchState.AMBIGUOUS
+    assert dispatch.value.enqueue_started_at is None
+    assert dispatch.value.terminal_at == progress.value.fenced_at
+    assert progress.value.previous_dispatch_sha256 == (
+        store.state.invocation.command.expected_dispatch_sha256
+    )
+    assert progress.value.abandonment_subject.previous_dispatch_revision == 0
+    assert progress.value.abandonment_subject.ambiguous_dispatch_revision == 1
+
+    released = asyncio.run(
+        abandoner.abandon(store.state.invocation, principal=_principal())
+    )
+    replay = asyncio.run(
+        abandoner.abandon(store.state.invocation, principal=_principal())
+    )
+
+    assert released.phase is RecoveryAbandonmentPhase.RELEASED
+    assert replay == released
+    assert len(store.fence_commits) == 1
+    assert len(store.finalize_commits) == 1
+
+
+def test_prepared_dispatch_requires_expiry_exact_binding_and_receipt_absence() -> None:
+    state = _prepared_state()
+
+    not_expired = _Store(state)
+    abandoner, _, _ = _abandoner(not_expired, clock=_Clock(-60))
+    with pytest.raises(RecoveryAbandonmentError) as expiry_failure:
+        asyncio.run(abandoner.abandon(state.invocation, principal=_principal()))
+    assert expiry_failure.value.code is RecoveryAbandonmentFailureCode.DISPATCH_NOT_EXPIRED
+    assert not not_expired.fence_commits
+
+    wrong_command = state.invocation.command.model_copy(
+        update={"expected_dispatch_sha256": "f" * 64}
+    )
+    wrong_binding = _Store(
+        replace(
+            state,
+            invocation=state.invocation.model_copy(update={"command": wrong_command}),
+        )
+    )
+    abandoner, _, _ = _abandoner(wrong_binding)
+    with pytest.raises(RecoveryAbandonmentError) as binding_failure:
+        asyncio.run(
+            abandoner.abandon(wrong_binding.state.invocation, principal=_principal())
+        )
+    assert binding_failure.value.code is RecoveryAbandonmentFailureCode.DISPATCH_INVALID
+    assert not wrong_binding.fence_commits
+
+    receipt_source = _Store(state)
+    abandoner, _, _ = _abandoner(receipt_source)
+    asyncio.run(abandoner.abandon(state.invocation, principal=_principal()))
+    receipt = _late_epoch_denial(receipt_source)
+    with_receipt = _Store(replace(state, recovery_receipt=receipt))
+    abandoner, _, _ = _abandoner(with_receipt)
+    with pytest.raises(RecoveryAbandonmentError) as receipt_failure:
+        asyncio.run(abandoner.abandon(state.invocation, principal=_principal()))
+    assert receipt_failure.value.code is RecoveryAbandonmentFailureCode.RECEIPT_EXISTS
+    assert not with_receipt.fence_commits
 
 
 def _prior_epoch_terminal_state(

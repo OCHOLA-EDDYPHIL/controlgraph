@@ -931,7 +931,7 @@ class RecoveryAbandoner:
             or dispatch.target != progress.target
             or dispatch.epoch not in {command.expected_epoch, command.expected_epoch - 1}
             or (
-                abandonment_subject.previous_dispatch_revision == 1
+                abandonment_subject.previous_dispatch_revision in {0, 1}
                 and dispatch.terminal_at != progress.fenced_at
             )
             or (
@@ -1498,6 +1498,7 @@ def _dispatch_state_is_abandonable(
     stored: StoredRecord[RecoveryDispatchRecordV2],
 ) -> bool:
     expected_revision = {
+        RecoveryDispatchState.PREPARED: 0,
         RecoveryDispatchState.ENQUEUE_STARTED: 1,
         RecoveryDispatchState.CREATED: 2,
         RecoveryDispatchState.DUPLICATE: 2,
@@ -1526,6 +1527,19 @@ def _previous_recovery_dispatch(
     ambiguous: RecoveryDispatchRecordV2,
     subject: RecoveryAbandonmentEvidenceSubjectV1,
 ) -> RecoveryDispatchRecordV2:
+    if subject.previous_dispatch_revision == 0:
+        candidate = RecoveryDispatchRecordV2.model_validate(
+            {
+                **ambiguous.model_dump(mode="python"),
+                "state": RecoveryDispatchState.PREPARED,
+                "terminal_at": None,
+                "result": None,
+            }
+        )
+        if recovery_dispatch_record_sha256(candidate) == subject.previous_dispatch_sha256:
+            return candidate
+        raise ValueError("previous recovery dispatch does not match abandonment evidence")
+
     if subject.previous_dispatch_revision == 1:
         candidate = RecoveryDispatchRecordV2.model_validate(
             {

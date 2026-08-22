@@ -202,6 +202,7 @@ def _dispatch_state_is_abandonable(
     stored: StoredRecord[RecoveryDispatchRecordV2],
 ) -> bool:
     expected_revision = {
+        RecoveryDispatchState.PREPARED: 0,
         RecoveryDispatchState.ENQUEUE_STARTED: 1,
         RecoveryDispatchState.CREATED: 2,
         RecoveryDispatchState.DUPLICATE: 2,
@@ -357,7 +358,7 @@ def _validate_recovery_abandonment_fence_commit(
         or replacement_dispatch.result is None
         or replacement_dispatch.result.enqueue_disposition != "AMBIGUOUS"
         or (
-            previous_dispatch_revision == 1
+            previous_dispatch_revision in {0, 1}
             and replacement_dispatch.terminal_at != progress.fenced_at
         )
         or (
@@ -695,7 +696,7 @@ def _validate_recovery_abandonment_finalize_commit(
         or dispatch.dispatch_id != progress.recovery_dispatch_id
         or dispatch.state is not RecoveryDispatchState.AMBIGUOUS
         or (
-            progress.abandonment_subject.previous_dispatch_revision == 1
+            progress.abandonment_subject.previous_dispatch_revision in {0, 1}
             and dispatch.terminal_at != progress.fenced_at
         )
         or (
