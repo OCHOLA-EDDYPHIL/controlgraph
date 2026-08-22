@@ -43,6 +43,24 @@ describe("timeline projection decoder", () => {
     expect(page.nextCursor).toEqual(page.head);
   });
 
+  it("accepts the backend's independent-verification signature purpose", () => {
+    const entry = timelineEntry(1, "VERIFICATION_RECORDED", {
+      verificationStatus: "VERIFIED",
+    });
+    const wireEntry = timelineEntryWire(entry);
+    const signature = wireEntry.signature as Record<string, unknown>;
+    signature.purpose = "INDEPENDENT_VERIFICATION";
+    const body = JSON.parse(timelinePageBody([entry], QUERY)) as Record<
+      string,
+      unknown
+    >;
+    body.entries = [wireEntry];
+
+    const page = decodeTimelinePage(canonicalJson(body), QUERY);
+
+    expect(page.entries[0]?.signature?.purpose).toBe("INDEPENDENT_VERIFICATION");
+  });
+
   it("accepts one exact contiguous operator projection", () => {
     const entries = [
       timelineEntry(1, "AUTHORITY_ROOT_CREATED"),
