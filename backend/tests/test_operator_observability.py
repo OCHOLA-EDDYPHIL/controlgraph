@@ -565,7 +565,7 @@ class _RuntimeStore(_Store):
 
 
 class _NeverTaskEnqueuer:
-    def enqueue(self, *args: object, **kwargs: object) -> object:
+    async def enqueue(self, *args: object, **kwargs: object) -> object:
         raise AssertionError("runtime composition must not enqueue a task")
 
 

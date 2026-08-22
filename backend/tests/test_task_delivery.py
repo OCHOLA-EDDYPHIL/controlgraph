@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 from google.api_core.exceptions import AlreadyExists, DeadlineExceeded
+from google.auth.credentials import AnonymousCredentials
 from google.cloud import tasks_v2
 from recovery_v2_test_data import RecoveryV2Bundle, make_unhealthy_v3_recovery_bundle
 from test_recovery_execution import _DispatchStore
@@ -25,6 +26,7 @@ from controlgraph_canary.application.tasks import (
     TaskDeliverySettings,
     TaskDispatcher,
     TaskEnqueueDisposition,
+    TaskEnqueueResult,
     TaskRoute,
 )
 from controlgraph_canary.contracts import (
@@ -44,7 +46,12 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryDispatchState,
     create_recovery_intent,
 )
-from controlgraph_canary.integrations.google.tasks import GoogleCloudTasksEnqueuer
+from controlgraph_canary.integrations.google import tasks as google_tasks
+from controlgraph_canary.integrations.google.tasks import (
+    CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS,
+    CLOUD_TASKS_ENQUEUE_WALL_TIMEOUT_SECONDS,
+    GoogleCloudTasksEnqueuer,
+)
 
 PROJECT_ID = "controlgraph-canary-abc123"
 EXECUTOR_ORIGIN = "https://controlgraph-executor-abc-uc.a.run.app"
@@ -268,10 +275,18 @@ class _Response:
 class _CapturingClient:
     def __init__(self, *, duplicate_after_first: bool = False) -> None:
         self.requests: list[dict[str, object]] = []
+        self.rpc_options: list[tuple[None, float]] = []
         self.duplicate_after_first = duplicate_after_first
 
-    def create_task(self, *, request: dict[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         self.requests.append(request)
+        self.rpc_options.append((retry, timeout))
         task = cast(dict[str, object], request["task"])
         if self.duplicate_after_first and len(self.requests) > 1:
             raise AlreadyExists("synthetic duplicate")
@@ -282,16 +297,58 @@ class _DeadlineExceededClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def create_task(self, *, request: dict[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         self.calls += 1
         raise DeadlineExceeded("synthetic deadline")
+
+
+class _BlockingClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.cancelled = 0
+        self.rpc_options: list[tuple[None, float]] = []
+
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
+        self.calls += 1
+        self.rpc_options.append((retry, timeout))
+        self.entered.set()
+        try:
+            await self.release.wait()
+            task = cast(dict[str, object], request["task"])
+            return _Response(cast(str, task["name"]))
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.finished.set()
 
 
 class _AlreadyExistsClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def create_task(self, *, request: dict[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         self.calls += 1
         raise AlreadyExists("synthetic duplicate")
 
@@ -300,7 +357,13 @@ class _UnexpectedResponseClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def create_task(self, *, request: dict[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         self.calls += 1
         return _Response("projects/other/locations/us-central1/queues/other/tasks/other")
 
@@ -315,7 +378,13 @@ class _RaisingNameClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def create_task(self, *, request: dict[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         self.calls += 1
         return _RaisingNameResponse()
 
@@ -334,7 +403,13 @@ class _RaisingEqualityClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def create_task(self, *, request: dict[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: dict[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         self.calls += 1
         return _NonStringNameResponse()
 
@@ -400,9 +475,11 @@ def test_generic_recovery_cannot_bypass_the_typed_one_use_enqueue_path() -> None
     )
 
     with pytest.raises(TaskAddressingError, match="directly confirmed"):
-        dispatcher.dispatch(
-            task_request(action=CapabilityAction.RECOVER_STABLE),
-            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        asyncio.run(
+            dispatcher.dispatch(
+                task_request(action=CapabilityAction.RECOVER_STABLE),
+                now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+            )
         )
 
     assert client.requests == []
@@ -420,10 +497,12 @@ def test_dispatch_prepared_recovery_submits_exact_provider_request() -> None:
     addressed = dispatcher.prepare(bundle.task, now=now)
     permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:15Z")
 
-    result = dispatcher.dispatch_prepared_recovery(
-        addressed,
-        permit=permit,
-        now=now,
+    result = asyncio.run(
+        dispatcher.dispatch_prepared_recovery(
+            addressed,
+            permit=permit,
+            now=now,
+        )
     )
 
     project_id = bundle.root.content.target.project_id
@@ -434,6 +513,8 @@ def test_dispatch_prepared_recovery_submits_exact_provider_request() -> None:
     )
     assert result.disposition is TaskEnqueueDisposition.CREATED
     assert result.task_name == task_name
+    assert CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS == 10.0
+    assert client.rpc_options == [(None, CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS)]
     assert client.requests == [
         {
             "parent": (
@@ -476,10 +557,12 @@ def test_dispatch_prepared_recovery_accepts_delayed_valid_task() -> None:
     delayed = datetime(2026, 8, 21, 12, 10, 30, tzinfo=UTC)
     permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:10:30Z")
 
-    result = dispatcher.dispatch_prepared_recovery(
-        addressed,
-        permit=permit,
-        now=delayed,
+    result = asyncio.run(
+        dispatcher.dispatch_prepared_recovery(
+            addressed,
+            permit=permit,
+            now=delayed,
+        )
     )
 
     assert result.disposition is TaskEnqueueDisposition.CREATED
@@ -499,16 +582,20 @@ def test_dispatch_prepared_recovery_adopts_provider_duplicate_once() -> None:
     addressed = dispatcher.prepare(bundle.task, now=now)
     permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:15Z")
 
-    result = dispatcher.dispatch_prepared_recovery(
-        addressed,
-        permit=permit,
-        now=now,
-    )
-    with pytest.raises(TaskAddressingError, match="permit is invalid"):
+    result = asyncio.run(
         dispatcher.dispatch_prepared_recovery(
             addressed,
             permit=permit,
             now=now,
+        )
+    )
+    with pytest.raises(TaskAddressingError, match="permit is invalid"):
+        asyncio.run(
+            dispatcher.dispatch_prepared_recovery(
+                addressed,
+                permit=permit,
+                now=now,
+            )
         )
 
     assert result.disposition is TaskEnqueueDisposition.DUPLICATE
@@ -527,16 +614,20 @@ def test_dispatch_prepared_recovery_timeout_is_ambiguous_and_one_shot() -> None:
     addressed = dispatcher.prepare(bundle.task, now=now)
     permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:15Z")
 
-    result = dispatcher.dispatch_prepared_recovery(
-        addressed,
-        permit=permit,
-        now=now,
-    )
-    with pytest.raises(TaskAddressingError, match="permit is invalid"):
+    result = asyncio.run(
         dispatcher.dispatch_prepared_recovery(
             addressed,
             permit=permit,
             now=now,
+        )
+    )
+    with pytest.raises(TaskAddressingError, match="permit is invalid"):
+        asyncio.run(
+            dispatcher.dispatch_prepared_recovery(
+                addressed,
+                permit=permit,
+                now=now,
+            )
         )
 
     assert result.disposition is TaskEnqueueDisposition.AMBIGUOUS
@@ -558,10 +649,12 @@ def test_dispatch_prepared_recovery_rejects_expired_task_before_provider_call() 
     permit = recovery_enqueue_permit(bundle, started_at="2026-08-21T12:09:30Z")
 
     with pytest.raises(TaskAddressingError, match="expired"):
-        dispatcher.dispatch_prepared_recovery(
-            addressed,
-            permit=permit,
-            now=datetime(2026, 8, 21, 12, 11, 30, tzinfo=UTC),
+        asyncio.run(
+            dispatcher.dispatch_prepared_recovery(
+                addressed,
+                permit=permit,
+                now=datetime(2026, 8, 21, 12, 11, 30, tzinfo=UTC),
+            )
         )
 
     assert client.requests == []
@@ -590,9 +683,11 @@ def test_provider_adapter_rechecks_the_seal_before_create_task(
     client = _CapturingClient()
 
     with pytest.raises(TaskAddressingError, match="seal"):
-        GoogleCloudTasksEnqueuer(client, addressor).enqueue(
-            altered,
-            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        asyncio.run(
+            GoogleCloudTasksEnqueuer(client, addressor).enqueue(
+                altered,
+                now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+            )
         )
 
     assert client.requests == []
@@ -610,9 +705,11 @@ def test_delayed_task_keeps_canonical_body_and_only_fixed_http_fields() -> None:
         GoogleCloudTasksEnqueuer(client, addressor),
     )
 
-    result = dispatcher.dispatch(
-        request,
-        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            request,
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
     )
 
     assert MAX_SCHEDULE_DELAY_SECONDS == 600
@@ -648,8 +745,13 @@ def test_duplicate_enqueue_uses_one_deterministic_identity() -> None:
     )
     now = datetime(2026, 8, 19, 12, 1, tzinfo=UTC)
 
-    first = dispatcher.dispatch(request, now=now)
-    duplicate = dispatcher.dispatch(request, now=now)
+    async def dispatch_twice() -> tuple[TaskEnqueueResult, TaskEnqueueResult]:
+        return (
+            await dispatcher.dispatch(request, now=now),
+            await dispatcher.dispatch(request, now=now),
+        )
+
+    first, duplicate = asyncio.run(dispatch_twice())
 
     assert first.disposition is TaskEnqueueDisposition.CREATED
     assert duplicate.disposition is TaskEnqueueDisposition.DUPLICATE
@@ -666,9 +768,11 @@ def test_expired_task_is_rejected_before_provider_call() -> None:
     )
 
     with pytest.raises(TaskAddressingError, match="expired"):
-        dispatcher.dispatch(
-            task_request(),
-            now=datetime(2026, 8, 19, 12, 10, tzinfo=UTC),
+        asyncio.run(
+            dispatcher.dispatch(
+                task_request(),
+                now=datetime(2026, 8, 19, 12, 10, tzinfo=UTC),
+            )
         )
 
     assert client.requests == []
@@ -682,9 +786,11 @@ def test_create_task_timeout_is_explicitly_ambiguous_and_not_retried() -> None:
         GoogleCloudTasksEnqueuer(client, addressor),
     )
 
-    result = dispatcher.dispatch(
-        task_request(),
-        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            task_request(),
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
     )
 
     assert client.calls == 1
@@ -694,28 +800,93 @@ def test_create_task_timeout_is_explicitly_ambiguous_and_not_retried() -> None:
     )
 
 
-def test_default_task_client_is_deferred_and_unavailable_is_ambiguous(
+def test_hanging_create_is_wall_bounded_and_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_tasks,
+        "CLOUD_TASKS_ENQUEUE_WALL_TIMEOUT_SECONDS",
+        0.2,
+    )
+    client = _BlockingClient()
+    addressor = TaskAddressor(delivery_settings())
+    enqueuer = GoogleCloudTasksEnqueuer(client, addressor)
+    now = datetime(2026, 8, 19, 12, 1, tzinfo=UTC)
+    addressed = addressor.seal(task_request(), now=now)
+
+    result = asyncio.run(enqueuer.enqueue(addressed, now=now))
+
+    assert (
+        0
+        < CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS
+        < CLOUD_TASKS_ENQUEUE_WALL_TIMEOUT_SECONDS
+        < 45.0
+    )
+    assert result.disposition is TaskEnqueueDisposition.AMBIGUOUS
+    assert client.entered.is_set()
+    assert client.calls == 1
+    assert client.rpc_options == [(None, CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS)]
+    assert client.finished.is_set()
+    assert client.cancelled == 1
+
+
+def test_default_credentials_are_resolved_before_runtime_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
 
-    def unavailable_client() -> object:
+    def unavailable_credentials(*, default_scopes: tuple[str, ...]) -> object:
         nonlocal calls
         calls += 1
         raise RuntimeError("synthetic credentials detail")
 
-    monkeypatch.setattr(tasks_v2, "CloudTasksClient", unavailable_client)
+    monkeypatch.setattr(google_tasks.google.auth, "default", unavailable_credentials)
+    addressor = TaskAddressor(delivery_settings())
+
+    with pytest.raises(RuntimeError, match="synthetic credentials detail"):
+        GoogleCloudTasksEnqueuer.from_default_credentials(addressor)
+
+    assert calls == 1
+
+
+def test_default_async_client_is_created_on_the_dispatch_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_credentials = AnonymousCredentials()
+    provider = _CapturingClient()
+    resolved_scopes: list[tuple[str, ...]] = []
+    client_loops: list[asyncio.AbstractEventLoop] = []
+
+    def resolve_credentials(
+        *,
+        default_scopes: tuple[str, ...],
+    ) -> tuple[AnonymousCredentials, None]:
+        resolved_scopes.append(default_scopes)
+        return expected_credentials, None
+
+    def create_client(*, credentials: object) -> _CapturingClient:
+        assert credentials is expected_credentials
+        client_loops.append(asyncio.get_running_loop())
+        return provider
+
+    monkeypatch.setattr(google_tasks.google.auth, "default", resolve_credentials)
+    monkeypatch.setattr(tasks_v2, "CloudTasksAsyncClient", create_client)
     addressor = TaskAddressor(delivery_settings())
     enqueuer = GoogleCloudTasksEnqueuer.from_default_credentials(addressor)
 
-    assert calls == 0
-    result = TaskDispatcher(addressor, enqueuer).dispatch(
-        task_request(),
-        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
-    )
+    assert resolved_scopes == [("https://www.googleapis.com/auth/cloud-platform",)]
+    assert client_loops == []
 
-    assert calls == 1
-    assert result.disposition is TaskEnqueueDisposition.AMBIGUOUS
+    async def dispatch() -> TaskEnqueueResult:
+        loop = asyncio.get_running_loop()
+        result = await TaskDispatcher(addressor, enqueuer).dispatch(
+            task_request(),
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
+        assert client_loops == [loop]
+        return result
+
+    assert asyncio.run(dispatch()).disposition is TaskEnqueueDisposition.CREATED
 
 
 def test_unexpected_provider_response_is_ambiguous_and_not_retried() -> None:
@@ -726,9 +897,11 @@ def test_unexpected_provider_response_is_ambiguous_and_not_retried() -> None:
         GoogleCloudTasksEnqueuer(client, addressor),
     )
 
-    result = dispatcher.dispatch(
-        task_request(),
-        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            task_request(),
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
     )
 
     assert client.calls == 1
@@ -743,9 +916,11 @@ def test_raising_provider_response_name_is_ambiguous_and_not_retried() -> None:
         GoogleCloudTasksEnqueuer(client, addressor),
     )
 
-    result = dispatcher.dispatch(
-        task_request(),
-        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            task_request(),
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
     )
 
     assert client.calls == 1
@@ -760,9 +935,11 @@ def test_non_string_provider_response_name_is_ambiguous_without_comparison() -> 
         GoogleCloudTasksEnqueuer(client, addressor),
     )
 
-    result = dispatcher.dispatch(
-        task_request(),
-        now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            task_request(),
+            now=datetime(2026, 8, 19, 12, 1, tzinfo=UTC),
+        )
     )
 
     assert client.calls == 1
@@ -778,9 +955,11 @@ def test_provider_adapter_rechecks_expiry_immediately_before_create_task() -> No
     client = _CapturingClient()
 
     with pytest.raises(TaskAddressingError, match="expired"):
-        GoogleCloudTasksEnqueuer(client, addressor).enqueue(
-            addressed,
-            now=datetime(2026, 8, 19, 12, 10, tzinfo=UTC),
+        asyncio.run(
+            GoogleCloudTasksEnqueuer(client, addressor).enqueue(
+                addressed,
+                now=datetime(2026, 8, 19, 12, 10, tzinfo=UTC),
+            )
         )
 
     assert client.requests == []

@@ -373,7 +373,7 @@ class PromotionRolloutCoordinator:
             raise CanaryExecutionError(CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE) from None
 
         try:
-            dispatched = self._task_dispatcher.dispatch_prepared_v2(
+            dispatched = await self._task_dispatcher.dispatch_prepared_v2(
                 addressed,
                 permit=direct_start.permit,
                 now=dispatch_time,

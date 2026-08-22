@@ -267,7 +267,7 @@ class RecoveryTaskDispatcher(Protocol):
         now: datetime,
     ) -> AddressedTask: ...
 
-    def dispatch_prepared_recovery(
+    async def dispatch_prepared_recovery(
         self,
         task: AddressedTask,
         *,
@@ -1207,7 +1207,7 @@ class RecoveryRolloutCoordinator:
             raise _error(RecoveryExecutionErrorCode.DISPATCH_UNAVAILABLE) from None
 
         try:
-            dispatched = self._task_dispatcher.dispatch_prepared_recovery(
+            dispatched = await self._task_dispatcher.dispatch_prepared_recovery(
                 addressed,
                 permit=direct_start.permit,
                 now=dispatch_time,

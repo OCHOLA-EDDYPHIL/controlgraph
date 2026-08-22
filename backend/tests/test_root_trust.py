@@ -863,7 +863,12 @@ def _coordinator_environment() -> dict[str, str]:
 
 
 class _UnusedTaskEnqueuer:
-    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+    async def enqueue(
+        self,
+        task: AddressedTask,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         del task, now
         raise AssertionError("settings composition must not enqueue a task")
 
