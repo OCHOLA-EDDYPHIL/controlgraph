@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self
 
@@ -36,7 +37,11 @@ TIMELINE_PAGE_COMMAND_V1: Final = "controlgraph.timeline-page-command/v1"
 TIMELINE_ENTRY_PROJECTION_V1: Final = "controlgraph.timeline-entry-projection/v1"
 TIMELINE_PAGE_V1: Final = "controlgraph.timeline-page/v1"
 TIMELINE_RAW_SOURCE_V1: Final = "controlgraph.timeline-raw-source/v1"
+TIMELINE_REDACTED_SOURCE_V1: Final = "controlgraph.timeline-redacted-source/v1"
 TIMELINE_RAW_EVIDENCE_V1: Final = "controlgraph.timeline-raw-evidence/v1"
+TIMELINE_RAW_DELETION_RECEIPT_V1: Final = (
+    "controlgraph.timeline-raw-deletion-receipt/v1"
+)
 TIMELINE_RAW_EXPORT_COMMAND_V1: Final = "controlgraph.timeline-raw-export-command/v1"
 TIMELINE_RAW_EXPORT_ITEM_V1: Final = "controlgraph.timeline-raw-export-item/v1"
 TIMELINE_RAW_EXPORT_V1: Final = "controlgraph.timeline-raw-export/v1"
@@ -46,6 +51,8 @@ TIMELINE_HEAD_COLLECTION: Final = "controlgraph_timeline_heads"
 TIMELINE_IDENTITY_COLLECTION: Final = "controlgraph_timeline_identities"
 TIMELINE_ENTRY_COLLECTION: Final = "controlgraph_timeline_entries"
 TIMELINE_RAW_COLLECTION: Final = "controlgraph_timeline_raw"
+TIMELINE_RAW_TOMBSTONE_COLLECTION: Final = "controlgraph_timeline_raw_tombstones"
+TIMELINE_SIGNED_INTENT_COLLECTION: Final = "controlgraph_signed_intents"
 TIMELINE_MAX_PAGE_SIZE: Final = 100
 TIMELINE_MAX_RAW_EXPORT_SIZE: Final = 25
 TIMELINE_DEFAULT_RAW_RETENTION_DAYS: Final = 30
@@ -64,6 +71,25 @@ CanonicalPayload = Annotated[
     StringConstraints(min_length=2, max_length=65_536),
     AfterValidator(validate_nfc_text),
 ]
+
+_FORBIDDEN_RAW_KEYS: Final = frozenset(
+    {
+        "access_token",
+        "authorization",
+        "capability",
+        "cookie",
+        "id_token",
+        "identity_token",
+        "refresh_token",
+        "set-cookie",
+    }
+)
+_FORBIDDEN_RAW_SCHEMAS: Final = frozenset(
+    {
+        "controlgraph.signed-capability/v1",
+        "controlgraph.task-request/v1",
+    }
+)
 
 
 class TimelineAudience(StrEnum):
@@ -175,13 +201,14 @@ class TimelineStorageKind(StrEnum):
     HEAD = "HEAD"
     IDENTITY = "IDENTITY"
     ENTRY = "ENTRY"
+    RAW_DELETION = "RAW_DELETION"
 
 
 class TimelineRawLifecycleStatus(StrEnum):
     """Honest raw-record availability at one export evaluation instant."""
 
     AVAILABLE = "AVAILABLE"
-    EXPIRED_BY_POLICY = "EXPIRED_BY_POLICY"
+    DELETED = "DELETED"
 
 
 _AUDIENCE_ORDER: Final[dict[TimelineAudience, int]] = {
@@ -580,7 +607,40 @@ class TimelineRawSourceV1(StrictContractModel):
             raise ValueError("timeline raw source is not UTF-8") from error
         if hashlib.sha256(encoded).hexdigest() != self.record_sha256:
             raise ValueError("timeline raw source digest is invalid")
+        try:
+            parsed = json.loads(self.canonical_record)
+        except (TypeError, ValueError) as error:
+            raise ValueError("timeline raw source is not canonical JSON") from error
+        if _contains_forbidden_raw_material(parsed):
+            raise ValueError("timeline raw source contains excluded credentials or capability")
         return self
+
+
+class TimelineRedactedSourceV1(StrictContractModel):
+    """Digest-only substitute for a source that must never enter evidence storage."""
+
+    schema_version: Literal["controlgraph.timeline-redacted-source/v1"]
+    source_schema_version: ContractVersion
+    source_sha256: Sha256Digest
+    redaction_policy: Literal["EXCLUDE_CAPABILITY_AND_CREDENTIAL_MATERIAL_V1"]
+
+
+def _contains_forbidden_raw_material(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("schema_version") in _FORBIDDEN_RAW_SCHEMAS:
+            return True
+        for key, nested in value.items():
+            if isinstance(key, str) and key.casefold() in _FORBIDDEN_RAW_KEYS:
+                return True
+            if _contains_forbidden_raw_material(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contains_forbidden_raw_material(item) for item in value)
+    if isinstance(value, str):
+        lowered = value.casefold()
+        return lowered.startswith("bearer ") or "-----begin private key-----" in lowered
+    return False
 
 
 class TimelineRawEvidenceV1(StrictContractModel):
@@ -605,6 +665,38 @@ class TimelineRawEvidenceV1(StrictContractModel):
             or self.recorded_at >= self.expires_at
         ):
             raise ValueError("timeline raw evidence bindings are invalid")
+        return self
+
+
+class TimelineRawDeletionReceiptV1(StrictContractModel):
+    """Durable proof that an expired raw record was deleted by exact ID."""
+
+    schema_version: Literal["controlgraph.timeline-raw-deletion-receipt/v1"]
+    receipt_id: Identifier
+    target: TargetBinding
+    sequence: PositiveSafeInteger
+    entry_id: Identifier
+    entry_sha256: Sha256Digest
+    source_id: Identifier
+    raw_source_id: Identifier
+    record_sha256: Sha256Digest
+    expires_at: UtcSecond
+    deletion_confirmed_at: UtcSecond
+    deletion_policy: Literal["EXPIRE_RAW_PRESERVE_DIGEST_V1"]
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> Self:
+        expected = timeline_raw_deletion_receipt_id(
+            self.target,
+            self.source_id,
+            self.record_sha256,
+        )
+        if (
+            self.receipt_id != expected
+            or self.entry_id != f"cgtimeline:{self.entry_sha256}"
+            or self.deletion_confirmed_at < self.expires_at
+        ):
+            raise ValueError("timeline raw deletion receipt bindings are invalid")
         return self
 
 
@@ -644,6 +736,9 @@ class TimelineRawExportItemV1(StrictContractModel):
     expires_at: UtcSecond
     lifecycle_status: TimelineRawLifecycleStatus
     canonical_record: CanonicalPayload | None
+    deletion_receipt_id: Identifier | None
+    deletion_receipt_sha256: Sha256Digest | None
+    deletion_confirmed_at: UtcSecond | None
     deletion_policy: Literal["EXPIRE_RAW_PRESERVE_DIGEST_V1"]
 
     @model_validator(mode="after")
@@ -655,6 +750,19 @@ class TimelineRawExportItemV1(StrictContractModel):
             != (self.canonical_record is not None)
         ):
             raise ValueError("timeline raw export item is invalid")
+        receipt_fields = (
+            self.deletion_receipt_id,
+            self.deletion_receipt_sha256,
+            self.deletion_confirmed_at,
+        )
+        if (
+            self.lifecycle_status is TimelineRawLifecycleStatus.AVAILABLE
+            and any(value is not None for value in receipt_fields)
+        ) or (
+            self.lifecycle_status is TimelineRawLifecycleStatus.DELETED
+            and not all(value is not None for value in receipt_fields)
+        ):
+            raise ValueError("timeline raw export deletion evidence is invalid")
         if self.canonical_record is not None:
             try:
                 encoded = self.canonical_record.encode("utf-8")
@@ -700,7 +808,7 @@ class TimelineRawExportV1(StrictContractModel):
                 item.lifecycle_status is TimelineRawLifecycleStatus.AVAILABLE
                 and self.evaluated_at >= item.expires_at
             ) or (
-                item.lifecycle_status is TimelineRawLifecycleStatus.EXPIRED_BY_POLICY
+                item.lifecycle_status is TimelineRawLifecycleStatus.DELETED
                 and self.evaluated_at < item.expires_at
             ):
                 raise ValueError("timeline raw lifecycle status is invalid")
@@ -841,6 +949,55 @@ def timeline_raw_document_id(target: TargetBinding, source_id: str) -> str:
     )
 
 
+def timeline_raw_deletion_receipt_id(
+    target: TargetBinding,
+    source_id: str,
+    record_sha256: str,
+) -> str:
+    if type(source_id) is not str or not source_id:
+        raise TypeError("timeline raw source identity must be exact")
+    if (
+        type(record_sha256) is not str
+        or len(record_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in record_sha256)
+    ):
+        raise ValueError("timeline raw record digest is invalid")
+    digest = _document_digest(
+        "controlgraph.timeline-raw-deletion-receipt/v1",
+        timeline_target_sha256(target),
+        source_id,
+        record_sha256,
+    )
+    return f"cgtimeline-delete:{digest}"
+
+
+def timeline_raw_tombstone_document_id(target: TargetBinding, source_id: str) -> str:
+    if type(source_id) is not str or not source_id:
+        raise TypeError("timeline raw source identity must be exact")
+    return _document_digest(
+        "controlgraph.timeline-raw-tombstone-document/v1",
+        timeline_target_sha256(target),
+        source_id,
+    )
+
+
+def timeline_signed_intent_document_id(
+    target: TargetBinding,
+    capability_sha256: str,
+) -> str:
+    if (
+        type(capability_sha256) is not str
+        or len(capability_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in capability_sha256)
+    ):
+        raise ValueError("capability digest is invalid")
+    return _document_digest(
+        "controlgraph.signed-intent-document/v1",
+        timeline_target_sha256(target),
+        capability_sha256,
+    )
+
+
 def timeline_capability_source_id(capability_sha256: str) -> str:
     """Return the exact timeline source identity for one signed envelope digest."""
 
@@ -899,12 +1056,16 @@ __all__ = [
     "TIMELINE_PAGE_COMMAND_V1",
     "TIMELINE_PAGE_V1",
     "TIMELINE_RAW_COLLECTION",
+    "TIMELINE_RAW_DELETION_RECEIPT_V1",
     "TIMELINE_RAW_EVIDENCE_V1",
     "TIMELINE_RAW_EXPORT_COMMAND_V1",
     "TIMELINE_RAW_EXPORT_ITEM_V1",
     "TIMELINE_RAW_EXPORT_V1",
     "TIMELINE_RAW_SOURCE_V1",
+    "TIMELINE_RAW_TOMBSTONE_COLLECTION",
+    "TIMELINE_REDACTED_SOURCE_V1",
     "TIMELINE_SIGNATURE_METADATA_V1",
+    "TIMELINE_SIGNED_INTENT_COLLECTION",
     "TIMELINE_STORAGE_DOCUMENT_V1",
     "TimelineActorRole",
     "TimelineAudience",
@@ -924,12 +1085,14 @@ __all__ = [
     "TimelineIdentityV1",
     "TimelinePageCommandV1",
     "TimelinePageV1",
+    "TimelineRawDeletionReceiptV1",
     "TimelineRawEvidenceV1",
     "TimelineRawExportCommandV1",
     "TimelineRawExportItemV1",
     "TimelineRawExportV1",
     "TimelineRawLifecycleStatus",
     "TimelineRawSourceV1",
+    "TimelineRedactedSourceV1",
     "TimelineSignatureMetadataV1",
     "TimelineStorageDocumentV1",
     "TimelineStorageKind",
@@ -944,6 +1107,9 @@ __all__ = [
     "timeline_head_logical_id",
     "timeline_identity_document_id",
     "timeline_identity_logical_id",
+    "timeline_raw_deletion_receipt_id",
     "timeline_raw_document_id",
+    "timeline_raw_tombstone_document_id",
+    "timeline_signed_intent_document_id",
     "timeline_target_sha256",
 ]

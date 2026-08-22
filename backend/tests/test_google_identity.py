@@ -23,6 +23,7 @@ API_AUDIENCE = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
 OPERATOR_EMAIL = "operator@example.com"
 OPERATOR_SUBJECT = "223456789012345678901"
 OPERATOR_OAUTH_CLIENT_AUDIENCE = "32555940559.apps.googleusercontent.com"
+OPERATOR_SESSION_NONCE = "a" * 43
 TOKEN = "synthetic_header.synthetic_payload.synthetic_signature"
 NOW = 1_776_236_400.0
 
@@ -114,8 +115,8 @@ def test_google_identity_verifier_returns_bounded_context_for_exact_caller(
     assert not hasattr(context, "token")
 
 
-def test_operator_token_uses_oauth_audience_and_seals_route_context() -> None:
-    backend = CapturingVerifier(operator_claims())
+def test_operator_token_uses_oauth_audience_and_retains_only_session_nonce() -> None:
+    backend = CapturingVerifier(operator_claims(nonce=OPERATOR_SESSION_NONCE))
     verifier = GoogleIdentityVerifier(
         backend,
         clock=lambda: NOW,
@@ -128,6 +129,37 @@ def test_operator_token_uses_oauth_audience_and_seals_route_context() -> None:
     assert context.email == OPERATOR_EMAIL
     assert context.subject == OPERATOR_SUBJECT
     assert context.audience == API_AUDIENCE
+    assert context.operator_session_nonce == OPERATOR_SESSION_NONCE
+    assert backend.calls == [(TOKEN, OPERATOR_OAUTH_CLIENT_AUDIENCE)]
+    assert TOKEN not in repr(context)
+
+
+@pytest.mark.parametrize("nonce", ["", "a" * 42, "a" * 44, "not+a+base64url+nonce", 7])
+def test_operator_token_rejects_malformed_session_nonce(nonce: object) -> None:
+    backend = CapturingVerifier(operator_claims(nonce=nonce))
+
+    with pytest.raises(AuthenticationError) as failure:
+        GoogleIdentityVerifier(
+            backend,
+            clock=lambda: NOW,
+            operator_oauth_client_audience=OPERATOR_OAUTH_CLIENT_AUDIENCE,
+        ).authenticate(f"Bearer {TOKEN}", operator_policy())
+
+    assert failure.value.code is AuthenticationDenialCode.CREDENTIAL_INVALID
+    assert TOKEN not in str(failure.value)
+
+
+def test_operator_nonce_is_inspected_only_after_signed_identity_and_time_claims() -> None:
+    backend = CapturingVerifier(operator_claims(nonce="malformed", exp=int(NOW)))
+
+    with pytest.raises(AuthenticationError) as failure:
+        GoogleIdentityVerifier(
+            backend,
+            clock=lambda: NOW,
+            operator_oauth_client_audience=OPERATOR_OAUTH_CLIENT_AUDIENCE,
+        ).authenticate(f"Bearer {TOKEN}", operator_policy())
+
+    assert failure.value.code is AuthenticationDenialCode.TOKEN_EXPIRED
     assert backend.calls == [(TOKEN, OPERATOR_OAUTH_CLIENT_AUDIENCE)]
 
 

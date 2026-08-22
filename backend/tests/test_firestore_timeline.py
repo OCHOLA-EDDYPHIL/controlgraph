@@ -32,6 +32,7 @@ from controlgraph_canary.application.timeline import (
 from controlgraph_canary.application.timeline_projectors import (
     project_signed_capability,
 )
+from controlgraph_canary.application.timeline_recording import TimelineRecorder
 from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64url
 from controlgraph_canary.contracts.models import (
     CAPABILITY_CLAIMS_V1,
@@ -46,6 +47,8 @@ from controlgraph_canary.contracts.timeline import (
     TIMELINE_PAGE_COMMAND_V1,
     TIMELINE_RAW_COLLECTION,
     TIMELINE_RAW_EXPORT_COMMAND_V1,
+    TIMELINE_RAW_TOMBSTONE_COLLECTION,
+    TIMELINE_SIGNED_INTENT_COLLECTION,
     TimelineActorRole,
     TimelineAudience,
     TimelineDisplayFieldName,
@@ -57,6 +60,8 @@ from controlgraph_canary.contracts.timeline import (
     timeline_capability_source_id,
     timeline_entry_document_id,
     timeline_raw_document_id,
+    timeline_raw_tombstone_document_id,
+    timeline_signed_intent_document_id,
 )
 from controlgraph_canary.integrations.google.firestore_timeline import (
     FIRESTORE_TIMELINE_DATABASE,
@@ -124,7 +129,7 @@ class _Transaction:
     def __init__(self, client: _Client) -> None:
         self.client = client
         self.write_results: list[object] = []
-        self.writes: list[tuple[str, str, dict[str, Any]]] = []
+        self.writes: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def read(self, path: str) -> dict[str, Any] | None:
         return self.client.documents.get(path)
@@ -144,6 +149,9 @@ class _Transaction:
     ) -> None:
         del option
         self.writes.append(("update", reference.path, deepcopy(field_updates)))
+
+    def delete(self, reference: TimelineDocumentReferencePort) -> None:
+        self.writes.append(("delete", reference.path, None))
 
 
 class _Client:
@@ -218,6 +226,10 @@ async def _run_transaction(
         await body(transaction)
         assert len(transaction.writes) == expected_writes
         for operation, path, data in transaction.writes:
+            if operation == "delete":
+                client.documents.pop(path, None)
+                continue
+            assert data is not None
             if operation == "create":
                 if path in client.documents:
                     raise RuntimeError("synthetic create contention")
@@ -382,7 +394,7 @@ async def test_exact_get_pages_are_order_independent_and_reconnect_without_omiss
     assert all(len(paths) <= 3 for paths in client.batch_calls)
     assert not hasattr(store, "list")
     assert not hasattr(store, "query")
-    assert not hasattr(store, "delete")
+    assert not hasattr(store, "delete_timeline_entry")
 
 
 @_async_test
@@ -654,15 +666,35 @@ async def test_signed_intent_is_read_by_receipt_bound_envelope_digest() -> None:
         signature_verified=False,
     )
 
-    await store.append_with_raw(projection.event, projection.raw_source)
+    recorder = TimelineRecorder(
+        service=TimelineWriteService(
+            target=TARGET,
+            policy_set=standard_timeline_evidence_policy_set(TARGET),
+            store=store,
+        ),
+        grant=TimelineWriteGrant(
+            target=TARGET,
+            writer_role=TimelineActorRole.COORDINATOR,
+            principal_id="coordinator:synthetic",
+        ),
+        policy_set=standard_timeline_evidence_policy_set(TARGET),
+        signed_intent_store=store,
+    )
+    await recorder.record_signed_capability(signed, signature_verified=False)
 
     assert projection.event.source_id == timeline_capability_source_id(digest)
+    intent_path = (
+        f"{TIMELINE_SIGNED_INTENT_COLLECTION}/"
+        f"{timeline_signed_intent_document_id(TARGET, digest)}"
+    )
+    assert intent_path in client.documents
+    assert signed.signature not in projection.raw_source.canonical_record
     assert await store.read_signed_intent(digest) == signed
     assert await store.read_signed_intent("f" * 64) is None
 
 
 @_async_test
-async def test_raw_export_hides_ttl_lag_and_accepts_policy_expiration_deletion() -> None:
+async def test_raw_export_deletes_expired_raw_and_returns_durable_receipt() -> None:
     now = [NOW]
     client = _Client()
     store = _store(client, clock=lambda: now[0])
@@ -677,25 +709,32 @@ async def test_raw_export_hides_ttl_lag_and_accepts_policy_expiration_deletion()
     )
 
     now[0] = NOW + timedelta(days=30)
-    lagging = await store.read_raw_export(command)
-    lagging_export = await TimelineRawExportService(target=TARGET, store=store).export(
+    deleted = await store.read_raw_export(command)
+    deleted_export = await TimelineRawExportService(target=TARGET, store=store).export(
         command,
         TimelineRawExportGrant(target=TARGET, principal_id="operator:synthetic"),
     )
-    assert lagging.raw_evidence[0] is not None
-    assert lagging_export.entries[0].lifecycle_status is (
-        TimelineRawLifecycleStatus.EXPIRED_BY_POLICY
-    )
-    assert lagging_export.entries[0].canonical_record is None
-    assert lagging_export.entries[0].record_sha256 == raw_source.record_sha256
+    assert deleted.raw_evidence == (None,)
+    assert deleted.deletion_receipts[0] is not None
+    assert deleted_export.entries[0].lifecycle_status is TimelineRawLifecycleStatus.DELETED
+    assert deleted_export.entries[0].canonical_record is None
+    assert deleted_export.entries[0].record_sha256 == raw_source.record_sha256
+    assert deleted_export.entries[0].deletion_receipt_id is not None
+    assert deleted_export.entries[0].deletion_receipt_sha256 is not None
 
     raw_path = (
         f"{TIMELINE_RAW_COLLECTION}/"
         f"{timeline_raw_document_id(TARGET, event.source_id)}"
     )
-    del client.documents[raw_path]
-    deleted = await store.read_raw_export(command)
-    assert deleted.raw_evidence == (None,)
+    assert raw_path not in client.documents
+    tombstone_path = (
+        f"{TIMELINE_RAW_TOMBSTONE_COLLECTION}/"
+        f"{timeline_raw_tombstone_document_id(TARGET, event.source_id)}"
+    )
+    assert tombstone_path in client.documents
+    replay = await store.read_raw_export(command)
+    assert replay.raw_evidence == (None,)
+    assert replay.deletion_receipts == deleted.deletion_receipts
 
 
 @_async_test

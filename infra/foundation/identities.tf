@@ -1,5 +1,10 @@
 locals {
   workload_service_accounts = {
+    console = {
+      account_id   = "controlgraph-console"
+      display_name = "ControlGraph operator console"
+      description  = "Public static console host with no control-plane permissions."
+    }
     api = {
       account_id   = "controlgraph-api"
       display_name = "ControlGraph API"

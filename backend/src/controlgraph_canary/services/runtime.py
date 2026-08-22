@@ -187,6 +187,10 @@ from controlgraph_canary.application.timeline import (
     TimelineWriteService,
 )
 from controlgraph_canary.application.timeline_recording import TimelineRecorder
+from controlgraph_canary.application.timeline_relay import (
+    ApiTimelineClient,
+    CoordinatorTimelineRelay,
+)
 from controlgraph_canary.contracts.health import (
     RolloutHealthPolicyV2,
     create_rollout_health_policy_v2,
@@ -361,6 +365,7 @@ def create_runtime_service_app(
     timeline_read_service = None
     timeline_raw_export_service = None
     timeline_recorder = None
+    coordinator_timeline_relay = None
     if role is ServiceRole.EVIDENCE_WRITER:
         if settings.evidence_key_version is None or settings.signing_algorithm is None:
             raise ValueError("evidence-writer signing configuration is incomplete")
@@ -699,27 +704,9 @@ def create_runtime_service_app(
             clock=preflight_clock,
         )
     elif role is ServiceRole.API:
-        from controlgraph_canary.integrations.google.firestore_timeline import (
-            FirestoreTimelineStore,
-        )
-
         if settings.coordinator_url is None:
             raise ValueError("API root-creation relay configuration is incomplete")
         timeline_target = _reference_target(settings)
-        timeline_policy_set = standard_timeline_evidence_policy_set(timeline_target)
-        timeline_store = FirestoreTimelineStore.production(
-            target=timeline_target,
-            configured_project_id=settings.project_id,
-            policy_set=timeline_policy_set,
-        )
-        timeline_read_service = TimelineReadService(
-            target=timeline_target,
-            store=timeline_store,
-        )
-        timeline_raw_export_service = TimelineRawExportService(
-            target=timeline_target,
-            store=timeline_store,
-        )
         selected_transport = (
             internal_transport
             if internal_transport is not None
@@ -729,6 +716,22 @@ def create_runtime_service_app(
                 timeout_seconds=45.0,
             )
         )
+        timeline_client = ApiTimelineClient(
+            target=timeline_target,
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                caller_role=CallerRole.API,
+                project_number=settings.project_number,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            operator_policy=_operator_timeline_policy(policy, TIMELINE_READ_PATH),
+            security_audit_policy=_security_audit_timeline_policy(settings),
+            restricted_export_policy=_restricted_export_timeline_policy(settings),
+            transport=selected_transport,
+        )
+        timeline_read_service = timeline_client
+        timeline_raw_export_service = timeline_client
         api_root_creation_client = ApiRootCreationClient(
             route=CoordinatorInternalRoute(
                 project_id=settings.project_id,
@@ -1235,6 +1238,21 @@ def create_runtime_service_app(
                 ),
             ),
             policy_set=timeline_policy_set,
+            signed_intent_store=timeline_store,
+        )
+        coordinator_timeline_relay = CoordinatorTimelineRelay(
+            authentication_policy=policy,
+            operator_policy=_operator_timeline_policy(
+                _operator_api_policy(settings),
+                TIMELINE_READ_PATH,
+            ),
+            security_audit_policy=_security_audit_timeline_policy(settings),
+            restricted_export_policy=_restricted_export_timeline_policy(settings),
+            read_service=TimelineReadService(target=target, store=timeline_store),
+            raw_export_service=TimelineRawExportService(
+                target=target,
+                store=timeline_store,
+            ),
         )
         coordinator_independent_verification_client = (
             CoordinatorIndependentVerificationClient(
@@ -1690,13 +1708,22 @@ def create_runtime_service_app(
             if timeline_read_service is not None
             else None
         ),
+        timeline_security_read_authentication_policy=(
+            _security_audit_timeline_policy(settings)
+            if timeline_read_service is not None
+            else None
+        ),
         timeline_raw_export_service=timeline_raw_export_service,
         timeline_raw_export_authentication_policy=(
-            _operator_timeline_policy(policy, TIMELINE_RAW_EXPORT_PATH)
+            _restricted_export_timeline_policy(settings)
             if timeline_raw_export_service is not None
             else None
         ),
+        coordinator_timeline_relay=coordinator_timeline_relay,
         timeline_recorder=timeline_recorder,
+        operator_console_origin=(
+            settings.operator_console_origin if role is ServiceRole.API else None
+        ),
         mutation_enabled=settings.mutations_enabled,
     )
     if coordinator_clients is not None:
@@ -1789,6 +1816,8 @@ def create_runtime_service_app(
         app.state.controlgraph_timeline_raw_export = timeline_raw_export_service
     if timeline_recorder is not None:
         app.state.controlgraph_timeline_recorder = timeline_recorder
+    if coordinator_timeline_relay is not None:
+        app.state.controlgraph_timeline_relay = coordinator_timeline_relay
     return app
 
 
@@ -1841,6 +1870,51 @@ def _operator_timeline_policy(
         path=path,
         audience=base.audience,
         caller=base.caller,
+    )
+
+
+def _security_audit_timeline_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    return _privileged_timeline_policy(
+        settings,
+        path=TIMELINE_READ_PATH,
+        email=settings.security_auditor_identity,
+        subject=settings.security_auditor_subject,
+    )
+
+
+def _restricted_export_timeline_policy(
+    settings: ControllerSettings,
+) -> RouteAuthenticationPolicy:
+    return _privileged_timeline_policy(
+        settings,
+        path=TIMELINE_RAW_EXPORT_PATH,
+        email=settings.restricted_exporter_identity,
+        subject=settings.restricted_exporter_subject,
+    )
+
+
+def _privileged_timeline_policy(
+    settings: ControllerSettings,
+    *,
+    path: str,
+    email: str | None,
+    subject: str | None,
+) -> RouteAuthenticationPolicy:
+    if email is None or subject is None:
+        raise ValueError("privileged timeline identity is incomplete")
+    return RouteAuthenticationPolicy(
+        project_id=settings.project_id,
+        project_number=settings.project_number,
+        service_role=ServiceRole.API,
+        path=path,
+        audience=_service_audience(ServiceRole.API, settings.project_number),
+        caller=CallerBinding(
+            role=CallerRole.OPERATOR,
+            email=email,
+            subject=subject,
+        ),
     )
 
 

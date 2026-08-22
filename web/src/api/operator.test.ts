@@ -35,7 +35,7 @@ function credential(overrides: Partial<OperatorCredential> = {}): OperatorCreden
     subject: "123456789012345678901",
     expiresAtEpochSeconds: Math.floor(Date.now() / 1000) + 600,
     idToken: "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.synthetic-signature",
-    csrfToken: "c".repeat(48),
+    csrfToken: "c".repeat(43),
     ...overrides,
   } as OperatorCredential;
 }
@@ -329,7 +329,7 @@ describe("authenticated operator API", () => {
         new OperatorApiError("UNAVAILABLE", "OPERATOR_API_DEADLINE_EXCEEDED"),
       );
 
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(60_000);
       await assertion;
     } finally {
       vi.useRealTimers();

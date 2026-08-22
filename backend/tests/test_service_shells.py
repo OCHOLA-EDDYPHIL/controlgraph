@@ -160,6 +160,13 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
                     "32555940559.apps.googleusercontent.com"
                 ),
+                "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN": (
+                    f"https://controlgraph-console-{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
             }
         )
     if role is ServiceRole.COORDINATOR:
@@ -189,6 +196,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
                 "CONTROLGRAPH_OPERATOR_EMAIL": "operator@example.com",
                 "CONTROLGRAPH_OPERATOR_SUBJECT": SUBJECT,
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
                 "CONTROLGRAPH_EXECUTOR_URL": (
                     f"https://controlgraph-executor-{PROJECT_NUMBER}."
                     "us-central1.run.app"

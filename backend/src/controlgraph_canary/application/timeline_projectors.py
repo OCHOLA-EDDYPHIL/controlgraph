@@ -50,6 +50,7 @@ from controlgraph_canary.contracts.timeline import (
     TIMELINE_DISPLAY_FIELD_V1,
     TIMELINE_EVENT_V1,
     TIMELINE_RAW_SOURCE_V1,
+    TIMELINE_REDACTED_SOURCE_V1,
     TIMELINE_SIGNATURE_METADATA_V1,
     TimelineActorRole,
     TimelineAudience,
@@ -62,6 +63,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineEvidenceClass,
     TimelineEvidencePolicySetV1,
     TimelineRawSourceV1,
+    TimelineRedactedSourceV1,
     TimelineSignatureMetadataV1,
     TimelineTerminalClassification,
     TimelineVerificationStatus,
@@ -166,12 +168,13 @@ def _policy(
 def _raw_source(
     source: StrictContractModel,
     *,
+    retained_source: StrictContractModel | None = None,
     target: TargetBinding,
     evidence_class: TimelineEvidenceClass,
     payload_sha256: str,
     signature_sha256: str | None,
 ) -> TimelineRawSourceV1:
-    canonical = canonical_json_bytes(source)
+    canonical = canonical_json_bytes(retained_source or source)
     record_sha256 = hashlib.sha256(canonical).hexdigest()
     source_schema_version = getattr(source, "schema_version", None)
     if type(source_schema_version) is not str:
@@ -186,6 +189,18 @@ def _raw_source(
         record_sha256=record_sha256,
         canonical_record=canonical.decode("utf-8"),
         signature_sha256=signature_sha256,
+    )
+
+
+def _redacted_source(source: StrictContractModel) -> TimelineRedactedSourceV1:
+    source_schema_version = getattr(source, "schema_version", None)
+    if type(source_schema_version) is not str:
+        raise TypeError("timeline source schema version is absent")
+    return TimelineRedactedSourceV1(
+        schema_version=TIMELINE_REDACTED_SOURCE_V1,
+        source_schema_version=source_schema_version,
+        source_sha256=canonical_sha256(source),
+        redaction_policy="EXCLUDE_CAPABILITY_AND_CREDENTIAL_MATERIAL_V1",
     )
 
 
@@ -208,6 +223,7 @@ def _projection(
     terminal_classification: TimelineTerminalClassification,
     display_fields: tuple[TimelineDisplayFieldV1, ...],
     policy_set: TimelineEvidencePolicySetV1,
+    retained_source: StrictContractModel | None = None,
 ) -> TimelineProjection:
     evidence_class = _EVENT_CLASS[event_type]
     if target != policy_set.target:
@@ -219,6 +235,7 @@ def _projection(
     signature_sha256 = None if signature is None else signature.signature_sha256
     raw = _raw_source(
         source,
+        retained_source=retained_source,
         target=target,
         evidence_class=evidence_class,
         payload_sha256=payload_sha256,
@@ -383,6 +400,7 @@ def project_signed_capability(
     )
     return _projection(
         source=signed,
+        retained_source=_redacted_source(signed),
         source_id=timeline_capability_source_id(canonical_sha256(signed)),
         event_type=TimelineEventType.CAPABILITY_ISSUED,
         target=claims.target,
@@ -444,6 +462,7 @@ def project_task_request(
     intent = task.intent
     return _projection(
         source=task,
+        retained_source=_redacted_source(task),
         source_id=task.task_id,
         event_type=TimelineEventType.TASK_CREATED,
         target=intent.target,
@@ -550,8 +569,15 @@ def _project_dispatch_result(
     occurred_at: str,
     policy_set: TimelineEvidencePolicySetV1,
 ) -> TimelineProjection:
+    normalized_source = source
+    normalized_disposition = disposition
+    if disposition in {"CREATED", "DUPLICATE"}:
+        normalized_source = type(source).model_validate(
+            {**source.model_dump(mode="python"), "enqueue_disposition": "CREATED"}
+        )
+        normalized_disposition = "CREATED"
     return _projection(
-        source=source,
+        source=normalized_source,
         source_id=source_id,
         event_type=TimelineEventType.TASK_CREATED,
         target=target,
@@ -571,7 +597,7 @@ def _project_dispatch_result(
                 (TimelineCorrelationKind.TASK, task_id, TimelineAudience.OPERATOR),
             )
         ),
-        payload_sha256=canonical_sha256(source),
+        payload_sha256=canonical_sha256(normalized_source),
         signature=None,
         verification_status=TimelineVerificationStatus.NOT_APPLICABLE,
         terminal_classification=TimelineTerminalClassification.NONE,
@@ -584,7 +610,7 @@ def _project_dispatch_result(
                 ),
                 (
                     TimelineDisplayFieldName.OUTCOME,
-                    disposition,
+                    normalized_disposition,
                     TimelineAudience.PUBLIC_DEMO,
                 ),
                 (
@@ -1297,8 +1323,13 @@ def project_recovery_dispatch(
 
     if type(result) is not RecoveryDispatchResultV2:
         raise TypeError("recovery dispatch projection input must be exact")
+    normalized = result
+    if result.enqueue_disposition in {"CREATED", "DUPLICATE"}:
+        normalized = RecoveryDispatchResultV2.model_validate(
+            {**result.model_dump(mode="python"), "enqueue_disposition": "CREATED"}
+        )
     return _projection(
-        source=result,
+        source=normalized,
         source_id=result.task_id,
         event_type=TimelineEventType.RECOVERY_TASK_CREATED,
         target=result.target,
@@ -1327,7 +1358,7 @@ def project_recovery_dispatch(
                 ),
             )
         ),
-        payload_sha256=canonical_sha256(result),
+        payload_sha256=canonical_sha256(normalized),
         signature=None,
         verification_status=TimelineVerificationStatus.NOT_APPLICABLE,
         terminal_classification=TimelineTerminalClassification.NONE,
@@ -1340,7 +1371,7 @@ def project_recovery_dispatch(
                 ),
                 (
                     TimelineDisplayFieldName.OUTCOME,
-                    result.enqueue_disposition,
+                    normalized.enqueue_disposition,
                     TimelineAudience.PUBLIC_DEMO,
                 ),
                 (

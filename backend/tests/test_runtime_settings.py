@@ -46,6 +46,13 @@ def _api_environment() -> dict[str, str]:
             "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
                 "32555940559.apps.googleusercontent.com"
             ),
+            "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN": (
+                "https://controlgraph-console-123456789012.us-central1.run.app"
+            ),
+            "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+            "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+            "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+            "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
         }
     )
     return environment
@@ -168,6 +175,25 @@ def test_api_requires_and_binds_exact_operator_oauth_client_audience() -> None:
     assert settings.operator_oauth_client_audience == environment[
         "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"
     ]
+    assert (
+        settings.operator_console_origin
+        == environment["CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN"]
+    )
+    assert settings.security_auditor_identity == "security@example.com"
+    assert settings.restricted_exporter_identity == "exporter@example.com"
+
+
+def test_api_rejects_reused_privileged_timeline_identity() -> None:
+    environment = _api_environment()
+    environment["CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"] = environment[
+        "CONTROLGRAPH_AUTH_CALLER_EMAIL"
+    ]
+    environment["CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"] = environment[
+        "CONTROLGRAPH_AUTH_CALLER_SUBJECT"
+    ]
+
+    with pytest.raises(ValueError, match="must be distinct"):
+        ControllerSettings.from_environment(environment)
 
 
 @pytest.mark.parametrize(
@@ -194,6 +220,24 @@ def test_api_rejects_absent_operator_oauth_client_audience() -> None:
     del environment["CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"]
 
     with pytest.raises(ValueError, match="missing environment variables"):
+        ControllerSettings.from_environment(environment)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "",
+        "http://controlgraph-console-123456789012.us-central1.run.app",
+        "https://controlgraph-api-123456789012.us-central1.run.app",
+        "https://controlgraph-console-123456789012.us-central1.run.app/",
+        "https://controlgraph-console-999999999999.us-central1.run.app",
+    ],
+)
+def test_api_rejects_noncanonical_operator_console_origin(origin: str) -> None:
+    environment = _api_environment()
+    environment["CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN"] = origin
+
+    with pytest.raises(ValueError, match="CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN"):
         ControllerSettings.from_environment(environment)
 
 

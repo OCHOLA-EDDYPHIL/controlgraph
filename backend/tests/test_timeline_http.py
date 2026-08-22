@@ -7,6 +7,8 @@ from controlgraph_canary.application.identity import (
     TIMELINE_RAW_EXPORT_PATH,
     TIMELINE_READ_PATH,
     AuthenticationContext,
+    AuthenticationDenialCode,
+    AuthenticationError,
     CallerBinding,
     CallerRole,
     RouteAuthenticationPolicy,
@@ -34,6 +36,10 @@ from controlgraph_canary.http.service import create_service_app
 PROJECT_NUMBER = "123456789012"
 OPERATOR_EMAIL = "operator@example.com"
 OPERATOR_SUBJECT = "123456789012345678901"
+SECURITY_EMAIL = "security@example.com"
+SECURITY_SUBJECT = "223456789012345678901"
+EXPORTER_EMAIL = "exporter@example.com"
+EXPORTER_SUBJECT = "323456789012345678901"
 AUDIENCE = (
     f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
 )
@@ -44,9 +50,28 @@ OPERATOR_HEADERS = {
         "bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
     ),
 }
+SECURITY_TOKEN = "Bearer security.payload.signature"
+SECURITY_HEADERS = {
+    CONTROLGRAPH_AUTHORIZATION_HEADER: SECURITY_TOKEN,
+    SERVERLESS_AUTHORIZATION_HEADER: (
+        "bearer security.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+    ),
+}
+EXPORT_TOKEN = "Bearer exporter.payload.signature"
+EXPORT_HEADERS = {
+    CONTROLGRAPH_AUTHORIZATION_HEADER: EXPORT_TOKEN,
+    SERVERLESS_AUTHORIZATION_HEADER: (
+        "bearer exporter.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+    ),
+}
 
 
-def _policy(path: str) -> RouteAuthenticationPolicy:
+def _policy(
+    path: str,
+    *,
+    email: str = OPERATOR_EMAIL,
+    subject: str = OPERATOR_SUBJECT,
+) -> RouteAuthenticationPolicy:
     return RouteAuthenticationPolicy(
         project_id=TARGET.project_id,
         project_number=PROJECT_NUMBER,
@@ -55,8 +80,8 @@ def _policy(path: str) -> RouteAuthenticationPolicy:
         audience=AUDIENCE,
         caller=CallerBinding(
             role=CallerRole.OPERATOR,
-            email=OPERATOR_EMAIL,
-            subject=OPERATOR_SUBJECT,
+            email=email,
+            subject=subject,
         ),
     )
 
@@ -70,12 +95,19 @@ class _Authenticator:
         authorization_header: str | None,
         policy: RouteAuthenticationPolicy,
     ) -> AuthenticationContext:
-        assert authorization_header == FULL_TOKEN
+        identities = {
+            FULL_TOKEN: (OPERATOR_EMAIL, OPERATOR_SUBJECT),
+            SECURITY_TOKEN: (SECURITY_EMAIL, SECURITY_SUBJECT),
+            EXPORT_TOKEN: (EXPORTER_EMAIL, EXPORTER_SUBJECT),
+        }
+        identity = identities.get(authorization_header or "")
+        if identity != (policy.caller.email, policy.caller.subject):
+            raise AuthenticationError(AuthenticationDenialCode.CALLER_DENIED)
         self.paths.append(policy.path)
         return AuthenticationContext(
             role=CallerRole.OPERATOR,
-            email=OPERATOR_EMAIL,
-            subject=OPERATOR_SUBJECT,
+            email=identity[0],
+            subject=identity[1],
             issuer="accounts.google.com",
             audience=AUDIENCE,
             issued_at=1_700_000_000,
@@ -118,6 +150,7 @@ class _TimelineStore:
             head=None,
             entries=(),
             raw_evidence=(),
+            deletion_receipts=(),
             evaluated_at="2026-08-21T12:00:00Z",
         )
 
@@ -131,8 +164,17 @@ def _client() -> tuple[TestClient, _Authenticator, _TimelineStore]:
         authentication_policy=_policy(protected_path(ServiceRole.API)),
         timeline_read_service=TimelineReadService(target=TARGET, store=store),
         timeline_read_authentication_policy=_policy(TIMELINE_READ_PATH),
+        timeline_security_read_authentication_policy=_policy(
+            TIMELINE_READ_PATH,
+            email=SECURITY_EMAIL,
+            subject=SECURITY_SUBJECT,
+        ),
         timeline_raw_export_service=TimelineRawExportService(target=TARGET, store=store),
-        timeline_raw_export_authentication_policy=_policy(TIMELINE_RAW_EXPORT_PATH),
+        timeline_raw_export_authentication_policy=_policy(
+            TIMELINE_RAW_EXPORT_PATH,
+            email=EXPORTER_EMAIL,
+            subject=EXPORTER_SUBJECT,
+        ),
     )
     return TestClient(app), authenticator, store
 
@@ -173,12 +215,22 @@ def test_timeline_get_rejects_target_override_ambiguous_cursor_and_elevation() -
         f"{TIMELINE_READ_PATH}?audience=RESTRICTED",
         headers=OPERATOR_HEADERS,
     )
+    audit_denied = client.get(
+        f"{TIMELINE_READ_PATH}?audience=SECURITY_AUDIT",
+        headers=OPERATOR_HEADERS,
+    )
+    audit_accepted = client.get(
+        f"{TIMELINE_READ_PATH}?audience=SECURITY_AUDIT",
+        headers=SECURITY_HEADERS,
+    )
 
     assert target_override.status_code == 400
     assert duplicate.status_code == 400
     assert incomplete_cursor.status_code == 400
     assert elevated.status_code == 403
-    assert store.page_commands == []
+    assert audit_denied.status_code == 403
+    assert audit_accepted.status_code == 200
+    assert [item.audience.value for item in store.page_commands] == ["SECURITY_AUDIT"]
 
 
 def test_timeline_get_rejects_incomplete_operator_identity_envelope() -> None:
@@ -197,17 +249,26 @@ def test_timeline_get_rejects_incomplete_operator_identity_envelope() -> None:
 def test_raw_export_requires_separate_confirmation_and_is_no_store() -> None:
     client, authenticator, store = _client()
 
-    denied = client.get(TIMELINE_RAW_EXPORT_PATH, headers=OPERATOR_HEADERS)
-    accepted = client.get(
+    denied = client.get(
         TIMELINE_RAW_EXPORT_PATH,
         headers={
             **OPERATOR_HEADERS,
             "X-ControlGraph-Raw-Export": "EXPORT_RESTRICTED_EVIDENCE_V1",
         },
     )
+    unconfirmed = client.get(TIMELINE_RAW_EXPORT_PATH, headers=EXPORT_HEADERS)
+    accepted = client.get(
+        TIMELINE_RAW_EXPORT_PATH,
+        headers={
+            **EXPORT_HEADERS,
+            "X-ControlGraph-Raw-Export": "EXPORT_RESTRICTED_EVIDENCE_V1",
+        },
+    )
 
     assert denied.status_code == 403
-    assert denied.json()["code"] == "TIMELINE_RAW_EXPORT_ACCESS_DENIED"
+    assert denied.json()["code"] == "AUTH_CALLER_DENIED"
+    assert unconfirmed.status_code == 403
+    assert unconfirmed.json()["code"] == "TIMELINE_RAW_EXPORT_ACCESS_DENIED"
     assert accepted.status_code == 200
     assert accepted.headers["cache-control"] == "no-store"
     assert accepted.json()["command"]["target"] == TARGET.model_dump(mode="json")

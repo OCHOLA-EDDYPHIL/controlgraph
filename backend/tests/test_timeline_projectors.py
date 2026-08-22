@@ -8,6 +8,8 @@ from health_execution_test_data import (
 )
 from revocation_proof_test_data import make_revocation_proof_records
 from root_v2_test_data import make_root_v2_records
+from test_canary_execution import _capability
+from test_canary_execution import _result as _canary_dispatch_result
 from test_independent_verification import (
     _async,
     _bundle,
@@ -21,15 +23,21 @@ from timeline_test_data import OTHER_TARGET
 
 from controlgraph_canary.application.completion_classification import classify_completion
 from controlgraph_canary.application.timeline_projectors import (
+    project_canary_dispatch,
     project_completion_classification,
     project_epoch_authority,
     project_epoch_revocation,
     project_execution_receipt,
     project_independent_verification,
+    project_signed_capability,
     project_signed_evidence_event,
     project_signed_health_proof,
 )
-from controlgraph_canary.contracts.codec import canonical_json_bytes, canonical_sha256
+from controlgraph_canary.contracts.codec import (
+    canonical_json_bytes,
+    canonical_sha256,
+    decode_contract,
+)
 from controlgraph_canary.contracts.independent_verification import (
     COMPLETION_ASSESSMENT_REQUEST_V1,
     COMPLETION_CLASSIFICATION_V1,
@@ -45,10 +53,43 @@ from controlgraph_canary.contracts.timeline import (
     TimelineCorrelationKind,
     TimelineDisplayFieldName,
     TimelineEventType,
+    TimelineRedactedSourceV1,
     TimelineTerminalClassification,
     TimelineVerificationStatus,
     standard_timeline_evidence_policy_set,
 )
+
+
+def test_capability_raw_evidence_is_digest_only() -> None:
+    signed = _capability()
+    projection = project_signed_capability(
+        signed,
+        policy_set=standard_timeline_evidence_policy_set(signed.claims.target),
+        signature_verified=False,
+    )
+
+    retained = decode_contract(
+        projection.raw_source.canonical_record,
+        TimelineRedactedSourceV1,
+    )
+    assert retained.source_schema_version == signed.schema_version
+    assert retained.source_sha256 == canonical_sha256(signed)
+    assert signed.signature not in projection.raw_source.canonical_record
+    assert signed.claims.capability_id not in projection.raw_source.canonical_record
+
+
+def test_created_and_duplicate_dispatches_have_one_replay_identity() -> None:
+    created = _canary_dispatch_result()
+    duplicate = type(created).model_validate(
+        {**created.model_dump(mode="python"), "enqueue_disposition": "DUPLICATE"}
+    )
+    policy_set = standard_timeline_evidence_policy_set(created.target)
+
+    created_projection = project_canary_dispatch(created, policy_set=policy_set)
+    duplicate_projection = project_canary_dispatch(duplicate, policy_set=policy_set)
+
+    assert created_projection == duplicate_projection
+    assert _fields(created_projection)[TimelineDisplayFieldName.OUTCOME] == "CREATED"
 
 
 def _fields(projection):  # type: ignore[no-untyped-def]

@@ -20,14 +20,14 @@ const SERVERLESS_AUTHORIZATION_HEADER = "X-Serverless-Authorization";
 const CSRF_HEADER = "X-ControlGraph-CSRF";
 const MAX_RESPONSE_BYTES = 65_536;
 const TIMELINE_DEADLINE_MS = 10_000;
-const MUTATION_DEADLINE_MS = 30_000;
+const MUTATION_DEADLINE_MS = 60_000;
 const REVOCATION_REQUEST_DIGEST_DOMAIN =
   "controlgraph.epoch-revocation-request-sha256/v1\0";
 const REVOCATION_EVIDENCE_ID_DOMAIN =
   "controlgraph.epoch-revocation-evidence-id/v1\0";
 const identifier = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const sha256 = /^[0-9a-f]{64}$/;
-const csrfToken = /^[A-Za-z0-9_-]{32,256}$/;
+const csrfToken = /^[A-Za-z0-9_-]{43}$/;
 const jwt = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const googleSubject = /^[1-9][0-9]{5,31}$/;
 const humanEmail = /^[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
@@ -138,7 +138,7 @@ function validCredential(value: OperatorCredential): OperatorCredential {
     !Number.isSafeInteger(value.expiresAtEpochSeconds) ||
     value.expiresAtEpochSeconds <= now + 15 ||
     typeof value.idToken !== "string" ||
-    value.idToken.length > 16_384 ||
+    value.idToken.length > 6_144 ||
     !jwt.test(value.idToken) ||
     typeof value.csrfToken !== "string" ||
     !csrfToken.test(value.csrfToken)

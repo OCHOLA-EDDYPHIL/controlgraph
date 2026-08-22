@@ -3,9 +3,10 @@ locals {
   timeline_raw_collection     = "controlgraph_timeline_raw"
   timeline_raw_expiry_field   = "expires_at"
   timeline_raw_retention_days = 30
+  signed_intent_collection    = "controlgraph_signed_intents"
+  signed_intent_expiry_field  = "expires_at"
 
   firestore_readers = toset([
-    "api",
     "issuer",
     "executor",
     "recovery",
@@ -26,10 +27,11 @@ check "timeline_raw_retention_is_bounded" {
       local.timeline_raw_collection == "controlgraph_timeline_raw" &&
       local.timeline_raw_expiry_field == "expires_at" &&
       local.timeline_raw_retention_days == 30 &&
-      contains(local.firestore_readers, "api") &&
+      local.signed_intent_collection == "controlgraph_signed_intents" &&
+      !contains(local.firestore_readers, "api") &&
       !contains(local.firestore_writers, "api")
     )
-    error_message = "Raw timeline evidence must use its fixed 30-day TTL field and read-only API access."
+    error_message = "Raw evidence and signed intents must be TTL-bound and inaccessible to the API identity."
   }
 }
 
@@ -102,6 +104,23 @@ resource "google_firestore_field" "timeline_raw_expiry" {
   database   = google_firestore_database.authority.name
   collection = local.timeline_raw_collection
   field      = local.timeline_raw_expiry_field
+
+  ttl_config {}
+
+  index_config {}
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_firestore_database.authority]
+}
+
+resource "google_firestore_field" "signed_intent_expiry" {
+  project    = var.project_id
+  database   = google_firestore_database.authority.name
+  collection = local.signed_intent_collection
+  field      = local.signed_intent_expiry_field
 
   ttl_config {}
 

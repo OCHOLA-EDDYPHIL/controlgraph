@@ -297,12 +297,19 @@ class IndependentVerificationService:
                 IndependentVerificationErrorCode.UNAVAILABLE
             ) from None
 
-        samples: list[ProbeSampleObservationV1] = []
-        for sample_index in range(1, policy.sample_count + 1):
-            samples.append(
-                await self._probe_once(probe_request, sample_index)
+        # The policy bounds the whole observation, not a serial chain of twenty
+        # independent two-second waits.  Launch the fixed sample set together so
+        # an entirely unavailable target still leaves time for evidence signing
+        # inside the coordinator's end-to-end deadline.  ``gather`` preserves the
+        # input order, keeping the canonical observation deterministic.
+        sample_tuple = tuple(
+            await asyncio.gather(
+                *(
+                    self._probe_once(probe_request, sample_index)
+                    for sample_index in range(1, policy.sample_count + 1)
+                )
             )
-        sample_tuple = tuple(samples)
+        )
         counts = [sample.outcome for sample in sample_tuple]
         try:
             observation = ProbeObservationV1(

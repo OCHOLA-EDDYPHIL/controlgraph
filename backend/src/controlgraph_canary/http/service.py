@@ -144,6 +144,10 @@ from controlgraph_canary.application.timeline import (
     TimelineReadService,
 )
 from controlgraph_canary.application.timeline_recording import TimelineRecorder
+from controlgraph_canary.application.timeline_relay import (
+    ApiTimelineClient,
+    CoordinatorTimelineRelay,
+)
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
 from controlgraph_canary.contracts.canary_execution import (
     ApplyCanaryCommandV1,
@@ -235,7 +239,12 @@ from controlgraph_canary.contracts.timeline import (
     TimelinePageCommandV1,
     TimelineRawExportCommandV1,
 )
+from controlgraph_canary.contracts.timeline_relay import (
+    TimelineRawExportInvocationV1,
+    TimelineReadInvocationV1,
+)
 from controlgraph_canary.http.identity_headers import authentication_header
+from controlgraph_canary.http.operator_csrf import validate_operator_csrf
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
@@ -460,11 +469,14 @@ def create_service_app(
     recovery_receipt_authority_authentication_policy: (RouteAuthenticationPolicy | None) = None,
     recovery_executor_facade_handler: RecoveryExecutorFacadeHandler | None = None,
     recovery_executor_facade_authentication_policy: (RouteAuthenticationPolicy | None) = None,
-    timeline_read_service: TimelineReadService | None = None,
+    timeline_read_service: TimelineReadService | ApiTimelineClient | None = None,
     timeline_read_authentication_policy: RouteAuthenticationPolicy | None = None,
-    timeline_raw_export_service: TimelineRawExportService | None = None,
+    timeline_security_read_authentication_policy: RouteAuthenticationPolicy | None = None,
+    timeline_raw_export_service: TimelineRawExportService | ApiTimelineClient | None = None,
     timeline_raw_export_authentication_policy: RouteAuthenticationPolicy | None = None,
+    coordinator_timeline_relay: CoordinatorTimelineRelay | None = None,
     timeline_recorder: TimelineRecorder | None = None,
+    operator_console_origin: str | None = None,
     mutation_enabled: bool = False,
 ) -> FastAPI:
     """Create one authenticated role shell with explicitly bounded work."""
@@ -475,6 +487,15 @@ def create_service_app(
         raise ValueError("authenticator and authentication policy must be configured together")
     if authentication_policy is not None and authentication_policy.service_role is not role:
         raise ValueError("authentication policy does not match the service role")
+    if operator_console_origin is not None:
+        expected_console_origin = (
+            f"https://controlgraph-console-{authentication_policy.project_number}"
+            ".us-central1.run.app"
+            if authentication_policy is not None
+            else None
+        )
+        if role is not ServiceRole.API or operator_console_origin != expected_console_origin:
+            raise ValueError("operator console origin does not match the API boundary")
     if verified_task_handler is not None and capability_verifier is None:
         raise ValueError("a protected task handler requires capability verification")
     if verified_task_handler is not None and not mutation_enabled:
@@ -640,29 +661,70 @@ def create_service_app(
         or not mutation_enabled
     ):
         raise ValueError("recovery executor facade is limited to its exact route")
-    timeline_pairs = (
-        (
-            timeline_read_service,
-            timeline_read_authentication_policy,
-            TIMELINE_READ_PATH,
-        ),
-        (
-            timeline_raw_export_service,
-            timeline_raw_export_authentication_policy,
-            TIMELINE_RAW_EXPORT_PATH,
-        ),
-    )
-    for timeline_service, timeline_policy, timeline_path in timeline_pairs:
-        if (timeline_service is None) != (timeline_policy is None):
-            raise ValueError("timeline service requires its exact route policy")
-        if timeline_service is not None and (
-            role is not ServiceRole.API
-            or type(timeline_policy) is not RouteAuthenticationPolicy
-            or timeline_policy.service_role is not ServiceRole.API
-            or timeline_policy.path != timeline_path
-            or timeline_policy.caller.role is not CallerRole.OPERATOR
-        ):
-            raise ValueError("timeline reads are limited to exact operator API routes")
+    if (
+        timeline_read_service is None
+        and (
+            timeline_read_authentication_policy is not None
+            or timeline_security_read_authentication_policy is not None
+        )
+    ) or (
+        timeline_read_service is not None
+        and (
+            timeline_read_authentication_policy is None
+            or timeline_security_read_authentication_policy is None
+        )
+    ):
+        raise ValueError("timeline read service requires both projection policies")
+    if timeline_read_service is not None and (
+        role is not ServiceRole.API
+        or type(timeline_read_service) not in {TimelineReadService, ApiTimelineClient}
+        or type(timeline_read_authentication_policy) is not RouteAuthenticationPolicy
+        or type(timeline_security_read_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or timeline_read_authentication_policy.service_role is not ServiceRole.API
+        or timeline_security_read_authentication_policy.service_role
+        is not ServiceRole.API
+        or timeline_read_authentication_policy.path != TIMELINE_READ_PATH
+        or timeline_security_read_authentication_policy.path != TIMELINE_READ_PATH
+        or timeline_read_authentication_policy.caller.role is not CallerRole.OPERATOR
+        or timeline_security_read_authentication_policy.caller.role
+        is not CallerRole.OPERATOR
+        or timeline_read_authentication_policy.caller
+        == timeline_security_read_authentication_policy.caller
+    ):
+        raise ValueError("timeline reads require distinct operator and audit policies")
+    if (timeline_raw_export_service is None) != (
+        timeline_raw_export_authentication_policy is None
+    ):
+        raise ValueError("timeline raw export requires its exact route policy")
+    if timeline_raw_export_service is not None and (
+        role is not ServiceRole.API
+        or type(timeline_raw_export_service) not in {
+            TimelineRawExportService,
+            ApiTimelineClient,
+        }
+        or type(timeline_raw_export_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or timeline_raw_export_authentication_policy.service_role is not ServiceRole.API
+        or timeline_raw_export_authentication_policy.path != TIMELINE_RAW_EXPORT_PATH
+        or timeline_raw_export_authentication_policy.caller.role
+        is not CallerRole.OPERATOR
+        or timeline_raw_export_authentication_policy.caller
+        in {
+            timeline_read_authentication_policy.caller
+            if timeline_read_authentication_policy is not None
+            else None,
+            timeline_security_read_authentication_policy.caller
+            if timeline_security_read_authentication_policy is not None
+            else None,
+        }
+    ):
+        raise ValueError("raw export requires a distinct restricted identity")
+    if coordinator_timeline_relay is not None and (
+        role is not ServiceRole.COORDINATOR
+        or type(coordinator_timeline_relay) is not CoordinatorTimelineRelay
+    ):
+        raise ValueError("timeline projection relay is coordinator-limited")
     if timeline_recorder is not None and (
         role is not ServiceRole.COORDINATOR or type(timeline_recorder) is not TimelineRecorder
     ):
@@ -756,11 +818,9 @@ def create_service_app(
         elif audience not in {
             TimelineAudience.PUBLIC_DEMO.value,
             TimelineAudience.OPERATOR.value,
+            TimelineAudience.SECURITY_AUDIT.value,
         }:
-            if audience in {
-                TimelineAudience.SECURITY_AUDIT.value,
-                TimelineAudience.RESTRICTED.value,
-            }:
+            if audience == TimelineAudience.RESTRICTED.value:
                 raise TimelineReadError(TimelineReadErrorCode.ACCESS_DENIED)
             raise ValueError("timeline audience is invalid")
         return sequence, digest, limit, audience
@@ -772,10 +832,16 @@ def create_service_app(
     async def timeline_read(request: Request) -> Response:
         correlation_id = _correlation_id()
         service = timeline_read_service
-        route_policy = timeline_read_authentication_policy
+        requested_audiences = request.query_params.getlist("audience")
+        route_policy = (
+            timeline_security_read_authentication_policy
+            if requested_audiences == [TimelineAudience.SECURITY_AUDIT.value]
+            else timeline_read_authentication_policy
+        )
         if (
             authenticator is None
-            or type(service) is not TimelineReadService
+            or service is None
+            or type(service) not in {TimelineReadService, ApiTimelineClient}
             or type(route_policy) is not RouteAuthenticationPolicy
         ):
             return _timeline_denial(
@@ -810,14 +876,21 @@ def create_service_app(
                 limit=limit,
                 audience=TimelineAudience(audience_value),
             )
-            page = await service.read(
-                command,
-                TimelineReadGrant(
-                    target=service.target,
-                    maximum_audience=TimelineAudience.OPERATOR,
-                    principal_id=_timeline_principal(context),
-                ),
-            )
+            if isinstance(service, ApiTimelineClient):
+                page = await service.read(command, context)
+            else:
+                page = await service.read(
+                    command,
+                    TimelineReadGrant(
+                        target=service.target,
+                        maximum_audience=(
+                            TimelineAudience.SECURITY_AUDIT
+                            if command.audience is TimelineAudience.SECURITY_AUDIT
+                            else TimelineAudience.OPERATOR
+                        ),
+                        principal_id=_timeline_principal(context),
+                    ),
+                )
         except asyncio.CancelledError:
             raise
         except (TypeError, ValueError):
@@ -843,7 +916,8 @@ def create_service_app(
         route_policy = timeline_raw_export_authentication_policy
         if (
             authenticator is None
-            or type(service) is not TimelineRawExportService
+            or service is None
+            or type(service) not in {TimelineRawExportService, ApiTimelineClient}
             or type(route_policy) is not RouteAuthenticationPolicy
         ):
             return _timeline_denial(
@@ -883,13 +957,16 @@ def create_service_app(
                 after_entry_sha256=digest,
                 limit=limit,
             )
-            exported = await service.export(
-                command,
-                TimelineRawExportGrant(
-                    target=service.target,
-                    principal_id=_timeline_principal(context),
-                ),
-            )
+            if isinstance(service, ApiTimelineClient):
+                exported = await service.export(command, context)
+            else:
+                exported = await service.export(
+                    command,
+                    TimelineRawExportGrant(
+                        target=service.target,
+                        principal_id=_timeline_principal(context),
+                    ),
+                )
         except asyncio.CancelledError:
             raise
         except (TypeError, ValueError):
@@ -938,6 +1015,15 @@ def create_service_app(
                 AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
                 correlation_id,
             )
+        if role is ServiceRole.API:
+            try:
+                validate_operator_csrf(
+                    request.headers,
+                    context,
+                    expected_origin=(operator_console_origin or authentication_policy.audience),
+                )
+            except AuthenticationError as error:
+                return _authentication_denial(error.code, correlation_id)
         request.state.authentication = context
         if role is ServiceRole.API and (
             api_root_creation_client is not None
@@ -1106,6 +1192,7 @@ def create_service_app(
             or coordinator_service_claim_release_relay is not None
             or coordinator_recovery_abandonment_relay is not None
             or coordinator_operator_observation_relay is not None
+            or coordinator_timeline_relay is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -1274,6 +1361,26 @@ def create_service_app(
                             failure_code=None,
                         )
                     response_body = canonical_json_bytes(proof_outcome)
+                elif type(invocation) is TimelineReadInvocationV1:
+                    if coordinator_timeline_relay is None:
+                        raise TimelineReadError(
+                            TimelineReadErrorCode.CONFIGURATION_INVALID
+                        )
+                    timeline_page = await coordinator_timeline_relay.read(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(timeline_page)
+                elif type(invocation) is TimelineRawExportInvocationV1:
+                    if coordinator_timeline_relay is None:
+                        raise TimelineRawExportError(
+                            TimelineRawExportErrorCode.CONFIGURATION_INVALID
+                        )
+                    timeline_export = await coordinator_timeline_relay.export(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(timeline_export)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
@@ -1329,6 +1436,10 @@ def create_service_app(
                 )
             except OperatorObservationError as error:
                 return _operator_observation_denial(error.code.value, correlation_id)
+            except TimelineReadError as error:
+                return _timeline_denial(error.code.value, correlation_id)
+            except TimelineRawExportError as error:
+                return _timeline_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -2112,6 +2223,8 @@ def _decode_coordinator_invocation(
     | TargetTrafficReadInvocationV1
     | HealthEvaluationInvocationV1
     | RecoveryInvocationV2
+    | TimelineReadInvocationV1
+    | TimelineRawExportInvocationV1
     | EpochRevocationProofInvocationV1
     | EpochRevocationInvocationV1
 ):
@@ -2167,6 +2280,16 @@ def _decode_coordinator_invocation(
             raise
     try:
         return decode_contract(body, EpochRevocationProofInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TimelineReadInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TimelineRawExportInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -2264,7 +2387,12 @@ def _authentication_denial(
         AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
     }:
         status_code = 503
-    elif code is AuthenticationDenialCode.CALLER_DENIED:
+    elif code in {
+        AuthenticationDenialCode.CALLER_DENIED,
+        AuthenticationDenialCode.BROWSER_ORIGIN_DENIED,
+        AuthenticationDenialCode.CSRF_MISSING,
+        AuthenticationDenialCode.CSRF_INVALID,
+    }:
         status_code = 403
     else:
         status_code = 401

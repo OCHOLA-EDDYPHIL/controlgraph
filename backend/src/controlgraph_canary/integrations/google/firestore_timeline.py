@@ -42,7 +42,10 @@ from controlgraph_canary.contracts.timeline import (
     TIMELINE_IDENTITY_V1,
     TIMELINE_PAGE_COMMAND_V1,
     TIMELINE_RAW_COLLECTION,
+    TIMELINE_RAW_DELETION_RECEIPT_V1,
     TIMELINE_RAW_EVIDENCE_V1,
+    TIMELINE_RAW_TOMBSTONE_COLLECTION,
+    TIMELINE_SIGNED_INTENT_COLLECTION,
     TIMELINE_STORAGE_DOCUMENT_V1,
     TimelineAudience,
     TimelineEntryV1,
@@ -52,12 +55,12 @@ from controlgraph_canary.contracts.timeline import (
     TimelineHeadV1,
     TimelineIdentityV1,
     TimelinePageCommandV1,
+    TimelineRawDeletionReceiptV1,
     TimelineRawEvidenceV1,
     TimelineRawExportCommandV1,
     TimelineRawSourceV1,
     TimelineStorageDocumentV1,
     TimelineStorageKind,
-    timeline_capability_source_id,
     timeline_entry,
     timeline_entry_document_id,
     timeline_entry_logical_id,
@@ -65,7 +68,10 @@ from controlgraph_canary.contracts.timeline import (
     timeline_head_logical_id,
     timeline_identity_document_id,
     timeline_identity_logical_id,
+    timeline_raw_deletion_receipt_id,
     timeline_raw_document_id,
+    timeline_raw_tombstone_document_id,
+    timeline_signed_intent_document_id,
 )
 
 FIRESTORE_TIMELINE_DATABASE: Final = "controlgraph-authority"
@@ -76,6 +82,7 @@ FIRESTORE_TIMELINE_MAX_TRANSACTION_ATTEMPTS: Final = 3
 _CONTROLGRAPH_PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _DOCUMENT_FIELDS = frozenset(TimelineStorageDocumentV1.model_fields)
 _RAW_STORAGE_VERSION: Final = "controlgraph.timeline-raw-storage/v1"
+_SIGNED_INTENT_STORAGE_VERSION: Final = "controlgraph.signed-intent-storage/v1"
 _RAW_DOCUMENT_FIELDS: Final = frozenset(
     {
         "schema_version",
@@ -83,6 +90,16 @@ _RAW_DOCUMENT_FIELDS: Final = frozenset(
         "entry_id",
         "entry_sha256",
         "sequence",
+        "canonical_payload",
+        "payload_sha256",
+        "expires_at",
+    }
+)
+_SIGNED_INTENT_DOCUMENT_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "logical_id",
+        "capability_sha256",
         "canonical_payload",
         "payload_sha256",
         "expires_at",
@@ -138,6 +155,8 @@ class TimelineTransactionPort(Protocol):
         field_updates: dict[str, Any],
         option: object | None = None,
     ) -> None: ...
+
+    def delete(self, reference: TimelineDocumentReferencePort) -> None: ...
 
 
 class AsyncFirestoreTimelineClientPort(Protocol):
@@ -198,10 +217,20 @@ class _ReadSpec:
     model_type: type[StrictContractModel]
 
 
+@dataclass(frozen=True, slots=True)
+class _StoredSignedIntent:
+    value: SignedCapability
+    expires_at: datetime
+
+
 class _ReplayDetected(RuntimeError):
     def __init__(self, entry: TimelineEntryV1) -> None:
         self.entry = entry
         super().__init__("timeline replay detected")
+
+
+class _SignedIntentReplay(RuntimeError):
+    pass
 
 
 def _default_client_factory(
@@ -350,6 +379,65 @@ def _raw_document_data(raw: TimelineRawEvidenceV1) -> dict[str, Any]:
     return data
 
 
+def _signed_intent_logical_id(target: TargetBinding, capability_sha256: str) -> str:
+    return (
+        "cgsigned-intent:"
+        f"{timeline_signed_intent_document_id(target, capability_sha256)}"
+    )
+
+
+def _signed_intent_document_data(
+    signed: SignedCapability,
+    *,
+    expires_at: datetime,
+) -> dict[str, Any]:
+    capability_sha256 = canonical_sha256(signed)
+    data: dict[str, Any] = {
+        "schema_version": _SIGNED_INTENT_STORAGE_VERSION,
+        "logical_id": _signed_intent_logical_id(
+            signed.claims.target,
+            capability_sha256,
+        ),
+        "capability_sha256": capability_sha256,
+        "canonical_payload": canonical_json_bytes(signed).decode("utf-8"),
+        "payload_sha256": capability_sha256,
+        "expires_at": _aware_utc(expires_at),
+    }
+    if set(data) != _SIGNED_INTENT_DOCUMENT_FIELDS:
+        raise TimelineStoreCorruptRecord
+    return data
+
+
+def _raw_deletion_receipt(
+    entry: TimelineEntryV1,
+    *,
+    confirmed_at: str,
+) -> TimelineRawDeletionReceiptV1:
+    event = entry.content.event
+    expires_at = _utc_second(
+        _parse_utc_second(entry.content.recorded_at)
+        + timedelta(days=event.raw_retention_days)
+    )
+    return TimelineRawDeletionReceiptV1(
+        schema_version=TIMELINE_RAW_DELETION_RECEIPT_V1,
+        receipt_id=timeline_raw_deletion_receipt_id(
+            entry.content.target,
+            event.source_id,
+            event.raw_record_sha256,
+        ),
+        target=entry.content.target,
+        sequence=entry.content.sequence,
+        entry_id=entry.entry_id,
+        entry_sha256=entry.entry_sha256,
+        source_id=event.source_id,
+        raw_source_id=event.raw_source_id,
+        record_sha256=event.raw_record_sha256,
+        expires_at=expires_at,
+        deletion_confirmed_at=confirmed_at,
+        deletion_policy="EXPIRE_RAW_PRESERVE_DIGEST_V1",
+    )
+
+
 def _is_contention(error: BaseException) -> bool:
     current: BaseException | None = error
     visited: set[int] = set()
@@ -364,7 +452,7 @@ def _is_contention(error: BaseException) -> bool:
 
 
 class FirestoreTimelineStore:
-    """Append and page one fixed target without collection enumeration or deletion."""
+    """Append/page one target and delete expired raw records only by exact ID."""
 
     @classmethod
     def production(
@@ -609,35 +697,141 @@ class FirestoreTimelineStore:
             source_id=source_id,
         )
 
+    def _decode_signed_intent_snapshot(
+        self,
+        snapshot: object,
+        *,
+        reference: TimelineDocumentReferencePort,
+        capability_sha256: str,
+    ) -> _StoredSignedIntent | None:
+        try:
+            provider = cast(TimelineProviderSnapshotPort, snapshot)
+            _aware_utc(provider.read_time)
+            if provider.reference.path != reference.path or type(provider.exists) is not bool:
+                raise ValueError("signed intent snapshot metadata is invalid")
+            if not provider.exists:
+                if provider.to_dict() is not None or provider.update_time is not None:
+                    raise ValueError("missing signed intent snapshot contains data")
+                return None
+            if provider.update_time is None:
+                raise ValueError("signed intent snapshot update time is absent")
+            _aware_utc(provider.update_time)
+            data = provider.to_dict()
+            if type(data) is not dict or set(data) != _SIGNED_INTENT_DOCUMENT_FIELDS:
+                raise ValueError("signed intent wrapper shape is invalid")
+            expires_at = _aware_utc(data.get("expires_at"))
+            if (
+                data.get("schema_version") != _SIGNED_INTENT_STORAGE_VERSION
+                or data.get("logical_id")
+                != _signed_intent_logical_id(self._target, capability_sha256)
+                or data.get("capability_sha256") != capability_sha256
+                or data.get("payload_sha256") != capability_sha256
+                or type(data.get("canonical_payload")) is not str
+            ):
+                raise ValueError("signed intent wrapper identity is invalid")
+            signed = decode_contract(data["canonical_payload"], SignedCapability)
+            if (
+                signed.claims.target != self._target
+                or canonical_sha256(signed) != capability_sha256
+            ):
+                raise ValueError("signed intent binding is invalid")
+            return _StoredSignedIntent(value=signed, expires_at=expires_at)
+        except TimelineStoreCorruptRecord:
+            raise
+        except Exception:
+            raise TimelineStoreCorruptRecord from None
+
+    async def _read_signed_intent_one(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        transaction: TimelineTransactionPort | None,
+        capability_sha256: str,
+    ) -> _StoredSignedIntent | None:
+        reference = self._reference(
+            client,
+            TIMELINE_SIGNED_INTENT_COLLECTION,
+            timeline_signed_intent_document_id(self._target, capability_sha256),
+        )
+        snapshot = await self._snapshot(reference, transaction=transaction)
+        return self._decode_signed_intent_snapshot(
+            snapshot,
+            reference=reference,
+            capability_sha256=capability_sha256,
+        )
+
+    async def persist_signed_intent(self, signed: SignedCapability) -> None:
+        """Persist a capability in a TTL-bound, non-exportable exact-ID collection."""
+
+        if type(signed) is not SignedCapability or signed.claims.target != self._target:
+            raise ValueError("signed intent does not match the configured target")
+        capability_sha256 = canonical_sha256(signed)
+        client = await self._client()
+        expires_at = self._clock() + timedelta(
+            days=self._retention_by_class[TimelineEvidenceClass.CAPABILITY]
+        )
+
+        async def write(transaction: TimelineTransactionPort) -> None:
+            current = await self._read_signed_intent_one(
+                client=client,
+                transaction=transaction,
+                capability_sha256=capability_sha256,
+            )
+            if current is not None:
+                if current.value != signed:
+                    raise TimelineStoreCorruptRecord
+                raise _SignedIntentReplay
+            reference = self._reference(
+                client,
+                TIMELINE_SIGNED_INTENT_COLLECTION,
+                timeline_signed_intent_document_id(self._target, capability_sha256),
+            )
+            transaction.create(
+                reference,
+                _signed_intent_document_data(signed, expires_at=expires_at),
+            )
+
+        try:
+            async with asyncio.timeout(FIRESTORE_TIMELINE_TIMEOUT_SECONDS):
+                await self._transaction_runner(
+                    client,
+                    FIRESTORE_TIMELINE_MAX_TRANSACTION_ATTEMPTS,
+                    1,
+                    write,
+                )
+        except asyncio.CancelledError:
+            raise
+        except _SignedIntentReplay:
+            return
+        except TimelineStoreCorruptRecord:
+            raise
+        except Exception:
+            try:
+                current = await self._read_signed_intent_one(
+                    client=client,
+                    transaction=None,
+                    capability_sha256=capability_sha256,
+                )
+            except TimelineStoreError:
+                raise TimelineStoreOutcomeUnknown from None
+            if current is not None and current.value == signed:
+                return
+            raise TimelineStoreOutcomeUnknown from None
+
     async def read_signed_intent(
         self,
         capability_sha256: str,
     ) -> SignedCapability | None:
         """Read one unexpired signed capability by its receipt-bound digest."""
 
-        source_id = timeline_capability_source_id(capability_sha256)
-        raw = await self._read_raw_one(
+        stored = await self._read_signed_intent_one(
             client=await self._client(),
             transaction=None,
-            source_id=source_id,
+            capability_sha256=capability_sha256,
         )
-        if raw is None or self._clock() >= _parse_utc_second(raw.expires_at):
+        if stored is None or self._clock() >= stored.expires_at:
             return None
-        source = raw.raw_source
-        try:
-            capability = decode_contract(source.canonical_record, SignedCapability)
-            if (
-                raw.source_id != source_id
-                or source.evidence_class is not TimelineEvidenceClass.CAPABILITY
-                or canonical_sha256(capability) != capability_sha256
-                or capability.claims.target != self._target
-            ):
-                raise ValueError("timeline capability binding is invalid")
-            return capability
-        except TimelineStoreCorruptRecord:
-            raise
-        except Exception:
-            raise TimelineStoreCorruptRecord from None
+        return stored.value
 
     async def _read_one[ModelT: StrictContractModel](
         self,
@@ -1496,6 +1690,142 @@ class FirestoreTimelineStore:
             entries=tuple(entries),
         )
 
+    def _deletion_receipt_matches_entry(
+        self,
+        receipt: TimelineRawDeletionReceiptV1,
+        entry: TimelineEntryV1,
+    ) -> bool:
+        event = entry.content.event
+        expected_expiry = _utc_second(
+            _parse_utc_second(entry.content.recorded_at)
+            + timedelta(days=event.raw_retention_days)
+        )
+        return (
+            receipt.target == self._target
+            and receipt.sequence == entry.content.sequence
+            and receipt.entry_id == entry.entry_id
+            and receipt.entry_sha256 == entry.entry_sha256
+            and receipt.source_id == event.source_id
+            and receipt.raw_source_id == event.raw_source_id
+            and receipt.record_sha256 == event.raw_record_sha256
+            and receipt.expires_at == expected_expiry
+        )
+
+    async def _delete_expired_raw(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        entry: TimelineEntryV1,
+        confirmed_at: str,
+    ) -> TimelineRawDeletionReceiptV1:
+        event = entry.content.event
+        expected = _raw_deletion_receipt(entry, confirmed_at=confirmed_at)
+        tombstone_document_id = timeline_raw_tombstone_document_id(
+            self._target,
+            event.source_id,
+        )
+        logical_id = expected.receipt_id
+        selected: TimelineRawDeletionReceiptV1 | None = None
+
+        async def write(transaction: TimelineTransactionPort) -> None:
+            nonlocal selected
+            current = await self._read_one(
+                client=client,
+                transaction=transaction,
+                collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
+                document_id=tombstone_document_id,
+                kind=TimelineStorageKind.RAW_DELETION,
+                logical_id=logical_id,
+                model_type=TimelineRawDeletionReceiptV1,
+            )
+            raw = await self._read_raw_one(
+                client=client,
+                transaction=transaction,
+                source_id=event.source_id,
+            )
+            if raw is not None and raw != _raw_evidence(
+                entry=entry,
+                raw_source=raw.raw_source,
+            ):
+                raise TimelineStoreCorruptRecord
+            if current is not None:
+                if (
+                    current.wrapper.revision != 0
+                    or not self._deletion_receipt_matches_entry(current.value, entry)
+                ):
+                    raise TimelineStoreCorruptRecord
+                selected = current.value
+                prepared = _PreparedDocument(
+                    wrapper=current.wrapper,
+                    value=current.value,
+                    collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
+                    document_id=tombstone_document_id,
+                )
+            else:
+                selected = expected
+                prepared = _prepared_document(
+                    kind=TimelineStorageKind.RAW_DELETION,
+                    logical_id=logical_id,
+                    collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
+                    document_id=tombstone_document_id,
+                    revision=0,
+                    value=expected,
+                )
+            transaction.delete(
+                self._reference(
+                    client,
+                    TIMELINE_RAW_COLLECTION,
+                    timeline_raw_document_id(self._target, event.source_id),
+                )
+            )
+            receipt_reference = self._reference(
+                client,
+                prepared.collection,
+                prepared.document_id,
+            )
+            if current is None:
+                transaction.create(receipt_reference, _document_data(prepared.wrapper))
+            else:
+                transaction.update(receipt_reference, _document_data(prepared.wrapper))
+
+        try:
+            async with asyncio.timeout(FIRESTORE_TIMELINE_TIMEOUT_SECONDS):
+                await self._transaction_runner(
+                    client,
+                    FIRESTORE_TIMELINE_MAX_TRANSACTION_ATTEMPTS,
+                    2,
+                    write,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreCorruptRecord:
+            raise
+        except Exception:
+            adopted = await self._read_one(
+                client=client,
+                transaction=None,
+                collection=TIMELINE_RAW_TOMBSTONE_COLLECTION,
+                document_id=tombstone_document_id,
+                kind=TimelineStorageKind.RAW_DELETION,
+                logical_id=logical_id,
+                model_type=TimelineRawDeletionReceiptV1,
+            )
+            remaining = await self._read_raw_one(
+                client=client,
+                transaction=None,
+                source_id=event.source_id,
+            )
+            if (
+                adopted is None
+                or remaining is not None
+                or not self._deletion_receipt_matches_entry(adopted.value, entry)
+            ):
+                raise TimelineStoreOutcomeUnknown from None
+            return adopted.value
+        if selected is None:
+            raise TimelineStoreOutcomeUnknown
+        return selected
+
     async def read_raw_export(
         self,
         command: TimelineRawExportCommandV1,
@@ -1514,23 +1844,39 @@ class FirestoreTimelineStore:
         )
         summary = await self.read_page(summary_command)
         client = await self._client()
+        evaluated_at = _utc_second(self._clock())
+        evaluated = _parse_utc_second(evaluated_at)
         try:
-            raw_evidence = await asyncio.gather(
-                *(
-                    self._read_raw_one(
-                        client=client,
-                        transaction=None,
-                        source_id=entry.content.event.source_id,
-                    )
-                    for entry in summary.entries
+            async def read_lifecycle(
+                entry: TimelineEntryV1,
+            ) -> tuple[TimelineRawEvidenceV1 | None, TimelineRawDeletionReceiptV1 | None]:
+                expires = _parse_utc_second(entry.content.recorded_at) + timedelta(
+                    days=entry.content.event.raw_retention_days
                 )
+                if evaluated >= expires:
+                    receipt = await self._delete_expired_raw(
+                        client=client,
+                        entry=entry,
+                        confirmed_at=evaluated_at,
+                    )
+                    return None, receipt
+                raw = await self._read_raw_one(
+                    client=client,
+                    transaction=None,
+                    source_id=entry.content.event.source_id,
+                )
+                return raw, None
+
+            lifecycle = await asyncio.gather(
+                *(read_lifecycle(entry) for entry in summary.entries)
             )
             return TimelineRawReadSlice(
                 command=command,
                 head=summary.head,
                 entries=summary.entries,
-                raw_evidence=tuple(raw_evidence),
-                evaluated_at=_utc_second(self._clock()),
+                raw_evidence=tuple(item[0] for item in lifecycle),
+                deletion_receipts=tuple(item[1] for item in lifecycle),
+                evaluated_at=evaluated_at,
             )
         except asyncio.CancelledError:
             raise

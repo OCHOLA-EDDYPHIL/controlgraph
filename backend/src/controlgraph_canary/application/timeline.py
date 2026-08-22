@@ -29,6 +29,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineHeadV1,
     TimelinePageCommandV1,
     TimelinePageV1,
+    TimelineRawDeletionReceiptV1,
     TimelineRawEvidenceV1,
     TimelineRawExportCommandV1,
     TimelineRawExportItemV1,
@@ -234,6 +235,7 @@ class TimelineRawReadSlice:
     head: TimelineHeadV1 | None
     entries: tuple[TimelineEntryV1, ...]
     raw_evidence: tuple[TimelineRawEvidenceV1 | None, ...]
+    deletion_receipts: tuple[TimelineRawDeletionReceiptV1 | None, ...]
     evaluated_at: str
 
     def __post_init__(self) -> None:
@@ -250,6 +252,7 @@ class TimelineRawReadSlice:
                 self.command.after_sequence != 0
                 or self.entries
                 or self.raw_evidence
+                or self.deletion_receipts
             ):
                 raise ValueError("an empty timeline cannot satisfy a raw export cursor")
             return
@@ -257,6 +260,7 @@ class TimelineRawReadSlice:
             type(self.head) is not TimelineHeadV1
             or self.head.target != self.command.target
             or len(self.raw_evidence) != len(self.entries)
+            or len(self.deletion_receipts) != len(self.entries)
         ):
             raise ValueError("timeline raw read head or record count is invalid")
         expected_count = min(
@@ -267,7 +271,12 @@ class TimelineRawReadSlice:
             raise ValueError("timeline raw read slice is not omission-free")
         sequence = self.command.after_sequence + 1
         predecessor = self.command.after_entry_sha256
-        for entry, raw in zip(self.entries, self.raw_evidence, strict=True):
+        for entry, raw, receipt in zip(
+            self.entries,
+            self.raw_evidence,
+            self.deletion_receipts,
+            strict=True,
+        ):
             if (
                 type(entry) is not TimelineEntryV1
                 or entry.content.target != self.command.target
@@ -276,10 +285,17 @@ class TimelineRawReadSlice:
             ):
                 raise ValueError("timeline raw read slice is not contiguous")
             expires = _raw_expires_at(entry)
-            if raw is None:
-                if evaluated < expires:
-                    raise ValueError("unexpired timeline raw evidence is absent")
-            elif not _raw_matches_entry(raw, entry, expires_at=_utc_second(expires)):
+            if raw is None and (
+                evaluated < expires
+                or receipt is None
+                or not _deletion_receipt_matches_entry(receipt, entry)
+            ):
+                raise ValueError("timeline raw deletion evidence is absent")
+            if raw is not None and (
+                evaluated >= expires
+                or receipt is not None
+                or not _raw_matches_entry(raw, entry, expires_at=_utc_second(expires))
+            ):
                 raise ValueError("timeline raw evidence does not match its entry")
             sequence += 1
             predecessor = entry.entry_sha256
@@ -362,7 +378,7 @@ class TimelineStore(Protocol):
 
 @runtime_checkable
 class TimelineRawStore(Protocol):
-    """Atomic raw append and exact-ID export surface; never list or delete."""
+    """Atomic raw append plus exact-ID export and policy-bound expiry deletion."""
 
     @property
     def target(self) -> TargetBinding: ...
@@ -541,6 +557,23 @@ def _raw_matches_entry(
     )
 
 
+def _deletion_receipt_matches_entry(
+    receipt: TimelineRawDeletionReceiptV1,
+    entry: TimelineEntryV1,
+) -> bool:
+    event = entry.content.event
+    return (
+        receipt.target == entry.content.target
+        and receipt.sequence == entry.content.sequence
+        and receipt.entry_id == entry.entry_id
+        and receipt.entry_sha256 == entry.entry_sha256
+        and receipt.source_id == event.source_id
+        and receipt.raw_source_id == event.raw_source_id
+        and receipt.record_sha256 == event.raw_record_sha256
+        and receipt.expires_at == _utc_second(_raw_expires_at(entry))
+    )
+
+
 def project_timeline_raw_export(read: TimelineRawReadSlice) -> TimelineRawExportV1:
     """Project a validated raw slice while honoring expiration before TTL cleanup."""
 
@@ -548,13 +581,18 @@ def project_timeline_raw_export(read: TimelineRawReadSlice) -> TimelineRawExport
         raise TypeError("timeline raw export projection requires an exact read slice")
     evaluated = _parse_utc_second(read.evaluated_at)
     items: list[TimelineRawExportItemV1] = []
-    for entry, raw in zip(read.entries, read.raw_evidence, strict=True):
+    for entry, raw, receipt in zip(
+        read.entries,
+        read.raw_evidence,
+        read.deletion_receipts,
+        strict=True,
+    ):
         content = entry.content
         event = content.event
         expires = _raw_expires_at(entry)
-        expired = evaluated >= expires
-        if raw is None and not expired:
-            raise ValueError("unexpired timeline raw evidence is absent")
+        deleted = evaluated >= expires
+        if (raw is None) != deleted or (receipt is not None) != deleted:
+            raise ValueError("timeline raw lifecycle evidence is inconsistent")
         source = None if raw is None else raw.raw_source
         items.append(
             TimelineRawExportItemV1(
@@ -576,16 +614,25 @@ def project_timeline_raw_export(read: TimelineRawReadSlice) -> TimelineRawExport
                 recorded_at=content.recorded_at,
                 expires_at=_utc_second(expires),
                 lifecycle_status=(
-                    TimelineRawLifecycleStatus.EXPIRED_BY_POLICY
-                    if expired
+                    TimelineRawLifecycleStatus.DELETED
+                    if deleted
                     else TimelineRawLifecycleStatus.AVAILABLE
                 ),
                 canonical_record=(
                     None
-                    if expired
+                    if deleted
                     else source.canonical_record
                     if source is not None
                     else None
+                ),
+                deletion_receipt_id=(
+                    receipt.receipt_id if receipt is not None else None
+                ),
+                deletion_receipt_sha256=(
+                    canonical_sha256(receipt) if receipt is not None else None
+                ),
+                deletion_confirmed_at=(
+                    receipt.deletion_confirmed_at if receipt is not None else None
                 ),
                 deletion_policy="EXPIRE_RAW_PRESERVE_DIGEST_V1",
             )

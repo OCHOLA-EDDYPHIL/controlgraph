@@ -94,6 +94,16 @@ class CompletionClassificationTimelineRecorder(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class TimelineSignedIntentStore(Protocol):
+    """Coordinator-only capability storage excluded from timeline evidence exports."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def persist_signed_intent(self, signed: SignedCapability) -> None: ...
+
+
 class TimelineRecorder:
     """Append already-derived projections in their causal order."""
 
@@ -103,6 +113,7 @@ class TimelineRecorder:
         service: TimelineWriteService,
         grant: TimelineWriteGrant,
         policy_set: TimelineEvidencePolicySetV1,
+        signed_intent_store: TimelineSignedIntentStore,
     ) -> None:
         if (
             type(service) is not TimelineWriteService
@@ -110,11 +121,14 @@ class TimelineRecorder:
             or type(policy_set) is not TimelineEvidencePolicySetV1
             or service.target != grant.target
             or policy_set.target != service.target
+            or not isinstance(signed_intent_store, TimelineSignedIntentStore)
+            or signed_intent_store.target != service.target
         ):
             raise ValueError("timeline recorder configuration is invalid")
         self._service = service
         self._grant = grant
         self._policy_set = policy_set
+        self._signed_intent_store = signed_intent_store
 
     @property
     def target(self) -> TargetBinding:
@@ -239,6 +253,7 @@ class TimelineRecorder:
         *,
         signature_verified: bool,
     ) -> None:
+        await self._signed_intent_store.persist_signed_intent(signed)
         await self.record(
             project_signed_capability(
                 signed,
@@ -295,4 +310,5 @@ __all__ = [
     "IndependentVerificationTimelineRecorder",
     "TimelineProjectionRecorder",
     "TimelineRecorder",
+    "TimelineSignedIntentStore",
 ]

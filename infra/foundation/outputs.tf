@@ -82,6 +82,11 @@ output "firestore_authority" {
       retention_days = local.timeline_raw_retention_days
       ttl_field_id   = google_firestore_field.timeline_raw_expiry.id
     }
+    signed_intent = {
+      collection   = local.signed_intent_collection
+      expiry_field = local.signed_intent_expiry_field
+      ttl_field_id = google_firestore_field.signed_intent_expiry.id
+    }
   }
 }
 

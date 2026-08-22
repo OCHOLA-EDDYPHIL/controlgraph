@@ -80,6 +80,9 @@ class AuthenticationDenialCode(StrEnum):
     TOKEN_EXPIRED = "AUTH_TOKEN_EXPIRED"
     TOKEN_NOT_YET_VALID = "AUTH_TOKEN_NOT_YET_VALID"
     TOKEN_LIFETIME_DENIED = "AUTH_TOKEN_LIFETIME_DENIED"
+    BROWSER_ORIGIN_DENIED = "AUTH_BROWSER_ORIGIN_DENIED"
+    CSRF_MISSING = "AUTH_CSRF_MISSING"
+    CSRF_INVALID = "AUTH_CSRF_INVALID"
     VERIFICATION_UNAVAILABLE = "AUTH_VERIFICATION_UNAVAILABLE"
 
 
@@ -216,6 +219,7 @@ class AuthenticationContext:
     audience: str
     issued_at: int
     expires_at: int
+    operator_session_nonce: str | None = None
 
 
 class IdentityAuthenticator(Protocol):

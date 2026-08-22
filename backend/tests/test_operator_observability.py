@@ -57,6 +57,10 @@ from controlgraph_canary.application.operator_observability import (
 )
 from controlgraph_canary.application.root_trust import CoordinatorInternalRoute
 from controlgraph_canary.application.tasks import TaskEnqueuer
+from controlgraph_canary.application.timeline_relay import (
+    ApiTimelineClient,
+    CoordinatorTimelineRelay,
+)
 from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
     canonical_sha256,
@@ -178,6 +182,13 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
                     "32555940559.apps.googleusercontent.com"
                 ),
+                "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN": (
+                    f"https://controlgraph-console-{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
             }
         )
     elif role is ServiceRole.VERIFIER:
@@ -209,6 +220,10 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
                 "CONTROLGRAPH_OPERATOR_EMAIL": OPERATOR_EMAIL,
                 "CONTROLGRAPH_OPERATOR_SUBJECT": OPERATOR_SUBJECT,
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
                 "CONTROLGRAPH_EXECUTOR_URL": EXECUTOR_AUDIENCE,
                 "CONTROLGRAPH_RECOVERY_URL": RECOVERY_AUDIENCE,
                 "CONTROLGRAPH_EXECUTION_QUEUE": "controlgraph-execution",
@@ -1041,6 +1056,8 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
         api.state.controlgraph_operator_observation_client,
         ApiOperatorObservationClient,
     )
+    assert isinstance(api.state.controlgraph_timeline_read, ApiTimelineClient)
+    assert api.state.controlgraph_timeline_raw_export is api.state.controlgraph_timeline_read
     assert isinstance(
         verifier.state.controlgraph_stable_snapshot_capture,
         StableSnapshotCaptureService,
@@ -1076,4 +1093,8 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
     assert isinstance(
         coordinator.state.controlgraph_operator_observation_relay,
         CoordinatorOperatorObservationRelay,
+    )
+    assert isinstance(
+        coordinator.state.controlgraph_timeline_relay,
+        CoordinatorTimelineRelay,
     )

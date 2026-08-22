@@ -308,6 +308,29 @@ class _EvidenceClient:
         )
 
 
+class _ConcurrentFailureProbeTransport:
+    endpoint = _ProbeTransport.endpoint
+
+    def __init__(self) -> None:
+        self.entered = 0
+        self.all_entered = asyncio.Event()
+
+    async def get(
+        self,
+        *,
+        nonce: str,
+        correlation_id: str,
+        timeout_milliseconds: int,
+        response_limit_bytes: int,
+    ) -> ProbeHttpResponse:
+        del nonce, correlation_id, timeout_milliseconds, response_limit_bytes
+        self.entered += 1
+        if self.entered == 20:
+            self.all_entered.set()
+        await asyncio.wait_for(self.all_entered.wait(), timeout=0.25)
+        raise OSError("synthetic concurrent transport failure")
+
+
 def _service_with(
     state: object,
     outcomes: list[str] | None = None,
@@ -626,6 +649,30 @@ def test_probe_uncertainty_is_always_inconclusive(
     assert result.signing_request.probe is not None
     assert result.signing_request.probe.status is ProbeAttestationStatus.INCONCLUSIVE
     assert result.signing_request.probe.reason is reason
+
+
+def test_all_probe_failures_complete_concurrently_and_are_signed_inconclusive() -> None:
+    transport = _ConcurrentFailureProbeTransport()
+    evidence = _EvidenceClient()
+    service = IndependentVerificationService(
+        target=_target(),
+        authentication_policy=_policy(),
+        reader_factory=lambda _request: _Reader(_state()),
+        probe_transport=transport,
+        evidence_client=evidence,
+        clock=lambda: NOW,
+        nonce_factory=lambda: "n" * 32,
+    )
+
+    result = _async(service.attest_probe(_request(), _caller()))
+
+    probe = result.signing_request.probe
+    assert probe is not None
+    assert transport.entered == 20
+    assert probe.status is ProbeAttestationStatus.INCONCLUSIVE
+    assert probe.reason is ProbeAttestationReason.TRANSPORT_UNAVAILABLE
+    assert probe.observation.unavailable_count == 20
+    assert len(evidence.calls) == 1
 
 
 @pytest.mark.parametrize(

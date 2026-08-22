@@ -11,6 +11,16 @@ output "controller_services" {
   }
 }
 
+output "operator_console" {
+  description = "Public static console host and its fixed private operator API origin."
+  value = {
+    service    = module.console.service
+    origin     = local.console_origin
+    api_origin = local.service_audiences.api
+    image      = var.console_image
+  }
+}
+
 output "task_queues" {
   description = "Fixed addressed Cloud Tasks delivery routes and bounds."
   value = {

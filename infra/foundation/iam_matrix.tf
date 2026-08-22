@@ -135,8 +135,8 @@ locals {
   }
 
   identity_expected_allows = {
+    console = toset([])
     api = toset([
-      "firestore_authority_read",
       "kms_capability_public_key_read",
       "kms_capability_version_read",
       "kms_evidence_public_key_read",
@@ -231,7 +231,6 @@ locals {
     { for identity in keys(local.identity_expected_allows) : identity => toset([]) },
     {
       api = toset([
-        "firestore_authority_read",
         "kms_capability_public_key_read",
         "kms_capability_version_read",
         "kms_evidence_public_key_read",
@@ -449,6 +448,17 @@ check "operator_permissions_are_bounded" {
       local.identity_implemented_allows.operator == local.identity_expected_allows.operator
     )
     error_message = "The operator may invoke the API and control only the fixed execution queue."
+  }
+}
+
+check "console_has_no_control_plane_permissions" {
+  assert {
+    condition = (
+      local.identity_expected_allows.console == toset([]) &&
+      local.identity_implemented_allows.console == toset([]) &&
+      length(local.iam_permission_matrix.console.expected_denials) == length(local.iam_permission_domains)
+    )
+    error_message = "The public console runtime identity must have no control-plane permissions."
   }
 }
 

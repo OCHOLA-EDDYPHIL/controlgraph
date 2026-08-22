@@ -86,6 +86,14 @@ locals {
       service = module.api.service.name
       member  = var.operator_principal
     }
+    api_security_auditor = {
+      service = module.api.service.name
+      member  = var.security_auditor_principal
+    }
+    api_restricted_exporter = {
+      service = module.api.service.name
+      member  = var.restricted_exporter_principal
+    }
     coordinator = {
       service = module.coordinator.service.name
       member  = "serviceAccount:${local.service_accounts.api}"
@@ -134,6 +142,8 @@ check "runtime_invoker_map_is_closed" {
     condition = (
       toset(keys(local.run_invokers)) == toset([
         "api",
+        "api_security_auditor",
+        "api_restricted_exporter",
         "coordinator",
         "coordinator_receipts",
         "issuer",
@@ -147,6 +157,8 @@ check "runtime_invoker_map_is_closed" {
       ]) &&
       local.run_invokers.coordinator_receipts.service == module.coordinator.service.name &&
       local.run_invokers.coordinator_receipts.member == "serviceAccount:${local.service_accounts.executor}" &&
+      local.run_invokers.api_security_auditor.service == module.api.service.name &&
+      local.run_invokers.api_restricted_exporter.service == module.api.service.name &&
       local.run_invokers.executor_recovery_facade.service == module.executor.service.name &&
       local.run_invokers.executor_recovery_facade.member == "serviceAccount:${local.service_accounts.recovery}" &&
       local.run_invokers.evidence_writer.service == module.evidence_writer.service.name &&
@@ -166,6 +178,26 @@ resource "google_cloud_run_v2_service_iam_member" "invoker" {
   name     = each.value.service
   role     = "roles/run.invoker"
   member   = each.value.member
+}
+
+resource "google_cloud_run_v2_service_iam_member" "operator_console_public" {
+  project  = var.project_id
+  location = var.region
+  name     = module.console.service.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+check "operator_console_has_no_control_plane_identity" {
+  assert {
+    condition = (
+      local.service_accounts.console == "controlgraph-console@${var.project_id}.iam.gserviceaccount.com" &&
+      google_cloud_run_v2_service_iam_member.operator_console_public.name == module.console.service.name &&
+      google_cloud_run_v2_service_iam_member.operator_console_public.member == "allUsers" &&
+      local.run_invokers.api.member == var.operator_principal
+    )
+    error_message = "The public console must remain separate from the exact human API invoker boundary."
+  }
 }
 
 resource "google_cloud_run_v2_service_iam_member" "verifier_target_snapshot" {

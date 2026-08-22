@@ -12,10 +12,11 @@ locals {
     firestore_writer = {
       role_id     = "controlgraph.firestoreAuthorityWriter"
       title       = "ControlGraph Firestore authority writer"
-      description = "Create and update authority records without deletion permissions."
+      description = "Create and update authority records and delete only application-expired raw evidence."
       permissions = [
         "datastore.databases.get",
         "datastore.entities.create",
+        "datastore.entities.delete",
         "datastore.entities.get",
         "datastore.entities.update",
       ]

@@ -1,7 +1,8 @@
 locals {
-  service_accounts = data.terraform_remote_state.foundation.outputs.service_account_emails
-  service_subjects = data.terraform_remote_state.foundation.outputs.service_account_subjects
-  project_number   = tostring(data.terraform_remote_state.foundation.outputs.project_number)
+  service_accounts     = data.terraform_remote_state.foundation.outputs.service_account_emails
+  service_subjects     = data.terraform_remote_state.foundation.outputs.service_account_subjects
+  project_number       = tostring(data.terraform_remote_state.foundation.outputs.project_number)
+  console_service_name = "controlgraph-console"
   service_names = {
     api             = "controlgraph-api"
     coordinator     = "controlgraph-coordinator"
@@ -36,9 +37,12 @@ locals {
     for role, service_name in local.service_names :
     role => "https://${service_name}-${local.project_number}.${var.region}.run.app"
   }
+  console_origin = "https://${local.console_service_name}-${local.project_number}.${var.region}.run.app"
 
   runtime_identity_emails = {
     operator              = trimprefix(var.operator_principal, "user:")
+    security_auditor      = trimprefix(var.security_auditor_principal, "user:")
+    restricted_exporter   = trimprefix(var.restricted_exporter_principal, "user:")
     api                   = local.service_accounts.api
     coordinator           = local.service_accounts.coordinator
     issuer                = local.service_accounts.issuer
@@ -52,6 +56,8 @@ locals {
 
   runtime_identity_subjects = {
     operator              = var.operator_subject
+    security_auditor      = var.security_auditor_subject
+    restricted_exporter   = var.restricted_exporter_subject
     api                   = tostring(local.service_subjects.api)
     coordinator           = tostring(local.service_subjects.coordinator)
     issuer                = tostring(local.service_subjects.issuer)
@@ -104,6 +110,8 @@ check "runtime_identity_map_is_closed" {
     condition = (
       toset(keys(local.runtime_identity_emails)) == toset([
         "operator",
+        "security_auditor",
+        "restricted_exporter",
         "api",
         "coordinator",
         "issuer",
@@ -118,6 +126,17 @@ check "runtime_identity_map_is_closed" {
       toset(keys(local.route_caller_roles)) == toset(keys(local.service_names))
     )
     error_message = "Runtime identity and protected-route caller maps must remain complete and closed."
+  }
+}
+
+check "timeline_reader_identities_are_separated" {
+  assert {
+    condition = length(toset([
+      "${local.runtime_identity_emails.operator}:${local.runtime_identity_subjects.operator}",
+      "${local.runtime_identity_emails.security_auditor}:${local.runtime_identity_subjects.security_auditor}",
+      "${local.runtime_identity_emails.restricted_exporter}:${local.runtime_identity_subjects.restricted_exporter}",
+    ])) == 3
+    error_message = "Operator, security-audit, and restricted-export identities must be distinct."
   }
 }
 

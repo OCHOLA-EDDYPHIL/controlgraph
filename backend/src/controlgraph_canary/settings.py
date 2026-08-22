@@ -45,6 +45,10 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256",
     "CONTROLGRAPH_OPERATOR_EMAIL",
     "CONTROLGRAPH_OPERATOR_SUBJECT",
+    "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL",
+    "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT",
+    "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL",
+    "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT",
     "CONTROLGRAPH_EXECUTOR_URL",
     "CONTROLGRAPH_RECOVERY_URL",
     "CONTROLGRAPH_EXECUTION_QUEUE",
@@ -59,7 +63,12 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
 
 API_ROOT_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_COORDINATOR_URL",
+    "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN",
     "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE",
+    "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL",
+    "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT",
+    "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL",
+    "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT",
 )
 
 ISSUER_ENVIRONMENT_KEYS = (
@@ -169,7 +178,12 @@ class ControllerSettings:
     candidate_revision_configuration_sha256: str | None
     operator_identity: str | None
     operator_subject: str | None
+    operator_console_origin: str | None
     operator_oauth_client_audience: str | None
+    security_auditor_identity: str | None
+    security_auditor_subject: str | None
+    restricted_exporter_identity: str | None
+    restricted_exporter_subject: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
@@ -251,7 +265,12 @@ class ControllerSettings:
         candidate_revision_configuration_sha256: str | None = None
         operator_identity: str | None = None
         operator_subject: str | None = None
+        operator_console_origin: str | None = None
         operator_oauth_client_audience: str | None = None
+        security_auditor_identity: str | None = None
+        security_auditor_subject: str | None = None
+        restricted_exporter_identity: str | None = None
+        restricted_exporter_subject: str | None = None
         executor_enabled = service_role is ServiceRole.EXECUTOR and mutations_enabled
         recovery_enabled = service_role is ServiceRole.RECOVERY and mutations_enabled
         if service_role is ServiceRole.API or executor_enabled:
@@ -262,6 +281,13 @@ class ControllerSettings:
                 project_number,
             )
         if service_role is ServiceRole.API:
+            raw_operator_console_origin = source["CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN"]
+            expected_console_origin = (
+                f"https://controlgraph-console-{project_number}.us-central1.run.app"
+            )
+            if raw_operator_console_origin != expected_console_origin:
+                raise ValueError("CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN is invalid")
+            operator_console_origin = raw_operator_console_origin
             raw_operator_oauth_client_audience = source[
                 "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"
             ]
@@ -272,6 +298,44 @@ class ControllerSettings:
             ):
                 raise ValueError("CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE is invalid")
             operator_oauth_client_audience = raw_operator_oauth_client_audience
+        if service_role in {ServiceRole.API, ServiceRole.COORDINATOR}:
+            security_auditor_identity = source[
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"
+            ].strip()
+            security_auditor_subject = source[
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"
+            ].strip()
+            restricted_exporter_identity = source[
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL"
+            ].strip()
+            restricted_exporter_subject = source[
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT"
+            ].strip()
+            _validate_operator_identity(security_auditor_identity)
+            _validate_operator_identity(restricted_exporter_identity)
+            if (
+                _PROJECT_NUMBER.fullmatch(security_auditor_subject) is None
+                or _PROJECT_NUMBER.fullmatch(restricted_exporter_subject) is None
+            ):
+                raise ValueError("timeline privileged reader subject is invalid")
+            ordinary_identity = (
+                source["CONTROLGRAPH_AUTH_CALLER_EMAIL"].strip()
+                if service_role is ServiceRole.API
+                else source["CONTROLGRAPH_OPERATOR_EMAIL"].strip()
+            )
+            ordinary_subject = (
+                source["CONTROLGRAPH_AUTH_CALLER_SUBJECT"].strip()
+                if service_role is ServiceRole.API
+                else source["CONTROLGRAPH_OPERATOR_SUBJECT"].strip()
+            )
+            if len(
+                {
+                    (ordinary_identity, ordinary_subject),
+                    (security_auditor_identity, security_auditor_subject),
+                    (restricted_exporter_identity, restricted_exporter_subject),
+                }
+            ) != 3:
+                raise ValueError("timeline privileged reader identities must be distinct")
         if (
             service_role
             in {
@@ -471,7 +535,12 @@ class ControllerSettings:
             candidate_revision_configuration_sha256=(candidate_revision_configuration_sha256),
             operator_identity=operator_identity,
             operator_subject=operator_subject,
+            operator_console_origin=operator_console_origin,
             operator_oauth_client_audience=operator_oauth_client_audience,
+            security_auditor_identity=security_auditor_identity,
+            security_auditor_subject=security_auditor_subject,
+            restricted_exporter_identity=restricted_exporter_identity,
+            restricted_exporter_subject=restricted_exporter_subject,
         )
 
 
