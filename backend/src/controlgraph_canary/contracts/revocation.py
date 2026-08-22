@@ -79,6 +79,7 @@ class EpochRevocationIdentityKind(StrEnum):
 
     REQUEST = "REQUEST"
     IDEMPOTENCY = "IDEMPOTENCY"
+    EPOCH = "EPOCH"
 
 
 class EpochRevocationAuditOutcome(StrEnum):

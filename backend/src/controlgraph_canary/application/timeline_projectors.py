@@ -33,6 +33,10 @@ from controlgraph_canary.contracts.models import (
     TaskRequest,
 )
 from controlgraph_canary.contracts.promotion_execution import PromotionDispatchResultV2
+from controlgraph_canary.contracts.recovery_abandonment import (
+    RecoveryAbandonmentPhase,
+    RecoveryAbandonmentResultV1,
+)
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryDispatchResultV2,
     RecoveryIntentV1,
@@ -61,6 +65,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineSignatureMetadataV1,
     TimelineTerminalClassification,
     TimelineVerificationStatus,
+    timeline_capability_source_id,
 )
 
 
@@ -378,7 +383,7 @@ def project_signed_capability(
     )
     return _projection(
         source=signed,
-        source_id=claims.capability_id,
+        source_id=timeline_capability_source_id(canonical_sha256(signed)),
         event_type=TimelineEventType.CAPABILITY_ISSUED,
         target=claims.target,
         actor_role=TimelineActorRole.ISSUER,
@@ -1014,8 +1019,8 @@ def project_epoch_revocation(
     outcome: EpochRevocationCallOutcomeV1,
     *,
     policy_set: TimelineEvidencePolicySetV1,
-) -> tuple[TimelineProjection, TimelineProjection]:
-    """Project an authenticated operator revocation and its terminal classification."""
+) -> tuple[TimelineProjection]:
+    """Project an authenticated operator revocation without inventing classification."""
 
     if type(outcome) is not EpochRevocationCallOutcomeV1:
         raise TypeError("epoch revocation projection input must be exact")
@@ -1076,39 +1081,7 @@ def project_epoch_revocation(
         ),
         policy_set=policy_set,
     )
-    terminal = _projection(
-        source=outcome,
-        source_id=f"{outcome.attempt_id}:terminal",
-        event_type=TimelineEventType.TERMINAL_CLASSIFIED,
-        target=result.target,
-        actor_role=TimelineActorRole.COORDINATOR,
-        actor=result.target.project_id,
-        root_id=result.root_id,
-        root_sha256=result.root_sha256,
-        epoch=result.new_epoch,
-        occurred_at=result.committed_at,
-        correlations=correlations,
-        payload_sha256=canonical_sha256(outcome),
-        signature=None,
-        verification_status=TimelineVerificationStatus.NOT_APPLICABLE,
-        terminal_classification=TimelineTerminalClassification.REVOKED,
-        display_fields=_display(
-            (
-                (
-                    TimelineDisplayFieldName.OUTCOME,
-                    "REVOKED",
-                    TimelineAudience.PUBLIC_DEMO,
-                ),
-                (
-                    TimelineDisplayFieldName.SUMMARY,
-                    "Rollout classified as revoked",
-                    TimelineAudience.PUBLIC_DEMO,
-                ),
-            )
-        ),
-        policy_set=policy_set,
-    )
-    return action, terminal
+    return (action,)
 
 
 def project_service_claim_release(
@@ -1172,6 +1145,85 @@ def project_service_claim_release(
                 (
                     TimelineDisplayFieldName.SUMMARY,
                     "Terminal rollout independently classified",
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+            )
+        ),
+        policy_set=policy_set,
+    )
+
+
+def project_recovery_abandonment(
+    result: RecoveryAbandonmentResultV1,
+    *,
+    policy_set: TimelineEvidencePolicySetV1,
+) -> TimelineProjection:
+    """Project each durable phase of an operator-approved recovery abandonment."""
+
+    if type(result) is not RecoveryAbandonmentResultV1:
+        raise TypeError("recovery abandonment projection input must be exact")
+    released = result.phase is RecoveryAbandonmentPhase.RELEASED
+    return _projection(
+        source=result,
+        source_id=f"{result.result_id}:{result.phase.value.lower()}",
+        event_type=TimelineEventType.OPERATOR_ACTION_RECORDED,
+        target=result.target,
+        actor_role=TimelineActorRole.OPERATOR,
+        actor=result.operator_identity,
+        root_id=result.root_id,
+        root_sha256=result.root_sha256,
+        epoch=result.fenced_epoch,
+        occurred_at=(
+            result.released_at
+            if released and result.released_at is not None
+            else result.fenced_at
+        ),
+        correlations=_correlations(
+            (
+                (
+                    TimelineCorrelationKind.EVIDENCE,
+                    result.fence_evidence_id,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.RECOVERY,
+                    result.recovery_dispatch_id,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.REQUEST,
+                    result.request_id,
+                    TimelineAudience.OPERATOR,
+                ),
+            )
+        ),
+        payload_sha256=canonical_sha256(result),
+        signature=None,
+        verification_status=(
+            TimelineVerificationStatus.VERIFIED
+            if released
+            else TimelineVerificationStatus.AMBIGUOUS
+        ),
+        terminal_classification=TimelineTerminalClassification.NONE,
+        display_fields=_display(
+            (
+                (
+                    TimelineDisplayFieldName.ACTION,
+                    "ABANDON_AMBIGUOUS_RECOVERY",
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.OUTCOME,
+                    result.phase.value,
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.SUMMARY,
+                    (
+                        "Ambiguous recovery claim released"
+                        if released
+                        else "Ambiguous recovery fenced for reset"
+                    ),
                     TimelineAudience.PUBLIC_DEMO,
                 ),
             )
@@ -1311,6 +1363,7 @@ __all__ = [
     "project_execution_receipt",
     "project_independent_verification",
     "project_promotion_dispatch",
+    "project_recovery_abandonment",
     "project_recovery_dispatch",
     "project_recovery_intent",
     "project_service_claim_release",

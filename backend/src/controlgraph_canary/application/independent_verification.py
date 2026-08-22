@@ -41,7 +41,6 @@ from controlgraph_canary.contracts.independent_verification import (
     INDEPENDENT_VERIFICATION_SIGNING_REQUEST_V1,
     PROBE_ATTESTATION_V1,
     PROBE_OBSERVATION_V1,
-    PROBE_POLICY_V1,
     PROBE_REQUEST_V1,
     PROBE_SAMPLE_OBSERVATION_V1,
     ConfigurationAttestationReason,
@@ -59,7 +58,6 @@ from controlgraph_canary.contracts.independent_verification import (
     ProbeAttestationStatus,
     ProbeAttestationV1,
     ProbeObservationV1,
-    ProbePolicyV1,
     ProbeRequestV1,
     ProbeSampleObservationV1,
     ProbeSampleOutcome,
@@ -67,8 +65,8 @@ from controlgraph_canary.contracts.independent_verification import (
     SignedIndependentVerificationEvidenceV1,
     VerificationRequestV1,
     configuration_attestation_reason,
+    fixed_probe_policy,
     probe_attestation_reason,
-    probe_distribution_bounds,
     probe_observation_sha256,
 )
 from controlgraph_canary.contracts.models import TargetBinding, TrafficAllocation
@@ -280,23 +278,12 @@ class IndependentVerificationService:
 
         self._require_request(request, caller)
         try:
-            stable_min, stable_max, candidate_min, candidate_max = (
-                probe_distribution_bounds(
-                    request.stable_percent,
-                    request.candidate_percent,
-                )
+            policy = fixed_probe_policy(
+                request.stable_percent,
+                request.candidate_percent,
             )
-            policy = ProbePolicyV1(
-                schema_version=PROBE_POLICY_V1,
-                sample_count=20,
-                timeout_milliseconds=2_000,
-                max_attempts_per_sample=1,
-                response_limit_bytes=1_024,
-                stable_minimum=stable_min,
-                stable_maximum=stable_max,
-                candidate_minimum=candidate_min,
-                candidate_maximum=candidate_max,
-            )
+            if canonical_sha256(policy) != request.probe_policy_sha256:
+                raise ValueError("probe policy is not request-bound")
             probe_request = ProbeRequestV1(
                 schema_version=PROBE_REQUEST_V1,
                 verification=request,
@@ -646,6 +633,8 @@ def _evidence(
         epoch=request.epoch,
         target=request.target,
         plan_sha256=request.plan_sha256,
+        service_claim_sha256=request.service_claim_sha256,
+        probe_policy_sha256=request.probe_policy_sha256,
         signed_intent_sha256=request.signed_intent_sha256,
         action=request.action,
         stable_revision=request.stable_revision,

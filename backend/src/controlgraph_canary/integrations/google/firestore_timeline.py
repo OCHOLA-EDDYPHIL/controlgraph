@@ -33,7 +33,7 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     decode_contract,
 )
-from controlgraph_canary.contracts.models import TargetBinding
+from controlgraph_canary.contracts.models import SignedCapability, TargetBinding
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_ENTRY_COLLECTION,
     TIMELINE_HEAD_COLLECTION,
@@ -47,6 +47,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineAudience,
     TimelineEntryV1,
     TimelineEventV1,
+    TimelineEvidenceClass,
     TimelineEvidencePolicySetV1,
     TimelineHeadV1,
     TimelineIdentityV1,
@@ -56,6 +57,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineRawSourceV1,
     TimelineStorageDocumentV1,
     TimelineStorageKind,
+    timeline_capability_source_id,
     timeline_entry,
     timeline_entry_document_id,
     timeline_entry_logical_id,
@@ -607,6 +609,36 @@ class FirestoreTimelineStore:
             source_id=source_id,
         )
 
+    async def read_signed_intent(
+        self,
+        capability_sha256: str,
+    ) -> SignedCapability | None:
+        """Read one unexpired signed capability by its receipt-bound digest."""
+
+        source_id = timeline_capability_source_id(capability_sha256)
+        raw = await self._read_raw_one(
+            client=await self._client(),
+            transaction=None,
+            source_id=source_id,
+        )
+        if raw is None or self._clock() >= _parse_utc_second(raw.expires_at):
+            return None
+        source = raw.raw_source
+        try:
+            capability = decode_contract(source.canonical_record, SignedCapability)
+            if (
+                raw.source_id != source_id
+                or source.evidence_class is not TimelineEvidenceClass.CAPABILITY
+                or canonical_sha256(capability) != capability_sha256
+                or capability.claims.target != self._target
+            ):
+                raise ValueError("timeline capability binding is invalid")
+            return capability
+        except TimelineStoreCorruptRecord:
+            raise
+        except Exception:
+            raise TimelineStoreCorruptRecord from None
+
     async def _read_one[ModelT: StrictContractModel](
         self,
         *,
@@ -721,6 +753,68 @@ class FirestoreTimelineStore:
         if current != expected:
             raise TimelineStoreConflict
 
+    async def _adopt_exact_prefix(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        existing: list[TimelineEntryV1 | None],
+        items: tuple[tuple[TimelineEventV1, TimelineRawSourceV1], ...],
+    ) -> tuple[TimelineAppendResult, ...]:
+        first_missing = next(
+            (index for index, entry in enumerate(existing) if entry is None),
+            len(existing),
+        )
+        if any(entry is not None for entry in existing[first_missing:]):
+            raise TimelineStoreConflict
+        adopted: list[TimelineAppendResult] = []
+        for entry, (_, raw_source) in zip(
+            existing[:first_missing],
+            items[:first_missing],
+            strict=True,
+        ):
+            assert entry is not None
+            await self._require_existing_raw(
+                client=client,
+                transaction=None,
+                entry=entry,
+                raw_source=raw_source,
+            )
+            adopted.append(TimelineAppendAdopted(entry))
+        return tuple(adopted)
+
+    async def _read_existing_group(
+        self,
+        items: tuple[tuple[TimelineEventV1, TimelineRawSourceV1], ...],
+    ) -> list[TimelineEntryV1 | None]:
+        existing: list[TimelineEntryV1 | None] = []
+        for event, _ in items:
+            try:
+                existing.append(await self._read_existing_append(event))
+            except (TimelineStoreConflict, TimelineStoreCorruptRecord):
+                raise
+            except TimelineStoreUnavailable:
+                existing.append(None)
+        return existing
+
+    async def _read_stable_exact_prefix(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        items: tuple[tuple[TimelineEventV1, TimelineRawSourceV1], ...],
+    ) -> tuple[TimelineAppendResult, ...]:
+        for attempt in range(2):
+            existing = await self._read_existing_group(items)
+            try:
+                return await self._adopt_exact_prefix(
+                    client=client,
+                    existing=existing,
+                    items=items,
+                )
+            except TimelineStoreConflict:
+                if attempt:
+                    raise
+        raise TimelineStoreConflict
+
     async def append(self, event: TimelineEventV1) -> TimelineAppendResult:
         """Append once by immutable source identity or adopt an exact replay."""
 
@@ -737,13 +831,273 @@ class FirestoreTimelineStore:
             raise TypeError("timeline raw source must be exact")
         return await self._append(event, raw_source=raw_source)
 
-    async def _append(
+    async def append_many_with_raw(
+        self,
+        items: tuple[tuple[TimelineEventV1, TimelineRawSourceV1], ...],
+    ) -> tuple[TimelineAppendResult, ...]:
+        """Append one causal group in a single Firestore transaction."""
+
+        if type(items) is not tuple or not items or len(items) > 32:
+            raise TypeError("timeline append group is invalid")
+        source_ids: set[str] = set()
+        for item in items:
+            if type(item) is not tuple or len(item) != 2:
+                raise TypeError("timeline append group item is invalid")
+            event, raw_source = item
+            self._validate_event(event, raw_source=raw_source)
+            if event.source_id in source_ids:
+                raise ValueError("timeline append group source identities must be unique")
+            source_ids.add(event.source_id)
+
+        client = await self._client()
+        adopted_prefix = await self._read_stable_exact_prefix(
+            client=client,
+            items=items,
+        )
+        if len(adopted_prefix) == len(items):
+            return adopted_prefix
+        if adopted_prefix:
+            appended = await self.append_many_with_raw(items[len(adopted_prefix) :])
+            return adopted_prefix + appended
+
+        recorded_at = _utc_second(self._clock())
+        created: tuple[TimelineEntryV1, ...] | None = None
+
+        async def write(transaction: TimelineTransactionPort) -> None:
+            nonlocal created
+            identities: list[tuple[str, _DecodedDocument[TimelineIdentityV1] | None]] = []
+            for event, _ in items:
+                logical_id = timeline_identity_logical_id(self._target, event.source_id)
+                identity = await self._read_one(
+                    client=client,
+                    transaction=transaction,
+                    collection=TIMELINE_IDENTITY_COLLECTION,
+                    document_id=timeline_identity_document_id(
+                        self._target,
+                        event.source_id,
+                    ),
+                    kind=TimelineStorageKind.IDENTITY,
+                    logical_id=logical_id,
+                    model_type=TimelineIdentityV1,
+                )
+                identities.append((logical_id, identity))
+            if any(identity is not None for _, identity in identities):
+                raise TimelineStoreConflict
+
+            head_document_id = timeline_head_document_id(self._target)
+            current_head = await self._read_one(
+                client=client,
+                transaction=transaction,
+                collection=TIMELINE_HEAD_COLLECTION,
+                document_id=head_document_id,
+                kind=TimelineStorageKind.HEAD,
+                logical_id=timeline_head_logical_id(self._target),
+                model_type=TimelineHeadV1,
+            )
+            if current_head is None:
+                first_sequence = 1
+                predecessor = None
+            else:
+                if (
+                    current_head.wrapper.revision != current_head.value.sequence
+                    or current_head.value.target != self._target
+                ):
+                    raise TimelineStoreCorruptRecord
+                first_sequence = current_head.value.sequence + 1
+                predecessor = current_head.value.entry_sha256
+
+            pending: list[
+                tuple[
+                    _PreparedDocument[TimelineIdentityV1],
+                    _PreparedDocument[TimelineEntryV1],
+                    TimelineRawEvidenceV1,
+                    TimelineEntryV1,
+                ]
+            ] = []
+            for offset, ((event, raw_source), (identity_logical_id, _)) in enumerate(
+                zip(items, identities, strict=True)
+            ):
+                sequence = first_sequence + offset
+                entry_logical_id = timeline_entry_logical_id(self._target, sequence)
+                current_entry = await self._read_one(
+                    client=client,
+                    transaction=transaction,
+                    collection=TIMELINE_ENTRY_COLLECTION,
+                    document_id=timeline_entry_document_id(self._target, sequence),
+                    kind=TimelineStorageKind.ENTRY,
+                    logical_id=entry_logical_id,
+                    model_type=TimelineEntryV1,
+                )
+                current_raw = await self._read_raw_one(
+                    client=client,
+                    transaction=transaction,
+                    source_id=event.source_id,
+                )
+                if current_entry is not None or current_raw is not None:
+                    raise TimelineStoreCorruptRecord
+                entry = timeline_entry(
+                    event,
+                    sequence=sequence,
+                    previous_entry_sha256=predecessor,
+                    recorded_at=recorded_at,
+                )
+                next_identity = TimelineIdentityV1(
+                    schema_version=TIMELINE_IDENTITY_V1,
+                    target=self._target,
+                    source_id=event.source_id,
+                    source_schema_version=event.source_schema_version,
+                    event_sha256=canonical_sha256(event),
+                    sequence=sequence,
+                    entry_id=entry.entry_id,
+                    entry_sha256=entry.entry_sha256,
+                    recorded_at=recorded_at,
+                )
+                pending.append(
+                    (
+                        _prepared_document(
+                            kind=TimelineStorageKind.IDENTITY,
+                            logical_id=identity_logical_id,
+                            collection=TIMELINE_IDENTITY_COLLECTION,
+                            document_id=timeline_identity_document_id(
+                                self._target,
+                                event.source_id,
+                            ),
+                            revision=0,
+                            value=next_identity,
+                        ),
+                        _prepared_document(
+                            kind=TimelineStorageKind.ENTRY,
+                            logical_id=entry_logical_id,
+                            collection=TIMELINE_ENTRY_COLLECTION,
+                            document_id=timeline_entry_document_id(
+                                self._target,
+                                sequence,
+                            ),
+                            revision=0,
+                            value=entry,
+                        ),
+                        _raw_evidence(entry=entry, raw_source=raw_source),
+                        entry,
+                    )
+                )
+                predecessor = entry.entry_sha256
+
+            final_entry = pending[-1][3]
+            head = TimelineHeadV1(
+                schema_version=TIMELINE_HEAD_V1,
+                target=self._target,
+                sequence=final_entry.content.sequence,
+                entry_id=final_entry.entry_id,
+                entry_sha256=final_entry.entry_sha256,
+                updated_at=recorded_at,
+            )
+            prepared_head = _prepared_document(
+                kind=TimelineStorageKind.HEAD,
+                logical_id=timeline_head_logical_id(self._target),
+                collection=TIMELINE_HEAD_COLLECTION,
+                document_id=head_document_id,
+                revision=head.sequence,
+                value=head,
+            )
+            for prepared_identity, prepared_entry, raw, entry in pending:
+                transaction.create(
+                    self._reference(
+                        client,
+                        prepared_identity.collection,
+                        prepared_identity.document_id,
+                    ),
+                    _document_data(prepared_identity.wrapper),
+                )
+                transaction.create(
+                    self._reference(
+                        client,
+                        prepared_entry.collection,
+                        prepared_entry.document_id,
+                    ),
+                    _document_data(prepared_entry.wrapper),
+                )
+                transaction.create(
+                    self._reference(
+                        client,
+                        TIMELINE_RAW_COLLECTION,
+                        timeline_raw_document_id(
+                            self._target,
+                            entry.content.event.source_id,
+                        ),
+                    ),
+                    _raw_document_data(raw),
+                )
+            head_reference = self._reference(
+                client,
+                prepared_head.collection,
+                prepared_head.document_id,
+            )
+            if current_head is None:
+                transaction.create(head_reference, _document_data(prepared_head.wrapper))
+            else:
+                transaction.update(head_reference, _document_data(prepared_head.wrapper))
+            created = tuple(item[3] for item in pending)
+
+        try:
+            async with asyncio.timeout(FIRESTORE_TIMELINE_TIMEOUT_SECONDS):
+                await self._transaction_runner(
+                    client,
+                    FIRESTORE_TIMELINE_MAX_TRANSACTION_ATTEMPTS,
+                    3 * len(items) + 1,
+                    write,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreConflict:
+            try:
+                adopted_prefix = await self._read_stable_exact_prefix(
+                    client=client,
+                    items=items,
+                )
+            except (TimelineStoreConflict, TimelineStoreCorruptRecord):
+                raise
+            except TimelineStoreUnavailable:
+                raise TimelineStoreOutcomeUnknown from None
+            if len(adopted_prefix) == len(items):
+                return adopted_prefix
+            if adopted_prefix:
+                appended = await self.append_many_with_raw(
+                    items[len(adopted_prefix) :]
+                )
+                return adopted_prefix + appended
+            raise
+        except TimelineStoreCorruptRecord:
+            raise
+        except Exception as error:
+            try:
+                adopted_prefix = await self._read_stable_exact_prefix(
+                    client=client,
+                    items=items,
+                )
+            except (TimelineStoreConflict, TimelineStoreCorruptRecord):
+                raise
+            except TimelineStoreUnavailable:
+                raise TimelineStoreOutcomeUnknown from None
+            if len(adopted_prefix) == len(items):
+                return adopted_prefix
+            if adopted_prefix:
+                appended = await self.append_many_with_raw(
+                    items[len(adopted_prefix) :]
+                )
+                return adopted_prefix + appended
+            if _is_contention(error):
+                raise TimelineStoreConflict from None
+            raise TimelineStoreOutcomeUnknown from None
+        if created is None:
+            raise TimelineStoreOutcomeUnknown
+        return tuple(TimelineAppendCreated(entry) for entry in created)
+
+    def _validate_event(
         self,
         event: TimelineEventV1,
         *,
         raw_source: TimelineRawSourceV1 | None,
-    ) -> TimelineAppendResult:
-
+    ) -> None:
         if (
             type(event) is not TimelineEventV1
             or event.target != self._target
@@ -765,6 +1119,15 @@ class FirestoreTimelineStore:
             or raw_source.signature_sha256 != signature_sha256
         ):
             raise ValueError("timeline raw source does not match its event")
+
+    async def _append(
+        self,
+        event: TimelineEventV1,
+        *,
+        raw_source: TimelineRawSourceV1 | None,
+    ) -> TimelineAppendResult:
+
+        self._validate_event(event, raw_source=raw_source)
         try:
             existing = await self._read_existing_append(event)
         except TimelineStoreConflict:

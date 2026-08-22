@@ -623,7 +623,10 @@ class _FakeKmsClient:
         )
 
 
-@pytest.mark.parametrize("service_role", [ServiceRole.EXECUTOR, ServiceRole.RECOVERY])
+@pytest.mark.parametrize(
+    "service_role",
+    [ServiceRole.COORDINATOR, ServiceRole.EXECUTOR, ServiceRole.RECOVERY],
+)
 def test_kms_capability_trust_loader_verifies_only_the_exact_enabled_version(
     service_role: ServiceRole,
 ) -> None:
@@ -675,7 +678,6 @@ def test_kms_capability_trust_loader_verifies_only_the_exact_enabled_version(
     "service_role",
     [
         ServiceRole.API,
-        ServiceRole.COORDINATOR,
         ServiceRole.ISSUER,
         ServiceRole.VERIFIER,
         ServiceRole.EVIDENCE_WRITER,

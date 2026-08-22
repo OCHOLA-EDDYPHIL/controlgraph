@@ -1063,10 +1063,14 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
     )
     assert (
         coordinator.state.controlgraph_independent_verification_client._timeline_recorder
-        is coordinator.state.controlgraph_timeline_recorder
+        is None
     )
     assert (
         coordinator.state.controlgraph_completion_classification._timeline_recorder
+        is None
+    )
+    assert (
+        coordinator.state.controlgraph_completion_workflow._timeline_recorder
         is coordinator.state.controlgraph_timeline_recorder
     )
     assert isinstance(

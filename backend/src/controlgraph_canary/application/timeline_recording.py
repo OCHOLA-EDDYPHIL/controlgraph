@@ -16,6 +16,7 @@ from controlgraph_canary.application.timeline_projectors import (
     project_execution_receipt,
     project_independent_verification,
     project_promotion_dispatch,
+    project_recovery_abandonment,
     project_recovery_dispatch,
     project_recovery_intent,
     project_service_claim_release,
@@ -35,6 +36,7 @@ from controlgraph_canary.contracts.models import (
     TargetBinding,
 )
 from controlgraph_canary.contracts.promotion_execution import PromotionDispatchResultV2
+from controlgraph_canary.contracts.recovery_abandonment import RecoveryAbandonmentResultV1
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryDispatchResultV2,
     RecoveryIntentV1,
@@ -43,6 +45,7 @@ from controlgraph_canary.contracts.revocation import EpochRevocationCallOutcomeV
 from controlgraph_canary.contracts.root_creation import (
     RootCreationResultV1,
     RootCreationResultV2,
+    SignedEvidenceEventV1,
 )
 from controlgraph_canary.contracts.service_claim_release import ServiceClaimReleaseResultV1
 from controlgraph_canary.contracts.timeline import TimelineEvidencePolicySetV1
@@ -120,12 +123,10 @@ class TimelineRecorder:
     async def record(self, *projections: TimelineProjection) -> None:
         if not projections or any(type(item) is not TimelineProjection for item in projections):
             raise TypeError("timeline recorder requires exact projections")
-        for projection in projections:
-            await self._service.append_with_raw(
-                projection.event,
-                projection.raw_source,
-                self._grant,
-            )
+        await self._service.append_many_with_raw(
+            tuple((item.event, item.raw_source) for item in projections),
+            self._grant,
+        )
 
     async def record_root_creation(
         self,
@@ -181,6 +182,57 @@ class TimelineRecorder:
             )
         )
 
+    async def record_verification_bundle(
+        self,
+        *verified: VerifiedIndependentVerificationEvidenceV1,
+    ) -> None:
+        if not verified:
+            raise TypeError("verification timeline bundle cannot be empty")
+        await self.record(
+            *(
+                project_independent_verification(item, policy_set=self._policy_set)
+                for item in verified
+            )
+        )
+
+    async def record_completion_bundle(
+        self,
+        classification: CompletionClassificationV1,
+        *verified: VerifiedIndependentVerificationEvidenceV1,
+    ) -> None:
+        await self.record(
+            *(
+                project_independent_verification(item, policy_set=self._policy_set)
+                for item in verified
+            ),
+            project_completion_classification(
+                classification,
+                policy_set=self._policy_set,
+            ),
+        )
+
+    async def record_stale_denial_completion(
+        self,
+        receipt: ExecutionReceipt,
+        signed_authority: SignedEvidenceEventV1 | None,
+        classification: CompletionClassificationV1,
+    ) -> None:
+        if signed_authority is not None:
+            await self.record(
+                project_signed_evidence_event(
+                    signed_authority,
+                    policy_set=self._policy_set,
+                    signature_verified=True,
+                )
+            )
+        await self.record(
+            project_execution_receipt(receipt, policy_set=self._policy_set),
+            project_completion_classification(
+                classification,
+                policy_set=self._policy_set,
+            ),
+        )
+
     async def record_signed_capability(
         self,
         signed: SignedCapability,
@@ -201,8 +253,35 @@ class TimelineRecorder:
     async def record_recovery_dispatch(self, result: RecoveryDispatchResultV2) -> None:
         await self.record(project_recovery_dispatch(result, policy_set=self._policy_set))
 
+    async def record_recovery_abandonment(
+        self,
+        result: RecoveryAbandonmentResultV1,
+    ) -> None:
+        await self.record(
+            project_recovery_abandonment(result, policy_set=self._policy_set)
+        )
+
     async def record_epoch_revocation(self, result: EpochRevocationCallOutcomeV1) -> None:
         await self.record(*project_epoch_revocation(result, policy_set=self._policy_set))
+
+    async def record_epoch_revocation_completion(
+        self,
+        result: EpochRevocationCallOutcomeV1,
+        signed_evidence: SignedEvidenceEventV1,
+        classification: CompletionClassificationV1,
+    ) -> None:
+        await self.record(
+            project_signed_evidence_event(
+                signed_evidence,
+                policy_set=self._policy_set,
+                signature_verified=True,
+            ),
+            *project_epoch_revocation(result, policy_set=self._policy_set),
+            project_completion_classification(
+                classification,
+                policy_set=self._policy_set,
+            ),
+        )
 
     async def record_service_claim_release(
         self,

@@ -71,15 +71,20 @@ class CoordinatorCompletionClassificationService:
         self,
         *,
         target: TargetBinding,
-        timeline_recorder: CompletionClassificationTimelineRecorder,
+        timeline_recorder: CompletionClassificationTimelineRecorder | None = None,
     ) -> None:
         if (
             type(target) is not TargetBinding
-            or not isinstance(
-                timeline_recorder,
-                CompletionClassificationTimelineRecorder,
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(
+                        timeline_recorder,
+                        CompletionClassificationTimelineRecorder,
+                    )
+                    or timeline_recorder.target != target
+                )
             )
-            or timeline_recorder.target != target
         ):
             raise ValueError("completion classification service configuration is invalid")
         self._target = target
@@ -99,7 +104,8 @@ class CoordinatorCompletionClassificationService:
         ):
             raise ValueError("completion classification bundle is outside the configured target")
         classification = classify_completion(bundle)
-        await self._timeline_recorder.record_completion_classification(classification)
+        if self._timeline_recorder is not None:
+            await self._timeline_recorder.record_completion_classification(classification)
         return classification
 
 
@@ -120,6 +126,8 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         or execution.epoch != verification.epoch
         or execution.target != verification.target
         or execution.plan_sha256 != verification.plan_sha256
+        or execution.service_claim_sha256 != verification.service_claim_sha256
+        or execution.probe_policy_sha256 != verification.probe_policy_sha256
         or execution.signed_intent_sha256 != verification.signed_intent_sha256
         or execution.request_id != verification.request_id
         or execution.correlation_id != verification.correlation_id
@@ -127,6 +135,10 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         != verification.observation_window_started_at
         or execution.observation_window_ends_at
         != verification.observation_window_ends_at
+        or (
+            request.kind is not CompletionKind.STALE_CAPABILITY_DENIAL
+            and execution.observed_authority_epoch != verification.epoch
+        )
     ):
         return CompletionReason.EVIDENCE_BINDING_MISMATCH
 
@@ -151,6 +163,8 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         if (
             execution.outcome is not ReceiptOutcome.DENIED
             or execution.reason_code is not ReasonCode.EPOCH_MISMATCH
+            or execution.observed_authority_epoch is None
+            or execution.observed_authority_epoch <= execution.epoch
         ):
             return CompletionReason.EXECUTION_EVIDENCE_CONTRADICTORY
         return CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE
@@ -168,6 +182,8 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         or execution.reason_code is not None
     ):
         return CompletionReason.EXECUTION_EVIDENCE_CONTRADICTORY
+    if _assessment_is_stale(bundle):
+        return CompletionReason.EVIDENCE_STALE
 
     configuration = bundle.configuration
     if configuration is None:
@@ -236,6 +252,8 @@ def _evidence_matches(
         and signed.epoch == expected.epoch
         and signed.target == expected.target
         and signed.plan_sha256 == expected.plan_sha256
+        and signed.service_claim_sha256 == expected.service_claim_sha256
+        and signed.probe_policy_sha256 == expected.probe_policy_sha256
         and signed.signed_intent_sha256 == expected.signed_intent_sha256
         and signed.action is expected.action
         and signed.stable_revision == expected.stable_revision
@@ -262,11 +280,18 @@ def _authority_matches(
 ) -> bool:
     authority = bundle.authority
     expected = bundle.request.verification
+    execution = bundle.execution
+    expected_epoch = (
+        execution.observed_authority_epoch
+        if kind is AuthorityCompletionKind.EPOCH_ADVANCEMENT
+        and execution is not None
+        else expected.epoch
+    )
     return authority is not None and (
         authority.kind is kind
         and authority.root_id == expected.root_id
         and authority.root_sha256 == expected.root_sha256
-        and authority.epoch == expected.epoch
+        and authority.epoch == expected_epoch
         and authority.target == expected.target
         and authority.plan_sha256 == expected.plan_sha256
         and authority.request_id == expected.request_id

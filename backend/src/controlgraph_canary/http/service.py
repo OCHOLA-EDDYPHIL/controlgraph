@@ -185,6 +185,10 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionCommandV2,
     PromotionInvocationV2,
 )
+from controlgraph_canary.contracts.receipt_authority import (
+    ReceiptAuthorityOperation,
+    ReceiptAuthorityResponseV1,
+)
 from controlgraph_canary.contracts.recovery_abandonment import (
     RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
     RecoveryAbandonmentClassificationRequestV1,
@@ -193,10 +197,6 @@ from controlgraph_canary.contracts.recovery_abandonment import (
     RecoveryAbandonmentFailureCode,
     RecoveryAbandonmentInvocationV1,
     RecoveryAbandonmentRelayResponseV1,
-)
-from controlgraph_canary.contracts.receipt_authority import (
-    ReceiptAuthorityOperation,
-    ReceiptAuthorityResponseV1,
 )
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryCapabilityIssuanceCommandV2,
@@ -1211,6 +1211,10 @@ def create_service_app(
                             failure_code=error.code,
                         )
                     else:
+                        if timeline_recorder is not None:
+                            await timeline_recorder.record_recovery_abandonment(
+                                abandonment_result
+                            )
                         abandonment_outcome = RecoveryAbandonmentRelayResponseV1(
                             schema_version=RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
                             result=abandonment_result,

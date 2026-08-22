@@ -142,19 +142,16 @@ def test_receipt_and_authority_projectors_do_not_invent_terminal_state() -> None
     )
 
 
-def test_epoch_revocation_projects_action_before_terminal_classification() -> None:
+def test_epoch_revocation_projects_action_without_synthetic_classification() -> None:
     outcome = make_revocation_proof_records().call_outcome
     policy_set = standard_timeline_evidence_policy_set(outcome.result.target)
 
-    action, terminal = project_epoch_revocation(outcome, policy_set=policy_set)
+    (action,) = project_epoch_revocation(outcome, policy_set=policy_set)
 
     assert action.event.event_type is TimelineEventType.OPERATOR_ACTION_RECORDED
     assert _fields(action)[TimelineDisplayFieldName.ACTION] == "REVOKE_EPOCH"
     assert _fields(action)[TimelineDisplayFieldName.REASON_CODE] == "OPERATOR_REQUESTED"
     assert action.event.terminal_classification is TimelineTerminalClassification.NONE
-    assert terminal.event.event_type is TimelineEventType.TERMINAL_CLASSIFIED
-    assert terminal.event.terminal_classification is TimelineTerminalClassification.REVOKED
-    assert action.event.occurred_at == terminal.event.occurred_at
 
 
 def test_independent_verification_projection_preserves_verified_signature_and_bindings() -> None:

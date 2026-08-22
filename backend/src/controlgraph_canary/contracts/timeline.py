@@ -841,6 +841,18 @@ def timeline_raw_document_id(target: TargetBinding, source_id: str) -> str:
     )
 
 
+def timeline_capability_source_id(capability_sha256: str) -> str:
+    """Return the exact timeline source identity for one signed envelope digest."""
+
+    if (
+        type(capability_sha256) is not str
+        or len(capability_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in capability_sha256)
+    ):
+        raise ValueError("capability digest is invalid")
+    return f"cgcapability:{capability_sha256}"
+
+
 def timeline_entry(
     event: TimelineEventV1,
     *,
@@ -924,6 +936,7 @@ __all__ = [
     "TimelineTerminalClassification",
     "TimelineVerificationStatus",
     "standard_timeline_evidence_policy_set",
+    "timeline_capability_source_id",
     "timeline_entry",
     "timeline_entry_document_id",
     "timeline_entry_logical_id",

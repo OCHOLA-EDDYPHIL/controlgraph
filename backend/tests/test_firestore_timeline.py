@@ -29,6 +29,17 @@ from controlgraph_canary.application.timeline import (
     TimelineWriteGrant,
     TimelineWriteService,
 )
+from controlgraph_canary.application.timeline_projectors import (
+    project_signed_capability,
+)
+from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64url
+from controlgraph_canary.contracts.models import (
+    CAPABILITY_CLAIMS_V1,
+    SIGNED_CAPABILITY_V1,
+    CapabilityAction,
+    CapabilityClaims,
+    SignedCapability,
+)
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_DISPLAY_FIELD_V1,
     TIMELINE_ENTRY_COLLECTION,
@@ -43,6 +54,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineRawExportCommandV1,
     TimelineRawLifecycleStatus,
     standard_timeline_evidence_policy_set,
+    timeline_capability_source_id,
     timeline_entry_document_id,
     timeline_raw_document_id,
 )
@@ -50,6 +62,7 @@ from controlgraph_canary.integrations.google.firestore_timeline import (
     FIRESTORE_TIMELINE_DATABASE,
     AsyncFirestoreTimelineClientPort,
     FirestoreTimelineStore,
+    FirestoreTimelineTransactionRunner,
     TimelineDocumentReferencePort,
     TimelineTransactionBody,
 )
@@ -222,13 +235,14 @@ def _store(
     client: _Client,
     *,
     clock: Callable[[], datetime] = lambda: NOW,
+    transaction_runner: FirestoreTimelineTransactionRunner | None = None,
 ) -> FirestoreTimelineStore:
     return FirestoreTimelineStore(
         target=TARGET,
         configured_project_id=TARGET.project_id,
         policy_set=standard_timeline_evidence_policy_set(TARGET),
         client_factory=lambda: client,
-        transaction_runner=_run_transaction,
+        transaction_runner=transaction_runner or _run_transaction,
         clock=clock,
     )
 
@@ -470,6 +484,181 @@ async def test_raw_append_is_atomic_replay_safe_and_exact_id_exported() -> None:
     with pytest.raises(TimelineWriteError) as denied:
         await writer.append_with_raw(event, unrelated_raw, grant)
     assert denied.value.code is TimelineWriteErrorCode.POLICY_DENIED
+
+
+@_async_test
+async def test_grouped_raw_append_is_one_transaction_and_replay_safe() -> None:
+    client = _Client()
+    store = _store(client)
+    items = (timeline_event_with_raw(36), timeline_event_with_raw(37))
+    writer = TimelineWriteService(
+        target=TARGET,
+        policy_set=standard_timeline_evidence_policy_set(TARGET),
+        store=store,
+    )
+    grant = TimelineWriteGrant(
+        target=TARGET,
+        writer_role=TimelineActorRole.COORDINATOR,
+        principal_id="coordinator:synthetic",
+    )
+
+    created = await writer.append_many_with_raw(items, grant)
+    replay = await writer.append_many_with_raw(items, grant)
+
+    assert all(isinstance(item, TimelineAppendCreated) for item in created)
+    assert all(isinstance(item, TimelineAppendAdopted) for item in replay)
+    assert tuple(item.entry for item in replay) == tuple(item.entry for item in created)
+    assert [item.entry.content.sequence for item in created] == [1, 2]
+    assert created[1].entry.content.previous_entry_sha256 == created[0].entry.entry_sha256
+    assert client.transaction_count == 1
+    assert client.write_count == 7
+
+
+@_async_test
+async def test_grouped_raw_append_recovers_an_exact_lost_commit_response() -> None:
+    client = _Client()
+    client.lose_next_commit = True
+    store = _store(client)
+    items = (timeline_event_with_raw(38), timeline_event_with_raw(39))
+
+    result = await store.append_many_with_raw(items)
+
+    assert all(isinstance(item, TimelineAppendAdopted) for item in result)
+    assert [item.entry.content.sequence for item in result] == [1, 2]
+    assert client.transaction_count == 1
+    assert client.write_count == 7
+
+
+@_async_test
+async def test_grouped_raw_append_adopts_exact_prefix_and_appends_missing_suffix() -> None:
+    client = _Client()
+    store = _store(client)
+    first = timeline_event_with_raw(40)
+    second = timeline_event_with_raw(41)
+    await store.append_with_raw(*first)
+
+    result = await store.append_many_with_raw((first, second))
+
+    assert isinstance(result[0], TimelineAppendAdopted)
+    assert isinstance(result[1], TimelineAppendCreated)
+    assert [item.entry.content.sequence for item in result] == [1, 2]
+    assert client.transaction_count == 2
+    assert client.write_count == 8
+
+
+@_async_test
+async def test_grouped_raw_append_adopts_a_concurrent_exact_commit() -> None:
+    client = _Client()
+    store = _store(client)
+    concurrent_store = _store(client)
+    items = (timeline_event_with_raw(42), timeline_event_with_raw(43))
+    original_read = store._read_existing_append
+    first_read = True
+
+    async def racing_read(event):  # type: ignore[no-untyped-def]
+        nonlocal first_read
+        existing = await original_read(event)
+        if first_read:
+            first_read = False
+            await concurrent_store.append_many_with_raw(items)
+        return existing
+
+    store._read_existing_append = racing_read  # type: ignore[method-assign]
+
+    result = await store.append_many_with_raw(items)
+
+    assert all(isinstance(item, TimelineAppendAdopted) for item in result)
+    assert [item.entry.content.sequence for item in result] == [1, 2]
+    assert client.transaction_count == 1
+    assert client.write_count == 7
+
+
+@_async_test
+async def test_grouped_raw_append_adopts_exact_commit_after_preflight() -> None:
+    client = _Client()
+    concurrent_store = _store(client)
+    items = (timeline_event_with_raw(44), timeline_event_with_raw(45))
+    raced = False
+
+    async def racing_runner(
+        client_port: AsyncFirestoreTimelineClientPort,
+        maximum_attempts: int,
+        expected_writes: int,
+        body: TimelineTransactionBody,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            await concurrent_store.append_many_with_raw(items)
+        await _run_transaction(
+            client_port,
+            maximum_attempts,
+            expected_writes,
+            body,
+        )
+
+    store = _store(client, transaction_runner=racing_runner)
+
+    result = await store.append_many_with_raw(items)
+
+    assert all(isinstance(item, TimelineAppendAdopted) for item in result)
+    assert [item.entry.content.sequence for item in result] == [1, 2]
+    assert client.transaction_count == 2
+    assert client.write_count == 7
+
+
+@_async_test
+async def test_signed_intent_is_read_by_receipt_bound_envelope_digest() -> None:
+    client = _Client()
+    store = _store(client)
+    claims = CapabilityClaims(
+        schema_version=CAPABILITY_CLAIMS_V1,
+        capability_id=f"cgcap-{'c' * 64}",
+        issuer=f"controlgraph-issuer@{TARGET.project_id}.iam.gserviceaccount.com",
+        subject=f"controlgraph-executor@{TARGET.project_id}.iam.gserviceaccount.com",
+        audience="https://controlgraph-executor.example/internal/execute",
+        target=TARGET,
+        root_id=f"cgroot:{'a' * 64}",
+        root_sha256="a" * 64,
+        epoch=1,
+        action=CapabilityAction.APPLY_CANARY,
+        stable_revision="controlgraph-reference-target-stable-v1",
+        candidate_revision="controlgraph-reference-target-candidate-v1",
+        stable_percent=90,
+        candidate_percent=10,
+        concurrency=None,
+        plan_sha256="b" * 64,
+        provider_etag="stable-etag-1",
+        request_id="request-capability-001",
+        idempotency_key="capability-001",
+        parent_capability_sha256=None,
+        issued_at="2026-08-21T00:00:00Z",
+        not_before="2026-08-21T00:00:00Z",
+        expires_at="2026-08-21T00:10:00Z",
+        signing_algorithm="EC_SIGN_P256_SHA256",
+        signing_key_version=(
+            f"projects/{TARGET.project_id}/locations/us-central1/keyRings/"
+            "controlgraph-signing/cryptoKeys/capability-signing/cryptoKeyVersions/1"
+        ),
+    )
+    signed = SignedCapability(
+        schema_version=SIGNED_CAPABILITY_V1,
+        claims=claims,
+        claims_sha256=canonical_sha256(claims),
+        signature=encode_base64url(b"synthetic-capability-signature"),
+    )
+    digest = canonical_sha256(signed)
+    projection = project_signed_capability(
+        signed,
+        policy_set=standard_timeline_evidence_policy_set(TARGET),
+        signature_verified=False,
+    )
+
+    await store.append_with_raw(projection.event, projection.raw_source)
+
+    assert projection.event.source_id == timeline_capability_source_id(digest)
+    assert await store.read_signed_intent(digest) == signed
+    assert await store.read_signed_intent("f" * 64) is None
 
 
 @_async_test

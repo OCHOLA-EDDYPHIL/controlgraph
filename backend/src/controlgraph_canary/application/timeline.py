@@ -379,6 +379,19 @@ class TimelineRawStore(Protocol):
     ) -> TimelineRawReadSlice: ...
 
 
+@runtime_checkable
+class TimelineRawBatchStore(Protocol):
+    """Atomic ordered append surface for one causally related projection group."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def append_many_with_raw(
+        self,
+        items: tuple[tuple[TimelineEventV1, TimelineRawSourceV1], ...],
+    ) -> tuple[TimelineAppendResult, ...]: ...
+
+
 def _is_visible(data_class: TimelineAudience, audience: TimelineAudience) -> bool:
     return _AUDIENCE_RANK[data_class] <= _AUDIENCE_RANK[audience]
 
@@ -790,6 +803,62 @@ class TimelineWriteService:
         except TimelineStoreError:
             raise TimelineWriteError(TimelineWriteErrorCode.STORE_UNAVAILABLE) from None
 
+    async def append_many_with_raw(
+        self,
+        items: tuple[tuple[TimelineEventV1, TimelineRawSourceV1], ...],
+        grant: TimelineWriteGrant,
+    ) -> tuple[TimelineAppendResult, ...]:
+        """Atomically append one nonempty, ordered group of summary and raw records."""
+
+        if (
+            type(items) is not tuple
+            or not items
+            or len(items) > 32
+            or type(grant) is not TimelineWriteGrant
+            or not isinstance(self._store, TimelineRawBatchStore)
+        ):
+            raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
+        source_ids: set[str] = set()
+        for item in items:
+            if type(item) is not tuple or len(item) != 2:
+                raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
+            event, raw_source = item
+            if type(event) is not TimelineEventV1 or type(raw_source) is not TimelineRawSourceV1:
+                raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
+            if (
+                event.target != self._target
+                or raw_source.target != self._target
+                or grant.target != self._target
+            ):
+                raise TimelineWriteError(TimelineWriteErrorCode.TARGET_DENIED)
+            policy = self._policies[event.evidence_class]
+            signature_sha256 = (
+                None if event.signature is None else event.signature.signature_sha256
+            )
+            if grant.writer_role not in policy.writer_roles:
+                raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
+            if (
+                event.source_id in source_ids
+                or event.policy_sha256 != self._policy_sha256
+                or event.raw_retention_days != policy.raw_retention_days
+                or raw_source.raw_source_id != event.raw_source_id
+                or raw_source.source_schema_version != event.source_schema_version
+                or raw_source.evidence_class is not event.evidence_class
+                or raw_source.payload_sha256 != event.payload_sha256
+                or raw_source.record_sha256 != event.raw_record_sha256
+                or raw_source.signature_sha256 != signature_sha256
+            ):
+                raise TimelineWriteError(TimelineWriteErrorCode.POLICY_DENIED)
+            source_ids.add(event.source_id)
+        try:
+            return await self._store.append_many_with_raw(items)
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreConflict:
+            raise TimelineWriteError(TimelineWriteErrorCode.CONFLICT) from None
+        except TimelineStoreError:
+            raise TimelineWriteError(TimelineWriteErrorCode.STORE_UNAVAILABLE) from None
+
 
 __all__ = [
     "REDACTED_DISPLAY_VALUE",
@@ -797,6 +866,7 @@ __all__ = [
     "TimelineAppendCreated",
     "TimelineAppendResult",
     "TimelineCursorInvalid",
+    "TimelineRawBatchStore",
     "TimelineRawExportError",
     "TimelineRawExportErrorCode",
     "TimelineRawExportGrant",

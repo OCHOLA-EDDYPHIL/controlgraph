@@ -218,6 +218,8 @@ class VerificationRequestV1(StrictContractModel):
     epoch: PositiveSafeInteger
     target: TargetBinding
     plan_sha256: Sha256Digest
+    service_claim_sha256: Sha256Digest
+    probe_policy_sha256: Sha256Digest
     signed_intent_sha256: Sha256Digest
     action: CapabilityAction
     stable_revision: CloudRunName
@@ -243,6 +245,9 @@ class VerificationRequestV1(StrictContractModel):
         }[self.action]
         start = _parse_utc(self.observation_window_started_at)
         end = _parse_utc(self.observation_window_ends_at)
+        expected_policy_sha256 = canonical_sha256(
+            fixed_probe_policy(self.stable_percent, self.candidate_percent)
+        )
         if (
             self.root_id != f"cgroot:{self.root_sha256}"
             or self.target.service_name != _REFERENCE_SERVICE
@@ -250,6 +255,7 @@ class VerificationRequestV1(StrictContractModel):
             or not self.stable_revision.startswith(prefix)
             or not self.candidate_revision.startswith(prefix)
             or (self.stable_percent, self.candidate_percent) != expected_traffic
+            or self.probe_policy_sha256 != expected_policy_sha256
             or not start < end
             or (end - start).total_seconds() > 300
         ):
@@ -420,6 +426,8 @@ class ProbeRequestV1(StrictContractModel):
             or parsed.query
             or parsed.fragment
             or actual_bounds != expected_bounds
+            or canonical_sha256(self.policy)
+            != self.verification.probe_policy_sha256
             or not _timestamp_in_window(self.started_at, self.verification)
         ):
             raise ValueError("probe request bindings are invalid")
@@ -560,6 +568,8 @@ class IndependentVerificationEvidenceV1(StrictContractModel):
     epoch: PositiveSafeInteger
     target: TargetBinding
     plan_sha256: Sha256Digest
+    service_claim_sha256: Sha256Digest
+    probe_policy_sha256: Sha256Digest
     signed_intent_sha256: Sha256Digest
     action: CapabilityAction
     stable_revision: CloudRunName
@@ -628,6 +638,8 @@ class IndependentVerificationSigningRequestV1(StrictContractModel):
             or evidence.epoch != verification.epoch
             or evidence.target != verification.target
             or evidence.plan_sha256 != verification.plan_sha256
+            or evidence.service_claim_sha256 != verification.service_claim_sha256
+            or evidence.probe_policy_sha256 != verification.probe_policy_sha256
             or evidence.signed_intent_sha256 != verification.signed_intent_sha256
             or evidence.action is not verification.action
             or evidence.stable_revision != verification.stable_revision
@@ -724,6 +736,8 @@ class ExecutionCompletionEvidenceV1(StrictContractModel):
     epoch: PositiveSafeInteger
     target: TargetBinding
     plan_sha256: Sha256Digest
+    service_claim_sha256: Sha256Digest
+    probe_policy_sha256: Sha256Digest
     signed_intent_sha256: Sha256Digest
     intent_signature_verified: Literal[True]
     request_id: Identifier
@@ -733,6 +747,7 @@ class ExecutionCompletionEvidenceV1(StrictContractModel):
     action: CapabilityAction
     outcome: ReceiptOutcome
     reason_code: ReasonCode | None
+    observed_authority_epoch: PositiveSafeInteger | None
     receipt_sha256: Sha256Digest
     receipt_persisted: Literal[True]
     write_outcome_known: bool
@@ -754,6 +769,13 @@ class ExecutionCompletionEvidenceV1(StrictContractModel):
             or (
                 self.outcome is ReceiptOutcome.AMBIGUOUS
                 and self.reason_code is not ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS
+            )
+            or (
+                self.reason_code is ReasonCode.EPOCH_MISMATCH
+                and (
+                    self.observed_authority_epoch is None
+                    or self.observed_authority_epoch <= self.epoch
+                )
             )
         ):
             raise ValueError("execution completion evidence is inconsistent")
@@ -805,7 +827,7 @@ class CompletionAssessmentRequestV1(StrictContractModel):
         if (
             (expected_action is not None and self.verification.action is not expected_action)
             or _parse_utc(self.assessed_at)
-            < _parse_utc(self.verification.observation_window_ends_at)
+            < _parse_utc(self.verification.observation_window_started_at)
         ):
             raise ValueError("completion assessment request is invalid")
         return self
@@ -945,6 +967,29 @@ def probe_distribution_bounds(
     raise ValueError("unsupported probe traffic distribution")
 
 
+def fixed_probe_policy(
+    stable_percent: int,
+    candidate_percent: int,
+) -> ProbePolicyV1:
+    """Return the sole versioned probe policy admitted for one rollout action."""
+
+    stable_min, stable_max, candidate_min, candidate_max = probe_distribution_bounds(
+        stable_percent,
+        candidate_percent,
+    )
+    return ProbePolicyV1(
+        schema_version=PROBE_POLICY_V1,
+        sample_count=20,
+        timeout_milliseconds=2_000,
+        max_attempts_per_sample=1,
+        response_limit_bytes=1_024,
+        stable_minimum=stable_min,
+        stable_maximum=stable_max,
+        candidate_minimum=candidate_min,
+        candidate_maximum=candidate_max,
+    )
+
+
 def probe_attestation_reason(
     policy: ProbePolicyV1,
     observation: ProbeObservationV1,
@@ -1069,6 +1114,7 @@ __all__ = [
     "VerificationRequestV1",
     "VerifiedIndependentVerificationEvidenceV1",
     "configuration_attestation_reason",
+    "fixed_probe_policy",
     "independent_verification_signing_input_sha256",
     "probe_attestation_reason",
     "probe_distribution_bounds",

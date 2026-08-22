@@ -32,6 +32,11 @@ from controlgraph_canary.contracts.evidence import (
     EVIDENCE_CHAIN_HEAD_V1,
     EvidenceChainHeadV1,
 )
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionClassificationV1,
+    CompletionKind,
+    CompletionStatus,
+)
 from controlgraph_canary.contracts.models import (
     EPOCH_AUTHORITY_V1,
     EVIDENCE_EVENT_V1,
@@ -39,14 +44,17 @@ from controlgraph_canary.contracts.models import (
     EpochChangeCause,
     EvidenceEvent,
     EvidenceKind,
+    TargetBinding,
 )
 from controlgraph_canary.contracts.revocation import (
     EPOCH_REVOCATION_AUDIT_V1,
+    EPOCH_REVOCATION_CALL_OUTCOME_V1,
     EPOCH_REVOCATION_EVIDENCE_SUBJECT_V1,
     EPOCH_REVOCATION_IDENTITY_V1,
     EPOCH_REVOCATION_RESULT_V1,
     EpochRevocationAuditOutcome,
     EpochRevocationAuditV1,
+    EpochRevocationCallOutcomeV1,
     EpochRevocationCommitV1,
     EpochRevocationEvidenceSubjectV1,
     EpochRevocationFailureCode,
@@ -57,8 +65,12 @@ from controlgraph_canary.contracts.revocation import (
     epoch_revocation_evidence_id,
     epoch_revocation_request_sha256,
 )
-from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
-from controlgraph_canary.contracts.storage import ServiceClaimStatus
+from controlgraph_canary.contracts.root_creation import (
+    RolloutRootV2,
+    RolloutRootV3,
+    SignedEvidenceEventV1,
+)
+from controlgraph_canary.contracts.storage import ServiceClaimRecord, ServiceClaimStatus
 
 MAX_REVOCATION_COMMIT_ATTEMPTS: Final = 4
 
@@ -80,6 +92,34 @@ class EpochRevocationEvidenceClient(Protocol):
     async def sign(self, event: EvidenceEvent) -> SignedEvidenceEventV1: ...
 
 
+@runtime_checkable
+class RevocationCompletionWorkflow(Protocol):
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def classify_revocation(
+        self,
+        *,
+        root: RolloutRootV2 | RolloutRootV3,
+        service_claim: ServiceClaimRecord,
+        result: EpochRevocationResultV1,
+        signed_evidence: SignedEvidenceEventV1,
+    ) -> CompletionClassificationV1: ...
+
+
+@runtime_checkable
+class RevocationTimelineRecorder(Protocol):
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def record_epoch_revocation_completion(
+        self,
+        result: EpochRevocationCallOutcomeV1,
+        signed_evidence: SignedEvidenceEventV1,
+        classification: CompletionClassificationV1,
+    ) -> None: ...
+
+
 class EpochRevoker:
     """Advance authority through signed evidence and one atomic Firestore bundle."""
 
@@ -89,6 +129,8 @@ class EpochRevoker:
         store: EpochRevocationStore,
         evidence_client: EpochRevocationEvidenceClient,
         operator_policy: RouteAuthenticationPolicy,
+        completion_workflow: RevocationCompletionWorkflow | None = None,
+        timeline_recorder: RevocationTimelineRecorder | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
@@ -98,12 +140,30 @@ class EpochRevoker:
             or operator_policy.service_role is not ServiceRole.API
             or operator_policy.caller.role is not CallerRole.OPERATOR
             or operator_policy.project_id != store.target.project_id
+            or (completion_workflow is None) != (timeline_recorder is None)
+            or (
+                completion_workflow is not None
+                and (
+                    not isinstance(completion_workflow, RevocationCompletionWorkflow)
+                    or completion_workflow.target != store.target
+                    or not callable(getattr(evidence_client, "verify", None))
+                )
+            )
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(timeline_recorder, RevocationTimelineRecorder)
+                    or timeline_recorder.target != store.target
+                )
+            )
             or (clock is not None and not callable(clock))
         ):
             raise TypeError("revocation coordinator configuration is invalid")
         self._store = store
         self._evidence_client = evidence_client
         self._operator_policy = operator_policy
+        self._completion_workflow = completion_workflow
+        self._timeline_recorder = timeline_recorder
         self._clock = clock or _system_utc_second
         self._lock = asyncio.Lock()
 
@@ -116,7 +176,69 @@ class EpochRevoker:
         """Serialize the low-volume manual mutation path within one coordinator."""
 
         async with self._lock:
-            return await self._revoke_locked(invocation, principal=principal)
+            result = await self._revoke_locked(invocation, principal=principal)
+            await self._classify_committed(invocation, result)
+            return result
+
+    async def _classify_committed(
+        self,
+        invocation: EpochRevocationInvocationV1,
+        result: EpochRevocationResultV1,
+    ) -> None:
+        workflow = self._completion_workflow
+        recorder = self._timeline_recorder
+        if workflow is None or recorder is None:
+            return
+        try:
+            state = await self._read_state(invocation)
+            trusted = inspect_root_authority_bundle(
+                state.root_bundle,
+                target=self._store.target,
+            )
+            stored = state.result_evidence
+            if (
+                trusted is None
+                or type(trusted.service_claim) is not ServiceClaimRecord
+                or type(stored) is not StoredRecord
+                or type(stored.value) is not SignedEvidenceEventV1
+                or stored.value.event.evidence_id != result.evidence_id
+                or canonical_sha256(stored.value) != result.evidence_sha256
+            ):
+                raise ValueError("committed revocation evidence is unavailable")
+            verify = getattr(self._evidence_client, "verify", None)
+            if not callable(verify):
+                raise ValueError("revocation evidence verifier is unavailable")
+            await verify(stored.value)
+            classification = await workflow.classify_revocation(
+                root=trusted.root,
+                service_claim=trusted.service_claim,
+                result=result,
+                signed_evidence=stored.value,
+            )
+            if (
+                type(classification) is not CompletionClassificationV1
+                or classification.status is not CompletionStatus.COMPLETE
+                or classification.request.kind is not CompletionKind.REVOCATION
+                or classification.request.verification.root_id != result.root_id
+                or classification.request.verification.epoch != result.new_epoch
+            ):
+                raise ValueError("committed revocation was not classified complete")
+            await recorder.record_epoch_revocation_completion(
+                EpochRevocationCallOutcomeV1(
+                    schema_version=EPOCH_REVOCATION_CALL_OUTCOME_V1,
+                    attempt_id=invocation.attempt_id,
+                    audit_id=invocation.attempt_id,
+                    result=result,
+                ),
+                stored.value,
+                classification,
+            )
+        except asyncio.CancelledError:
+            raise
+        except EpochRevocationError:
+            raise
+        except Exception:
+            raise EpochRevocationError(EpochRevocationFailureCode.OUTCOME_UNKNOWN) from None
 
     async def record_authenticated_denial(
         self,
@@ -946,4 +1068,6 @@ __all__ = [
     "EpochRevocationError",
     "EpochRevocationEvidenceClient",
     "EpochRevoker",
+    "RevocationCompletionWorkflow",
+    "RevocationTimelineRecorder",
 ]

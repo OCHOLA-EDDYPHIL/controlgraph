@@ -21,6 +21,7 @@ from controlgraph_canary.application.canary_execution import (
 from controlgraph_canary.application.capability_issuance import (
     CapabilityIssuer,
     CapabilityIssuerConfiguration,
+    TrustBundleCapabilityVerifier,
 )
 from controlgraph_canary.application.capability_verification import (
     CapabilityVerifier,
@@ -32,6 +33,11 @@ from controlgraph_canary.application.cloud_run import (
 )
 from controlgraph_canary.application.completion_classification import (
     CoordinatorCompletionClassificationService,
+)
+from controlgraph_canary.application.completion_workflow import (
+    CompletionAuthorityEvidenceVerifier,
+    CompletionAuthorityReader,
+    CoordinatorCompletionWorkflow,
 )
 from controlgraph_canary.application.evidence_signing import EvidenceSigningService
 from controlgraph_canary.application.execution import FinalMutationGate
@@ -321,6 +327,7 @@ def create_runtime_service_app(
     coordinator_clients = None
     coordinator_independent_verification_client = None
     coordinator_completion_classification_service = None
+    coordinator_completion_workflow = None
     api_root_creation_client = None
     coordinator_root_creation_relay = None
     api_operator_observation_client = None
@@ -1241,14 +1248,24 @@ def create_runtime_service_app(
                         client=kms_client,
                     )
                 ),
-                timeline_recorder=timeline_recorder,
             )
         )
         coordinator_completion_classification_service = (
             CoordinatorCompletionClassificationService(
                 target=target,
-                timeline_recorder=timeline_recorder,
             )
+        )
+        completion_intent_verifier = (
+            TrustBundleCapabilityVerifier(
+                GoogleKmsCapabilityTrustLoader(
+                    project_id=settings.project_id,
+                    service_role=ServiceRole.COORDINATOR,
+                    key_version=settings.capability_key_version,
+                    client=kms_client,
+                ).load()
+            )
+            if settings.mutations_enabled
+            else None
         )
         selected_store = (
             authority_store
@@ -1257,6 +1274,27 @@ def create_runtime_service_app(
                 target=target,
                 configured_project_id=settings.project_id,
             )
+        )
+        stale_authority_reader = (
+            cast(CompletionAuthorityReader, selected_store)
+            if isinstance(selected_store, CompletionAuthorityReader)
+            else None
+        )
+        coordinator_completion_workflow = CoordinatorCompletionWorkflow(
+            target=target,
+            verifier=coordinator_independent_verification_client,
+            classifier=coordinator_completion_classification_service,
+            timeline_recorder=timeline_recorder,
+            authority_reader=stale_authority_reader,
+            authority_evidence_verifier=(
+                cast(CompletionAuthorityEvidenceVerifier, coordinator_clients.evidence)
+                if stale_authority_reader is not None
+                else None
+            ),
+            signed_intent_reader=(
+                timeline_store if completion_intent_verifier is not None else None
+            ),
+            signed_intent_verifier=completion_intent_verifier,
         )
         health_chain_store = FirestoreHealthChainStore(
             target=target,
@@ -1291,6 +1329,7 @@ def create_runtime_service_app(
                 signature_verifier=evidence_signature_verifier,
             ),
             operator_policy=_operator_api_policy(settings),
+            completion_workflow=coordinator_completion_workflow,
             clock=service_claim_release_clock,
         )
         if isinstance(selected_store, RecoveryAbandonmentStore):
@@ -1309,7 +1348,14 @@ def create_runtime_service_app(
                 operator_policy=_operator_api_policy(settings),
                 clock=recovery_abandonment_clock,
             )
-        receipt_authority_service = ReceiptAuthorityService(selected_store)
+        receipt_authority_service = ReceiptAuthorityService(
+            selected_store,
+            completion_workflow=(
+                coordinator_completion_workflow
+                if stale_authority_reader is not None
+                else None
+            ),
+        )
         receipt_authority_authentication_policy = _receipt_authority_policy(settings)
         recovery_receipt_authority_authentication_policy = _recovery_receipt_authority_policy(
             settings
@@ -1372,6 +1418,8 @@ def create_runtime_service_app(
                 store=cast(EpochRevocationStore, selected_store),
                 evidence_client=coordinator_clients.evidence,
                 operator_policy=_operator_api_policy(settings),
+                completion_workflow=coordinator_completion_workflow,
+                timeline_recorder=timeline_recorder,
                 clock=revocation_clock,
             ),
             proof_reader=EpochRevocationProofService(
@@ -1456,6 +1504,7 @@ def create_runtime_service_app(
                 selected_task_enqueuer,
             ),
             clock=recovery_clock,
+            timeline_recorder=timeline_recorder,
         )
         coordinator_recovery_relay = CoordinatorRecoveryRelay(
             authentication_policy=policy,
@@ -1475,6 +1524,7 @@ def create_runtime_service_app(
                 signature_verifier=health_signature_verifier,
             ),
             recovery_coordinator=recovery_coordinator,
+            target_verification_workflow=coordinator_completion_workflow,
             timeline_recorder=timeline_recorder,
         )
         coordinator_canary_relay = CoordinatorCanaryRelay(
@@ -1518,6 +1568,7 @@ def create_runtime_service_app(
                     selected_task_enqueuer,
                 ),
                 clock=promotion_clock,
+                timeline_recorder=timeline_recorder,
             ),
         )
     if (
@@ -1658,6 +1709,8 @@ def create_runtime_service_app(
         app.state.controlgraph_completion_classification = (
             coordinator_completion_classification_service
         )
+    if coordinator_completion_workflow is not None:
+        app.state.controlgraph_completion_workflow = coordinator_completion_workflow
     if api_root_creation_client is not None:
         app.state.controlgraph_root_creation_client = api_root_creation_client
     if coordinator_root_creation_relay is not None:

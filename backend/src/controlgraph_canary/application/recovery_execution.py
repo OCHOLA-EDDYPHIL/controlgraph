@@ -80,6 +80,7 @@ from controlgraph_canary.contracts.models import (
     EpochChangeCause,
     ExecutionReceipt,
     ReceiptOutcome,
+    SignedCapability,
     TargetBinding,
 )
 from controlgraph_canary.contracts.recovery_execution import (
@@ -244,6 +245,21 @@ class RecoveryCapabilityClient(Protocol):
         command: RecoveryCommandV2,
         authorization: RecoveryAuthorizationV1,
     ) -> RecoveryCapabilityIssuanceResultV2: ...
+
+
+@runtime_checkable
+class RecoveryCapabilityTimelineRecorder(Protocol):
+    """Persist the capability returned by the authenticated issuer boundary."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def record_signed_capability(
+        self,
+        signed: SignedCapability,
+        *,
+        signature_verified: bool,
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -1123,6 +1139,7 @@ class RecoveryRolloutCoordinator:
         dispatch_store: RecoveryDispatchStore,
         task_dispatcher: RecoveryTaskDispatcher,
         clock: Callable[[], datetime] | None = None,
+        timeline_recorder: RecoveryCapabilityTimelineRecorder | None = None,
     ) -> None:
         if (
             type(target) is not TargetBinding
@@ -1139,6 +1156,16 @@ class RecoveryRolloutCoordinator:
             or dispatch_store.target != target
             or not isinstance(task_dispatcher, RecoveryTaskDispatcher)
             or (clock is not None and not callable(clock))
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(
+                        timeline_recorder,
+                        RecoveryCapabilityTimelineRecorder,
+                    )
+                    or timeline_recorder.target != target
+                )
+            )
         ):
             raise _error(RecoveryExecutionErrorCode.CONFIGURATION_INVALID)
         self._target = target
@@ -1147,6 +1174,7 @@ class RecoveryRolloutCoordinator:
         self._dispatch_store = dispatch_store
         self._task_dispatcher = task_dispatcher
         self._clock = clock or _now
+        self._timeline_recorder = timeline_recorder
 
     async def dispatch(
         self,
@@ -1367,6 +1395,11 @@ class RecoveryRolloutCoordinator:
         capability = issuance.capability
         claims = capability.claims
         try:
+            if self._timeline_recorder is not None:
+                await self._timeline_recorder.record_signed_capability(
+                    capability,
+                    signature_verified=False,
+                )
             mutation = RecoveryMutationIntentV2(
                 schema_version=RECOVERY_MUTATION_INTENT_V2,
                 request_id=authorization.request_id,

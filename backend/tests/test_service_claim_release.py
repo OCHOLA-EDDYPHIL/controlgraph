@@ -19,6 +19,12 @@ from controlgraph_canary.application.authority_store import (
     RootCreationBundle,
     StoredRecord,
 )
+from controlgraph_canary.application.completion_classification import (
+    CoordinatorCompletionClassificationService,
+)
+from controlgraph_canary.application.completion_workflow import (
+    CoordinatorCompletionWorkflow,
+)
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     CallerBinding,
@@ -205,7 +211,7 @@ def _receipt(
             idempotency_key=TERMINAL_KEY,
             capability_sha256="5" * 64,
             mutation_sha256="6" * 64,
-            plan_sha256="7" * 64,
+            plan_sha256=canonical_sha256(bundle.root.value.content.rollout_plan),
             expected_poststate_sha256=expected_poststate,
             target=claim.target,
             root_id=claim.root_id,
@@ -590,6 +596,7 @@ def _releaser(
     store: _Store,
     *,
     classification: _ClassificationClient | None = None,
+    completion_workflow: CoordinatorCompletionWorkflow | None = None,
 ) -> tuple[ServiceClaimReleaser, _EvidenceClient, _ClassificationClient]:
     key = make_root_v3_records().root.content.evidence_signing_key_version
     evidence = _EvidenceClient(key)
@@ -601,11 +608,48 @@ def _releaser(
             evidence_client=evidence,
             classification_client=selected_classification,
             operator_policy=_policy(),
+            completion_workflow=completion_workflow,
             clock=lambda: next(times),
         ),
         evidence,
         selected_classification,
     )
+
+
+class _UnavailableCompletionVerifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def attest(self, invocation):  # type: ignore[no-untyped-def]
+        del invocation
+        self.calls += 1
+        raise RuntimeError("synthetic verifier outage")
+
+
+def test_release_rejects_ambiguous_shared_completion_classification() -> None:
+    invocation = _invocation()
+    store = _Store(invocation)
+    verifier = _UnavailableCompletionVerifier()
+    target = root_v2_target()
+    workflow = CoordinatorCompletionWorkflow(
+        target=target,
+        verifier=verifier,
+        classifier=CoordinatorCompletionClassificationService(target=target),
+        clock=lambda: NOW + timedelta(seconds=2),
+    )
+    releaser, _, classification = _releaser(
+        store,
+        completion_workflow=workflow,
+    )
+
+    with pytest.raises(ServiceClaimReleaseError) as failure:
+        asyncio.run(releaser.release(invocation, principal=_principal()))
+
+    assert failure.value.code is ServiceClaimReleaseFailureCode.CLASSIFICATION_DENIED
+    assert verifier.calls == 2
+    assert classification.calls == []
+    assert store.state.root_bundle is not None
+    assert store.state.root_bundle.service_claim.value.status is ServiceClaimStatus.RELEASING
 
 
 def test_release_fences_classifies_and_atomically_persists_exact_chain() -> None:

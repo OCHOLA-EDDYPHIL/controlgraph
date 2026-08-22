@@ -17,6 +17,7 @@ from controlgraph_canary.application.authority_store import (
 from controlgraph_canary.application.canary_execution import (
     CanaryExecutionError,
     CanaryExecutionErrorCode,
+    CapabilityTimelineRecorder,
 )
 from controlgraph_canary.application.health_orchestration import (
     HealthAttestationVerifier,
@@ -281,6 +282,7 @@ class PromotionRolloutCoordinator:
         dispatch_store: PromotionDispatchStoreV2,
         task_dispatcher: TaskDispatcher,
         clock: Callable[[], datetime] | None = None,
+        timeline_recorder: CapabilityTimelineRecorder | None = None,
     ) -> None:
         if (
             type(target) is not TargetBinding
@@ -295,6 +297,13 @@ class PromotionRolloutCoordinator:
             or dispatch_store.target != target
             or type(task_dispatcher) is not TaskDispatcher
             or (clock is not None and not callable(clock))
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(timeline_recorder, CapabilityTimelineRecorder)
+                    or timeline_recorder.target != target
+                )
+            )
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._target = target
@@ -303,6 +312,7 @@ class PromotionRolloutCoordinator:
         self._dispatch_store = dispatch_store
         self._task_dispatcher = task_dispatcher
         self._clock = clock or _now_utc_second
+        self._timeline_recorder = timeline_recorder
 
     async def dispatch(
         self,
@@ -450,6 +460,11 @@ class PromotionRolloutCoordinator:
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
         claims = capability.claims
         try:
+            if self._timeline_recorder is not None:
+                await self._timeline_recorder.record_signed_capability(
+                    capability,
+                    signature_verified=False,
+                )
             intent = PromotionMutationIntentV2(
                 schema_version=PROMOTION_MUTATION_INTENT_V2,
                 request_id=authorization.request_id,

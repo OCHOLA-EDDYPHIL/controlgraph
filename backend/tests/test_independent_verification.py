@@ -68,6 +68,7 @@ from controlgraph_canary.contracts.independent_verification import (
     INDEPENDENT_VERIFICATION_INVOCATION_V1,
     INDEPENDENT_VERIFICATION_PURPOSE,
     P256_SIGNING_ALGORITHM,
+    PROBE_REQUEST_V1,
     SEALED_REFERENCE_PROBE_V1,
     SIGNED_INDEPENDENT_VERIFICATION_EVIDENCE_V1,
     VERIFICATION_REQUEST_V1,
@@ -88,10 +89,12 @@ from controlgraph_canary.contracts.independent_verification import (
     IndependentVerificationKind,
     ProbeAttestationReason,
     ProbeAttestationStatus,
+    ProbeRequestV1,
     SealedReferenceProbeV1,
     SignedIndependentVerificationEvidenceV1,
     VerificationRequestV1,
     VerifiedIndependentVerificationEvidenceV1,
+    fixed_probe_policy,
     independent_verification_signing_input_sha256,
 )
 from controlgraph_canary.contracts.models import (
@@ -189,6 +192,10 @@ def _request(
         epoch=2,
         target=_target(),
         plan_sha256="b" * 64,
+        service_claim_sha256="d" * 64,
+        probe_policy_sha256=canonical_sha256(
+            fixed_probe_policy(stable_percent, candidate_percent)
+        ),
         signed_intent_sha256="9" * 64,
         action=action,
         stable_revision=STABLE,
@@ -339,6 +346,8 @@ def _execution(request: VerificationRequestV1) -> ExecutionCompletionEvidenceV1:
         epoch=request.epoch,
         target=request.target,
         plan_sha256=request.plan_sha256,
+        service_claim_sha256=request.service_claim_sha256,
+        probe_policy_sha256=request.probe_policy_sha256,
         signed_intent_sha256=request.signed_intent_sha256,
         intent_signature_verified=True,
         request_id=request.request_id,
@@ -348,6 +357,7 @@ def _execution(request: VerificationRequestV1) -> ExecutionCompletionEvidenceV1:
         action=request.action,
         outcome=ReceiptOutcome.VERIFIED,
         reason_code=None,
+        observed_authority_epoch=request.epoch,
         receipt_sha256="c" * 64,
         receipt_persisted=True,
         write_outcome_known=True,
@@ -422,6 +432,36 @@ def test_configuration_match_is_separately_signed_with_complete_observation() ->
     )
     assert reader.calls == 1
     assert len(evidence.calls) == 1
+
+
+def test_verification_request_rejects_a_substituted_probe_policy_digest() -> None:
+    request = _request()
+
+    with pytest.raises(ValidationError):
+        VerificationRequestV1.model_validate(
+            {
+                **request.model_dump(mode="python"),
+                "probe_policy_sha256": "f" * 64,
+            }
+        )
+
+
+def test_probe_request_rejects_policy_not_matching_committed_digest() -> None:
+    request = _request()
+    altered_policy = fixed_probe_policy(90, 10).model_copy(
+        update={"timeout_milliseconds": 1_999}
+    )
+    probe_request = ProbeRequestV1.model_construct(
+        schema_version=PROBE_REQUEST_V1,
+        verification=request,
+        policy=altered_policy,
+        endpoint="https://controlgraph-reference-target.example/v1/probe",
+        nonce="n" * 32,
+        started_at="2026-08-19T12:00:00Z",
+    )
+
+    with pytest.raises(ValueError):
+        probe_request.validate_probe()
 
 
 def test_configuration_mismatch_and_unavailable_are_signed_not_promoted_to_match() -> None:
@@ -839,6 +879,8 @@ def test_revocation_and_stale_denial_require_authority_evidence() -> None:
         epoch=request.epoch,
         target=request.target,
         plan_sha256=request.plan_sha256,
+        service_claim_sha256=request.service_claim_sha256,
+        probe_policy_sha256=request.probe_policy_sha256,
         signed_intent_sha256=request.signed_intent_sha256,
         intent_signature_verified=True,
         request_id=request.request_id,
@@ -848,6 +890,7 @@ def test_revocation_and_stale_denial_require_authority_evidence() -> None:
         action=request.action,
         outcome=ReceiptOutcome.DENIED,
         reason_code=ReasonCode.EPOCH_MISMATCH,
+        observed_authority_epoch=request.epoch + 1,
         receipt_sha256="d" * 64,
         receipt_persisted=True,
         write_outcome_known=True,
@@ -860,13 +903,26 @@ def test_revocation_and_stale_denial_require_authority_evidence() -> None:
     stale = CompletionEvidenceBundleV1(
         schema_version=COMPLETION_EVIDENCE_BUNDLE_V1,
         request=stale_request,
-        authority=_authority(request, AuthorityCompletionKind.EPOCH_ADVANCEMENT),
+        authority=_authority(
+            request,
+            AuthorityCompletionKind.EPOCH_ADVANCEMENT,
+        ).model_copy(update={"epoch": request.epoch + 1}),
         execution=stale_execution,
     )
 
     assert classify_completion(revocation).reason is CompletionReason.REVOCATION_COMPLETE
     assert classify_completion(stale).reason is (
         CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE
+    )
+    conflicting_epoch = stale.model_copy(
+        update={
+            "execution": stale_execution.model_copy(
+                update={"observed_authority_epoch": request.epoch + 2}
+            )
+        }
+    )
+    assert classify_completion(conflicting_epoch).reason is (
+        CompletionReason.EVIDENCE_BINDING_MISMATCH
     )
     missing = revocation.model_copy(update={"authority": None})
     assert classify_completion(missing).reason is (

@@ -20,6 +20,12 @@ from controlgraph_canary.application.authority_store import (
     RootCreationBundle,
     StoredRecord,
 )
+from controlgraph_canary.application.completion_classification import (
+    CoordinatorCompletionClassificationService,
+)
+from controlgraph_canary.application.completion_workflow import (
+    CoordinatorCompletionWorkflow,
+)
 from controlgraph_canary.application.health_orchestration import (
     VerifierHealthProofService,
 )
@@ -557,6 +563,7 @@ def _pipeline(
     reject_client_signatures: bool = False,
     unhealthy: bool = False,
     recovery_coordinator: RecoveryCoordinator | None = None,
+    target_verification_workflow: CoordinatorCompletionWorkflow | None = None,
 ) -> tuple[
     ApiHealthEvaluationClient,
     _LoopbackTransport,
@@ -602,6 +609,7 @@ def _pipeline(
         health_store=store,
         verifier=verifier_client,
         recovery_coordinator=recovery_coordinator or _RecoveryCoordinator(),
+        target_verification_workflow=target_verification_workflow,
     )
     transport.coordinator_service = coordinator_service
     transport.verifier_service = verifier_service
@@ -621,6 +629,84 @@ def _pipeline(
         coordinator_service,
         client_signature_verifier,
     )
+
+
+class _UnavailableTargetVerifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def attest(self, invocation):  # type: ignore[no-untyped-def]
+        del invocation
+        self.calls += 1
+        raise RuntimeError("synthetic verifier outage")
+
+
+def test_health_evaluation_requires_independent_target_observation() -> None:
+    clock = _Clock(datetime(2026, 8, 21, 12, 8, tzinfo=UTC))
+    root, _ = make_anchor()
+    verifier = _UnavailableTargetVerifier()
+    workflow = CoordinatorCompletionWorkflow(
+        target=root.content.target,
+        verifier=verifier,
+        classifier=CoordinatorCompletionClassificationService(
+            target=root.content.target
+        ),
+        clock=lambda: clock.value,
+    )
+    _, _, _, store, command, operator, coordinator, _ = _pipeline(
+        clock=clock,
+        target_verification_workflow=workflow,
+    )
+
+    with pytest.raises(HealthPipelineError) as failure:
+        asyncio.run(
+            coordinator.evaluate(
+                _invocation(command, operator),
+                _context(_policy(ServiceRole.COORDINATOR, CallerRole.API)),
+            )
+        )
+
+    assert failure.value.code is (
+        HealthPipelineErrorCode.INDEPENDENT_VERIFICATION_AMBIGUOUS
+    )
+    assert verifier.calls == 2
+    assert store.snapshot is None
+
+
+def test_health_replay_adopts_before_fresh_target_verification() -> None:
+    clock = _Clock(datetime(2026, 8, 21, 12, 8, tzinfo=UTC))
+    root, _ = make_anchor()
+    (
+        api,
+        _,
+        _,
+        _,
+        command,
+        operator,
+        coordinator,
+        _,
+    ) = _pipeline(clock=clock)
+
+    first = asyncio.run(api.evaluate(command, operator))
+    verifier = _UnavailableTargetVerifier()
+    coordinator._target_verification_workflow = CoordinatorCompletionWorkflow(
+        target=root.content.target,
+        verifier=verifier,
+        classifier=CoordinatorCompletionClassificationService(
+            target=root.content.target
+        ),
+        clock=lambda: clock.value,
+    )
+
+    replay = asyncio.run(
+        coordinator.evaluate(
+            _invocation(command, operator),
+            _context(_policy(ServiceRole.COORDINATOR, CallerRole.API)),
+        )
+    )
+
+    assert replay == first.model_copy(update={"append_disposition": "ADOPTED"})
+    assert verifier.calls == 0
 
 
 def _next_command(
