@@ -36,7 +36,7 @@ EXECUTION_HANDLER_PATH: Final = "/v1/internal/tasks/execute"
 RECOVERY_HANDLER_PATH: Final = "/v1/internal/tasks/recover"
 MAX_SCHEDULE_DELAY_SECONDS: Final = 600
 MAX_TASK_AGE_SECONDS: Final = 900
-TASK_DISPATCH_DEADLINE_SECONDS: Final = 30
+TASK_DISPATCH_DEADLINE_SECONDS: Final = 60
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,500}$")

@@ -37,6 +37,7 @@ module "executor" {
   container_image = var.controller_image
   service_account = local.service_accounts.executor
   ingress         = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  timeout         = "60s"
   network         = data.terraform_remote_state.foundation.outputs.network.network_id
   subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress      = "ALL_TRAFFIC"
@@ -68,6 +69,7 @@ module "recovery" {
   container_image = var.controller_image
   service_account = local.service_accounts.recovery
   ingress         = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  timeout         = "60s"
   network         = data.terraform_remote_state.foundation.outputs.network.network_id
   subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress      = "ALL_TRAFFIC"
