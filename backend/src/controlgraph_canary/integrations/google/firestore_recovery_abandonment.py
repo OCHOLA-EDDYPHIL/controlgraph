@@ -106,7 +106,6 @@ from controlgraph_canary.contracts.storage import (
 )
 from controlgraph_canary.integrations.google.firestore import (
     FIRESTORE_MAX_TRANSACTION_ATTEMPTS,
-    FIRESTORE_OPERATION_TIMEOUT_SECONDS,
     AsyncFirestoreAuthorityClientPort,
     FirestoreAuthorityStore,
     _await_shielded,
@@ -130,6 +129,7 @@ from controlgraph_canary.integrations.google.firestore import (
 
 _DOCUMENT_FIELDS: Final = frozenset(AuthorityStorageDocument.model_fields)
 _HEALTH_DOCUMENT_FIELDS: Final = frozenset(HealthStorageDocumentV1.model_fields)
+_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS: Final = 15.0
 
 
 def _claim_ownership_binding(
@@ -865,7 +865,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
         try:
             return await _await_shielded(
                 operation,
-                timeout_seconds=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
+                timeout_seconds=_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
             operation.add_done_callback(_consume_background_result)
@@ -877,7 +877,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
         try:
             await _await_shielded(
                 classification,
-                timeout_seconds=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
+                timeout_seconds=_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS,
             )
             return _TransactionCommitDisposition.READBACK_RESOLVED
         except asyncio.CancelledError:
@@ -1255,7 +1255,23 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 result=None if result is None else result.stored,
             )
 
-        await self._run_consistent_read(read)
+        client = await self._client()
+        try:
+            async with asyncio.timeout(
+                _RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS
+            ):
+                await self._transaction_runner(
+                    client,
+                    FIRESTORE_MAX_TRANSACTION_ATTEMPTS,
+                    0,
+                    read,
+                )
+        except asyncio.CancelledError:
+            raise
+        except AuthorityStoreCorruptRecord:
+            raise
+        except Exception:
+            raise AuthorityStoreUnavailable from None
         if decoded_state is None:
             raise AuthorityStoreUnavailable
         if decoded_state.root_bundle is not None:

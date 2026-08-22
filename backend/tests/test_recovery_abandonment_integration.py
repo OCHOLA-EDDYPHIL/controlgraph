@@ -48,6 +48,7 @@ from test_service_claim_classification import (
 from controlgraph_canary.application.authority_store import (
     AuthorityStore,
     AuthorityStoreConflict,
+    AuthorityStoreUnavailable,
     StoredRecord,
 )
 from controlgraph_canary.application.cloud_run import (
@@ -128,6 +129,10 @@ from controlgraph_canary.http.identity_headers import (
     SERVERLESS_AUTHORIZATION_HEADER,
 )
 from controlgraph_canary.http.service import create_service_app
+from controlgraph_canary.integrations.google import firestore as firestore_integration
+from controlgraph_canary.integrations.google import (
+    firestore_recovery_abandonment as abandonment_integration,
+)
 from controlgraph_canary.integrations.google.firestore import (
     _document_data,
     _prepared_document,
@@ -858,6 +863,147 @@ def _changed_dispatch(dispatch: RecoveryDispatchRecordV2) -> RecoveryDispatchRec
             "prepared_at": (prepared_at - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     )
+
+
+def test_firestore_abandonment_read_has_a_dedicated_total_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory, _, _, _, _ = _run_first_stage()
+    expected, _ = memory.fence_commits[0]
+
+    async def scenario() -> None:
+        client = _FakeClient()
+        runner = _FakeTransactionRunner()
+
+        async def delayed_runner(
+            delayed_client: _FakeClient,
+            maximum_attempts: int,
+            expected_writes: int,
+            body: Any,
+        ) -> None:
+            await asyncio.sleep(0.03)
+            await runner(delayed_client, maximum_attempts, expected_writes, body)
+
+        assert expected.root_bundle is not None
+        store = FirestoreRecoveryAbandonmentStore.for_test(
+            target=expected.root_bundle.root.value.content.target,
+            configured_project_id=expected.root_bundle.root.value.content.target.project_id,
+            client_factory=lambda: client,
+            transaction_runner=delayed_runner,
+        )
+        _seed_state(client, expected)
+
+        observed = await store.read_recovery_abandonment_state(expected.invocation)
+
+        assert observed == expected
+        assert runner.expected_writes == [0]
+
+    monkeypatch.setattr(
+        firestore_integration,
+        "FIRESTORE_OPERATION_TIMEOUT_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        abandonment_integration,
+        "_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS",
+        0.2,
+    )
+    asyncio.run(scenario())
+
+
+def test_firestore_abandonment_write_has_a_dedicated_total_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory, _, _, _, _ = _run_first_stage()
+    expected, commit = memory.fence_commits[0]
+
+    async def scenario() -> None:
+        client = _FakeClient()
+        runner = _FakeTransactionRunner()
+
+        async def delayed_runner(
+            delayed_client: _FakeClient,
+            maximum_attempts: int,
+            expected_writes: int,
+            body: Any,
+        ) -> None:
+            await asyncio.sleep(0.03)
+            await runner(delayed_client, maximum_attempts, expected_writes, body)
+
+        store = FirestoreRecoveryAbandonmentStore.for_test(
+            target=commit.replacement_dispatch.target,
+            configured_project_id=commit.replacement_dispatch.target.project_id,
+            client_factory=lambda: client,
+            transaction_runner=delayed_runner,
+        )
+        _seed_state(client, expected)
+
+        written = await store.commit_recovery_abandonment_fence(expected, commit)
+
+        assert written.recovery_dispatch.value == commit.replacement_dispatch
+        assert runner.expected_writes == [9]
+
+    monkeypatch.setattr(
+        firestore_integration,
+        "FIRESTORE_OPERATION_TIMEOUT_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        abandonment_integration,
+        "FIRESTORE_OPERATION_TIMEOUT_SECONDS",
+        0.005,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        abandonment_integration,
+        "_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS",
+        0.2,
+    )
+    asyncio.run(scenario())
+
+
+def test_firestore_abandonment_read_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory, _, _, _, _ = _run_first_stage()
+    expected, _ = memory.fence_commits[0]
+
+    async def scenario() -> None:
+        client = _FakeClient()
+        runner_started = asyncio.Event()
+
+        async def blocked_runner(
+            delayed_client: _FakeClient,
+            maximum_attempts: int,
+            expected_writes: int,
+            body: Any,
+        ) -> None:
+            del delayed_client, maximum_attempts, expected_writes, body
+            runner_started.set()
+            await asyncio.Event().wait()
+
+        assert expected.root_bundle is not None
+        store = FirestoreRecoveryAbandonmentStore.for_test(
+            target=expected.root_bundle.root.value.content.target,
+            configured_project_id=expected.root_bundle.root.value.content.target.project_id,
+            client_factory=lambda: client,
+            transaction_runner=blocked_runner,
+        )
+        _seed_state(client, expected)
+
+        with pytest.raises(AuthorityStoreUnavailable):
+            await asyncio.wait_for(
+                store.read_recovery_abandonment_state(expected.invocation),
+                timeout=0.5,
+            )
+        assert runner_started.is_set()
+
+    monkeypatch.setattr(
+        abandonment_integration,
+        "_RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    asyncio.run(scenario())
 
 
 def test_firestore_fence_rereads_receipt_absence_and_commits_one_cas() -> None:
