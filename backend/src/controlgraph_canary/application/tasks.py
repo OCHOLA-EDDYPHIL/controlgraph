@@ -127,7 +127,12 @@ class TaskEnqueueResult:
 class TaskEnqueuer(Protocol):
     """Port for exactly one provider create-task attempt."""
 
-    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+    async def enqueue(
+        self,
+        task: AddressedTask,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         """Attempt to create the addressed task once."""
 
 
@@ -217,7 +222,12 @@ class TaskDispatcher:
         self._addressor = addressor
         self._enqueuer = enqueuer
 
-    def dispatch(self, request: TaskRequest, *, now: datetime) -> TaskEnqueueResult:
+    async def dispatch(
+        self,
+        request: TaskRequest,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         if request.intent.action in {
             CapabilityAction.PROMOTE_CANDIDATE,
             CapabilityAction.RECOVER_STABLE,
@@ -227,14 +237,14 @@ class TaskDispatcher:
             )
         evaluation_time = _require_utc_second(now)
         addressed = self.prepare(request, now=evaluation_time)
-        return self._enqueuer.enqueue(addressed, now=evaluation_time)
+        return await self._enqueuer.enqueue(addressed, now=evaluation_time)
 
     def prepare(self, request: AddressableTaskRequest, *, now: datetime) -> AddressedTask:
         """Seal an exact task before durable enqueue ownership begins."""
 
         return self._addressor.seal(request, now=_require_utc_second(now))
 
-    def dispatch_prepared(
+    async def dispatch_prepared(
         self,
         task: AddressedTask,
         *,
@@ -261,9 +271,9 @@ class TaskDispatcher:
             )
         except (TypeError, ValueError) as error:
             raise TaskAddressingError("promotion enqueue permit is invalid") from error
-        return self._enqueuer.enqueue(task, now=evaluation_time)
+        return await self._enqueuer.enqueue(task, now=evaluation_time)
 
-    def dispatch_prepared_v2(
+    async def dispatch_prepared_v2(
         self,
         task: AddressedTask,
         *,
@@ -290,9 +300,9 @@ class TaskDispatcher:
             )
         except (TypeError, ValueError) as error:
             raise TaskAddressingError("V2 promotion enqueue permit is invalid") from error
-        return self._enqueuer.enqueue(task, now=evaluation_time)
+        return await self._enqueuer.enqueue(task, now=evaluation_time)
 
-    def dispatch_prepared_recovery(
+    async def dispatch_prepared_recovery(
         self,
         task: AddressedTask,
         *,
@@ -319,7 +329,7 @@ class TaskDispatcher:
             )
         except (TypeError, ValueError) as error:
             raise TaskAddressingError("recovery enqueue permit is invalid") from error
-        return self._enqueuer.enqueue(task, now=evaluation_time)
+        return await self._enqueuer.enqueue(task, now=evaluation_time)
 
 
 def _route_for_action(action: CapabilityAction) -> TaskRoute:

@@ -291,7 +291,12 @@ class _HoldingEnqueuer:
         self.tasks: dict[str, AddressedTask] = {}
         self.attempts: list[AddressedTask] = []
 
-    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+    async def enqueue(
+        self,
+        task: AddressedTask,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         del now
         self.attempts.append(task)
         if task.name in self.tasks:
@@ -307,7 +312,12 @@ class _HoldingEnqueuer:
 
 
 class _AmbiguousEnqueuer(_HoldingEnqueuer):
-    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+    async def enqueue(
+        self,
+        task: AddressedTask,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         del now
         self.attempts.append(task)
         self.tasks[task.name] = task
@@ -1636,13 +1646,13 @@ def test_same_second_start_cas_yields_one_one_use_enqueue_permit() -> None:
         assert len(direct) == len(conflicts) == 1
         dispatcher = TaskDispatcher(TaskAddressor(_delivery_settings()), enqueuer)
         addressed = dispatcher.prepare(prepared.value.task, now=ISSUE_TIME)
-        dispatched = dispatcher.dispatch_prepared_v2(
+        dispatched = await dispatcher.dispatch_prepared_v2(
             addressed,
             permit=direct[0].permit,
             now=ISSUE_TIME,
         )
         with pytest.raises(TaskAddressingError):
-            dispatcher.dispatch_prepared_v2(
+            await dispatcher.dispatch_prepared_v2(
                 addressed,
                 permit=direct[0].permit,
                 now=ISSUE_TIME,
@@ -1705,7 +1715,10 @@ def test_legacy_dispatch_cannot_bypass_promotion_enqueue_permit() -> None:
         dispatcher = TaskDispatcher(TaskAddressor(_delivery_settings()), enqueuer)
 
         with pytest.raises(TaskAddressingError):
-            dispatcher.dispatch(prepared.value.task, now=ISSUE_TIME)  # type: ignore[arg-type]
+            await dispatcher.dispatch(  # type: ignore[arg-type]
+                prepared.value.task,
+                now=ISSUE_TIME,
+            )
 
         assert enqueuer.attempts == []
 

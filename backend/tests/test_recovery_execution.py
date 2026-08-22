@@ -230,7 +230,7 @@ class _TaskDispatcher:
             body=b"sealed-recovery-task",
         )
 
-    def dispatch_prepared_recovery(
+    async def dispatch_prepared_recovery(
         self,
         task: AddressedTask,
         *,

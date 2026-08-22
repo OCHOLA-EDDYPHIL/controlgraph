@@ -324,7 +324,12 @@ class _RecordingEnqueuer:
         self.error: BaseException | None = None
         self.calls: list[tuple[AddressedTask, datetime]] = []
 
-    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+    async def enqueue(
+        self,
+        task: AddressedTask,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         self.calls.append((task, now))
         if self.error is not None:
             raise self.error

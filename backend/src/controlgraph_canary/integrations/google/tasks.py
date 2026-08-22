@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import datetime
-from threading import Lock
-from typing import Protocol, cast
+from typing import Final, Protocol, cast
 
+import google.auth
 from google.api_core.exceptions import AlreadyExists
+from google.auth.credentials import Credentials
 from google.cloud import tasks_v2
 
 from controlgraph_canary.application.tasks import (
@@ -18,11 +20,23 @@ from controlgraph_canary.application.tasks import (
     TaskEnqueueResult,
 )
 
+CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS: Final = 10.0
+CLOUD_TASKS_ENQUEUE_WALL_TIMEOUT_SECONDS: Final = 15.0
+_CLOUD_TASKS_AUTH_SCOPES: Final = (
+    "https://www.googleapis.com/auth/cloud-platform",
+)
+
 
 class CloudTasksCreateClient(Protocol):
     """Narrow client surface used by the task adapter."""
 
-    def create_task(self, *, request: Mapping[str, object]) -> object:
+    async def create_task(
+        self,
+        *,
+        request: Mapping[str, object],
+        retry: None,
+        timeout: float,
+    ) -> object:
         """Create one addressed task."""
 
 
@@ -33,18 +47,30 @@ class GoogleCloudTasksEnqueuer:
         self,
         client: CloudTasksCreateClient | None,
         addressor: TaskAddressor,
+        *,
+        credentials: Credentials | None = None,
     ) -> None:
+        if client is None and credentials is None:
+            raise ValueError("a Cloud Tasks client or credentials are required")
         self._client = client
+        self._credentials = credentials
         self._addressor = addressor
-        self._client_lock = Lock()
 
     @classmethod
     def from_default_credentials(cls, addressor: TaskAddressor) -> GoogleCloudTasksEnqueuer:
         """Construct the runtime client without exposing credential material."""
 
-        return cls(None, addressor)
+        credentials, _ = google.auth.default(
+            default_scopes=_CLOUD_TASKS_AUTH_SCOPES,
+        )
+        return cls(None, addressor, credentials=credentials)
 
-    def enqueue(self, task: AddressedTask, *, now: datetime) -> TaskEnqueueResult:
+    async def enqueue(
+        self,
+        task: AddressedTask,
+        *,
+        now: datetime,
+    ) -> TaskEnqueueResult:
         self._addressor.validate_seal(task, now=now)
         provider_request: dict[str, object] = {
             "parent": task.parent,
@@ -65,8 +91,14 @@ class GoogleCloudTasksEnqueuer:
             },
         }
         try:
-            response = self._get_client().create_task(request=provider_request)
-            response_name = getattr(response, "name", None)
+            async with asyncio.timeout(CLOUD_TASKS_ENQUEUE_WALL_TIMEOUT_SECONDS):
+                client = self._get_client()
+                response = await client.create_task(
+                    request=provider_request,
+                    retry=None,
+                    timeout=CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS,
+                )
+                response_name = getattr(response, "name", None)
         except AlreadyExists:
             return TaskEnqueueResult(
                 task_name=task.name,
@@ -91,12 +123,20 @@ class GoogleCloudTasksEnqueuer:
         client = self._client
         if client is not None:
             return client
-        with self._client_lock:
-            client = self._client
-            if client is None:
-                client = cast(CloudTasksCreateClient, tasks_v2.CloudTasksClient())
-                self._client = client
+        credentials = self._credentials
+        if credentials is None:
+            raise RuntimeError("Cloud Tasks credentials are unavailable")
+        client = cast(
+            CloudTasksCreateClient,
+            tasks_v2.CloudTasksAsyncClient(credentials=credentials),
+        )
+        self._client = client
         return client
 
 
-__all__ = ["CloudTasksCreateClient", "GoogleCloudTasksEnqueuer"]
+__all__ = [
+    "CLOUD_TASKS_CREATE_RPC_TIMEOUT_SECONDS",
+    "CLOUD_TASKS_ENQUEUE_WALL_TIMEOUT_SECONDS",
+    "CloudTasksCreateClient",
+    "GoogleCloudTasksEnqueuer",
+]

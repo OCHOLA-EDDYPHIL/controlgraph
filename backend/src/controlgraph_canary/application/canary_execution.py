@@ -373,7 +373,10 @@ class CanaryRolloutCoordinator:
                 intent=intent,
             )
             dispatch_time = _require_utc_second(self._clock())
-            dispatched = self._task_dispatcher.dispatch(request, now=dispatch_time)
+            dispatched = await self._task_dispatcher.dispatch(
+                request,
+                now=dispatch_time,
+            )
             capability_sha256 = canonical_sha256(capability)
             return CanaryDispatchResultV1(
                 schema_version=CANARY_DISPATCH_RESULT_V1,
