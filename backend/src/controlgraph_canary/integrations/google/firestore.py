@@ -2283,12 +2283,18 @@ class FirestoreAuthorityStore:
         reference: _DocumentReferencePort,
         *,
         transaction: _TransactionPort | None,
+        timeout_seconds: float | None = None,
     ) -> object:
+        selected_timeout = (
+            FIRESTORE_OPERATION_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         return await reference.get(
             field_paths=None,
             transaction=transaction,
             retry=None,
-            timeout=FIRESTORE_OPERATION_TIMEOUT_SECONDS,
+            timeout=selected_timeout,
             read_time=None,
         )
 
@@ -2435,8 +2441,13 @@ class FirestoreAuthorityStore:
         reference: _DocumentReferencePort,
         logical_id: str,
         document_id: str,
+        timeout_seconds: float | None = None,
     ) -> _DecodedDocument[ServiceClaimRecordValue] | None:
-        snapshot = await self._get_snapshot(reference, transaction=transaction)
+        snapshot = await self._get_snapshot(
+            reference,
+            transaction=transaction,
+            timeout_seconds=timeout_seconds,
+        )
         return self._decode_service_claim_snapshot(
             snapshot,
             reference=reference,
@@ -2504,8 +2515,13 @@ class FirestoreAuthorityStore:
         logical_id: str,
         document_id: str,
         model_type: type[ModelT],
+        timeout_seconds: float | None = None,
     ) -> _DecodedDocument[ModelT] | None:
-        snapshot = await self._get_snapshot(reference, transaction=transaction)
+        snapshot = await self._get_snapshot(
+            reference,
+            transaction=transaction,
+            timeout_seconds=timeout_seconds,
+        )
         return self._decode_snapshot(
             snapshot,
             reference=reference,
@@ -2520,6 +2536,8 @@ class FirestoreAuthorityStore:
         transaction: _TransactionPort,
         client: AsyncFirestoreAuthorityClientPort,
         root_id: str,
+        *,
+        timeout_seconds: float | None = None,
     ) -> _DecodedDocument[RolloutRootV2 | RolloutRootV3] | None:
         v2_document_id = rollout_root_v2_document_id(root_id)
         v3_document_id = rollout_root_v3_document_id(root_id)
@@ -2534,6 +2552,7 @@ class FirestoreAuthorityStore:
             logical_id=root_id,
             document_id=v2_document_id,
             model_type=RolloutRootV2,
+            timeout_seconds=timeout_seconds,
         )
         v3 = await self._transaction_read(
             transaction,
@@ -2546,6 +2565,7 @@ class FirestoreAuthorityStore:
             logical_id=root_id,
             document_id=v3_document_id,
             model_type=RolloutRootV3,
+            timeout_seconds=timeout_seconds,
         )
         if v2 is not None and v3 is not None:
             raise AuthorityStoreCorruptRecord
@@ -2556,6 +2576,8 @@ class FirestoreAuthorityStore:
         transaction: _TransactionPort,
         client: AsyncFirestoreAuthorityClientPort,
         root_id: str,
+        *,
+        timeout_seconds: float | None = None,
     ) -> _DecodedDocument[RootCreationResultV1 | RootCreationResultV2] | None:
         v1_document_id = root_creation_result_document_id(root_id)
         v2_document_id = root_creation_result_v2_document_id(root_id)
@@ -2570,6 +2592,7 @@ class FirestoreAuthorityStore:
             logical_id=root_id,
             document_id=v1_document_id,
             model_type=RootCreationResultV1,
+            timeout_seconds=timeout_seconds,
         )
         v2 = await self._transaction_read(
             transaction,
@@ -2582,6 +2605,7 @@ class FirestoreAuthorityStore:
             logical_id=root_id,
             document_id=v2_document_id,
             model_type=RootCreationResultV2,
+            timeout_seconds=timeout_seconds,
         )
         if v1 is not None and v2 is not None:
             raise AuthorityStoreCorruptRecord

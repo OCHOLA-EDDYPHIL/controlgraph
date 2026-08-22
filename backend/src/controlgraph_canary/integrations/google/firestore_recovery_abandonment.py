@@ -130,6 +130,7 @@ from controlgraph_canary.integrations.google.firestore import (
 _DOCUMENT_FIELDS: Final = frozenset(AuthorityStorageDocument.model_fields)
 _HEALTH_DOCUMENT_FIELDS: Final = frozenset(HealthStorageDocumentV1.model_fields)
 _RECOVERY_ABANDONMENT_OPERATION_TIMEOUT_SECONDS: Final = 15.0
+_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS: Final = 10.0
 
 
 def _claim_ownership_binding(
@@ -792,8 +793,13 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
         logical_id: str,
         document_id: str,
         model_type: type[ModelT],
+        timeout_seconds: float | None = None,
     ) -> _DecodedHealthDocument[ModelT] | None:
-        snapshot = await self._get_snapshot(reference, transaction=transaction)
+        snapshot = await self._get_snapshot(
+            reference,
+            transaction=transaction,
+            timeout_seconds=timeout_seconds,
+        )
         try:
             provider_snapshot = cast(_ProviderSnapshotPort, snapshot)
             if provider_snapshot.reference.path != reference.path:
@@ -908,6 +914,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 transaction,
                 client,
                 root_id,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             authority_document_id = epoch_authority_document_id(root_id)
             authority = await self._transaction_read(
@@ -921,11 +928,13 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=root_id,
                 document_id=authority_document_id,
                 model_type=EpochAuthorityRecord,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             creation = await self._transaction_read_root_creation_result(
                 transaction,
                 client,
                 root_id,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             root_bundle: RootCreationBundle | None = None
             root_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
@@ -943,6 +952,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     ),
                     logical_id=claim_logical_id,
                     document_id=claim_document_id,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
                 anchor = await self._transaction_read(
                     transaction,
@@ -957,6 +967,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                         creation.value.lineage_anchor
                     ),
                     model_type=CapabilityLineageAnchorV1,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
                 root_evidence_id = creation.value.winner_evidence_id
                 root_evidence_document_id = signed_evidence_event_document_id(root_evidence_id)
@@ -971,6 +982,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=root_evidence_id,
                     document_id=root_evidence_document_id,
                     model_type=SignedEvidenceEventV1,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
                 if claim is None or anchor is None or root_evidence is None:
                     raise AuthorityStoreCorruptRecord
@@ -995,6 +1007,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=root_id,
                 document_id=head_document_id,
                 model_type=EvidenceChainHeadV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             head_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
             if head is not None:
@@ -1017,6 +1030,9 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                         logical_id=head_evidence_id,
                         document_id=head_evidence_document_id,
                         model_type=SignedEvidenceEventV1,
+                        timeout_seconds=(
+                            _RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS
+                        ),
                     )
                     if head_evidence is None:
                         raise AuthorityStoreCorruptRecord
@@ -1037,6 +1053,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=intent_logical_id,
                 document_id=intent_document_id,
                 model_type=RecoveryIntentV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             dispatch: _DecodedHealthDocument[RecoveryDispatchStorageRecordV2] | None = None
             receipt: _DecodedDocument[ExecutionReceipt] | None = None
@@ -1073,6 +1090,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=request_identity_logical_id,
                     document_id=request_identity_document_id,
                     model_type=RecoveryDispatchIdentityV2,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
                 recovery_idempotency_identity = await self._transaction_read_health(
                     transaction,
@@ -1085,6 +1103,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=idempotency_identity_logical_id,
                     document_id=idempotency_identity_document_id,
                     model_type=RecoveryDispatchIdentityV2,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
                 dispatch_document_id = health_recovery_dispatch_document_id(
                     self._target,
@@ -1101,6 +1120,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=dispatch_id,
                     document_id=dispatch_document_id,
                     model_type=RecoveryDispatchStorageRecordV2,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
                 if any(
                     value is None
@@ -1141,6 +1161,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=receipt_logical_id,
                     document_id=receipt_document_id,
                     model_type=ExecutionReceipt,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
 
             async def abandonment_evidence(
@@ -1162,6 +1183,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=evidence_id,
                     document_id=document_id,
                     model_type=SignedEvidenceEventV1,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
 
             ambiguity = await abandonment_evidence("ambiguity")
@@ -1192,6 +1214,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=logical_id,
                     document_id=document_id,
                     model_type=RecoveryAbandonmentIdentityV1,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
 
             request_identity = await abandonment_identity(
@@ -1214,6 +1237,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=result_id,
                 document_id=progress_document_id,
                 model_type=RecoveryAbandonmentProgressV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             result_document_id = recovery_abandonment_result_document_id(result_id)
             result = await self._transaction_read(
@@ -1227,6 +1251,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=result_id,
                 document_id=result_document_id,
                 model_type=RecoveryAbandonmentResultV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             decoded_state = RecoveryAbandonmentState(
                 invocation=invocation,
@@ -1391,6 +1416,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 transaction,
                 client,
                 commit.progress.root_id,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_claim = await self._transaction_read_service_claim(
                 transaction,
@@ -1401,6 +1427,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 ),
                 logical_id=claim_logical_id,
                 document_id=claim_document.document_id,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_authority = await self._transaction_read(
                 transaction,
@@ -1413,6 +1440,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=commit.progress.root_id,
                 document_id=authority_document.document_id,
                 model_type=EpochAuthorityRecord,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             intent = cast(StoredRecord[RecoveryIntentV1], expected.recovery_intent)
             intent_document_id = recovery_intent_document_id(
@@ -1430,6 +1458,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=intent.value.intent_id,
                 document_id=intent_document_id,
                 model_type=RecoveryIntentV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_dispatch = await self._transaction_read_health(
                 transaction,
@@ -1442,6 +1471,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=commit.replacement_dispatch.dispatch_id,
                 document_id=dispatch_document[2],
                 model_type=RecoveryDispatchStorageRecordV2,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_dispatch_domain = (
                 None
@@ -1469,6 +1499,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 ),
                 document_id=receipt_document_id,
                 model_type=ExecutionReceipt,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_head = await self._transaction_read(
                 transaction,
@@ -1481,6 +1512,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=commit.progress.root_id,
                 document_id=head_document.document_id,
                 model_type=EvidenceChainHeadV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             predecessor = expected.head_evidence or root_bundle.signed_evidence
             predecessor_document_id = signed_evidence_event_document_id(
@@ -1497,6 +1529,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=predecessor.value.event.evidence_id,
                 document_id=predecessor_document_id,
                 model_type=SignedEvidenceEventV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
 
             async def current_authority_document(
@@ -1514,6 +1547,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=document.wrapper.logical_id,
                     document_id=document.document_id,
                     model_type=model_type,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
 
             current_new_documents = tuple(
@@ -1693,6 +1727,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=expected_dispatch.value.dispatch_id,
                 document_id=dispatch_document_id,
                 model_type=RecoveryDispatchStorageRecordV2,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_dispatch_record = (
                 None
@@ -1720,6 +1755,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 ),
                 document_id=receipt_document_id,
                 model_type=ExecutionReceipt,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_claim = await self._transaction_read_service_claim(
                 transaction,
@@ -1730,6 +1766,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 ),
                 logical_id=claim_logical_id,
                 document_id=claim_document.document_id,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             authority_document_id = epoch_authority_document_id(commit.result.root_id)
             current_authority = await self._transaction_read(
@@ -1743,6 +1780,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=commit.result.root_id,
                 document_id=authority_document_id,
                 model_type=EpochAuthorityRecord,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             current_head = await self._transaction_read(
                 transaction,
@@ -1755,6 +1793,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=commit.result.root_id,
                 document_id=head_document.document_id,
                 model_type=EvidenceChainHeadV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             progress = cast(
                 StoredRecord[RecoveryAbandonmentProgressV1],
@@ -1774,6 +1813,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=progress.value.result_id,
                 document_id=progress_document_id,
                 model_type=RecoveryAbandonmentProgressV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
 
             async def current_evidence(
@@ -1794,6 +1834,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=evidence_id,
                     document_id=document_id,
                     model_type=SignedEvidenceEventV1,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
 
             current_head_evidence = await current_evidence(expected.head_evidence)
@@ -1814,6 +1855,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                     logical_id=document.wrapper.logical_id,
                     document_id=document.document_id,
                     model_type=SignedEvidenceEventV1,
+                    timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
                 )
 
             current_classification = await new_evidence(classification_document)
@@ -1829,6 +1871,7 @@ class FirestoreRecoveryAbandonmentStore(FirestoreAuthorityStore):
                 logical_id=commit.result.result_id,
                 document_id=result_document.document_id,
                 model_type=RecoveryAbandonmentResultV1,
+                timeout_seconds=_RECOVERY_ABANDONMENT_RPC_TIMEOUT_SECONDS,
             )
             if (
                 current_dispatch_record != expected_dispatch
