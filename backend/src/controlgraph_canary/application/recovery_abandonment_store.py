@@ -56,7 +56,7 @@ def late_fence_receipt_matches(
         or type(stored.value) is not ExecutionReceipt
         or type(dispatch) is not RecoveryDispatchRecordV2
         or type(fenced_epoch) is not int
-        or fenced_epoch != dispatch.epoch + 1
+        or fenced_epoch not in {dispatch.epoch + 1, dispatch.epoch + 2}
         or type(fenced_at) is not str
     ):
         return False

@@ -1509,17 +1509,17 @@ class RecoveryRolloutCoordinator:
         command: RecoveryCommandV2,
     ) -> RecoveryDispatchResultV2 | None:
         expected_revisions = {
-            RecoveryDispatchState.PREPARED: 0,
-            RecoveryDispatchState.ENQUEUE_STARTED: 1,
-            RecoveryDispatchState.CREATED: 2,
-            RecoveryDispatchState.DUPLICATE: 2,
-            RecoveryDispatchState.AMBIGUOUS: 2,
+            RecoveryDispatchState.PREPARED: frozenset({0}),
+            RecoveryDispatchState.ENQUEUE_STARTED: frozenset({1}),
+            RecoveryDispatchState.CREATED: frozenset({2}),
+            RecoveryDispatchState.DUPLICATE: frozenset({2}),
+            RecoveryDispatchState.AMBIGUOUS: frozenset({2, 3}),
         }
         if (
             type(stored) is not StoredRecord
             or type(stored.value) is not RecoveryDispatchRecordV2
             or stored.value.target != self._target
-            or stored.revision != expected_revisions.get(stored.value.state)
+            or stored.revision not in expected_revisions.get(stored.value.state, frozenset())
             or stored.value.command_sha256 != recovery_command_sha256(command)
             or stored.value.task.intent.authorization.source != command.source
         ):

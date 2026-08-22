@@ -7,7 +7,7 @@ import re
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self, cast
 
-from pydantic import StringConstraints, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
 from controlgraph_canary.contracts.base import (
     Audience,
@@ -167,8 +167,8 @@ class RecoveryAbandonmentEvidenceSubjectV1(StrictContractModel):
     recovery_dispatch_id: Identifier
     previous_dispatch_sha256: Sha256Digest
     ambiguous_dispatch_sha256: Sha256Digest
-    previous_dispatch_revision: Literal[1]
-    ambiguous_dispatch_revision: Literal[2]
+    previous_dispatch_revision: Annotated[int, Field(ge=1, le=2)]
+    ambiguous_dispatch_revision: Annotated[int, Field(ge=2, le=3)]
     task_id: Identifier
     task_name: BoundedText
     task_sha256: Sha256Digest

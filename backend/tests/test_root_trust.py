@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -710,6 +711,43 @@ def test_one_shot_oidc_transport_uses_exact_audience_url_and_never_retries() -> 
     with pytest.raises(InternalTransportError):
         asyncio.run(transport.post(route, b"{}"))
     assert len(poster.calls) == 2
+
+
+def test_one_shot_oidc_transport_does_not_serialize_blocking_token_fetches() -> None:
+    concurrent_calls = 4
+    rendezvous = threading.Barrier(concurrent_calls)
+
+    class TokenProvider:
+        def token(self, audience: str) -> str:
+            assert audience == VERIFIER_AUDIENCE
+            rendezvous.wait(timeout=5)
+            return "synthetic.oidc.token"
+
+    class Poster:
+        def post(self, **request: object) -> InternalHttpResponse:
+            return InternalHttpResponse(
+                status_code=200,
+                content_type="application/json",
+                body=b"{}",
+            )
+
+    route = _route(ServiceRole.VERIFIER)
+    transport = GoogleOneShotOidcTransport(
+        project_id=PROJECT,
+        caller_role=CallerRole.COORDINATOR,
+        token_provider=TokenProvider(),
+        http_poster=Poster(),
+        timeout_seconds=30.0,
+    )
+
+    async def post_concurrently() -> tuple[bytes, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(transport.post(route, b"{}") for _ in range(concurrent_calls))
+            )
+        )
+
+    assert asyncio.run(post_concurrently()) == (b"{}",) * concurrent_calls
 
 
 @pytest.mark.parametrize(

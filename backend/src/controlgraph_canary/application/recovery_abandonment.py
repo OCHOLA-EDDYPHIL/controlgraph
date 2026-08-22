@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Final, Protocol, runtime_checkable
+from typing import Final, Literal, Protocol, runtime_checkable
 
 from controlgraph_canary.application.authority_store import (
     AuthorityStoreConflict,
@@ -365,15 +365,19 @@ class RecoveryAbandoner:
             if (
                 type(dispatch) is not StoredRecord
                 or type(dispatch.value) is not RecoveryDispatchRecordV2
-                or dispatch.revision != 1
-                or dispatch.value.state is not RecoveryDispatchState.ENQUEUE_STARTED
+                or not _dispatch_state_is_abandonable(dispatch)
                 or dispatch.value.dispatch_id != command.recovery_dispatch_id
                 or recovery_dispatch_record_sha256(dispatch.value)
                 != command.expected_dispatch_sha256
                 or dispatch.value.command_sha256 != intent.value.command_sha256
                 or dispatch.value.root_id != command.root_id
                 or dispatch.value.root_sha256 != command.expected_root_sha256
-                or dispatch.value.epoch != command.expected_epoch
+                or intent.value.epoch != dispatch.value.epoch
+                or not _dispatch_epoch_is_abandonable(
+                    trusted.authority,
+                    command_epoch=command.expected_epoch,
+                    dispatch_epoch=dispatch.value.epoch,
+                )
                 or dispatch.value.target != self._store.target
             ):
                 return RecoveryAbandonmentFailureCode.DISPATCH_INVALID
@@ -390,7 +394,8 @@ class RecoveryAbandoner:
             or trusted.authority.current_epoch != command.expected_epoch + 1
             or trusted.service_claim.release_fence_epoch != trusted.authority.current_epoch
             or type(state.recovery_dispatch) is not StoredRecord
-            or state.recovery_dispatch.revision != 2
+            or state.recovery_dispatch.revision
+            != progress.abandonment_subject.ambiguous_dispatch_revision
             or state.recovery_dispatch.value.state is not RecoveryDispatchState.AMBIGUOUS
             or recovery_dispatch_record_sha256(state.recovery_dispatch.value)
             != progress.ambiguous_dispatch_sha256
@@ -433,12 +438,14 @@ class RecoveryAbandoner:
             or dispatch_record.value.task.expires_at > fenced_at
         ):
             raise RecoveryAbandonmentError(RecoveryAbandonmentFailureCode.DISPATCH_NOT_EXPIRED)
+        previous_dispatch_revision = dispatch_record.revision
+        ambiguous_dispatch_revision = previous_dispatch_revision + 1
         ambiguous_result = _ambiguous_dispatch_result(dispatch_record.value)
         ambiguous_dispatch = RecoveryDispatchRecordV2.model_validate(
             {
                 **dispatch_record.value.model_dump(mode="python"),
                 "state": RecoveryDispatchState.AMBIGUOUS,
-                "terminal_at": fenced_at,
+                "terminal_at": dispatch_record.value.terminal_at or fenced_at,
                 "result": ambiguous_result,
             }
         )
@@ -461,8 +468,8 @@ class RecoveryAbandoner:
             recovery_dispatch_id=ambiguous_dispatch.dispatch_id,
             previous_dispatch_sha256=previous_dispatch_sha256,
             ambiguous_dispatch_sha256=ambiguous_dispatch_sha256,
-            previous_dispatch_revision=1,
-            ambiguous_dispatch_revision=2,
+            previous_dispatch_revision=previous_dispatch_revision,
+            ambiguous_dispatch_revision=ambiguous_dispatch_revision,
             task_id=ambiguous_dispatch.task.task_id,
             task_name=ambiguous_dispatch.task_name,
             task_sha256=ambiguous_dispatch.task_sha256,
@@ -509,7 +516,7 @@ class RecoveryAbandoner:
             ),
             recovery_dispatch_id=ambiguous_dispatch.dispatch_id,
             recovery_dispatch_sha256=ambiguous_dispatch_sha256,
-            recovery_dispatch_revision=2,
+            recovery_dispatch_revision=ambiguous_dispatch_revision,
             recovery_receipt_id=receipt_id,
             receipt_absent_at_fence=True,
             evidence_id=abandonment_evidence_id,
@@ -832,7 +839,6 @@ class RecoveryAbandoner:
             or type(claim) is not ServiceClaimRecordV3
             or claim.status not in {ServiceClaimStatus.RELEASING, ServiceClaimStatus.RELEASED}
             or type(dispatch_record) is not StoredRecord
-            or dispatch_record.revision != 2
             or type(dispatch_record.value) is not RecoveryDispatchRecordV2
             or type(intent_record) is not StoredRecord
             or intent_record.revision != 0
@@ -841,16 +847,17 @@ class RecoveryAbandoner:
             raise RecoveryAbandonmentError(RecoveryAbandonmentFailureCode.TRUSTED_STATE_INVALID)
         dispatch = dispatch_record.value
         intent = intent_record.value
-        if dispatch.state is not RecoveryDispatchState.AMBIGUOUS:
+        abandonment_subject = progress.abandonment_subject
+        if (
+            dispatch.state is not RecoveryDispatchState.AMBIGUOUS
+            or dispatch_record.revision
+            != abandonment_subject.ambiguous_dispatch_revision
+        ):
             raise RecoveryAbandonmentError(RecoveryAbandonmentFailureCode.TRUSTED_STATE_INVALID)
         try:
-            previous_dispatch = RecoveryDispatchRecordV2.model_validate(
-                {
-                    **dispatch.model_dump(mode="python"),
-                    "state": RecoveryDispatchState.ENQUEUE_STARTED,
-                    "terminal_at": None,
-                    "result": None,
-                }
+            previous_dispatch = _previous_recovery_dispatch(
+                dispatch,
+                abandonment_subject,
             )
             fenced_claim = ServiceClaimRecordV3.model_validate(
                 {
@@ -894,7 +901,6 @@ class RecoveryAbandoner:
         )
         fenced_authority = self._fenced_authority(progress, command, fence)
         proof = claim.terminal_root_proof
-        abandonment_subject = progress.abandonment_subject
         fence_subject = progress.fence_subject
         abandonment_event = abandonment.event
         fence_event = fence.event
@@ -918,13 +924,23 @@ class RecoveryAbandoner:
             or intent.command_sha256 != dispatch.command_sha256
             or intent.root_id != progress.root_id
             or intent.root_sha256 != progress.root_sha256
-            or intent.epoch != command.expected_epoch
+            or intent.epoch != dispatch.epoch
             or dispatch.dispatch_id != progress.recovery_dispatch_id
             or dispatch.root_id != progress.root_id
             or dispatch.root_sha256 != progress.root_sha256
             or dispatch.target != progress.target
-            or dispatch.epoch != command.expected_epoch
-            or dispatch.terminal_at != progress.fenced_at
+            or dispatch.epoch not in {command.expected_epoch, command.expected_epoch - 1}
+            or (
+                abandonment_subject.previous_dispatch_revision == 1
+                and dispatch.terminal_at != progress.fenced_at
+            )
+            or (
+                abandonment_subject.previous_dispatch_revision == 2
+                and (
+                    dispatch.terminal_at is None
+                    or dispatch.terminal_at > progress.fenced_at
+                )
+            )
             or dispatch.result != _ambiguous_dispatch_result(dispatch)
             or dispatch.task.expires_at > progress.fenced_at
             or progress.recovery_receipt_id
@@ -983,8 +999,10 @@ class RecoveryAbandoner:
             or abandonment_subject.recovery_dispatch_id != dispatch.dispatch_id
             or abandonment_subject.previous_dispatch_sha256 != progress.previous_dispatch_sha256
             or abandonment_subject.ambiguous_dispatch_sha256 != progress.ambiguous_dispatch_sha256
-            or abandonment_subject.previous_dispatch_revision != 1
-            or abandonment_subject.ambiguous_dispatch_revision != 2
+            or abandonment_subject.previous_dispatch_revision
+            != dispatch_record.revision - 1
+            or abandonment_subject.ambiguous_dispatch_revision
+            != dispatch_record.revision
             or abandonment_subject.task_id != dispatch.task.task_id
             or abandonment_subject.task_name != dispatch.task_name
             or abandonment_subject.task_sha256 != dispatch.task_sha256
@@ -1411,8 +1429,17 @@ class RecoveryAbandoner:
     ) -> None:
         if state.root_bundle is None or type(written) is not RecoveryAbandonmentFenceWriteResult:
             raise RecoveryAbandonmentError(RecoveryAbandonmentFailureCode.TRUSTED_STATE_INVALID)
+        dispatch = state.recovery_dispatch
+        if type(dispatch) is not StoredRecord:
+            raise RecoveryAbandonmentError(
+                RecoveryAbandonmentFailureCode.TRUSTED_STATE_INVALID
+            )
         expected = (
-            (written.recovery_dispatch, commit.replacement_dispatch, 2),
+            (
+                written.recovery_dispatch,
+                commit.replacement_dispatch,
+                dispatch.revision + 1,
+            ),
             (
                 written.service_claim,
                 commit.replacement_claim,
@@ -1467,7 +1494,71 @@ class RecoveryAbandoner:
             raise RecoveryAbandonmentError(RecoveryAbandonmentFailureCode.TRUSTED_STATE_INVALID)
 
 
-def _ambiguous_dispatch_result(record: RecoveryDispatchRecordV2) -> RecoveryDispatchResultV2:
+def _dispatch_state_is_abandonable(
+    stored: StoredRecord[RecoveryDispatchRecordV2],
+) -> bool:
+    expected_revision = {
+        RecoveryDispatchState.ENQUEUE_STARTED: 1,
+        RecoveryDispatchState.CREATED: 2,
+        RecoveryDispatchState.DUPLICATE: 2,
+    }
+    return stored.revision == expected_revision.get(stored.value.state)
+
+
+def _dispatch_epoch_is_abandonable(
+    authority: EpochAuthorityRecord,
+    *,
+    command_epoch: int,
+    dispatch_epoch: int,
+) -> bool:
+    if authority.current_epoch != command_epoch:
+        return False
+    if dispatch_epoch == command_epoch:
+        return True
+    return (
+        dispatch_epoch + 1 == command_epoch
+        and authority.previous_epoch == dispatch_epoch
+        and authority.cause is EpochChangeCause.OPERATOR_REVOCATION
+    )
+
+
+def _previous_recovery_dispatch(
+    ambiguous: RecoveryDispatchRecordV2,
+    subject: RecoveryAbandonmentEvidenceSubjectV1,
+) -> RecoveryDispatchRecordV2:
+    if subject.previous_dispatch_revision == 1:
+        candidate = RecoveryDispatchRecordV2.model_validate(
+            {
+                **ambiguous.model_dump(mode="python"),
+                "state": RecoveryDispatchState.ENQUEUE_STARTED,
+                "terminal_at": None,
+                "result": None,
+            }
+        )
+        if recovery_dispatch_record_sha256(candidate) == subject.previous_dispatch_sha256:
+            return candidate
+        raise ValueError("previous recovery dispatch does not match abandonment evidence")
+
+    for state in (RecoveryDispatchState.CREATED, RecoveryDispatchState.DUPLICATE):
+        disposition: Literal["CREATED", "DUPLICATE", "AMBIGUOUS"] = (
+            "CREATED" if state is RecoveryDispatchState.CREATED else "DUPLICATE"
+        )
+        candidate = RecoveryDispatchRecordV2.model_validate(
+            {
+                **ambiguous.model_dump(mode="python"),
+                "state": state,
+                "result": _recovery_dispatch_result(ambiguous, disposition),
+            }
+        )
+        if recovery_dispatch_record_sha256(candidate) == subject.previous_dispatch_sha256:
+            return candidate
+    raise ValueError("previous recovery dispatch does not match abandonment evidence")
+
+
+def _recovery_dispatch_result(
+    record: RecoveryDispatchRecordV2,
+    disposition: Literal["CREATED", "DUPLICATE", "AMBIGUOUS"],
+) -> RecoveryDispatchResultV2:
     task = record.task
     authorization = task.intent.authorization
     return RecoveryDispatchResultV2(
@@ -1502,10 +1593,14 @@ def _ambiguous_dispatch_result(record: RecoveryDispatchRecordV2) -> RecoveryDisp
         capability_sha256=canonical_sha256(task.capability),
         task_id=task.task_id,
         task_name=record.task_name,
-        enqueue_disposition="AMBIGUOUS",
+        enqueue_disposition=disposition,
         scheduled_at=task.scheduled_at,
         expires_at=task.expires_at,
     )
+
+
+def _ambiguous_dispatch_result(record: RecoveryDispatchRecordV2) -> RecoveryDispatchResultV2:
+    return _recovery_dispatch_result(record, "AMBIGUOUS")
 
 
 def _identity_claims(

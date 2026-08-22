@@ -8,13 +8,18 @@ from typing import Any, Literal
 
 import pytest
 from pydantic import ValidationError
-from recovery_v2_test_data import RecoveryV2Bundle, make_revoked_v3_recovery_bundle
+from recovery_v2_test_data import (
+    RecoveryV2Bundle,
+    make_revoked_v3_recovery_bundle,
+    make_unhealthy_v3_recovery_bundle,
+)
 from revocation_proof_test_data import (
     OPERATOR,
     OPERATOR_SUBJECT,
     make_revocation_proof_records,
 )
 from root_v2_test_data import PROJECT_NUMBER, make_root_v3_records, root_v2_target
+from test_recovery_execution_contracts import _dispatch_record
 from test_root_creation_application import (
     _candidate as next_root_candidate,
 )
@@ -74,6 +79,8 @@ from controlgraph_canary.contracts.models import (
     EVIDENCE_EVENT_V1,
     EXECUTION_RECEIPT_V1,
     CapabilityAction,
+    EpochAuthorityRecord,
+    EpochChangeCause,
     EvidenceEvent,
     EvidenceKind,
     ExecutionReceipt,
@@ -215,7 +222,11 @@ def _dispatch(bundle: RecoveryV2Bundle) -> RecoveryDispatchRecordV2:
     )
 
 
-def _invocation(dispatch: RecoveryDispatchRecordV2) -> RecoveryAbandonmentInvocationV1:
+def _invocation(
+    dispatch: RecoveryDispatchRecordV2,
+    *,
+    expected_epoch: int | None = None,
+) -> RecoveryAbandonmentInvocationV1:
     principal = _principal()
     return RecoveryAbandonmentInvocationV1(
         schema_version=RECOVERY_ABANDONMENT_INVOCATION_V1,
@@ -223,7 +234,7 @@ def _invocation(dispatch: RecoveryDispatchRecordV2) -> RecoveryAbandonmentInvoca
             schema_version=RECOVERY_ABANDONMENT_COMMAND_V1,
             root_id=dispatch.root_id,
             expected_root_sha256=dispatch.root_sha256,
-            expected_epoch=dispatch.epoch,
+            expected_epoch=dispatch.epoch if expected_epoch is None else expected_epoch,
             recovery_dispatch_id=dispatch.dispatch_id,
             expected_dispatch_sha256=recovery_dispatch_record_sha256(dispatch),
             reason="The enqueue outcome is unknown after its bounded task lifetime.",
@@ -448,7 +459,11 @@ class _Store:
         self.fence_commits.append((expected, commit))
         bundle = expected.root_bundle
         assert bundle is not None
-        dispatch = StoredRecord(commit.replacement_dispatch, 2)
+        assert expected.recovery_dispatch is not None
+        dispatch = StoredRecord(
+            commit.replacement_dispatch,
+            expected.recovery_dispatch.revision + 1,
+        )
         claim = StoredRecord(commit.replacement_claim, bundle.service_claim.revision + 1)
         authority = StoredRecord(commit.replacement_authority, bundle.authority.revision + 1)
         abandonment = StoredRecord(commit.abandonment_evidence, 0)
@@ -734,6 +749,164 @@ def test_first_stage_atomically_fences_without_releasing_the_claim() -> None:
     assert dispatch.value.state is RecoveryDispatchState.AMBIGUOUS
     assert dispatch.value.result is not None
     assert dispatch.value.result.enqueue_disposition == "AMBIGUOUS"
+
+
+def _prior_epoch_terminal_state(
+    terminal_state: RecoveryDispatchState = RecoveryDispatchState.CREATED,
+) -> RecoveryAbandonmentState:
+    recovery = make_unhealthy_v3_recovery_bundle()
+    terminal_dispatch = _dispatch_record(recovery, state=terminal_state)
+    root_bundle, head, head_evidence = _root_bundle_and_head()
+    return RecoveryAbandonmentState(
+        invocation=_invocation(
+            terminal_dispatch,
+            expected_epoch=root_bundle.authority.value.current_epoch,
+        ),
+        root_bundle=root_bundle,
+        recovery_intent=StoredRecord(
+            create_recovery_intent(
+                recovery.command,
+                created_at=recovery.command.source.triggered_at,
+            ),
+            0,
+        ),
+        recovery_dispatch=StoredRecord(terminal_dispatch, 2),
+        recovery_receipt=None,
+        chain_head=head,
+        head_evidence=head_evidence,
+        abandonment_evidence=None,
+        fence_evidence=None,
+        classification_evidence=None,
+        release_evidence=None,
+        request_identity=None,
+        idempotency_identity=None,
+        progress=None,
+        result=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [RecoveryDispatchState.CREATED, RecoveryDispatchState.DUPLICATE],
+)
+def test_expired_terminal_dispatch_from_prior_operator_epoch_is_safely_abandoned(
+    terminal_state: RecoveryDispatchState,
+) -> None:
+    state = _prior_epoch_terminal_state(terminal_state)
+    root_bundle = state.root_bundle
+    terminal_dispatch = state.recovery_dispatch
+    assert root_bundle is not None and terminal_dispatch is not None
+    assert root_bundle.authority.value.current_epoch == terminal_dispatch.value.epoch + 1
+    assert root_bundle.authority.value.cause.value == "OPERATOR_REVOCATION"
+    store = _Store(state)
+    abandoner, _, _ = _abandoner(store)
+
+    fenced = asyncio.run(abandoner.abandon(state.invocation, principal=_principal()))
+
+    assert fenced.phase is RecoveryAbandonmentPhase.FENCED_RESET_REQUIRED
+    assert store.state.root_bundle is not None
+    assert store.state.root_bundle.authority.value.previous_epoch == 2
+    assert store.state.root_bundle.authority.value.current_epoch == 3
+    assert store.state.recovery_dispatch is not None
+    assert store.state.recovery_dispatch.revision == 3
+    assert store.state.recovery_dispatch.value.state is RecoveryDispatchState.AMBIGUOUS
+    assert store.state.progress is not None
+    assert store.state.progress.value.abandonment_subject.previous_dispatch_revision == 2
+    assert store.state.progress.value.abandonment_subject.ambiguous_dispatch_revision == 3
+
+    released = asyncio.run(
+        abandoner.abandon(store.state.invocation, principal=_principal())
+    )
+
+    assert released.phase is RecoveryAbandonmentPhase.RELEASED
+    assert len(store.fence_commits) == 1
+    assert len(store.finalize_commits) == 1
+
+
+@pytest.mark.parametrize("authority_case", ["two-behind", "wrong-cause", "wrong-previous"])
+def test_prior_epoch_terminal_cleanup_rejects_any_wider_epoch_relation(
+    authority_case: str,
+) -> None:
+    state = _prior_epoch_terminal_state()
+    assert state.root_bundle is not None
+    authority = state.root_bundle.authority.value
+    if authority_case == "two-behind":
+        authority = EpochAuthorityRecord.model_validate(
+            {
+                **authority.model_dump(mode="python"),
+                "current_epoch": 3,
+                "previous_epoch": 2,
+                "revision": 2,
+            }
+        )
+    elif authority_case == "wrong-cause":
+        authority = authority.model_copy(update={"cause": EpochChangeCause.SUPERSESSION})
+    else:
+        authority = authority.model_copy(update={"previous_epoch": 2})
+    command = state.invocation.command.model_copy(
+        update={"expected_epoch": authority.current_epoch}
+    )
+    state = replace(
+        state,
+        invocation=state.invocation.model_copy(update={"command": command}),
+        root_bundle=replace(
+            state.root_bundle,
+            authority=StoredRecord(authority, authority.revision),
+        ),
+    )
+    store = _Store(state)
+    abandoner, _, _ = _abandoner(store)
+
+    with pytest.raises(RecoveryAbandonmentError) as failure:
+        asyncio.run(abandoner.abandon(state.invocation, principal=_principal()))
+
+    expected_code = (
+        RecoveryAbandonmentFailureCode.TRUSTED_STATE_INVALID
+        if authority_case == "two-behind"
+        else RecoveryAbandonmentFailureCode.DISPATCH_INVALID
+    )
+    assert failure.value.code is expected_code
+    assert not store.fence_commits
+
+
+def test_prior_epoch_terminal_cleanup_accepts_only_exact_late_fence_denial() -> None:
+    store = _Store(_prior_epoch_terminal_state())
+    abandoner, _, _ = _abandoner(store)
+    asyncio.run(abandoner.abandon(store.state.invocation, principal=_principal()))
+    dispatch = store.state.recovery_dispatch
+    progress = store.state.progress
+    assert dispatch is not None and progress is not None
+    exact = _late_epoch_denial(store)
+
+    assert progress.value.fenced_epoch == dispatch.value.epoch + 2
+    assert late_fence_receipt_matches(
+        exact,
+        dispatch.value,
+        fenced_epoch=progress.value.fenced_epoch,
+        fenced_at=progress.value.fenced_at,
+    )
+    for out_of_bounds in (dispatch.value.epoch, dispatch.value.epoch + 3):
+        assert not late_fence_receipt_matches(
+            exact,
+            dispatch.value,
+            fenced_epoch=out_of_bounds,
+            fenced_at=progress.value.fenced_at,
+        )
+    assert not late_fence_receipt_matches(
+        _late_epoch_denial(
+            store,
+            observed_authority_epoch=progress.value.fenced_epoch - 1,
+        ),
+        dispatch.value,
+        fenced_epoch=progress.value.fenced_epoch,
+        fenced_at=progress.value.fenced_at,
+    )
+
+    store.state = replace(store.state, recovery_receipt=exact)
+    released = asyncio.run(
+        abandoner.abandon(store.state.invocation, principal=_principal())
+    )
+    assert released.phase is RecoveryAbandonmentPhase.RELEASED
 
 
 def test_finalize_requires_independent_stable_classification_and_never_marks_recovered() -> None:

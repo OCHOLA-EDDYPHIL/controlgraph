@@ -618,7 +618,11 @@ def create_service_app(
                 request.headers,
                 authentication_policy,
             )
-            context = authenticator.authenticate(authorization_header, authentication_policy)
+            context = await asyncio.to_thread(
+                authenticator.authenticate,
+                authorization_header,
+                authentication_policy,
+            )
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
         except Exception:
@@ -1217,7 +1221,11 @@ def create_service_app(
             )
         try:
             authorization_header = authentication_header(request.headers, policy)
-            context = authenticator.authenticate(authorization_header, policy)
+            context = await asyncio.to_thread(
+                authenticator.authenticate,
+                authorization_header,
+                policy,
+            )
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
         except Exception:
@@ -1292,7 +1300,11 @@ def create_service_app(
             )
         try:
             authorization_header = authentication_header(request.headers, policy)
-            context = authenticator.authenticate(authorization_header, policy)
+            context = await asyncio.to_thread(
+                authenticator.authenticate,
+                authorization_header,
+                policy,
+            )
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
         except Exception:
@@ -1345,7 +1357,11 @@ def create_service_app(
             )
         try:
             authorization_header = authentication_header(request.headers, policy)
-            context = authenticator.authenticate(authorization_header, policy)
+            context = await asyncio.to_thread(
+                authenticator.authenticate,
+                authorization_header,
+                policy,
+            )
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
         except Exception:
@@ -1403,7 +1419,11 @@ def create_service_app(
             )
         try:
             authorization_header = authentication_header(request.headers, policy)
-            context = authenticator.authenticate(authorization_header, policy)
+            context = await asyncio.to_thread(
+                authenticator.authenticate,
+                authorization_header,
+                policy,
+            )
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
         except Exception:
@@ -1458,7 +1478,11 @@ def create_service_app(
             )
         try:
             authorization_header = authentication_header(request.headers, policy)
-            context = authenticator.authenticate(authorization_header, policy)
+            context = await asyncio.to_thread(
+                authenticator.authenticate,
+                authorization_header,
+                policy,
+            )
         except AuthenticationError as error:
             return _authentication_denial(error.code, correlation_id)
         except Exception:
