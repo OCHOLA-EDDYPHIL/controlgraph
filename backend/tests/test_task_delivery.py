@@ -714,6 +714,7 @@ def test_delayed_task_keeps_canonical_body_and_only_fixed_http_fields() -> None:
 
     assert MAX_SCHEDULE_DELAY_SECONDS == 600
     assert MAX_TASK_AGE_SECONDS == 900
+    assert TASK_DISPATCH_DEADLINE_SECONDS == 60
     assert result.disposition is TaskEnqueueDisposition.CREATED
     provider_request = client.requests[0]
     assert set(provider_request) == {"parent", "task"}

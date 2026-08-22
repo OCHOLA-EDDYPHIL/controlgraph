@@ -967,6 +967,7 @@ def create_runtime_service_app(
             else GoogleOneShotOidcTransport(
                 project_id=settings.project_id,
                 caller_role=CallerRole.RECOVERY,
+                timeout_seconds=45.0,
             )
         )
         capability_verifier = CapabilityVerifier(
