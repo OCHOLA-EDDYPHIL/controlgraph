@@ -222,6 +222,17 @@ source receipt and current root and epoch before permitting one traffic update c
 captured stable revision at 100 percent. Exact readback is required for `VERIFIED`; drift, a lost
 response, or a nonmatching observation remains `AMBIGUOUS` without blind mutation retry.
 
+An explicitly revoked V3 rollout uses a third, mode-separated trigger rather than masquerading as
+a terminal unhealthy decision or the legacy V2 compatibility path. The coordinator accepts it
+only from the authenticated operator API after `RECOVER_CAPTURED_STABLE` confirmation. Both the
+authorization resolver and issuer independently require the current authority record to equal the
+signed operator-revocation proof at N+1, require an exact verified 90/10 APPLY receipt at its
+direct predecessor N and no later than the revocation commit, verify the proof with the root's
+exact evidence key, and obtain a fresh signed exact-90/10 prestate. Downstream authorization,
+task, recovery-facade, receipt, readback, and service-claim-release boundaries stay unchanged. The
+current N+1 authority is used to issue a stable-only recovery capability; revoked epoch-N
+capability authority is never revived.
+
 ## Receipts, replay, and uncertain outcomes
 
 The deterministic idempotency identity binds request identity, capability digest, root, epoch,

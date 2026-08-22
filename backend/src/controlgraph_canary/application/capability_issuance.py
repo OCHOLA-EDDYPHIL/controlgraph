@@ -95,6 +95,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryCommandV2,
     RecoveryIntentV1,
     RevokedV2RecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     UnhealthyRecoverySourceV1,
     create_recovery_apply_receipt_locator,
     create_recovery_authorization,
@@ -1106,11 +1107,14 @@ class CapabilityIssuer:
             raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         stored_receipt = receipt.value
         source = command.source
-        expected_receipt_epoch = (
-            command.expected_epoch
-            if type(source) is UnhealthyRecoverySourceV1
-            else 1
-        )
+        if type(source) is UnhealthyRecoverySourceV1:
+            expected_receipt_epoch = command.expected_epoch
+        elif type(source) is RevokedV2RecoverySourceV1:
+            expected_receipt_epoch = 1
+        elif type(source) is RevokedV3RecoverySourceV1:
+            expected_receipt_epoch = source.revocation_proof.result.previous_epoch
+        else:
+            raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
         try:
             locator = create_recovery_apply_receipt_locator(
                 stored_receipt,
@@ -1187,6 +1191,31 @@ class CapabilityIssuer:
                 or proof.authority != authority
                 or proof.result.previous_epoch != 1
                 or proof.result.new_epoch != 2
+                or proof.signed_evidence.signing_key_version
+                != state.root.content.evidence_signing_key_version
+                or revocation_verifier.evidence_key_version
+                != state.root.content.evidence_signing_key_version
+            ):
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID)
+            try:
+                await revocation_verifier.verify(proof.signed_evidence)
+            except Exception:
+                raise _deny(CapabilityIssuanceErrorCode.TRUSTED_STATE_INVALID) from None
+        elif type(source) is RevokedV3RecoverySourceV1:
+            authority = state.authority
+            proof = source.revocation_proof
+            if (
+                type(state.root) is not RolloutRootV3
+                or state.snapshot.authority_revision != authority.revision
+                or authority.revision < 1
+                or authority.current_epoch != source.epoch
+                or authority.previous_epoch != stored_receipt.epoch
+                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+                or proof.authority != authority
+                or proof.result.previous_epoch != stored_receipt.epoch
+                or proof.result.new_epoch != source.epoch
+                or _parse_utc_second(stored_receipt.updated_at)
+                > _parse_utc_second(proof.result.committed_at)
                 or proof.signed_evidence.signing_key_version
                 != state.root.content.evidence_signing_key_version
                 or revocation_verifier.evidence_key_version

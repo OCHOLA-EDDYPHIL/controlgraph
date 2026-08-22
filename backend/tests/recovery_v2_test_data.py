@@ -11,7 +11,7 @@ from health_execution_test_data import (
     make_verified_apply_receipt,
 )
 from revocation_proof_test_data import make_revocation_proof_records
-from root_v2_test_data import make_root_v2_records
+from root_v2_test_data import make_root_v2_records, make_root_v3_records
 
 from controlgraph_canary.application.health_evaluation import (
     derive_next_health_evaluation_state,
@@ -57,6 +57,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     create_recovery_prestate_request,
     create_recovery_prestate_result,
     create_revoked_v2_recovery_command,
+    create_revoked_v3_recovery_command,
     create_unhealthy_recovery_command,
     recovery_capability_id,
     recovery_capability_issuance_command_sha256,
@@ -427,9 +428,43 @@ def make_revoked_v2_recovery_bundle() -> RecoveryV2Bundle:
     )
 
 
+@lru_cache(maxsize=1)
+def make_revoked_v3_recovery_bundle() -> RecoveryV2Bundle:
+    records = make_root_v3_records()
+    root = records.root
+    proof = make_revocation_proof_records(
+        root_records=records,
+        committed_at="2026-08-21T12:05:00Z",
+    ).proof
+    apply_locator = create_recovery_apply_receipt_locator(
+        make_verified_apply_receipt(root),
+        storage_revision=2,
+    )
+    command = create_revoked_v3_recovery_command(
+        root=root,
+        revocation_proof=proof,
+        verified_apply_receipt=apply_locator,
+        request_id="request-revoked-v3-recovery-001",
+        idempotency_key="revoked-v3-recovery-001",
+        scheduled_at="2026-08-21T12:09:30Z",
+        confirmation=RECOVER_CAPTURED_STABLE,
+    )
+    return _finish_bundle(
+        root=root,
+        command=command,
+        requested_at="2026-08-21T12:09:10Z",
+        retrieved_at="2026-08-21T12:09:11Z",
+        valid_until="2026-08-21T12:14:10Z",
+        current_provider_etag="revoked-v3-canary-etag-9",
+        service_generation=9,
+        task_expires_at="2026-08-21T12:11:30Z",
+    )
+
+
 __all__ = [
     "RecoveryV2Bundle",
     "make_revoked_v2_recovery_bundle",
+    "make_revoked_v3_recovery_bundle",
     "make_unhealthy_recovery_chain",
     "make_unhealthy_v3_recovery_bundle",
     "make_v2_verified_apply_receipt",

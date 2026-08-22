@@ -70,6 +70,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryHealthChainLocatorV1,
     RecoveryIntentV1,
     RevokedV2RecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     recovery_command_sha256,
     recovery_dispatch_id,
     recovery_intent_id,
@@ -1262,7 +1263,8 @@ class FirestoreHealthChainStore(FirestoreHealthChainReader):
             raise TypeError("recovery intent persistence requires an exact intent")
         validated = RecoveryIntentV1.model_validate(intent)
         if (
-            type(validated.command.source) is not RevokedV2RecoverySourceV1
+            type(validated.command.source)
+            not in (RevokedV2RecoverySourceV1, RevokedV3RecoverySourceV1)
             or validated.command.source.target != self._target
         ):
             raise ValueError("recovery intent does not match the configured target")

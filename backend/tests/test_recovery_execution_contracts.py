@@ -8,9 +8,11 @@ from pydantic import ValidationError
 from recovery_v2_test_data import (
     RecoveryV2Bundle,
     make_revoked_v2_recovery_bundle,
+    make_revoked_v3_recovery_bundle,
     make_unhealthy_recovery_chain,
     make_unhealthy_v3_recovery_bundle,
 )
+from root_v2_test_data import make_root_v3_records
 
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES, StrictContractModel
 from controlgraph_canary.contracts.codec import (
@@ -50,7 +52,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryTaskRequestV2,
     RecoveryTriggerBasis,
     RevokedV2RecoverySourceV1,
-    UnhealthyRecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     create_recovery_apply_receipt_locator,
     create_recovery_authorization,
     create_recovery_health_chain_locator,
@@ -58,6 +60,8 @@ from controlgraph_canary.contracts.recovery_execution import (
     create_recovery_prestate_result,
     create_recovery_receipt_locator,
     create_revoked_v2_recovery_source,
+    create_revoked_v3_recovery_command,
+    create_revoked_v3_recovery_source,
     recovery_capability_id,
     recovery_command_sha256,
     recovery_dispatch_id,
@@ -183,6 +187,11 @@ def _dispatch_record(
             make_revoked_v2_recovery_bundle,
             "controlgraph.rollout-root/v2",
             RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V2,
+        ),
+        (
+            make_revoked_v3_recovery_bundle,
+            "controlgraph.rollout-root/v3",
+            RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V3,
         ),
     ],
 )
@@ -345,19 +354,121 @@ def test_v2_compatibility_is_structurally_operator_confirmed_and_v2_only() -> No
         )
 
 
-def test_unhealthy_source_is_v3_only_and_cannot_cross_into_v2() -> None:
-    v3 = make_unhealthy_v3_recovery_bundle()
-    v2 = make_revoked_v2_recovery_bundle()
-    assert type(v3.command.source) is UnhealthyRecoverySourceV1
+def test_revoked_v3_recovery_is_operator_confirmed_and_previous_apply_bound() -> None:
+    bundle = make_revoked_v3_recovery_bundle()
+    source = bundle.command.source
+    assert type(source) is RevokedV3RecoverySourceV1
+    assert source.confirmation == RECOVER_CAPTURED_STABLE
+    assert source.revocation_proof.result.previous_epoch == (
+        bundle.command.verified_apply_receipt.epoch
+    )
+    invocation = RecoveryInvocationV2(
+        schema_version=RECOVERY_INVOCATION_V2,
+        command=bundle.command,
+        operator_identity=source.revocation_proof.result.operator_identity,
+        operator_subject=source.revocation_proof.result.operator_subject,
+        operator_issuer="https://accounts.google.com",
+        operator_audience="https://controlgraph-api-123456789012.us-central1.run.app",
+        operator_issued_at=1_787_313_000,
+        operator_expires_at=1_787_313_600,
+    )
+    assert invocation.command == bundle.command
+
+    with pytest.raises(ValidationError, match="invocation"):
+        _replace(invocation, operator_identity="different-operator@example.test")
+    with pytest.raises(TypeError, match="RolloutRootV3"):
+        create_revoked_v3_recovery_source(
+            root=make_revoked_v2_recovery_bundle().root,  # type: ignore[arg-type]
+            revocation_proof=source.revocation_proof,
+            confirmation=RECOVER_CAPTURED_STABLE,
+        )
+    wrong_epoch_receipt = _replace(
+        bundle.command.verified_apply_receipt,
+        epoch=2,
+        observed_authority_epoch=2,
+    )
+    with pytest.raises(ValidationError, match="revoked V3 recovery command receipt"):
+        create_revoked_v3_recovery_command(
+            root=bundle.root,  # type: ignore[arg-type]
+            revocation_proof=source.revocation_proof,
+            verified_apply_receipt=wrong_epoch_receipt,
+            request_id=bundle.command.request_id,
+            idempotency_key=bundle.command.idempotency_key,
+            scheduled_at=bundle.command.scheduled_at,
+            confirmation=RECOVER_CAPTURED_STABLE,
+        )
+
+
+def test_revoked_v3_source_rejects_cross_root_target_confirmation_and_basis() -> None:
+    bundle = make_revoked_v3_recovery_bundle()
+    source = bundle.command.source
+    assert type(source) is RevokedV3RecoverySourceV1
+
+    with pytest.raises(ValidationError, match="revoked V3 recovery source proof"):
+        create_revoked_v3_recovery_source(
+            root=make_root_v3_records(variant=2).root,
+            revocation_proof=source.revocation_proof,
+            confirmation=RECOVER_CAPTURED_STABLE,
+        )
+    with pytest.raises(ValidationError, match="revoked V3 recovery source proof"):
+        _replace(
+            source,
+            target=source.target.model_copy(update={"environment": "other"}),
+        )
+    with pytest.raises(ValueError, match="confirmation"):
+        create_revoked_v3_recovery_source(
+            root=bundle.root,  # type: ignore[arg-type]
+            revocation_proof=source.revocation_proof,
+            confirmation="RECOVER_LATEST",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        RevokedV3RecoverySourceV1.model_validate(
+            {
+                **source.model_dump(mode="python"),
+                "basis": RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V2,
+            }
+        )
+
+
+def test_dispatch_result_rejects_cross_version_revoked_basis() -> None:
+    revoked_v3 = _dispatch_result(make_revoked_v3_recovery_bundle())
+    with pytest.raises(ValidationError, match="dispatch result bindings"):
+        _replace(
+            revoked_v3,
+            trigger_basis=RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V2,
+        )
+
+    revoked_v2 = _dispatch_result(make_revoked_v2_recovery_bundle())
+    with pytest.raises(ValidationError, match="dispatch result bindings"):
+        _replace(
+            revoked_v2,
+            trigger_basis=RecoveryTriggerBasis.OPERATOR_CONFIRMED_REVOKED_V3,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_bundle_factory", "other_root_bundle_factory"),
+    [
+        (make_unhealthy_v3_recovery_bundle, make_revoked_v2_recovery_bundle),
+        (make_revoked_v2_recovery_bundle, make_revoked_v3_recovery_bundle),
+        (make_revoked_v3_recovery_bundle, make_revoked_v2_recovery_bundle),
+    ],
+)
+def test_recovery_source_root_matrix_rejects_every_cross_mode_pair(
+    source_bundle_factory: Any,
+    other_root_bundle_factory: Any,
+) -> None:
+    source_bundle = source_bundle_factory()
+    other_root = other_root_bundle_factory().root
     with pytest.raises(ValidationError):
         RecoveryPrestateRequestV1.model_validate(
             {
-                **v3.prestate_request.model_dump(mode="python"),
-                "root": v2.root,
-                "root_schema_version": v2.root.schema_version,
-                "root_id": v2.root.root_id,
-                "root_sha256": v2.root.root_sha256,
-                "target": v2.root.content.target,
+                **source_bundle.prestate_request.model_dump(mode="python"),
+                "root": other_root,
+                "root_schema_version": other_root.schema_version,
+                "root_id": other_root.root_id,
+                "root_sha256": other_root.root_sha256,
+                "target": other_root.content.target,
             }
         )
 

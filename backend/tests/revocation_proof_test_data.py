@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
+from root_v2_test_data import (
+    PROJECT_NUMBER,
+    RootV2Records,
+    RootV3Records,
+    make_root_v2_records,
+)
 
 from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64url
 from controlgraph_canary.contracts.models import (
@@ -61,9 +66,11 @@ class RevocationProofRecords:
 def make_revocation_proof_records(
     *,
     attempt_id: str = "cgrevoke-attempt-proof-001",
+    root_records: RootV2Records | RootV3Records | None = None,
+    committed_at: str = COMMITTED_AT,
 ) -> RevocationProofRecords:
-    root_records = make_root_v2_records()
-    root = root_records.root
+    selected_records = root_records or make_root_v2_records()
+    root = selected_records.root
     command = EpochRevocationCommandV1(
         schema_version=EPOCH_REVOCATION_COMMAND_V1,
         root_id=root.root_id,
@@ -103,7 +110,7 @@ def make_revocation_proof_records(
         changed_by=OPERATOR,
         request_id=command.request_id,
         evidence_id=evidence_id,
-        changed_at=COMMITTED_AT,
+        changed_at=committed_at,
     )
     subject = EpochRevocationEvidenceSubjectV1(
         schema_version=EPOCH_REVOCATION_EVIDENCE_SUBJECT_V1,
@@ -115,13 +122,13 @@ def make_revocation_proof_records(
         operator_identity=OPERATOR,
         operator_subject=OPERATOR_SUBJECT,
         reason=command.reason,
-        service_claim_sha256=canonical_sha256(root_records.service_claim),
-        previous_authority_sha256=canonical_sha256(root_records.authority),
+        service_claim_sha256=canonical_sha256(selected_records.service_claim),
+        previous_authority_sha256=canonical_sha256(selected_records.authority),
         replacement_authority_sha256=canonical_sha256(authority),
         previous_epoch=1,
         new_epoch=2,
         evidence_id=evidence_id,
-        committed_at=COMMITTED_AT,
+        committed_at=committed_at,
     )
     event = EvidenceEvent(
         schema_version=EVIDENCE_EVENT_V1,
@@ -135,9 +142,9 @@ def make_revocation_proof_records(
         actor=OPERATOR,
         request_id=command.request_id,
         receipt_id=None,
-        occurred_at=COMMITTED_AT,
+        occurred_at=committed_at,
         subject_sha256=canonical_sha256(subject),
-        previous_event_sha256=canonical_sha256(root_records.signed_evidence),
+        previous_event_sha256=canonical_sha256(selected_records.signed_evidence),
         reason_code=None,
         provider_operation=None,
         target_configuration_sha256=None,
@@ -170,7 +177,7 @@ def make_revocation_proof_records(
         evidence_id=evidence_id,
         evidence_sha256=canonical_sha256(signed_evidence),
         evidence_subject=subject,
-        committed_at=COMMITTED_AT,
+        committed_at=committed_at,
     )
     audit = EpochRevocationAuditV1(
         schema_version=EPOCH_REVOCATION_AUDIT_V1,
@@ -189,7 +196,7 @@ def make_revocation_proof_records(
         result_id=result.result_id,
         evidence_id=evidence_id,
         new_epoch=2,
-        recorded_at=COMMITTED_AT,
+        recorded_at=committed_at,
     )
     proof = EpochRevocationProofV1(
         schema_version=EPOCH_REVOCATION_PROOF_V1,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from recovery_v2_test_data import make_revoked_v3_recovery_bundle
 from test_receipt_authority import (
     PROJECT_ID,
     PROJECT_NUMBER,
@@ -162,7 +163,12 @@ def test_receipt_paths_are_action_separated_under_executor_identity() -> None:
     assert recovery_transport.calls == 0
 
 
-def test_recovery_identity_cannot_enter_either_receipt_write_handler() -> None:
+def test_revoked_v3_recovery_does_not_expand_receipt_writer_identity() -> None:
+    bundle = make_revoked_v3_recovery_bundle()
+    assert bundle.task.capability.claims.subject == (
+        f"controlgraph-recovery@{PROJECT_ID}.iam.gserviceaccount.com"
+    )
+    assert bundle.task.capability.claims.action is CapabilityAction.RECOVER_STABLE
     service = ReceiptAuthorityService(_BackingStore())
     caller = _caller(CallerRole.RECOVERY)
 

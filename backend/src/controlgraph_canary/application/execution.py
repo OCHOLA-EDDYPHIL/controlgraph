@@ -59,6 +59,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     RecoveryMutationIntentV2,
     RecoveryTaskRequestV2,
     RevokedV2RecoverySourceV1,
+    RevokedV3RecoverySourceV1,
     UnhealthyRecoverySourceV1,
     create_recovery_apply_receipt_locator,
     recovery_capability_id,
@@ -543,16 +544,21 @@ class FinalMutationGate[ResultT]:
             intent = request.intent
             authorization = intent.authorization
             source = authorization.source
-            source_epoch_matches = (
-                type(source) is UnhealthyRecoverySourceV1
-                and receipt.epoch == authorization.epoch
-            ) or (
-                type(source) is RevokedV2RecoverySourceV1
-                and receipt.epoch
-                == source.revocation_proof.authority.previous_epoch
-                and authorization.epoch
-                == source.revocation_proof.authority.current_epoch
-            )
+            if type(source) is UnhealthyRecoverySourceV1:
+                source_epoch_matches = receipt.epoch == authorization.epoch
+            elif type(source) in (RevokedV2RecoverySourceV1, RevokedV3RecoverySourceV1):
+                revoked_source = cast(
+                    RevokedV2RecoverySourceV1 | RevokedV3RecoverySourceV1,
+                    source,
+                )
+                source_epoch_matches = (
+                    receipt.epoch
+                    == revoked_source.revocation_proof.authority.previous_epoch
+                    and authorization.epoch
+                    == revoked_source.revocation_proof.authority.current_epoch
+                )
+            else:
+                source_epoch_matches = False
             if (
                 observed_recovery_locator != locator
                 or canonical_sha256(receipt) != authorization.source_receipt_sha256
@@ -790,14 +796,19 @@ def _final_authority_denial(
         if not _recovery_request_matches_root(verified.request, verified.root):
             return ReasonCode.CLAIM_BINDING_MISMATCH
         source = verified.request.intent.authorization.source
-        if (
-            type(source) is RevokedV2RecoverySourceV1
-            and (
-                authority != source.revocation_proof.authority
-                or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
-                or authority.previous_epoch
-                != verified.request.intent.verified_apply_receipt.epoch
+        if type(source) in (RevokedV2RecoverySourceV1, RevokedV3RecoverySourceV1):
+            revoked_source = cast(
+                RevokedV2RecoverySourceV1 | RevokedV3RecoverySourceV1,
+                source,
             )
+            revoked_authority = revoked_source.revocation_proof.authority
+        else:
+            revoked_authority = None
+        if revoked_authority is not None and (
+            authority != revoked_authority
+            or authority.cause is not EpochChangeCause.OPERATOR_REVOCATION
+            or authority.previous_epoch
+            != verified.request.intent.verified_apply_receipt.epoch
         ):
             return ReasonCode.EPOCH_MISMATCH
         if (
@@ -988,6 +999,13 @@ def _recovery_request_matches_root(
     ) or (
         type(root) is RolloutRootV2
         and type(source) is RevokedV2RecoverySourceV1
+        and source.revocation_proof.authority.current_epoch
+        == authorization.epoch
+        and source.revocation_proof.authority.previous_epoch
+        == authorization.verified_apply_receipt.epoch
+    ) or (
+        type(root) is RolloutRootV3
+        and type(source) is RevokedV3RecoverySourceV1
         and source.revocation_proof.authority.current_epoch
         == authorization.epoch
         and source.revocation_proof.authority.previous_epoch

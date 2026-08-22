@@ -8,7 +8,9 @@ from health_storage_test_data import make_twenty_proof_chain
 from recovery_v2_test_data import (
     RecoveryV2Bundle,
     make_revoked_v2_recovery_bundle,
+    make_revoked_v3_recovery_bundle,
     make_unhealthy_recovery_chain,
+    make_unhealthy_v3_recovery_bundle,
 )
 from test_m2_firestore_authority_store import _FakeClient, _FakeTransactionRunner
 
@@ -327,12 +329,14 @@ def test_twenty_proofs_reconstruct_from_individual_bounded_documents() -> None:
     asyncio.run(scenario())
 
 
-def _prepared_recovery_record() -> tuple[
+def _prepared_recovery_record(
+    bundle_factory: object = make_revoked_v2_recovery_bundle,
+) -> tuple[
     RecoveryV2Bundle,
     RecoveryDispatchRecordV2,
     StoredRecord[RecoveryIntentV1],
 ]:
-    bundle = make_revoked_v2_recovery_bundle()
+    bundle = bundle_factory()  # type: ignore[operator]
     intent = create_recovery_intent(
         bundle.command,
         created_at=bundle.command.source.triggered_at,
@@ -477,6 +481,23 @@ def test_concurrent_terminal_unhealthy_appends_converge_on_one_recovery_intent()
     asyncio.run(scenario())
 
 
+def test_direct_intent_creation_still_rejects_automatic_unhealthy_source() -> None:
+    async def scenario() -> None:
+        bundle = make_unhealthy_v3_recovery_bundle()
+        intent = create_recovery_intent(
+            bundle.command,
+            created_at=bundle.command.source.triggered_at,
+        )
+        store, client, _ = _store()
+
+        with pytest.raises(ValueError, match="configured target"):
+            await store.create_or_adopt_recovery_intent(intent)
+
+        assert client.documents == {}
+
+    asyncio.run(scenario())
+
+
 def test_recovery_enqueue_start_never_reconstructs_a_permit() -> None:
     async def scenario() -> None:
         bundle, prepared, intent = _prepared_recovery_record()
@@ -502,9 +523,15 @@ def test_recovery_enqueue_start_never_reconstructs_a_permit() -> None:
     asyncio.run(scenario())
 
 
-def test_recovery_enqueue_permit_is_one_use_and_root_intent_conflicts() -> None:
+@pytest.mark.parametrize(
+    "bundle_factory",
+    [make_revoked_v2_recovery_bundle, make_revoked_v3_recovery_bundle],
+)
+def test_recovery_enqueue_permit_is_one_use_and_root_intent_conflicts(
+    bundle_factory: object,
+) -> None:
     async def scenario() -> None:
-        bundle, prepared, intent = _prepared_recovery_record()
+        bundle, prepared, intent = _prepared_recovery_record(bundle_factory)
         store, _, _ = _store()
         owned = await store.create_or_adopt_recovery_intent(intent.value)
         assert await store.create_or_adopt_recovery_intent(intent.value) == owned
