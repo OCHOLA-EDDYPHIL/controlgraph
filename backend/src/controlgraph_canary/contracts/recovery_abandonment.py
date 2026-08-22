@@ -167,8 +167,8 @@ class RecoveryAbandonmentEvidenceSubjectV1(StrictContractModel):
     recovery_dispatch_id: Identifier
     previous_dispatch_sha256: Sha256Digest
     ambiguous_dispatch_sha256: Sha256Digest
-    previous_dispatch_revision: Annotated[int, Field(ge=1, le=2)]
-    ambiguous_dispatch_revision: Annotated[int, Field(ge=2, le=3)]
+    previous_dispatch_revision: Annotated[int, Field(ge=0, le=2)]
+    ambiguous_dispatch_revision: Annotated[int, Field(ge=1, le=3)]
     task_id: Identifier
     task_name: BoundedText
     task_sha256: Sha256Digest

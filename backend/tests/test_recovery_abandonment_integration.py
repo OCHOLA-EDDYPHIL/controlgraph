@@ -27,9 +27,11 @@ from test_operator_observability import (
     _Transport,
 )
 from test_recovery_abandonment import (
+    _abandoner,
     _coordinator_policy,
     _late_epoch_denial,
     _operator_policy,
+    _prepared_state,
     _principal,
     _run_first_stage,
     _run_released_stage,
@@ -1074,6 +1076,29 @@ def test_firestore_fence_rereads_receipt_absence_and_commits_one_cas() -> None:
         assert persisted.recovery_receipt is None
         assert persisted.recovery_dispatch == written.recovery_dispatch
         assert persisted.progress == written.progress
+
+    asyncio.run(scenario())
+
+
+def test_firestore_fence_commits_expired_prepared_dispatch_as_revision_one() -> None:
+    memory = _Store(_prepared_state())
+    abandoner, _, _ = _abandoner(memory)
+    asyncio.run(abandoner.abandon(memory.state.invocation, principal=_principal()))
+    expected, commit = memory.fence_commits[0]
+
+    async def scenario() -> None:
+        client = _FakeClient()
+        runner = _FakeTransactionRunner()
+        store = _firestore_store(client, runner, commit.replacement_dispatch.target)
+        _seed_state(client, expected)
+
+        observed = await store.read_recovery_abandonment_state(expected.invocation)
+        written = await store.commit_recovery_abandonment_fence(observed, commit)
+
+        assert written.recovery_dispatch.revision == 1
+        assert written.recovery_dispatch.value.enqueue_started_at is None
+        persisted = await store.read_recovery_abandonment_state(expected.invocation)
+        assert persisted.recovery_dispatch == written.recovery_dispatch
 
     asyncio.run(scenario())
 

@@ -448,6 +448,42 @@ def test_recovery_coordinator_adopts_revision_three_ambiguous_cleanup() -> None:
     asyncio.run(scenario())
 
 
+def test_recovery_coordinator_replays_expired_prepared_abandonment_without_work() -> None:
+    async def scenario() -> None:
+        bundle = make_revoked_v3_recovery_bundle()
+        store = _DispatchStore(bundle)
+        coordinator, resolver, capability, dispatcher = _coordinator(store, bundle)
+        created = await coordinator.dispatch(bundle.command)
+        assert store.dispatch_record is not None
+        ambiguous_result = created.model_copy(update={"enqueue_disposition": "AMBIGUOUS"})
+        store.dispatch_record = StoredRecord(
+            RecoveryDispatchRecordV2.model_validate(
+                {
+                    **store.dispatch_record.value.model_dump(mode="python"),
+                    "state": RecoveryDispatchState.AMBIGUOUS,
+                    "enqueue_started_at": None,
+                    "terminal_at": bundle.task.expires_at,
+                    "result": ambiguous_result,
+                }
+            ),
+            1,
+        )
+        resolver.calls = 0
+        capability.calls = 0
+        dispatcher.dispatch_calls = 0
+        store.begin_calls = 0
+
+        replay = await coordinator.dispatch(bundle.command)
+
+        assert replay == ambiguous_result
+        assert resolver.calls == 0
+        assert capability.calls == 0
+        assert dispatcher.dispatch_calls == 0
+        assert store.begin_calls == 0
+
+    asyncio.run(scenario())
+
+
 def test_api_recovery_client_admits_revoked_v3_and_rejects_unhealthy() -> None:
     async def scenario() -> None:
         bundle = make_revoked_v3_recovery_bundle()

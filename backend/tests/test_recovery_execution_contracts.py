@@ -779,12 +779,58 @@ def test_dispatch_state_machine_does_not_reconstruct_enqueue_authority() -> None
     bundle = make_unhealthy_v3_recovery_bundle()
     prepared = _dispatch_record(bundle, state=RecoveryDispatchState.PREPARED)
     started = _dispatch_record(bundle, state=RecoveryDispatchState.ENQUEUE_STARTED)
+    abandoned_prepared = RecoveryDispatchRecordV2.model_validate(
+        {
+            **prepared.model_dump(mode="python"),
+            "state": RecoveryDispatchState.AMBIGUOUS,
+            "terminal_at": bundle.task.expires_at,
+            "result": _dispatch_result(bundle, disposition="AMBIGUOUS"),
+        }
+    )
     assert prepared.enqueue_started_at is None and prepared.result is None
     assert started.enqueue_started_at is not None and started.result is None
+    assert abandoned_prepared.enqueue_started_at is None
+    with pytest.raises(ValidationError, match="enqueue start"):
+        _replace(
+            abandoned_prepared,
+            terminal_at=bundle.authorization.scheduled_at,
+        )
     with pytest.raises(ValidationError, match="prepared"):
         _replace(prepared, enqueue_started_at=prepared.prepared_at)
     with pytest.raises(ValidationError, match="started"):
         _replace(started, result=_dispatch_result(bundle))
+
+    abandoned_storage = create_recovery_dispatch_storage_record(abandoned_prepared)
+    with pytest.raises(ValidationError, match="enqueue start"):
+        _replace(
+            abandoned_storage,
+            terminal_at=bundle.authorization.scheduled_at,
+        )
+    wrapper_values = {
+        "schema_version": HEALTH_STORAGE_DOCUMENT_V1,
+        "record_kind": HealthStorageKind.RECOVERY_DISPATCH,
+        "target": abandoned_storage.target,
+        "logical_id": abandoned_storage.dispatch_id,
+        "revision": 1,
+        "mutation_id": "abandon-prepared-dispatch-001",
+        "canonical_payload": canonical_json_bytes(abandoned_storage).decode("utf-8"),
+        "payload_sha256": canonical_sha256(abandoned_storage),
+    }
+    assert HealthStorageDocumentV1.model_validate(wrapper_values).revision == 1
+    with pytest.raises(ValidationError, match="wrapper binding"):
+        HealthStorageDocumentV1.model_validate({**wrapper_values, "revision": 2})
+
+    started_ambiguous = create_recovery_dispatch_storage_record(
+        _dispatch_record(bundle, state=RecoveryDispatchState.AMBIGUOUS)
+    )
+    with pytest.raises(ValidationError, match="wrapper binding"):
+        HealthStorageDocumentV1.model_validate(
+            {
+                **wrapper_values,
+                "canonical_payload": canonical_json_bytes(started_ambiguous).decode("utf-8"),
+                "payload_sha256": canonical_sha256(started_ambiguous),
+            }
+        )
 
 
 def test_apply_and_recovery_receipt_locators_bind_revision_and_terminal_state() -> None:

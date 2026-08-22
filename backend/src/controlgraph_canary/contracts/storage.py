@@ -338,7 +338,7 @@ class ServiceClaimAbandonmentProofV1(StrictContractModel):
     required_stable_baseline_configuration_sha256: Sha256Digest
     recovery_dispatch_id: Identifier
     recovery_dispatch_sha256: Sha256Digest
-    recovery_dispatch_revision: Annotated[int, Field(ge=2, le=3)]
+    recovery_dispatch_revision: Annotated[int, Field(ge=1, le=3)]
     recovery_receipt_id: Identifier
     receipt_absent_at_fence: Literal[True]
     evidence_id: Identifier
