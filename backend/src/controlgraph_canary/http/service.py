@@ -9,7 +9,7 @@ import re
 import sys
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Final
+from typing import Final, cast
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -75,6 +75,13 @@ from controlgraph_canary.application.promotion_execution import (
     CoordinatorPromotionRelay,
 )
 from controlgraph_canary.application.receipt_authority import ReceiptAuthorityService
+from controlgraph_canary.application.recovery_abandonment import (
+    RecoveryAbandonmentError,
+)
+from controlgraph_canary.application.recovery_abandonment_relay import (
+    ApiRecoveryAbandonmentClient,
+    CoordinatorRecoveryAbandonmentRelay,
+)
 from controlgraph_canary.application.recovery_execution import (
     ApiRecoveryClient,
     CoordinatorRecoveryRelay,
@@ -149,6 +156,15 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionCapabilityIssuanceCommandV2,
     PromotionCommandV2,
     PromotionInvocationV2,
+)
+from controlgraph_canary.contracts.recovery_abandonment import (
+    RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
+    RecoveryAbandonmentClassificationRequestV1,
+    RecoveryAbandonmentClassificationSigningRequestV1,
+    RecoveryAbandonmentCommandV1,
+    RecoveryAbandonmentFailureCode,
+    RecoveryAbandonmentInvocationV1,
+    RecoveryAbandonmentRelayResponseV1,
 )
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryCapabilityIssuanceCommandV2,
@@ -292,6 +308,15 @@ class ServiceClaimReleaseDenied(BaseModel):
     correlation_id: str
 
 
+class RecoveryAbandonmentDenied(BaseModel):
+    """Payload-free ambiguous-recovery abandonment failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 class ServiceClaimClassificationDenied(BaseModel):
     """Payload-free verifier classification failure."""
 
@@ -353,6 +378,8 @@ def create_service_app(
     coordinator_epoch_revocation_relay: CoordinatorEpochRevocationRelay | None = None,
     api_service_claim_release_client: ApiServiceClaimReleaseClient | None = None,
     coordinator_service_claim_release_relay: (CoordinatorServiceClaimReleaseRelay | None) = None,
+    api_recovery_abandonment_client: ApiRecoveryAbandonmentClient | None = None,
+    coordinator_recovery_abandonment_relay: (CoordinatorRecoveryAbandonmentRelay | None) = None,
     service_claim_classification_service: (ServiceClaimClassificationService | None) = None,
     classification_evidence_signing_service: (ClassificationEvidenceSigningService | None) = None,
     classification_evidence_authentication_policy: (RouteAuthenticationPolicy | None) = None,
@@ -431,6 +458,10 @@ def create_service_app(
         raise ValueError("service-claim release is limited to the API route")
     if coordinator_service_claim_release_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("claim release coordination is limited to the coordinator route")
+    if api_recovery_abandonment_client is not None and role is not ServiceRole.API:
+        raise ValueError("recovery abandonment is limited to the API route")
+    if coordinator_recovery_abandonment_relay is not None and role is not ServiceRole.COORDINATOR:
+        raise ValueError("recovery abandonment coordination is coordinator-limited")
     if service_claim_classification_service is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("claim classification is limited to the verifier route")
     if (classification_evidence_signing_service is None) != (
@@ -609,6 +640,7 @@ def create_service_app(
             or api_recovery_client is not None
             or api_epoch_revocation_client is not None
             or api_service_claim_release_client is not None
+            or api_recovery_abandonment_client is not None
             or api_operator_observation_client is not None
         ):
             try:
@@ -660,6 +692,16 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(release_result)
+                elif type(command) is RecoveryAbandonmentCommandV1:
+                    if api_recovery_abandonment_client is None:
+                        raise RecoveryAbandonmentError(
+                            RecoveryAbandonmentFailureCode.STORE_UNAVAILABLE
+                        )
+                    abandonment_result = await api_recovery_abandonment_client.abandon(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(abandonment_result)
                 elif type(command) is StableSnapshotCaptureCommandV1:
                     if api_operator_observation_client is None:
                         raise OperatorObservationError(
@@ -729,6 +771,11 @@ def create_service_app(
                     error.code.value,
                     correlation_id,
                 )
+            except RecoveryAbandonmentError as error:
+                return _recovery_abandonment_denial(
+                    error.code.value,
+                    correlation_id,
+                )
             except OperatorObservationError as error:
                 return _operator_observation_denial(error.code.value, correlation_id)
             except Exception:
@@ -750,6 +797,7 @@ def create_service_app(
             or coordinator_recovery_relay is not None
             or coordinator_epoch_revocation_relay is not None
             or coordinator_service_claim_release_relay is not None
+            or coordinator_recovery_abandonment_relay is not None
             or coordinator_operator_observation_relay is not None
         ):
             try:
@@ -820,6 +868,29 @@ def create_service_app(
                             failure_code=None,
                         )
                     response_body = canonical_json_bytes(release_outcome)
+                elif type(invocation) is RecoveryAbandonmentInvocationV1:
+                    if coordinator_recovery_abandonment_relay is None:
+                        raise RecoveryAbandonmentError(
+                            RecoveryAbandonmentFailureCode.STORE_UNAVAILABLE
+                        )
+                    try:
+                        abandonment_result = await coordinator_recovery_abandonment_relay.abandon(
+                            invocation,
+                            context,
+                        )
+                    except RecoveryAbandonmentError as error:
+                        abandonment_outcome = RecoveryAbandonmentRelayResponseV1(
+                            schema_version=RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
+                            result=None,
+                            failure_code=error.code,
+                        )
+                    else:
+                        abandonment_outcome = RecoveryAbandonmentRelayResponseV1(
+                            schema_version=RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
+                            result=abandonment_result,
+                            failure_code=None,
+                        )
+                    response_body = canonical_json_bytes(abandonment_outcome)
                 elif type(invocation) is StableSnapshotCaptureInvocationV1:
                     if coordinator_operator_observation_relay is None:
                         raise OperatorObservationError(
@@ -914,6 +985,11 @@ def create_service_app(
                 return _epoch_revocation_denial(error.code.value, correlation_id)
             except ServiceClaimReleaseError as error:
                 return _service_claim_release_denial(
+                    error.code.value,
+                    correlation_id,
+                )
+            except RecoveryAbandonmentError as error:
+                return _recovery_abandonment_denial(
                     error.code.value,
                     correlation_id,
                 )
@@ -1045,14 +1121,22 @@ def create_service_app(
                     response_body = canonical_json_bytes(prestate_result)
                 else:
                     if (
-                        type(verifier_request) is not ServiceClaimClassificationRequestV1
+                        type(verifier_request)
+                        not in (
+                            ServiceClaimClassificationRequestV1,
+                            RecoveryAbandonmentClassificationRequestV1,
+                        )
                         or service_claim_classification_service is None
                     ):
                         raise ServiceClaimClassificationError(
                             ServiceClaimClassificationErrorCode.CONFIGURATION_INVALID
                         )
                     classification_result = await service_claim_classification_service.classify(
-                        verifier_request,
+                        cast(
+                            ServiceClaimClassificationRequestV1
+                            | RecoveryAbandonmentClassificationRequestV1,
+                            verifier_request,
+                        ),
                         context,
                     )
                     response_body = canonical_json_bytes(classification_result)
@@ -1277,10 +1361,7 @@ def create_service_app(
         request.state.authentication = context
         try:
             body = await _read_contract_body(request)
-            signing_request = decode_contract(
-                body,
-                ServiceClaimClassificationSigningRequestV1,
-            )
+            signing_request = _decode_classification_signing_request(body)
             signed = await service.sign(signing_request, context)
             response_body = canonical_json_bytes(signed)
         except asyncio.CancelledError:
@@ -1477,6 +1558,7 @@ def _decode_api_command(
     | ApplyCanaryCommandV1
     | PromotionCommandV2
     | ServiceClaimReleaseCommandV1
+    | RecoveryAbandonmentCommandV1
     | StableSnapshotCaptureCommandV1
     | ExecutionReceiptReadCommandV1
     | TargetTrafficReadCommandV1
@@ -1516,6 +1598,11 @@ def _decode_api_command(
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
     try:
+        return decode_contract(body, RecoveryAbandonmentCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
         return decode_contract(body, StableSnapshotCaptureCommandV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
@@ -1545,6 +1632,7 @@ def _decode_coordinator_invocation(
     | ApplyCanaryInvocationV1
     | PromotionInvocationV2
     | ServiceClaimReleaseInvocationV1
+    | RecoveryAbandonmentInvocationV1
     | StableSnapshotCaptureInvocationV1
     | ExecutionReceiptReadInvocationV1
     | TargetTrafficReadInvocationV1
@@ -1584,6 +1672,11 @@ def _decode_coordinator_invocation(
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
     try:
+        return decode_contract(body, RecoveryAbandonmentInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
         return decode_contract(body, StableSnapshotCaptureInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
@@ -1615,6 +1708,7 @@ def _decode_verifier_request(
     | VerifierHealthEvaluationRequestV1
     | RecoveryPrestateRequestV1
     | ServiceClaimClassificationRequestV1
+    | RecoveryAbandonmentClassificationRequestV1
 ):
     try:
         return decode_contract(body, RootPreflightRequestV1)
@@ -1641,7 +1735,12 @@ def _decode_verifier_request(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
-    return decode_contract(body, ServiceClaimClassificationRequestV1)
+    try:
+        return decode_contract(body, ServiceClaimClassificationRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, RecoveryAbandonmentClassificationRequestV1)
 
 
 def _decode_issuance_command(
@@ -1662,6 +1761,17 @@ def _decode_issuance_command(
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
     return decode_contract(body, RecoveryCapabilityIssuanceCommandV2)
+
+
+def _decode_classification_signing_request(
+    body: bytes,
+) -> ServiceClaimClassificationSigningRequestV1 | RecoveryAbandonmentClassificationSigningRequestV1:
+    try:
+        return decode_contract(body, ServiceClaimClassificationSigningRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    return decode_contract(body, RecoveryAbandonmentClassificationSigningRequestV1)
 
 
 def _authentication_denial(
@@ -1928,6 +2038,36 @@ def _service_claim_release_denial(code: str, correlation_id: str) -> JSONRespons
     )
 
 
+def _recovery_abandonment_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = RecoveryAbandonmentDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        RecoveryAbandonmentFailureCode.CALLER_DENIED.value,
+        RecoveryAbandonmentFailureCode.COMMAND_DENIED.value,
+    }:
+        status_code = 403
+    elif code in {
+        RecoveryAbandonmentFailureCode.ROOT_NOT_FOUND.value,
+        RecoveryAbandonmentFailureCode.ROOT_MISMATCH.value,
+        RecoveryAbandonmentFailureCode.CLAIM_NOT_ACTIVE.value,
+        RecoveryAbandonmentFailureCode.EPOCH_MISMATCH.value,
+        RecoveryAbandonmentFailureCode.INTENT_INVALID.value,
+        RecoveryAbandonmentFailureCode.DISPATCH_INVALID.value,
+        RecoveryAbandonmentFailureCode.DISPATCH_NOT_EXPIRED.value,
+        RecoveryAbandonmentFailureCode.RECEIPT_EXISTS.value,
+        RecoveryAbandonmentFailureCode.IDENTITY_CONFLICT.value,
+        RecoveryAbandonmentFailureCode.CLASSIFICATION_DENIED.value,
+        RecoveryAbandonmentFailureCode.EVIDENCE_DENIED.value,
+    }:
+        status_code = 409
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
 def _service_claim_classification_denial(
     code: str,
     correlation_id: str,
@@ -2034,6 +2174,7 @@ __all__ = [
     "DisabledWork",
     "EvidenceSigningDenied",
     "OperatorObservationDenied",
+    "RecoveryAbandonmentDenied",
     "RootCreationDenied",
     "RootPreflightDenied",
     "ServiceClaimClassificationDenied",

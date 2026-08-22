@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, overload, runtime_checkable
 
 from controlgraph_canary.application.cloud_run import (
     CloudRunReadyState,
@@ -37,6 +37,18 @@ from controlgraph_canary.contracts.models import (
     EvidenceEvent,
     EvidenceKind,
     TargetBinding,
+)
+from controlgraph_canary.contracts.recovery_abandonment import (
+    RECOVERY_ABANDONMENT_CLASSIFICATION_ATTESTATION_V1,
+    RECOVERY_ABANDONMENT_CLASSIFICATION_RESULT_V1,
+    RECOVERY_ABANDONMENT_CLASSIFICATION_SIGNING_REQUEST_V1,
+    RECOVERY_ABANDONMENT_CLASSIFICATION_SUBJECT_V1,
+    RecoveryAbandonmentClassificationAttestationV1,
+    RecoveryAbandonmentClassificationRequestV1,
+    RecoveryAbandonmentClassificationResultV1,
+    RecoveryAbandonmentClassificationSigningRequestV1,
+    RecoveryAbandonmentClassificationSubjectV1,
+    recovery_abandonment_classification_request_sha256,
 )
 from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
 from controlgraph_canary.contracts.service_claim_release import (
@@ -94,7 +106,7 @@ class ServiceClaimClassificationReaderFactory(Protocol):
 
     def __call__(
         self,
-        request: ServiceClaimClassificationRequestV1,
+        request: (ServiceClaimClassificationRequestV1 | RecoveryAbandonmentClassificationRequestV1),
     ) -> ServiceClaimClassificationReader: ...
 
 
@@ -104,7 +116,10 @@ class VerifierClassificationEvidenceClientPort(Protocol):
 
     async def sign(
         self,
-        request: ServiceClaimClassificationSigningRequestV1,
+        request: (
+            ServiceClaimClassificationSigningRequestV1
+            | RecoveryAbandonmentClassificationSigningRequestV1
+        ),
     ) -> SignedEvidenceEventV1: ...
 
 
@@ -139,24 +154,40 @@ class ServiceClaimClassificationService:
         self._evidence_client = evidence_client
         self._clock = clock or _system_utc_second
 
+    @overload
     async def classify(
         self,
         request: ServiceClaimClassificationRequestV1,
         caller: AuthenticationContext,
-    ) -> ServiceClaimClassificationAttestationV1:
+    ) -> ServiceClaimClassificationAttestationV1: ...
+
+    @overload
+    async def classify(
+        self,
+        request: RecoveryAbandonmentClassificationRequestV1,
+        caller: AuthenticationContext,
+    ) -> RecoveryAbandonmentClassificationAttestationV1: ...
+
+    async def classify(
+        self,
+        request: (ServiceClaimClassificationRequestV1 | RecoveryAbandonmentClassificationRequestV1),
+        caller: AuthenticationContext,
+    ) -> ServiceClaimClassificationAttestationV1 | RecoveryAbandonmentClassificationAttestationV1:
         """Return only fresh, exact facts derived by the verifier reader."""
 
         if (
-            type(request) is not ServiceClaimClassificationRequestV1
+            type(request)
+            not in (
+                ServiceClaimClassificationRequestV1,
+                RecoveryAbandonmentClassificationRequestV1,
+            )
             or request.target.project_id != self._authentication_policy.project_id
         ):
             raise ServiceClaimClassificationError(
                 ServiceClaimClassificationErrorCode.REQUEST_DENIED
             )
         if not self._caller_is_exact(caller):
-            raise ServiceClaimClassificationError(
-                ServiceClaimClassificationErrorCode.CALLER_DENIED
-            )
+            raise ServiceClaimClassificationError(ServiceClaimClassificationErrorCode.CALLER_DENIED)
         try:
             reader = self._reader_factory(request)
         except asyncio.CancelledError:
@@ -171,9 +202,7 @@ class ServiceClaimClassificationService:
             or reader.reader_identity
             != f"controlgraph-verifier@{request.target.project_id}.iam.gserviceaccount.com"
         ):
-            raise ServiceClaimClassificationError(
-                ServiceClaimClassificationErrorCode.UNAVAILABLE
-            )
+            raise ServiceClaimClassificationError(ServiceClaimClassificationErrorCode.UNAVAILABLE)
         try:
             observed = await reader.read_service()
         except asyncio.CancelledError:
@@ -183,12 +212,8 @@ class ServiceClaimClassificationService:
                 ServiceClaimClassificationErrorCode.UNAVAILABLE
             ) from None
         if type(observed) is not CloudRunServiceState:
-            raise ServiceClaimClassificationError(
-                ServiceClaimClassificationErrorCode.UNAVAILABLE
-            )
-        expected_stable, expected_candidate = _expected_traffic(
-            request.expected_classification
-        )
+            raise ServiceClaimClassificationError(ServiceClaimClassificationErrorCode.UNAVAILABLE)
+        expected_stable, expected_candidate = _expected_traffic(request.expected_classification)
         projection = TargetConfigurationProjection(
             target=request.target,
             stable_revision=request.stable_revision,
@@ -223,11 +248,60 @@ class ServiceClaimClassificationService:
             )
         classified_at = self._timestamp()
         try:
+            if type(request) is RecoveryAbandonmentClassificationRequestV1:
+                abandonment_result = RecoveryAbandonmentClassificationResultV1(
+                    schema_version=RECOVERY_ABANDONMENT_CLASSIFICATION_RESULT_V1,
+                    request=request,
+                    request_sha256=(recovery_abandonment_classification_request_sha256(request)),
+                    classification="STABLE_BASELINE_CONFIRMED",
+                    service_generation=observed.generation,
+                    provider_etag=observed.etag,
+                    target_configuration_sha256=expected_digest,
+                    classified_by=reader.reader_identity,
+                    classified_at=classified_at,
+                )
+                abandonment_subject = RecoveryAbandonmentClassificationSubjectV1(
+                    schema_version=RECOVERY_ABANDONMENT_CLASSIFICATION_SUBJECT_V1,
+                    target=request.target,
+                    root_id=request.root_id,
+                    root_sha256=request.root_sha256,
+                    request_sha256=request.abandonment_request_sha256,
+                    classification_request_sha256=abandonment_result.request_sha256,
+                    classification="STABLE_BASELINE_CONFIRMED",
+                    fenced_epoch=request.fenced_epoch,
+                    fenced_authority_revision=request.fenced_authority_revision,
+                    service_generation=abandonment_result.service_generation,
+                    provider_etag=abandonment_result.provider_etag,
+                    target_configuration_sha256=(abandonment_result.target_configuration_sha256),
+                    evidence_id=request.classification_evidence_id,
+                    classified_by=abandonment_result.classified_by,
+                    classified_at=abandonment_result.classified_at,
+                )
+                abandonment_event = _classification_event(
+                    request=request,
+                    subject=abandonment_subject,
+                    classified_by=abandonment_result.classified_by,
+                    classified_at=abandonment_result.classified_at,
+                    target_configuration_sha256=(abandonment_result.target_configuration_sha256),
+                )
+                abandonment_signing_request = RecoveryAbandonmentClassificationSigningRequestV1(
+                    schema_version=(RECOVERY_ABANDONMENT_CLASSIFICATION_SIGNING_REQUEST_V1),
+                    result=abandonment_result,
+                    subject=abandonment_subject,
+                    event=abandonment_event,
+                )
+                signed = await self._evidence_client.sign(abandonment_signing_request)
+                return RecoveryAbandonmentClassificationAttestationV1(
+                    schema_version=RECOVERY_ABANDONMENT_CLASSIFICATION_ATTESTATION_V1,
+                    signing_request=abandonment_signing_request,
+                    signed_evidence=signed,
+                )
+            release_request = cast(ServiceClaimClassificationRequestV1, request)
             result = ServiceClaimClassificationResultV1(
                 schema_version=SERVICE_CLAIM_CLASSIFICATION_RESULT_V1,
-                request=request,
-                request_sha256=service_claim_classification_request_sha256(request),
-                classification=request.expected_classification,
+                request=release_request,
+                request_sha256=service_claim_classification_request_sha256(release_request),
+                classification=release_request.expected_classification,
                 service_generation=observed.generation,
                 provider_etag=observed.etag,
                 target_configuration_sha256=expected_digest,
@@ -240,36 +314,36 @@ class ServiceClaimClassificationService:
             ) from None
         subject = ServiceClaimTargetClassificationEvidenceSubjectV1(
             schema_version=SERVICE_CLAIM_TARGET_CLASSIFICATION_EVIDENCE_SUBJECT_V1,
-            target=request.target,
-            root_id=request.root_id,
-            root_sha256=request.root_sha256,
-            request_sha256=request.release_request_sha256,
+            target=release_request.target,
+            root_id=release_request.root_id,
+            root_sha256=release_request.root_sha256,
+            request_sha256=release_request.release_request_sha256,
             classification_request_sha256=result.request_sha256,
             classification=result.classification,
-            fenced_epoch=request.fenced_epoch,
-            fenced_authority_revision=request.fenced_authority_revision,
+            fenced_epoch=release_request.fenced_epoch,
+            fenced_authority_revision=release_request.fenced_authority_revision,
             service_generation=result.service_generation,
             provider_etag=result.provider_etag,
             target_configuration_sha256=result.target_configuration_sha256,
-            evidence_id=request.classification_evidence_id,
+            evidence_id=release_request.classification_evidence_id,
             classified_by=result.classified_by,
             classified_at=result.classified_at,
         )
         event = EvidenceEvent(
             schema_version=EVIDENCE_EVENT_V1,
-            evidence_id=request.classification_evidence_id,
-            sequence=request.previous_evidence_sequence + 1,
-            root_id=request.root_id,
-            root_sha256=request.root_sha256,
-            target=request.target,
-            epoch=request.fenced_epoch,
+            evidence_id=release_request.classification_evidence_id,
+            sequence=release_request.previous_evidence_sequence + 1,
+            root_id=release_request.root_id,
+            root_sha256=release_request.root_sha256,
+            target=release_request.target,
+            epoch=release_request.fenced_epoch,
             kind=EvidenceKind.TARGET_VERIFIED,
             actor=result.classified_by,
-            request_id=request.request_id,
+            request_id=release_request.request_id,
             receipt_id=None,
             occurred_at=result.classified_at,
             subject_sha256=canonical_sha256(subject),
-            previous_event_sha256=request.previous_event_sha256,
+            previous_event_sha256=release_request.previous_event_sha256,
             reason_code=None,
             provider_operation=None,
             target_configuration_sha256=result.target_configuration_sha256,
@@ -324,9 +398,7 @@ class ServiceClaimClassificationService:
             or value.utcoffset() != timedelta(0)
             or value.microsecond != 0
         ):
-            raise ServiceClaimClassificationError(
-                ServiceClaimClassificationErrorCode.UNAVAILABLE
-            )
+            raise ServiceClaimClassificationError(ServiceClaimClassificationErrorCode.UNAVAILABLE)
         return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -360,14 +432,30 @@ class CoordinatorServiceClaimClassificationClient:
         self._evidence_key_version = evidence_key_version
         self._signature_verifier = signature_verifier
 
+    @overload
     async def classify(
         self,
         request: ServiceClaimClassificationRequestV1,
-    ) -> ServiceClaimClassificationAttestationV1:
+    ) -> ServiceClaimClassificationAttestationV1: ...
+
+    @overload
+    async def classify(
+        self,
+        request: RecoveryAbandonmentClassificationRequestV1,
+    ) -> RecoveryAbandonmentClassificationAttestationV1: ...
+
+    async def classify(
+        self,
+        request: (ServiceClaimClassificationRequestV1 | RecoveryAbandonmentClassificationRequestV1),
+    ) -> ServiceClaimClassificationAttestationV1 | RecoveryAbandonmentClassificationAttestationV1:
         """Return only exact authenticated verifier facts for this request."""
 
         if (
-            type(request) is not ServiceClaimClassificationRequestV1
+            type(request)
+            not in (
+                ServiceClaimClassificationRequestV1,
+                RecoveryAbandonmentClassificationRequestV1,
+            )
             or request.target.project_id != self._route.project_id
         ):
             raise ServiceClaimClassificationError(
@@ -385,10 +473,27 @@ class CoordinatorServiceClaimClassificationClient:
                 ServiceClaimClassificationErrorCode.TRANSPORT_UNAVAILABLE
             ) from None
         try:
-            attestation = decode_contract(
-                body,
-                ServiceClaimClassificationAttestationV1,
+            attestation: (
+                ServiceClaimClassificationAttestationV1
+                | RecoveryAbandonmentClassificationAttestationV1
             )
+            if type(request) is RecoveryAbandonmentClassificationRequestV1:
+                attestation = decode_contract(
+                    body,
+                    RecoveryAbandonmentClassificationAttestationV1,
+                )
+                expected_request_sha256 = recovery_abandonment_classification_request_sha256(
+                    request
+                )
+            else:
+                release_request = cast(ServiceClaimClassificationRequestV1, request)
+                attestation = decode_contract(
+                    body,
+                    ServiceClaimClassificationAttestationV1,
+                )
+                expected_request_sha256 = service_claim_classification_request_sha256(
+                    release_request
+                )
         except ContractError:
             raise ServiceClaimClassificationError(
                 ServiceClaimClassificationErrorCode.RESPONSE_INVALID
@@ -399,12 +504,10 @@ class CoordinatorServiceClaimClassificationClient:
             ) from None
         if (
             attestation.signing_request.result.request != request
-            or attestation.signing_request.result.request_sha256
-            != service_claim_classification_request_sha256(request)
+            or attestation.signing_request.result.request_sha256 != expected_request_sha256
             or attestation.signing_request.result.classified_by
             != f"controlgraph-verifier@{self._route.project_id}.iam.gserviceaccount.com"
-            or attestation.signed_evidence.signing_key_version
-            != self._evidence_key_version
+            or attestation.signed_evidence.signing_key_version != self._evidence_key_version
         ):
             raise ServiceClaimClassificationError(
                 ServiceClaimClassificationErrorCode.RESPONSE_INVALID
@@ -427,19 +530,49 @@ def _traffic_matches_expected(
     """Treat provider-omitted zero allocations as zero, but reject extra revisions."""
 
     return set(observed).issubset(expected) and all(
-        observed.get(revision, 0) == percent
-        for revision, percent in expected.items()
+        observed.get(revision, 0) == percent for revision, percent in expected.items()
     )
 
 
 def _expected_traffic(
-    classification: ServiceClaimTargetClassification,
+    classification: ServiceClaimTargetClassification | str,
 ) -> tuple[int, int]:
     if classification is ServiceClaimTargetClassification.CANDIDATE_PROMOTED:
         return 0, 100
     if classification is ServiceClaimTargetClassification.STABLE_RESTORED:
         return 100, 0
+    if classification == "STABLE_BASELINE_CONFIRMED":
+        return 100, 0
     raise TypeError("an exact target classification is required")
+
+
+def _classification_event(
+    *,
+    request: RecoveryAbandonmentClassificationRequestV1,
+    subject: RecoveryAbandonmentClassificationSubjectV1,
+    classified_by: str,
+    classified_at: str,
+    target_configuration_sha256: str,
+) -> EvidenceEvent:
+    return EvidenceEvent(
+        schema_version=EVIDENCE_EVENT_V1,
+        evidence_id=request.classification_evidence_id,
+        sequence=request.previous_evidence_sequence + 1,
+        root_id=request.root_id,
+        root_sha256=request.root_sha256,
+        target=request.target,
+        epoch=request.fenced_epoch,
+        kind=EvidenceKind.TARGET_VERIFIED,
+        actor=classified_by,
+        request_id=request.request_id,
+        receipt_id=None,
+        occurred_at=classified_at,
+        subject_sha256=canonical_sha256(subject),
+        previous_event_sha256=request.previous_event_sha256,
+        reason_code=None,
+        provider_operation=None,
+        target_configuration_sha256=target_configuration_sha256,
+    )
 
 
 def _system_utc_second() -> datetime:

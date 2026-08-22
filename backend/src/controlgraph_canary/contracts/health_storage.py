@@ -720,6 +720,12 @@ def create_recovery_dispatch_storage_record(
     )
 
 
+def recovery_dispatch_record_sha256(record: RecoveryDispatchRecordV2) -> str:
+    """Hash the exact shallow durable projection of one recovery dispatch."""
+
+    return canonical_sha256(create_recovery_dispatch_storage_record(record))
+
+
 def recovery_dispatch_storage_record_value(
     stored: RecoveryDispatchStorageRecordV2,
 ) -> RecoveryDispatchRecordV2:
@@ -879,6 +885,7 @@ __all__ = [
     "recovery_dispatch_document_id",
     "recovery_dispatch_identity_document_id",
     "recovery_dispatch_identity_logical_id",
+    "recovery_dispatch_record_sha256",
     "recovery_dispatch_storage_record_value",
     "recovery_intent_document_id",
     "signed_health_proof_document_id",

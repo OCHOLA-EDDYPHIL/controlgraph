@@ -33,8 +33,11 @@ from controlgraph_canary.contracts.root_creation import (
     capability_lineage_anchor,
 )
 from controlgraph_canary.contracts.storage import (
+    SERVICE_CLAIM_ABANDONMENT_RELEASE_CONDITION,
     SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION,
     ServiceClaimRecord,
+    ServiceClaimRecordV3,
+    ServiceClaimRecordValue,
     ServiceClaimStatus,
 )
 
@@ -47,7 +50,7 @@ class RootAuthorityBundle(Protocol):
     def root(self) -> StoredRecord[RolloutRootV2 | RolloutRootV3]: ...
 
     @property
-    def service_claim(self) -> StoredRecord[ServiceClaimRecord]: ...
+    def service_claim(self) -> StoredRecord[ServiceClaimRecordValue]: ...
 
     @property
     def authority(self) -> StoredRecord[EpochAuthorityRecord]: ...
@@ -74,7 +77,7 @@ class TrustedRootAuthority:
     """Validated values and revisions from one atomic authority read."""
 
     root: RolloutRootV2 | RolloutRootV3
-    service_claim: ServiceClaimRecord
+    service_claim: ServiceClaimRecordValue
     authority: EpochAuthorityRecord
     lineage_anchor: CapabilityLineageAnchorV1
     root_revision: int
@@ -111,7 +114,8 @@ def inspect_root_authority_bundle(
     if (
         type(target) is not TargetBinding
         or type(root) not in (RolloutRootV2, RolloutRootV3)
-        or type(claim) is not ServiceClaimRecord
+        or type(claim) not in (ServiceClaimRecord, ServiceClaimRecordV3)
+        or (type(claim) is ServiceClaimRecordV3 and type(root) is not RolloutRootV3)
         or type(authority) is not EpochAuthorityRecord
         or type(anchor) is not CapabilityLineageAnchorV1
     ):
@@ -151,15 +155,17 @@ def inspect_root_authority_bundle(
 
 
 def service_claim_matches_content_addressed_root(
-    claim: ServiceClaimRecord,
+    claim: ServiceClaimRecordValue,
     root: RolloutRootV2 | RolloutRootV3,
 ) -> bool:
     """Return whether a service claim binds every root-derived target field."""
 
-    if type(claim) is not ServiceClaimRecord or type(root) not in (
+    if type(claim) not in (ServiceClaimRecord, ServiceClaimRecordV3) or type(root) not in (
         RolloutRootV2,
         RolloutRootV3,
     ):
+        return False
+    if type(claim) is ServiceClaimRecordV3 and type(root) is not RolloutRootV3:
         return False
     content = root.content
     snapshot = content.stable_snapshot
@@ -207,7 +213,12 @@ def service_claim_matches_content_addressed_root(
         and claim.candidate_target_configuration_sha256 == candidate_target_sha256
         and claim.operator_owner == content.approved_by
         and claim.workload_creator == "controlgraph.api/v1"
-        and claim.terminal_release_condition == SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+        and claim.terminal_release_condition
+        == (
+            SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+            if type(claim) is ServiceClaimRecord
+            else SERVICE_CLAIM_ABANDONMENT_RELEASE_CONDITION
+        )
         and content.approved_at <= claim.claimed_at
     )
 
@@ -218,14 +229,18 @@ def service_claim_matches_root_v2(
 ) -> bool:
     """Return whether a service claim binds one exact historical V2 root."""
 
-    return type(root) is RolloutRootV2 and service_claim_matches_content_addressed_root(
-        claim,
-        root,
+    return (
+        type(claim) is ServiceClaimRecord
+        and type(root) is RolloutRootV2
+        and service_claim_matches_content_addressed_root(
+            claim,
+            root,
+        )
     )
 
 
 def service_claim_matches_root_v3(
-    claim: ServiceClaimRecord,
+    claim: ServiceClaimRecordValue,
     root: RolloutRootV3,
 ) -> bool:
     """Return whether a service claim binds one exact current V3 root."""
@@ -399,17 +414,15 @@ def operator_lineage_anchor(
     )
 
 
-def _claim_lifecycle_revision_matches(claim: ServiceClaimRecord, revision: int) -> bool:
-    return (
-        claim.status is ServiceClaimStatus.ACTIVE
-        and revision % 3 == 0
-    ) or (
-        claim.status is ServiceClaimStatus.RELEASING
-        and revision % 3 == 1
-    ) or (
-        claim.status is ServiceClaimStatus.RELEASED
-        and revision % 3 == 2
-    )
+def _claim_lifecycle_revision_matches(
+    claim: ServiceClaimRecordValue,
+    revision: int,
+) -> bool:
+    if claim.status is ServiceClaimStatus.ACTIVE:
+        return type(claim) is ServiceClaimRecord and revision % 3 == 0
+    if claim.status is ServiceClaimStatus.RELEASING:
+        return revision % 3 == 1
+    return claim.status is ServiceClaimStatus.RELEASED and revision % 3 == 2
 
 
 def _parse_utc_second(value: str) -> int:

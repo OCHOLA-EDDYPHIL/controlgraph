@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self, cast
@@ -57,6 +58,7 @@ from controlgraph_canary.contracts.root_creation import (
 )
 
 SERVICE_CLAIM_V2: Final = "controlgraph.service-claim/v2"
+SERVICE_CLAIM_V3: Final = "controlgraph.service-claim/v3"
 AUTHORITY_STORAGE_DOCUMENT_V1: Final = "controlgraph.authority-storage-document/v1"
 FIRESTORE_DOCUMENT_ID_DOMAIN: Final = b"controlgraph.firestore-document-id/v1\0"
 _PROMOTION_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
@@ -65,12 +67,22 @@ _PROMOTION_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
 _PROMOTION_V2_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
     b"controlgraph.promotion-dispatch-identity-logical-id/v2\0"
 )
+_RECOVERY_ABANDONMENT_IDENTITY_LOGICAL_ID_DOMAIN: Final = (
+    b"controlgraph.recovery-abandonment-identity-logical-id/v1\0"
+)
 SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1: Final = "controlgraph.service-claim-terminal-root-proof/v1"
 SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1: Final = (
     "controlgraph.service-claim-target-classification-proof/v1"
 )
 SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION: Final = (
     "FENCED_EPOCH_AND_INDEPENDENT_TARGET_CLASSIFICATION_V2"
+)
+SERVICE_CLAIM_ABANDONMENT_RELEASE_CONDITION: Final = (
+    "FENCED_AMBIGUOUS_RECOVERY_AND_INDEPENDENT_STABLE_BASELINE_V1"
+)
+SERVICE_CLAIM_ABANDONMENT_PROOF_V1: Final = "controlgraph.service-claim-abandonment-proof/v1"
+SERVICE_CLAIM_STABLE_BASELINE_PROOF_V1: Final = (
+    "controlgraph.service-claim-stable-baseline-proof/v1"
 )
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
@@ -315,6 +327,201 @@ class ServiceClaimRecord(StrictContractModel):
         return self
 
 
+class ServiceClaimAbandonmentProofV1(StrictContractModel):
+    """Proof that one expired, outcome-unknown recovery was fenced and abandoned."""
+
+    schema_version: Literal["controlgraph.service-claim-abandonment-proof/v1"]
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    state: Literal["ABANDONED"]
+    required_stable_baseline_configuration_sha256: Sha256Digest
+    recovery_dispatch_id: Identifier
+    recovery_dispatch_sha256: Sha256Digest
+    recovery_dispatch_revision: Literal[2]
+    recovery_receipt_id: Identifier
+    receipt_absent_at_fence: Literal[True]
+    evidence_id: Identifier
+    evidence_sha256: Sha256Digest
+    confirmed_by: Literal["controlgraph.coordinator/v1"]
+    confirmed_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_target(self) -> Self:
+        _require_service_claim_target(self.target)
+        if self.root_id != f"cgroot:{self.root_sha256}":
+            raise ValueError("abandonment proof root identity is invalid")
+        return self
+
+
+class ServiceClaimStableBaselineProofV1(StrictContractModel):
+    """Independent verifier proof of the post-abandonment stable-only baseline."""
+
+    schema_version: Literal["controlgraph.service-claim-stable-baseline-proof/v1"]
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    classification: Literal["STABLE_BASELINE_CONFIRMED"]
+    fenced_epoch: PositiveSafeInteger
+    fenced_authority_revision: NonNegativeSafeInteger
+    service_generation: PositiveSafeInteger
+    provider_etag: OpaqueToken
+    target_configuration_sha256: Sha256Digest
+    evidence_id: Identifier
+    evidence_sha256: Sha256Digest
+    classified_by: BoundedText
+    classified_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_independent_reader(self) -> Self:
+        _require_service_claim_target(self.target)
+        expected_reader = f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
+        if self.root_id != f"cgroot:{self.root_sha256}" or self.classified_by != expected_reader:
+            raise ValueError("stable baseline proof is not verifier-bound")
+        if self.fenced_authority_revision != self.fenced_epoch - 1:
+            raise ValueError("stable baseline proof fence is incoherent")
+        return self
+
+
+class ServiceClaimRecordV3(StrictContractModel):
+    """Versioned claim state for explicit abandonment of ambiguous recovery."""
+
+    schema_version: Literal["controlgraph.service-claim/v3"]
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    stable_revision: CloudRunName
+    candidate_revision: CloudRunName
+    initial_epoch: Literal[1]
+    baseline_service_generation: NonNegativeSafeInteger
+    baseline_configuration_sha256: Sha256Digest
+    baseline_revision_configuration_sha256: Sha256Digest
+    candidate_revision_configuration_sha256: Sha256Digest
+    stable_target_configuration_sha256: Sha256Digest
+    candidate_target_configuration_sha256: Sha256Digest
+    operator_owner: BoundedText
+    workload_creator: Literal["controlgraph.api/v1"]
+    terminal_release_condition: Literal[
+        "FENCED_AMBIGUOUS_RECOVERY_AND_INDEPENDENT_STABLE_BASELINE_V1"
+    ]
+    status: ServiceClaimStatus
+    claim_request_id: Identifier
+    claim_evidence_id: Identifier
+    claimed_at: UtcSecond
+    release_fence_epoch: PositiveSafeInteger | None
+    release_fence_authority_revision: NonNegativeSafeInteger | None
+    release_fenced_by: BoundedText | None
+    release_fence_request_id: Identifier | None
+    release_fence_evidence_id: Identifier | None
+    release_fenced_at: UtcSecond | None
+    released_by: Literal["controlgraph.coordinator/v1"] | None
+    release_request_id: Identifier | None
+    release_evidence_id: Identifier | None
+    released_at: UtcSecond | None
+    terminal_root_proof: ServiceClaimAbandonmentProofV1 | None
+    target_classification_proof: ServiceClaimStableBaselineProofV1 | None
+
+    @model_validator(mode="after")
+    def validate_abandonment_lifecycle(self) -> Self:
+        _require_service_claim_target(self.target)
+        if self.status is ServiceClaimStatus.ACTIVE:
+            raise ValueError("V3 abandonment claims cannot be active")
+        if self.operator_owner == self.workload_creator:
+            raise ValueError("service claim operator and workload identities must differ")
+        if self.stable_revision == self.candidate_revision:
+            raise ValueError("service claim revisions must differ")
+        prefix = f"{self.target.service_name}-"
+        if not self.stable_revision.startswith(prefix) or not self.candidate_revision.startswith(
+            prefix
+        ):
+            raise ValueError("service claim revisions are outside the target service")
+        fence_values = (
+            self.release_fence_epoch,
+            self.release_fence_authority_revision,
+            self.release_fenced_by,
+            self.release_fence_request_id,
+            self.release_fence_evidence_id,
+            self.release_fenced_at,
+            self.terminal_root_proof,
+        )
+        if any(value is None for value in fence_values):
+            raise ValueError("abandonment claim requires a complete epoch fence")
+        final_release_values = (
+            self.released_by,
+            self.release_request_id,
+            self.release_evidence_id,
+            self.released_at,
+            self.target_classification_proof,
+        )
+        if self.status is ServiceClaimStatus.RELEASING:
+            if any(value is not None for value in final_release_values):
+                raise ValueError("releasing abandonment claim cannot be final")
+        elif self.status is ServiceClaimStatus.RELEASED:
+            if any(value is None for value in final_release_values):
+                raise ValueError("released abandonment claim requires final proof")
+        else:
+            raise ValueError("abandonment claim status is invalid")
+        abandonment = cast(ServiceClaimAbandonmentProofV1, self.terminal_root_proof)
+        if (
+            abandonment.target != self.target
+            or abandonment.root_id != self.root_id
+            or abandonment.root_sha256 != self.root_sha256
+            or abandonment.required_stable_baseline_configuration_sha256
+            != self.stable_target_configuration_sha256
+        ):
+            raise ValueError("abandonment proof does not match the claim")
+        fence_epoch = cast(int, self.release_fence_epoch)
+        fence_revision = cast(int, self.release_fence_authority_revision)
+        fence_evidence_id = cast(str, self.release_fence_evidence_id)
+        fenced_at = cast(str, self.release_fenced_at)
+        if (
+            fence_epoch <= self.initial_epoch
+            or fence_revision != fence_epoch - self.initial_epoch
+            or not self.claimed_at <= abandonment.confirmed_at <= fenced_at
+            or abandonment.evidence_id == fence_evidence_id
+        ):
+            raise ValueError("abandonment fence is not a later authority transition")
+        if self.status is ServiceClaimStatus.RELEASING:
+            return self
+        classification = cast(
+            ServiceClaimStableBaselineProofV1,
+            self.target_classification_proof,
+        )
+        if (
+            classification.target != self.target
+            or classification.root_id != self.root_id
+            or classification.root_sha256 != self.root_sha256
+            or classification.target_configuration_sha256 != self.stable_target_configuration_sha256
+            or classification.fenced_epoch != fence_epoch
+            or classification.fenced_authority_revision != fence_revision
+            or classification.service_generation <= self.baseline_service_generation
+            or classification.evidence_sha256 == abandonment.evidence_sha256
+            or self.release_request_id != self.release_fence_request_id
+        ):
+            raise ValueError("stable baseline proof does not match abandonment")
+        release_evidence_id = cast(str, self.release_evidence_id)
+        if (
+            len(
+                {
+                    self.claim_evidence_id,
+                    abandonment.evidence_id,
+                    fence_evidence_id,
+                    classification.evidence_id,
+                    release_evidence_id,
+                }
+            )
+            != 5
+        ):
+            raise ValueError("abandonment transition evidence must be independent")
+        released_at = cast(str, self.released_at)
+        if not (fenced_at <= classification.classified_at <= released_at):
+            raise ValueError("abandonment release proof times are not ordered")
+        return self
+
+
+ServiceClaimRecordValue = ServiceClaimRecord | ServiceClaimRecordV3
+
+
 def service_claim_matches_root(
     claim: ServiceClaimRecord,
     root: RolloutRoot,
@@ -367,11 +574,15 @@ def active_service_claim_matches_root(
 ) -> bool:
     """Return whether one active claim exactly binds an immutable rollout root."""
 
-    return claim.status is ServiceClaimStatus.ACTIVE and service_claim_matches_root(
-        claim,
-        root,
-        stable_target_configuration_sha256=stable_target_configuration_sha256,
-        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+    return (
+        type(claim) is ServiceClaimRecord
+        and claim.status is ServiceClaimStatus.ACTIVE
+        and service_claim_matches_root(
+            claim,
+            root,
+            stable_target_configuration_sha256=stable_target_configuration_sha256,
+            candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+        )
     )
 
 
@@ -434,16 +645,20 @@ def active_service_claim_matches_root_v2(
 ) -> bool:
     """Return whether one active claim exactly binds a content-addressed root."""
 
-    return claim.status is ServiceClaimStatus.ACTIVE and service_claim_matches_root_v2(
-        claim,
-        root,
-        stable_target_configuration_sha256=stable_target_configuration_sha256,
-        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+    return (
+        type(claim) is ServiceClaimRecord
+        and claim.status is ServiceClaimStatus.ACTIVE
+        and service_claim_matches_root_v2(
+            claim,
+            root,
+            stable_target_configuration_sha256=stable_target_configuration_sha256,
+            candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+        )
     )
 
 
 def service_claim_matches_root_v3(
-    claim: ServiceClaimRecord,
+    claim: ServiceClaimRecord | ServiceClaimRecordV3,
     root: RolloutRootV3,
     *,
     stable_target_configuration_sha256: str,
@@ -451,7 +666,10 @@ def service_claim_matches_root_v3(
 ) -> bool:
     """Return whether one claim exactly binds a V3 rollout root."""
 
-    if type(claim) is not ServiceClaimRecord or type(root) is not RolloutRootV3:
+    if (
+        type(claim) not in (ServiceClaimRecord, ServiceClaimRecordV3)
+        or type(root) is not RolloutRootV3
+    ):
         return False
     if any(
         type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
@@ -482,7 +700,12 @@ def service_claim_matches_root_v3(
         and claim.candidate_target_configuration_sha256 == candidate_target_configuration_sha256
         and claim.operator_owner == content.approved_by
         and claim.workload_creator == "controlgraph.api/v1"
-        and claim.terminal_release_condition == SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+        and claim.terminal_release_condition
+        == (
+            SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION
+            if type(claim) is ServiceClaimRecord
+            else SERVICE_CLAIM_ABANDONMENT_RELEASE_CONDITION
+        )
         and snapshot.captured_by == expected_reader
         and snapshot.captured_at <= content.approved_at <= claim.claimed_at
     )
@@ -497,11 +720,15 @@ def active_service_claim_matches_root_v3(
 ) -> bool:
     """Return whether one active claim exactly binds a V3 root."""
 
-    return claim.status is ServiceClaimStatus.ACTIVE and service_claim_matches_root_v3(
-        claim,
-        root,
-        stable_target_configuration_sha256=stable_target_configuration_sha256,
-        candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+    return (
+        type(claim) is ServiceClaimRecord
+        and claim.status is ServiceClaimStatus.ACTIVE
+        and service_claim_matches_root_v3(
+            claim,
+            root,
+            stable_target_configuration_sha256=stable_target_configuration_sha256,
+            candidate_target_configuration_sha256=candidate_target_configuration_sha256,
+        )
     )
 
 
@@ -525,6 +752,9 @@ class AuthorityStorageKind(StrEnum):
     SERVICE_CLAIM_RELEASE_IDENTITY = "controlgraph-service-claim-release-identities-v1"
     SERVICE_CLAIM_RELEASE_PROGRESS = "controlgraph-service-claim-release-progress-v1"
     SERVICE_CLAIM_RELEASE_RESULT = "controlgraph-service-claim-release-results-v1"
+    RECOVERY_ABANDONMENT_IDENTITY = "controlgraph-recovery-abandonment-identities-v1"
+    RECOVERY_ABANDONMENT_PROGRESS = "controlgraph-recovery-abandonment-progress-v1"
+    RECOVERY_ABANDONMENT_RESULT = "controlgraph-recovery-abandonment-results-v1"
     PROMOTION_DISPATCH_IDENTITY = "controlgraph-promotion-dispatch-identities-v1"
     PROMOTION_DISPATCH = "controlgraph-promotion-dispatches-v1"
     PROMOTION_DISPATCH_IDENTITY_V2 = "controlgraph-promotion-dispatch-identities-v2"
@@ -552,7 +782,15 @@ class AuthorityStorageDocument(StrictContractModel):
         elif self.record_kind is AuthorityStorageKind.ROLLOUT_ROOT_V3:
             model_type = RolloutRootV3
         elif self.record_kind is AuthorityStorageKind.SERVICE_CLAIM:
-            model_type = ServiceClaimRecord
+            try:
+                raw_claim = json.loads(self.canonical_payload)
+            except (TypeError, ValueError):
+                raise ValueError("authority storage payload is invalid") from None
+            model_type = (
+                ServiceClaimRecordV3
+                if type(raw_claim) is dict and raw_claim.get("schema_version") == SERVICE_CLAIM_V3
+                else ServiceClaimRecord
+            )
         elif self.record_kind is AuthorityStorageKind.EPOCH_AUTHORITY:
             model_type = EpochAuthorityRecord
         elif self.record_kind is AuthorityStorageKind.EXECUTION_RECEIPT:
@@ -581,25 +819,36 @@ class AuthorityStorageDocument(StrictContractModel):
             model_type = PromotionDispatchIdentityV2
         elif self.record_kind is AuthorityStorageKind.PROMOTION_DISPATCH_V2:
             model_type = PromotionDispatchRecordV2
-        else:
+        elif self.record_kind in {
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
+            AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+        }:
             from controlgraph_canary.contracts.service_claim_release import (
                 ServiceClaimReleaseIdentityV1,
                 ServiceClaimReleaseProgressV1,
                 ServiceClaimReleaseResultV1,
             )
 
-            if (
-                self.record_kind
-                is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY
-            ):
+            if self.record_kind is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY:
                 model_type = ServiceClaimReleaseIdentityV1
-            elif (
-                self.record_kind
-                is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS
-            ):
+            elif self.record_kind is AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS:
                 model_type = ServiceClaimReleaseProgressV1
             else:
                 model_type = ServiceClaimReleaseResultV1
+        else:
+            from controlgraph_canary.contracts.recovery_abandonment import (
+                RecoveryAbandonmentIdentityV1,
+                RecoveryAbandonmentProgressV1,
+                RecoveryAbandonmentResultV1,
+            )
+
+            if self.record_kind is AuthorityStorageKind.RECOVERY_ABANDONMENT_IDENTITY:
+                model_type = RecoveryAbandonmentIdentityV1
+            elif self.record_kind is AuthorityStorageKind.RECOVERY_ABANDONMENT_PROGRESS:
+                model_type = RecoveryAbandonmentProgressV1
+            else:
+                model_type = RecoveryAbandonmentResultV1
         try:
             payload = decode_contract(self.canonical_payload, model_type)
         except ContractError as error:
@@ -620,6 +869,9 @@ class AuthorityStorageDocument(StrictContractModel):
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_IDENTITY,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_PROGRESS,
             AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT,
+            AuthorityStorageKind.RECOVERY_ABANDONMENT_IDENTITY,
+            AuthorityStorageKind.RECOVERY_ABANDONMENT_PROGRESS,
+            AuthorityStorageKind.RECOVERY_ABANDONMENT_RESULT,
             AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY,
             AuthorityStorageKind.PROMOTION_DISPATCH_IDENTITY_V2,
         }
@@ -636,7 +888,7 @@ class AuthorityStorageDocument(StrictContractModel):
         ):
             raise ValueError("evidence head storage and sequence revisions do not match")
         if self.record_kind is AuthorityStorageKind.SERVICE_CLAIM:
-            claim = cast(ServiceClaimRecord, payload)
+            claim = cast(ServiceClaimRecord | ServiceClaimRecordV3, payload)
             expected_revision_remainder = {
                 ServiceClaimStatus.ACTIVE: 0,
                 ServiceClaimStatus.RELEASING: 1,
@@ -740,6 +992,33 @@ class AuthorityStorageDocument(StrictContractModel):
             else:
                 expected_logical_id = cast(
                     ServiceClaimReleaseResultV1,
+                    payload,
+                ).result_id
+        elif self.record_kind in {
+            AuthorityStorageKind.RECOVERY_ABANDONMENT_IDENTITY,
+            AuthorityStorageKind.RECOVERY_ABANDONMENT_PROGRESS,
+            AuthorityStorageKind.RECOVERY_ABANDONMENT_RESULT,
+        }:
+            from controlgraph_canary.contracts.recovery_abandonment import (
+                RecoveryAbandonmentIdentityV1,
+                RecoveryAbandonmentProgressV1,
+                RecoveryAbandonmentResultV1,
+            )
+
+            if self.record_kind is AuthorityStorageKind.RECOVERY_ABANDONMENT_IDENTITY:
+                abandonment_identity = cast(RecoveryAbandonmentIdentityV1, payload)
+                expected_logical_id = recovery_abandonment_identity_logical_id(
+                    abandonment_identity.identity_kind.value,
+                    abandonment_identity.identity_value,
+                )
+            elif self.record_kind is AuthorityStorageKind.RECOVERY_ABANDONMENT_PROGRESS:
+                expected_logical_id = cast(
+                    RecoveryAbandonmentProgressV1,
+                    payload,
+                ).result_id
+            else:
+                expected_logical_id = cast(
+                    RecoveryAbandonmentResultV1,
                     payload,
                 ).result_id
         else:
@@ -907,6 +1186,45 @@ def service_claim_release_result_document_id(result_id: str) -> str:
     return _document_id(AuthorityStorageKind.SERVICE_CLAIM_RELEASE_RESULT, result_id)
 
 
+def recovery_abandonment_identity_logical_id(kind: str, identity_value: str) -> str:
+    """Return the isolated collision domain for one abandonment identity."""
+
+    if kind not in {"REQUEST", "IDEMPOTENCY"}:
+        raise ValueError("recovery abandonment identity kind is invalid")
+    identity = _LogicalIdentity(value=identity_value).value
+    digest = hashlib.sha256(
+        _RECOVERY_ABANDONMENT_IDENTITY_LOGICAL_ID_DOMAIN
+        + kind.encode("ascii")
+        + b"\0"
+        + identity.encode("ascii")
+    ).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def recovery_abandonment_identity_document_id(
+    kind: str,
+    identity_value: str,
+) -> str:
+    """Return the immutable document ID for one abandonment identity."""
+
+    return _document_id(
+        AuthorityStorageKind.RECOVERY_ABANDONMENT_IDENTITY,
+        recovery_abandonment_identity_logical_id(kind, identity_value),
+    )
+
+
+def recovery_abandonment_progress_document_id(result_id: str) -> str:
+    """Return the immutable document ID for one committed abandonment fence."""
+
+    return _document_id(AuthorityStorageKind.RECOVERY_ABANDONMENT_PROGRESS, result_id)
+
+
+def recovery_abandonment_result_document_id(result_id: str) -> str:
+    """Return the immutable document ID for one finalized abandonment."""
+
+    return _document_id(AuthorityStorageKind.RECOVERY_ABANDONMENT_RESULT, result_id)
+
+
 def promotion_dispatch_identity_logical_id(kind: str, identity_value: str) -> str:
     """Return the collision domain for one promotion dispatch identity."""
 
@@ -1001,13 +1319,21 @@ def execution_receipt_document_id(target: TargetBinding, idempotency_key: str) -
 __all__ = [
     "AUTHORITY_STORAGE_DOCUMENT_V1",
     "FIRESTORE_DOCUMENT_ID_DOMAIN",
+    "SERVICE_CLAIM_ABANDONMENT_PROOF_V1",
+    "SERVICE_CLAIM_ABANDONMENT_RELEASE_CONDITION",
+    "SERVICE_CLAIM_STABLE_BASELINE_PROOF_V1",
     "SERVICE_CLAIM_TARGET_CLASSIFICATION_PROOF_V1",
     "SERVICE_CLAIM_TERMINAL_RELEASE_CONDITION",
     "SERVICE_CLAIM_TERMINAL_ROOT_PROOF_V1",
     "SERVICE_CLAIM_V2",
+    "SERVICE_CLAIM_V3",
     "AuthorityStorageDocument",
     "AuthorityStorageKind",
+    "ServiceClaimAbandonmentProofV1",
     "ServiceClaimRecord",
+    "ServiceClaimRecordV3",
+    "ServiceClaimRecordValue",
+    "ServiceClaimStableBaselineProofV1",
     "ServiceClaimStatus",
     "ServiceClaimTargetClassification",
     "ServiceClaimTargetClassificationProof",
@@ -1032,6 +1358,10 @@ __all__ = [
     "promotion_dispatch_identity_v2_document_id",
     "promotion_dispatch_identity_v2_logical_id",
     "promotion_dispatch_v2_document_id",
+    "recovery_abandonment_identity_document_id",
+    "recovery_abandonment_identity_logical_id",
+    "recovery_abandonment_progress_document_id",
+    "recovery_abandonment_result_document_id",
     "rollout_root_document_id",
     "rollout_root_v2_document_id",
     "rollout_root_v3_document_id",

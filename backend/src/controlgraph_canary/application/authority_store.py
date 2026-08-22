@@ -33,6 +33,8 @@ from controlgraph_canary.contracts.root_creation import (
 )
 from controlgraph_canary.contracts.storage import (
     ServiceClaimRecord,
+    ServiceClaimRecordV3,
+    ServiceClaimRecordValue,
     execution_receipt_logical_id,
 )
 
@@ -320,7 +322,7 @@ class RootCreationBundle:
     """One coherent view of six exact V2-era or V3-era root records."""
 
     root: StoredRecord[RolloutRootV2 | RolloutRootV3]
-    service_claim: StoredRecord[ServiceClaimRecord]
+    service_claim: StoredRecord[ServiceClaimRecordValue]
     authority: StoredRecord[EpochAuthorityRecord]
     lineage_anchor: StoredRecord[CapabilityLineageAnchorV1]
     signed_evidence: StoredRecord[SignedEvidenceEventV1]
@@ -328,20 +330,28 @@ class RootCreationBundle:
 
     def __post_init__(self) -> None:
         expected_types = (
-            (self.service_claim, ServiceClaimRecord),
             (self.authority, EpochAuthorityRecord),
             (self.lineage_anchor, CapabilityLineageAnchorV1),
             (self.signed_evidence, SignedEvidenceEventV1),
         )
-        if any(
-            type(record) is not StoredRecord or type(record.value) is not model_type
-            for record, model_type in expected_types
-        ) or type(self.root) is not StoredRecord or type(self.creation_result) is not StoredRecord:
+        if (
+            type(self.service_claim) is not StoredRecord
+            or type(self.service_claim.value) not in (ServiceClaimRecord, ServiceClaimRecordV3)
+            or any(
+                type(record) is not StoredRecord or type(record.value) is not model_type
+                for record, model_type in expected_types
+            )
+            or type(self.root) is not StoredRecord
+            or type(self.creation_result) is not StoredRecord
+        ):
             raise TypeError("root creation bundle requires exact stored records")
         pair = (type(self.root.value), type(self.creation_result.value))
         if pair not in (
             (RolloutRootV2, RootCreationResultV1),
             (RolloutRootV3, RootCreationResultV2),
+        ) or (
+            type(self.service_claim.value) is ServiceClaimRecordV3
+            and type(self.root.value) is not RolloutRootV3
         ):
             raise TypeError("root creation bundle versions do not match")
 
@@ -400,7 +410,7 @@ class FencedServiceClaim:
 class ReleasedServiceClaim:
     """The final claim release and unchanged fenced authority."""
 
-    service_claim: StoredRecord[ServiceClaimRecord]
+    service_claim: StoredRecord[ServiceClaimRecordValue]
     authority: StoredRecord[EpochAuthorityRecord]
 
 
@@ -422,7 +432,7 @@ class AuthorityStore(Protocol):
 
     async def create_rollout_after_release(
         self,
-        expected_released_claim: StoredRecord[ServiceClaimRecord],
+        expected_released_claim: StoredRecord[ServiceClaimRecordValue],
         root: RolloutRoot,
         service_claim: ServiceClaimRecord,
         authority: EpochAuthorityRecord,
@@ -439,7 +449,7 @@ class AuthorityStore(Protocol):
         signed_evidence: SignedEvidenceEventV1,
         creation_result: RootCreationResultV2,
         *,
-        expected_released_claim: StoredRecord[ServiceClaimRecord] | None = None,
+        expected_released_claim: StoredRecord[ServiceClaimRecordValue] | None = None,
     ) -> RootCreationWriteResult: ...
 
     async def read_root_creation_bundle(
@@ -449,7 +459,7 @@ class AuthorityStore(Protocol):
 
     async def read_rollout_root(self, root_id: str) -> StoredRecord[RolloutRoot] | None: ...
 
-    async def read_service_claim(self) -> StoredRecord[ServiceClaimRecord] | None: ...
+    async def read_service_claim(self) -> StoredRecord[ServiceClaimRecordValue] | None: ...
 
     async def read_authority(
         self,
