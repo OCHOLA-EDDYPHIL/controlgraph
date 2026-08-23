@@ -319,11 +319,12 @@ class CoordinatorCompletionWorkflow:
     ) -> CompletionClassificationV1:
         """Use the shared classifier for a persisted promotion or recovery receipt."""
 
+        verification_started_at = self._timestamp()
         observation = await self._observe(
             root=root,
             service_claim=service_claim,
             receipt=receipt,
-            started_at=receipt.updated_at,
+            started_at=verification_started_at,
         )
         kind = {
             CapabilityAction.PROMOTE_CANDIDATE: CompletionKind.PROMOTION,

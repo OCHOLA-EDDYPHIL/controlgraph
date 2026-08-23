@@ -576,14 +576,14 @@ def test_terminal_workflow_rejects_an_unverified_signed_intent() -> None:
     assert result.reason is CompletionReason.EXECUTION_PROOF_ABSENT
 
 
-def test_terminal_workflow_does_not_restamp_an_old_receipt() -> None:
+def test_terminal_workflow_reverifies_an_old_receipt_in_a_fresh_window() -> None:
     root, claim, old_receipt, signed = _receipt(
         CapabilityAction.PROMOTE_CANDIDATE,
         day="2026-08-21",
     )
     workflow = CoordinatorCompletionWorkflow(
         target=old_receipt.target,
-        verifier=_Verifier(unavailable=True),
+        verifier=_Verifier(),
         classifier=CoordinatorCompletionClassificationService(
             target=old_receipt.target
         ),
@@ -600,12 +600,13 @@ def test_terminal_workflow_does_not_restamp_an_old_receipt() -> None:
         )
     )
 
-    assert result.status is CompletionStatus.AMBIGUOUS
-    assert result.reason is CompletionReason.EVIDENCE_STALE
+    assert result.status is CompletionStatus.COMPLETE
+    assert result.reason is CompletionReason.PROMOTION_COMPLETE
     assert (
         result.request.verification.observation_window_started_at
-        == old_receipt.updated_at
+        == "2026-08-22T12:00:00Z"
     )
+    assert result.request.verification.signed_intent_sha256 == old_receipt.capability_sha256
 
 
 def test_revocation_workflow_uses_signature_verified_authority_evidence() -> None:
