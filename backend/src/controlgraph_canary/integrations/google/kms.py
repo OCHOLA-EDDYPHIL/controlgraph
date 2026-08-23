@@ -24,12 +24,24 @@ from controlgraph_canary.application.signing import (
     VerificationProfile,
     make_trust_bundle_entry,
 )
-from controlgraph_canary.contracts.codec import ContractError, decode_base64url
+from controlgraph_canary.contracts.codec import (
+    ContractError,
+    canonical_sha256,
+    decode_base64url,
+)
 from controlgraph_canary.contracts.health_execution import (
     HEALTH_ATTESTATION_PURPOSE,
     P256_SIGNING_ALGORITHM,
     SignedHealthDecisionProofV1,
     health_attestation_signing_input_sha256,
+)
+from controlgraph_canary.contracts.independent_verification import (
+    INDEPENDENT_VERIFICATION_PURPOSE,
+    SignedIndependentVerificationEvidenceV1,
+    independent_verification_signing_input_sha256,
+)
+from controlgraph_canary.contracts.independent_verification import (
+    P256_SIGNING_ALGORITHM as INDEPENDENT_VERIFICATION_SIGNING_ALGORITHM,
 )
 from controlgraph_canary.contracts.recovery_execution import (
     RECOVERY_PRESTATE_ATTESTATION_PURPOSE,
@@ -688,6 +700,93 @@ class GoogleKmsRecoveryPrestateAttestationVerifier:
         )
 
 
+class GoogleKmsIndependentVerificationEvidenceVerifier:
+    """Verify purpose-separated independent evidence with read-only KMS access."""
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        service_role: ServiceRole,
+        key_version: str,
+        client: object | None = None,
+    ) -> None:
+        if service_role not in {
+            ServiceRole.COORDINATOR,
+            ServiceRole.VERIFIER,
+            ServiceRole.ISSUER,
+        }:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "independent verification role is invalid",
+            )
+        try:
+            profile = SigningProfile.evidence(project_id, key_version)
+        except SigningError:
+            raise
+        except Exception:
+            raise _error(
+                SigningErrorCode.PROFILE_INVALID,
+                "independent verification profile is invalid",
+            ) from None
+        self._profile = profile
+        self._client = None if client is None else cast(_AsyncKmsClient, client)
+
+    @property
+    def project_id(self) -> str:
+        return self._profile.project_id
+
+    @property
+    def key_version(self) -> str:
+        return self._profile.key_version
+
+    async def verify(self, signed: SignedIndependentVerificationEvidenceV1) -> None:
+        """Verify exact payload bindings and canonical P-256 digest signature."""
+
+        if (
+            type(signed) is not SignedIndependentVerificationEvidenceV1
+            or signed.purpose != INDEPENDENT_VERIFICATION_PURPOSE
+            or signed.signing_algorithm
+            != INDEPENDENT_VERIFICATION_SIGNING_ALGORITHM
+            or signed.signing_key_version != self._profile.key_version
+            or signed.evidence.target.project_id != self._profile.project_id
+        ):
+            raise _error(
+                SigningErrorCode.KEY_VERSION_UNTRUSTED,
+                "independent verification key version is not trusted",
+            )
+        expected_digest = independent_verification_signing_input_sha256(
+            signed.evidence,
+            self._profile.key_version,
+        )
+        if not hmac.compare_digest(
+            canonical_sha256(signed.evidence),
+            signed.payload_sha256,
+        ) or not hmac.compare_digest(expected_digest, signed.signing_input_sha256):
+            raise _error(
+                SigningErrorCode.DIGEST_MISMATCH,
+                "independent verification signing digest is invalid",
+            )
+        try:
+            signature = decode_base64url(signed.signature, maximum_bytes=72)
+        except ContractError:
+            raise _error(
+                SigningErrorCode.SIGNATURE_INVALID,
+                "independent verification signature encoding is invalid",
+            ) from None
+        client = self._client
+        if client is None:
+            client = _default_async_client()
+            self._client = client
+        await _load_version_async(client, self._profile)
+        public_key_pem = await _load_public_key_async(client, self._profile)
+        _verify_p256_sha256_digest_signature(
+            public_key_pem=public_key_pem,
+            digest=bytes.fromhex(expected_digest),
+            signature=signature,
+        )
+
+
 def _verify_p256_sha256_digest_signature(
     *,
     public_key_pem: str,
@@ -882,6 +981,7 @@ __all__ = [
     "GoogleKmsDigestSigner",
     "GoogleKmsEvidenceSignatureVerifier",
     "GoogleKmsHealthAttestationVerifier",
+    "GoogleKmsIndependentVerificationEvidenceVerifier",
     "GoogleKmsRecoveryPrestateAttestationVerifier",
     "GoogleKmsTrustBundlePublisher",
 ]

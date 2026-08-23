@@ -25,6 +25,9 @@ RECOVERY_RECEIPT_AUTHORITY_PATH = "/v1/internal/authority/recovery-receipts"
 RECOVERY_EXECUTION_FACADE_PATH = "/v1/internal/execute/recovery"
 CLASSIFICATION_EVIDENCE_PATH = "/v1/internal/evidence/classifications/sign"
 HEALTH_ATTESTATION_PATH = "/v1/internal/evidence/health/attest"
+INDEPENDENT_VERIFICATION_EVIDENCE_PATH = (
+    "/v1/internal/evidence/independent-verification/sign"
+)
 RECOVERY_PRESTATE_ATTESTATION_PATH = (
     "/v1/internal/evidence/recovery-prestate/attest"
 )
@@ -133,6 +136,10 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EVIDENCE_WRITER
             and self.path == HEALTH_ATTESTATION_PATH
         )
+        independent_verification_evidence_route = (
+            self.service_role is ServiceRole.EVIDENCE_WRITER
+            and self.path == INDEPENDENT_VERIFICATION_EVIDENCE_PATH
+        )
         recovery_prestate_attestation_route = (
             self.service_role is ServiceRole.EVIDENCE_WRITER
             and self.path == RECOVERY_PRESTATE_ATTESTATION_PATH
@@ -146,6 +153,7 @@ class RouteAuthenticationPolicy:
             and not recovery_receipt_authority_route
             and not classification_evidence_route
             and not health_attestation_route
+            and not independent_verification_evidence_route
             and not recovery_prestate_attestation_route
             and not recovery_execution_facade_route
             and self.path != protected_path(self.service_role)
@@ -172,6 +180,7 @@ class RouteAuthenticationPolicy:
                         if (
                             classification_evidence_route
                             or health_attestation_route
+                            or independent_verification_evidence_route
                             or recovery_prestate_attestation_route
                         )
                         else expected_route_caller_role(self.service_role)
@@ -440,6 +449,7 @@ __all__ = [
     "CLASSIFICATION_EVIDENCE_PATH",
     "HEALTH_ATTESTATION_PATH",
     "IDENTITY_ENVIRONMENT_KEYS",
+    "INDEPENDENT_VERIFICATION_EVIDENCE_PATH",
     "RECEIPT_AUTHORITY_PATH",
     "RECOVERY_EXECUTION_FACADE_PATH",
     "RECOVERY_PRESTATE_ATTESTATION_PATH",

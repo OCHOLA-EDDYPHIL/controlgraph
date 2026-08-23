@@ -111,6 +111,7 @@ module "verifier" {
     CONTROLGRAPH_CAPABILITY_KEY_VERSION     = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
     CONTROLGRAPH_EVIDENCE_KEY_VERSION       = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
     CONTROLGRAPH_EVIDENCE_WRITER_URL        = local.service_audiences.evidence_writer
+    CONTROLGRAPH_REFERENCE_TARGET_URL       = "https://${module.reference_target.target.name}-${local.project_number}.${var.region}.run.app"
     CONTROLGRAPH_TARGET_NETWORK_RESOURCE    = data.terraform_remote_state.foundation.outputs.network.network_id
     CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   })

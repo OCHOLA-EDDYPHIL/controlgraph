@@ -49,6 +49,7 @@ from controlgraph_canary.application.health_pipeline import (
 from controlgraph_canary.application.identity import (
     CLASSIFICATION_EVIDENCE_PATH,
     HEALTH_ATTESTATION_PATH,
+    INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
     RECEIPT_AUTHORITY_PATH,
     RECOVERY_EXECUTION_FACADE_PATH,
     RECOVERY_PRESTATE_ATTESTATION_PATH,
@@ -61,6 +62,14 @@ from controlgraph_canary.application.identity import (
     RouteAuthenticationPolicy,
     ServiceRole,
     protected_path,
+)
+from controlgraph_canary.application.independent_verification import (
+    IndependentVerificationError,
+    IndependentVerificationErrorCode,
+    IndependentVerificationService,
+)
+from controlgraph_canary.application.independent_verification_signing import (
+    IndependentVerificationSigningService,
 )
 from controlgraph_canary.application.operator_observability import (
     ApiOperatorObservationClient,
@@ -140,6 +149,11 @@ from controlgraph_canary.contracts.health_pipeline import (
     HealthEvaluationCommandV1,
     HealthEvaluationInvocationV1,
     VerifierHealthEvaluationRequestV1,
+)
+from controlgraph_canary.contracts.independent_verification import (
+    IndependentVerificationInvocationV1,
+    IndependentVerificationKind,
+    IndependentVerificationSigningRequestV1,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
 from controlgraph_canary.contracts.operator_observability import (
@@ -326,6 +340,15 @@ class ServiceClaimClassificationDenied(BaseModel):
     correlation_id: str
 
 
+class IndependentVerificationDenied(BaseModel):
+    """Payload-free independent verification failure."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 class OperatorObservationDenied(BaseModel):
     """Payload-free stable denial for one bounded operator observation."""
 
@@ -381,8 +404,15 @@ def create_service_app(
     api_recovery_abandonment_client: ApiRecoveryAbandonmentClient | None = None,
     coordinator_recovery_abandonment_relay: (CoordinatorRecoveryAbandonmentRelay | None) = None,
     service_claim_classification_service: (ServiceClaimClassificationService | None) = None,
+    independent_verification_service: IndependentVerificationService | None = None,
     classification_evidence_signing_service: (ClassificationEvidenceSigningService | None) = None,
     classification_evidence_authentication_policy: (RouteAuthenticationPolicy | None) = None,
+    independent_verification_signing_service: (
+        IndependentVerificationSigningService | None
+    ) = None,
+    independent_verification_evidence_authentication_policy: (
+        RouteAuthenticationPolicy | None
+    ) = None,
     health_attestation_signing_service: HealthAttestationSigningService | None = None,
     health_attestation_authentication_policy: RouteAuthenticationPolicy | None = None,
     recovery_prestate_signing_service: RecoveryPrestateSigningService | None = None,
@@ -464,6 +494,8 @@ def create_service_app(
         raise ValueError("recovery abandonment coordination is coordinator-limited")
     if service_claim_classification_service is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("claim classification is limited to the verifier route")
+    if independent_verification_service is not None and role is not ServiceRole.VERIFIER:
+        raise ValueError("independent verification is limited to the verifier route")
     if (classification_evidence_signing_service is None) != (
         classification_evidence_authentication_policy is None
     ):
@@ -477,6 +509,26 @@ def create_service_app(
         or classification_evidence_authentication_policy.caller.role is not CallerRole.VERIFIER
     ):
         raise ValueError("classification evidence is limited to the verifier-to-writer route")
+    if (independent_verification_signing_service is None) != (
+        independent_verification_evidence_authentication_policy is None
+    ):
+        raise ValueError(
+            "independent verification evidence service and policy must be configured together"
+        )
+    if independent_verification_signing_service is not None and (
+        role is not ServiceRole.EVIDENCE_WRITER
+        or type(independent_verification_evidence_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or independent_verification_evidence_authentication_policy.service_role
+        is not ServiceRole.EVIDENCE_WRITER
+        or independent_verification_evidence_authentication_policy.path
+        != INDEPENDENT_VERIFICATION_EVIDENCE_PATH
+        or independent_verification_evidence_authentication_policy.caller.role
+        is not CallerRole.VERIFIER
+    ):
+        raise ValueError(
+            "independent verification evidence is limited to the verifier-to-writer route"
+        )
     if (health_attestation_signing_service is None) != (
         health_attestation_authentication_policy is None
     ):
@@ -1073,6 +1125,7 @@ def create_service_app(
             or target_traffic_observation_service is not None
             or verifier_health_evaluation_service is not None
             or verifier_recovery_prestate_service is not None
+            or independent_verification_service is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -1123,6 +1176,26 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(prestate_result)
+                elif type(verifier_request) is IndependentVerificationInvocationV1:
+                    if independent_verification_service is None:
+                        raise IndependentVerificationError(
+                            IndependentVerificationErrorCode.CONFIGURATION_INVALID
+                        )
+                    if verifier_request.kind is IndependentVerificationKind.CONFIGURATION:
+                        verification_result = (
+                            await independent_verification_service.attest_configuration(
+                                verifier_request.verification,
+                                context,
+                            )
+                        )
+                    else:
+                        verification_result = (
+                            await independent_verification_service.attest_probe(
+                                verifier_request.verification,
+                                context,
+                            )
+                        )
+                    response_body = canonical_json_bytes(verification_result)
                 else:
                     if (
                         type(verifier_request)
@@ -1156,6 +1229,11 @@ def create_service_app(
                 return _health_pipeline_denial(error.code.value, correlation_id)
             except RecoveryExecutionError as error:
                 return _recovery_execution_denial(error.code.value, correlation_id)
+            except IndependentVerificationError as error:
+                return _independent_verification_denial(
+                    error.code.value,
+                    correlation_id,
+                )
             except ServiceClaimClassificationError as error:
                 return _service_claim_classification_denial(
                     error.code.value,
@@ -1463,6 +1541,67 @@ def create_service_app(
             headers={"X-ControlGraph-Correlation-Id": correlation_id},
         )
 
+    async def independent_verification_evidence_work(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        policy = independent_verification_evidence_authentication_policy
+        service = independent_verification_signing_service
+        if (
+            authenticator is None
+            or type(policy) is not RouteAuthenticationPolicy
+            or type(service) is not IndependentVerificationSigningService
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CONFIGURATION_INVALID,
+                correlation_id,
+            )
+        try:
+            authorization_header = authentication_header(request.headers, policy)
+            context = authenticator.authenticate(authorization_header, policy)
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if type(context) is not AuthenticationContext or context.role is not CallerRole.VERIFIER:
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            body = await _read_contract_body(request)
+            signing_request = decode_contract(
+                body,
+                IndependentVerificationSigningRequestV1,
+            )
+            signed = await service.sign(signing_request, context)
+            response_body = canonical_json_bytes(signed)
+        except asyncio.CancelledError:
+            raise
+        except ContractError as error:
+            return _independent_verification_denial(
+                error.code.value,
+                correlation_id,
+            )
+        except IndependentVerificationError as error:
+            return _independent_verification_denial(
+                error.code.value,
+                correlation_id,
+            )
+        except Exception:
+            return _independent_verification_denial(
+                IndependentVerificationErrorCode.UNAVAILABLE.value,
+                correlation_id,
+            )
+        return Response(
+            content=response_body,
+            status_code=200,
+            media_type="application/json",
+            headers={"X-ControlGraph-Correlation-Id": correlation_id},
+        )
+
     async def recovery_prestate_attestation_work(request: Request) -> Response:
         correlation_id = _correlation_id()
         policy = recovery_prestate_authentication_policy
@@ -1549,6 +1688,13 @@ def create_service_app(
         app.add_api_route(
             CLASSIFICATION_EVIDENCE_PATH,
             classification_evidence_work,
+            methods=["POST"],
+            include_in_schema=False,
+        )
+    if independent_verification_signing_service is not None:
+        app.add_api_route(
+            INDEPENDENT_VERIFICATION_EVIDENCE_PATH,
+            independent_verification_evidence_work,
             methods=["POST"],
             include_in_schema=False,
         )
@@ -1731,6 +1877,7 @@ def _decode_verifier_request(
     | TargetTrafficReadRequestV1
     | VerifierHealthEvaluationRequestV1
     | RecoveryPrestateRequestV1
+    | IndependentVerificationInvocationV1
     | ServiceClaimClassificationRequestV1
     | RecoveryAbandonmentClassificationRequestV1
 ):
@@ -1756,6 +1903,11 @@ def _decode_verifier_request(
             raise
     try:
         return decode_contract(body, RecoveryPrestateRequestV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, IndependentVerificationInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -2121,6 +2273,33 @@ def _service_claim_classification_denial(
     )
 
 
+def _independent_verification_denial(
+    code: str,
+    correlation_id: str,
+) -> JSONResponse:
+    response = IndependentVerificationDenied(
+        code=code,
+        correlation_id=correlation_id,
+    )
+    if code in {
+        ContractErrorCode.INVALID.value,
+        ContractErrorCode.VERSION_UNSUPPORTED.value,
+    }:
+        status_code = 400
+    elif code in {
+        IndependentVerificationErrorCode.CALLER_DENIED.value,
+        IndependentVerificationErrorCode.REQUEST_DENIED.value,
+    }:
+        status_code = 403
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
+    )
+
+
 def _receipt_authority_denial(code: str, correlation_id: str) -> JSONResponse:
     response = CanaryExecutionDenied(code=code, correlation_id=correlation_id)
     return JSONResponse(
@@ -2197,6 +2376,7 @@ __all__ = [
     "CapabilityDenied",
     "DisabledWork",
     "EvidenceSigningDenied",
+    "IndependentVerificationDenied",
     "OperatorObservationDenied",
     "RecoveryAbandonmentDenied",
     "RootCreationDenied",

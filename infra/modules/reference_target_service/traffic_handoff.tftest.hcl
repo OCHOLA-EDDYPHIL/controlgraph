@@ -20,7 +20,7 @@ run "create_safe_stable_baseline" {
   assert {
     condition = (
       length(google_cloud_run_v2_service.reference.traffic) == 1 &&
-      google_cloud_run_v2_service.reference.traffic[0].revision == "controlgraph-reference-target-stable-v3" &&
+      google_cloud_run_v2_service.reference.traffic[0].revision == "controlgraph-reference-target-stable-v4" &&
       google_cloud_run_v2_service.reference.traffic[0].percent == 100
     )
     error_message = "Initial creation must establish the explicit 100-percent stable baseline."
@@ -36,10 +36,10 @@ run "stage_candidate_without_reclaiming_traffic" {
 
   assert {
     condition = (
-      google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-candidate-v3" &&
+      google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-candidate-v4" &&
       google_cloud_run_v2_service.reference.template[0].containers[0].image == var.candidate_image &&
       length(google_cloud_run_v2_service.reference.traffic) == 1 &&
-      google_cloud_run_v2_service.reference.traffic[0].revision == "controlgraph-reference-target-stable-v3" &&
+      google_cloud_run_v2_service.reference.traffic[0].revision == "controlgraph-reference-target-stable-v4" &&
       google_cloud_run_v2_service.reference.traffic[0].percent == 100
     )
     error_message = "Candidate revision staging must leave the previously established traffic untouched."

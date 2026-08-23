@@ -90,6 +90,7 @@ VERIFIER_PREFLIGHT_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE",
     "CONTROLGRAPH_EVIDENCE_WRITER_URL",
     "CONTROLGRAPH_EVIDENCE_KEY_VERSION",
+    "CONTROLGRAPH_REFERENCE_TARGET_URL",
 )
 
 RUNTIME_ROLES = frozenset(role.value for role in ServiceRole)
@@ -163,6 +164,7 @@ class ControllerSettings:
     classification_evidence_caller_subject: str | None
     target_network_resource: str | None
     target_subnetwork_resource: str | None
+    reference_target_url: str | None
     coordinator_url: str | None
     candidate_revision_configuration_sha256: str | None
     operator_identity: str | None
@@ -244,6 +246,7 @@ class ControllerSettings:
         classification_evidence_caller_subject: str | None = None
         target_network_resource: str | None = None
         target_subnetwork_resource: str | None = None
+        reference_target_url: str | None = None
         coordinator_url: str | None = None
         candidate_revision_configuration_sha256: str | None = None
         operator_identity: str | None = None
@@ -415,6 +418,8 @@ class ControllerSettings:
                 ServiceRole.EVIDENCE_WRITER,
                 project_number,
             )
+            reference_target_url = source["CONTROLGRAPH_REFERENCE_TARGET_URL"].strip()
+            _validate_reference_target_url(reference_target_url, project_number)
         if service_role is ServiceRole.VERIFIER or executor_enabled:
             target_network_resource = source["CONTROLGRAPH_TARGET_NETWORK_RESOURCE"].strip()
             target_subnetwork_resource = source["CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE"].strip()
@@ -461,6 +466,7 @@ class ControllerSettings:
             classification_evidence_caller_subject=(classification_evidence_caller_subject),
             target_network_resource=target_network_resource,
             target_subnetwork_resource=target_subnetwork_resource,
+            reference_target_url=reference_target_url,
             coordinator_url=coordinator_url,
             candidate_revision_configuration_sha256=(candidate_revision_configuration_sha256),
             operator_identity=operator_identity,
@@ -499,6 +505,29 @@ def _validate_target_resource(value: str, *, prefix: str) -> None:
         or "reconcile" in value.lower()
     ):
         raise ValueError("verifier target network resource is invalid")
+
+
+def _validate_reference_target_url(value: str, project_number: str) -> None:
+    expected = (
+        f"https://controlgraph-reference-target-{project_number}"
+        ".us-central1.run.app"
+    )
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("reference target URL is invalid") from None
+    if (
+        value != expected
+        or parsed.scheme != "https"
+        or parsed.netloc != parsed.hostname
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+        or value.endswith("/")
+    ):
+        raise ValueError("reference target URL is invalid")
 
 
 def _validate_task_caller(
