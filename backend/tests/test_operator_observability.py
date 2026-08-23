@@ -15,6 +15,7 @@ from test_root_trust import (
     PROJECT_NUMBER,
     STABLE,
     STABLE_CONFIGURATION,
+    _CapabilityKmsClient,
     _revision,
     _service,
     _target,
@@ -1061,7 +1062,7 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
         ServiceRole.COORDINATOR,
         environment=_runtime_environment(ServiceRole.COORDINATOR),
         internal_transport=_Transport(b"unused"),
-        kms_client=object(),
+        kms_client=_CapabilityKmsClient(),
         authority_store=cast(AuthorityStore, _RuntimeStore(None)),
         task_enqueuer=cast(TaskEnqueuer, _NeverTaskEnqueuer()),
     )

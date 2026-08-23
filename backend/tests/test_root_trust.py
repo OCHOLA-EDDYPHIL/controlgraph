@@ -526,6 +526,34 @@ class _KmsClient:
         )
 
 
+class _CapabilityKmsClient:
+    def __init__(self) -> None:
+        self.version_requests: list[dict[str, object]] = []
+        self.public_key_requests: list[dict[str, object]] = []
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        self.pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("ascii")
+
+    def get_crypto_key_version(self, request: dict[str, object]) -> object:
+        self.version_requests.append(request)
+        return SimpleNamespace(
+            name=CAPABILITY_KEY_VERSION,
+            state="ENABLED",
+            algorithm="EC_SIGN_P256_SHA256",
+        )
+
+    def get_public_key(self, request: dict[str, object]) -> object:
+        self.public_key_requests.append(request)
+        return SimpleNamespace(
+            name=CAPABILITY_KEY_VERSION,
+            algorithm="EC_SIGN_P256_SHA256",
+            pem=self.pem,
+            pem_crc32c=google_crc32c.value(self.pem.encode("ascii")),
+        )
+
+
 def test_preflight_contract_is_canonical_self_binding_and_rejects_substitution() -> None:
     request = _request()
     result = _result(request)
@@ -923,7 +951,7 @@ class _UnusedTaskEnqueuer:
         raise AssertionError("settings composition must not enqueue a task")
 
 
-def test_coordinator_runtime_composes_a_credential_lazy_exact_release_gate() -> None:
+def test_coordinator_runtime_composes_exact_release_gate_with_mutations_disabled() -> None:
     environment = _coordinator_environment()
     settings = ControllerSettings.from_environment(environment)
     assert settings.verifier_url == VERIFIER_AUDIENCE
@@ -931,14 +959,21 @@ def test_coordinator_runtime_composes_a_credential_lazy_exact_release_gate() -> 
     assert settings.evidence_key_version == EVIDENCE_KEY_VERSION
 
     transport = _Transport(b"{}")
+    kms = _CapabilityKmsClient()
     app = create_runtime_service_app(
         ServiceRole.COORDINATOR,
         environment=environment,
         internal_transport=transport,
-        kms_client=object(),
+        kms_client=kms,
         task_enqueuer=_UnusedTaskEnqueuer(),
     )
     assert isinstance(app.state.controlgraph_trust_clients, CoordinatorTrustClients)
+    assert not settings.mutations_enabled
+    completion_workflow = app.state.controlgraph_completion_workflow
+    assert completion_workflow._signed_intent_reader is not None
+    assert completion_workflow._signed_intent_verifier is not None
+    assert kms.version_requests == [{"name": CAPABILITY_KEY_VERSION}]
+    assert kms.public_key_requests == [{"name": CAPABILITY_KEY_VERSION}]
     assert isinstance(
         app.state.controlgraph_root_creation_relay,
         CoordinatorRootCreationRelay,

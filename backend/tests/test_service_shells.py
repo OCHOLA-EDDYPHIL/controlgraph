@@ -10,7 +10,9 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
+from test_root_trust import _CapabilityKmsClient
 
+import controlgraph_canary.integrations.google.kms as kms_module
 from controlgraph_canary.application.identity import (
     AuthenticationContext,
     AuthenticationDenialCode,
@@ -301,6 +303,8 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
 ) -> None:
     for key, value in _environment(role).items():
         monkeypatch.setenv(key, value)
+    if role is ServiceRole.COORDINATOR:
+        monkeypatch.setattr(kms_module, "_default_client", _CapabilityKmsClient)
     module = importlib.import_module(module_name)
     client = TestClient(module.app)
 

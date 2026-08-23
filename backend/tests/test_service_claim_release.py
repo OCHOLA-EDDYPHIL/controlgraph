@@ -6,6 +6,18 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from root_v2_test_data import PROJECT_NUMBER, make_root_v3_records, root_v2_target
+from test_completion_workflow import (
+    _IntentReader as _CompletionIntentReader,
+)
+from test_completion_workflow import (
+    _IntentVerifier as _CompletionIntentVerifier,
+)
+from test_completion_workflow import (
+    _receipt as _completion_receipt,
+)
+from test_completion_workflow import (
+    _Verifier as _CompletionVerifier,
+)
 from test_m2_firestore_authority_store import (
     _FakeClient,
     _FakeTransactionRunner,
@@ -650,6 +662,119 @@ def test_release_rejects_ambiguous_shared_completion_classification() -> None:
     assert classification.calls == []
     assert store.state.root_bundle is not None
     assert store.state.root_bundle.service_claim.value.status is ServiceClaimStatus.RELEASING
+
+
+def test_delayed_exact_release_replay_reverifies_without_a_second_fence() -> None:
+    _, _, old_receipt, signed_intent = _completion_receipt(
+        CapabilityAction.PROMOTE_CANDIDATE,
+        day="2026-08-20",
+    )
+    original = _invocation()
+    invocation = original.model_copy(
+        update={
+            "command": original.command.model_copy(
+                update={
+                    "terminal_receipt_idempotency_key": old_receipt.idempotency_key,
+                }
+            )
+        }
+    )
+    store = _Store(invocation)
+    store.state = replace(
+        store.state,
+        terminal_receipt=StoredRecord(old_receipt, 2),
+    )
+    verification_time = [NOW]
+    verifier = _CompletionVerifier(unavailable=True)
+    workflow = CoordinatorCompletionWorkflow(
+        target=store.target,
+        verifier=verifier,
+        classifier=CoordinatorCompletionClassificationService(target=store.target),
+        signed_intent_reader=_CompletionIntentReader(signed_intent, store.target),
+        signed_intent_verifier=_CompletionIntentVerifier(),
+        clock=lambda: verification_time[0],
+    )
+    initial, _, _ = _releaser(store, completion_workflow=workflow)
+
+    with pytest.raises(ServiceClaimReleaseError) as failure:
+        asyncio.run(initial.release(invocation, principal=_principal()))
+
+    assert failure.value.code is ServiceClaimReleaseFailureCode.CLASSIFICATION_DENIED
+    assert len(store.fence_commits) == 1
+    assert store.finalize_commits == []
+
+    replayed_at = NOW + timedelta(seconds=601)
+    verification_time[0] = replayed_at
+    verifier.unavailable = False
+    replay_principal = AuthenticationContext(
+        role=CallerRole.OPERATOR,
+        email=OPERATOR,
+        subject=OPERATOR_SUBJECT,
+        issuer="https://accounts.google.com",
+        audience=_api_audience(),
+        issued_at=int(replayed_at.timestamp()) - 60,
+        expires_at=int(replayed_at.timestamp()) + 600,
+    )
+    replay_invocation = ServiceClaimReleaseInvocationV1(
+        schema_version=SERVICE_CLAIM_RELEASE_INVOCATION_V1,
+        command=invocation.command,
+        attempt_id="release-attempt-002",
+        operator_identity=replay_principal.email,
+        operator_subject=replay_principal.subject,
+        operator_issuer=replay_principal.issuer,
+        operator_audience=replay_principal.audience,
+        operator_issued_at=replay_principal.issued_at,
+        operator_expires_at=replay_principal.expires_at,
+    )
+    key = make_root_v3_records().root.content.evidence_signing_key_version
+    replay_times = iter((replayed_at, replayed_at + timedelta(seconds=2)))
+    replay = ServiceClaimReleaser(
+        store=store,
+        evidence_client=_EvidenceClient(key),
+        classification_client=_ClassificationClient(key),
+        operator_policy=_policy(),
+        completion_workflow=workflow,
+        clock=lambda: next(replay_times),
+    )
+
+    result = asyncio.run(replay.release(replay_invocation, principal=replay_principal))
+
+    assert service_claim_release_request_sha256(replay_invocation) == (
+        service_claim_release_request_sha256(invocation)
+    )
+    assert store.state.root_bundle is not None
+    assert store.state.root_bundle.service_claim.value.status is ServiceClaimStatus.RELEASED
+    assert len(store.fence_commits) == 1
+    assert len(store.finalize_commits) == 1
+    assert store.state.result is not None
+    assert result == store.state.result.value
+    assert store.state.terminal_receipt == StoredRecord(old_receipt, 2)
+    assert len(verifier.calls) == 4
+    assert all(
+        (
+            call.verification.root_id,
+            call.verification.root_sha256,
+            call.verification.epoch,
+            call.verification.target,
+            call.verification.plan_sha256,
+            call.verification.action,
+            call.verification.request_id,
+            call.verification.signed_intent_sha256,
+            call.verification.observation_window_started_at,
+        )
+        == (
+            old_receipt.root_id,
+            old_receipt.root_sha256,
+            old_receipt.epoch,
+            old_receipt.target,
+            old_receipt.plan_sha256,
+            old_receipt.action,
+            old_receipt.request_id,
+            old_receipt.capability_sha256,
+            "2026-08-20T15:10:01Z",
+        )
+        for call in verifier.calls[-2:]
+    )
 
 
 def test_release_fences_classifies_and_atomically_persists_exact_chain() -> None:
