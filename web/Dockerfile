@@ -14,7 +14,7 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 COPY --from=build /web/dist ./dist
-COPY host.mjs ./host.mjs
+COPY --chown=node:node --chmod=0444 host.mjs ./host.mjs
 
 USER node
 EXPOSE 8080
