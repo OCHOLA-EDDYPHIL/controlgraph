@@ -38,6 +38,7 @@ from test_recovery_abandonment import (
     _signed_event,
     _Store,
 )
+from test_root_trust import _CapabilityKmsClient
 from test_service_claim_classification import (
     _classification_policy,
     _DigestBackend,
@@ -607,7 +608,7 @@ def test_runtime_composes_abandonment_across_all_four_service_roles() -> None:
         ServiceRole.COORDINATOR,
         environment=_runtime_environment(ServiceRole.COORDINATOR),
         internal_transport=_Transport(b"unused"),
-        kms_client=object(),
+        kms_client=_CapabilityKmsClient(),
         authority_store=cast(AuthorityStore, _RuntimeAbandonmentStore(None)),
         task_enqueuer=cast(TaskEnqueuer, _NeverTaskEnqueuer()),
     )

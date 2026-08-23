@@ -12,12 +12,13 @@ locals {
     firestore_writer = {
       role_id     = "controlgraph.firestoreAuthorityWriter"
       title       = "ControlGraph Firestore authority writer"
-      description = "Create and update authority records and delete only application-expired raw evidence."
+      description = "Create, query, and update authority records and delete only application-expired raw evidence."
       permissions = [
         "datastore.databases.get",
         "datastore.entities.create",
         "datastore.entities.delete",
         "datastore.entities.get",
+        "datastore.entities.list",
         "datastore.entities.update",
       ]
     }
@@ -117,6 +118,20 @@ check "run_snapshot_reader_is_get_only" {
       "run.services.get",
     ])
     error_message = "The snapshot reader role must contain only exact Cloud Run get permissions."
+  }
+}
+
+check "firestore_writer_supports_bounded_retention_queries" {
+  assert {
+    condition = toset(local.custom_iam_roles.firestore_writer.permissions) == toset([
+      "datastore.databases.get",
+      "datastore.entities.create",
+      "datastore.entities.delete",
+      "datastore.entities.get",
+      "datastore.entities.list",
+      "datastore.entities.update",
+    ])
+    error_message = "The Firestore writer role must support bounded retention queries without broader database permissions."
   }
 }
 

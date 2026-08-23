@@ -1284,17 +1284,13 @@ def create_runtime_service_app(
                 target=target,
             )
         )
-        completion_intent_verifier = (
-            TrustBundleCapabilityVerifier(
-                GoogleKmsCapabilityTrustLoader(
-                    project_id=settings.project_id,
-                    service_role=ServiceRole.COORDINATOR,
-                    key_version=settings.capability_key_version,
-                    client=kms_client,
-                ).load()
-            )
-            if settings.mutations_enabled
-            else None
+        completion_intent_verifier = TrustBundleCapabilityVerifier(
+            GoogleKmsCapabilityTrustLoader(
+                project_id=settings.project_id,
+                service_role=ServiceRole.COORDINATOR,
+                key_version=settings.capability_key_version,
+                client=kms_client,
+            ).load()
         )
         selected_store = (
             authority_store
@@ -1320,9 +1316,7 @@ def create_runtime_service_app(
                 if stale_authority_reader is not None
                 else None
             ),
-            signed_intent_reader=(
-                timeline_store if completion_intent_verifier is not None else None
-            ),
+            signed_intent_reader=timeline_store,
             signed_intent_verifier=completion_intent_verifier,
         )
         health_chain_store = FirestoreHealthChainStore(
