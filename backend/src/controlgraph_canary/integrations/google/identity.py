@@ -29,6 +29,7 @@ _JWT_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
 _GOOGLE_OAUTH_CLIENT_AUDIENCE = re.compile(
     r"^[0-9]{6,32}(?:-[a-z0-9]{6,128})?\.apps\.googleusercontent\.com$"
 )
+_OPERATOR_SESSION_NONCE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 class IdentityTokenVerifier(Protocol):
@@ -219,6 +220,15 @@ class GoogleIdentityVerifier:
             ):
                 raise _denied(AuthenticationDenialCode.TOKEN_LIFETIME_DENIED)
 
+            operator_session_nonce: str | None = None
+            if policy.caller.role is CallerRole.OPERATOR and claims.get("nonce") is not None:
+                operator_session_nonce = _bounded_ascii(
+                    claims.get("nonce"),
+                    maximum=43,
+                )
+                if _OPERATOR_SESSION_NONCE.fullmatch(operator_session_nonce) is None:
+                    raise _denied(AuthenticationDenialCode.CREDENTIAL_INVALID)
+
             return AuthenticationContext(
                 role=policy.caller.role,
                 email=verified_email,
@@ -227,6 +237,7 @@ class GoogleIdentityVerifier:
                 audience=route_audience,
                 issued_at=issued_at,
                 expires_at=expires_at,
+                operator_session_nonce=operator_session_nonce,
             )
         except AuthenticationError:
             raise

@@ -339,9 +339,25 @@ class _RecordingEnqueuer:
         )
 
 
+class _TimelineRecorder:
+    target = _target()
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[SignedCapability, bool]] = []
+
+    async def record_signed_capability(
+        self,
+        signed: SignedCapability,
+        *,
+        signature_verified: bool,
+    ) -> None:
+        self.calls.append((signed, signature_verified))
+
+
 def _rollout_coordinator(
     capability_client: _CapabilityClient,
     enqueuer: _RecordingEnqueuer,
+    timeline_recorder: _TimelineRecorder | None = None,
 ) -> CanaryRolloutCoordinator:
     return CanaryRolloutCoordinator(
         target=_target(),
@@ -351,6 +367,7 @@ def _rollout_coordinator(
             enqueuer,
         ),
         clock=lambda: NOW,
+        timeline_recorder=timeline_recorder,
     )
 
 
@@ -565,6 +582,22 @@ def test_coordinator_derives_exact_task_only_from_signed_claims() -> None:
     assert result.candidate_percent == 10
     assert result.task_name == addressed.name
     assert result.enqueue_disposition == TaskEnqueueDisposition.CREATED.value
+
+
+def test_coordinator_records_issued_capability_without_claiming_signature_verification() -> None:
+    capability = _capability()
+    recorder = _TimelineRecorder()
+    enqueuer = _RecordingEnqueuer()
+    coordinator = _rollout_coordinator(
+        _CapabilityClient(capability),
+        enqueuer,
+        timeline_recorder=recorder,
+    )
+
+    asyncio.run(coordinator.dispatch(_command()))
+
+    assert recorder.calls == [(capability, False)]
+    assert len(enqueuer.calls) == 1
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ from controlgraph_canary.application.root_relay import (
     ApiRootCreationClient,
     CoordinatorRootCreationRelay,
 )
+from controlgraph_canary.application.timeline import TimelineRetentionService
 from controlgraph_canary.http.identity_headers import (
     CONTROLGRAPH_AUTHORIZATION_HEADER,
     SERVERLESS_AUTHORIZATION_HEADER,
@@ -160,6 +161,13 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
                     "32555940559.apps.googleusercontent.com"
                 ),
+                "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN": (
+                    f"https://controlgraph-console-{PROJECT_NUMBER}.us-central1.run.app"
+                ),
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
             }
         )
     if role is ServiceRole.COORDINATOR:
@@ -189,6 +197,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
                 "CONTROLGRAPH_OPERATOR_EMAIL": "operator@example.com",
                 "CONTROLGRAPH_OPERATOR_SUBJECT": SUBJECT,
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
                 "CONTROLGRAPH_EXECUTOR_URL": (
                     f"https://controlgraph-executor-{PROJECT_NUMBER}."
                     "us-central1.run.app"
@@ -213,6 +225,10 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
                 ),
                 "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT": SUBJECT,
+                "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL": (
+                    f"cg-retention-sweeper@{PROJECT_ID}.iam.gserviceaccount.com"
+                ),
+                "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT": SUBJECT,
             }
         )
     if role is ServiceRole.VERIFIER:
@@ -305,6 +321,10 @@ def test_each_service_role_has_identity_safe_health_and_metadata(
         assert isinstance(
             module.app.state.controlgraph_promotion_relay,
             CoordinatorPromotionRelay,
+        )
+        assert isinstance(
+            module.app.state.controlgraph_timeline_retention,
+            TimelineRetentionService,
         )
 
     health = client.get("/healthz")

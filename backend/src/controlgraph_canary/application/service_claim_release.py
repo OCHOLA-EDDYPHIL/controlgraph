@@ -37,6 +37,11 @@ from controlgraph_canary.contracts.evidence import (
     EVIDENCE_CHAIN_HEAD_V1,
     EvidenceChainHeadV1,
 )
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionClassificationV1,
+    CompletionKind,
+    CompletionStatus,
+)
 from controlgraph_canary.contracts.models import (
     EPOCH_AUTHORITY_V1,
     EVIDENCE_EVENT_V1,
@@ -49,7 +54,11 @@ from controlgraph_canary.contracts.models import (
     ReceiptOutcome,
     TargetBinding,
 )
-from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
+from controlgraph_canary.contracts.root_creation import (
+    RolloutRootV2,
+    RolloutRootV3,
+    SignedEvidenceEventV1,
+)
 from controlgraph_canary.contracts.service_claim_release import (
     SERVICE_CLAIM_FENCE_EVIDENCE_SUBJECT_V1,
     SERVICE_CLAIM_RELEASE_EVIDENCE_SUBJECT_V1,
@@ -119,6 +128,22 @@ class ServiceClaimReleaseClassificationClient(Protocol):
     ) -> ServiceClaimClassificationAttestationV1: ...
 
 
+@runtime_checkable
+class ServiceClaimCompletionWorkflow(Protocol):
+    """Shared terminal classifier required by production release composition."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def classify_completion(
+        self,
+        *,
+        root: RolloutRootV2 | RolloutRootV3,
+        service_claim: ServiceClaimRecord,
+        receipt: ExecutionReceipt,
+    ) -> CompletionClassificationV1: ...
+
+
 class ServiceClaimReleaser:
     """Fence, classify, and release only one explicit authenticated request."""
 
@@ -129,6 +154,7 @@ class ServiceClaimReleaser:
         evidence_client: ServiceClaimReleaseEvidenceClient,
         classification_client: ServiceClaimReleaseClassificationClient,
         operator_policy: RouteAuthenticationPolicy,
+        completion_workflow: ServiceClaimCompletionWorkflow | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
@@ -142,12 +168,23 @@ class ServiceClaimReleaser:
             or operator_policy.service_role is not ServiceRole.API
             or operator_policy.caller.role is not CallerRole.OPERATOR
             or operator_policy.project_id != store.target.project_id
+            or (
+                completion_workflow is not None
+                and (
+                    not isinstance(
+                        completion_workflow,
+                        ServiceClaimCompletionWorkflow,
+                    )
+                    or completion_workflow.target != store.target
+                )
+            )
             or (clock is not None and not callable(clock))
         ):
             raise TypeError("service-claim release configuration is invalid")
         self._store = store
         self._evidence_client = evidence_client
         self._classification_client = classification_client
+        self._completion_workflow = completion_workflow
         self._operator_policy = operator_policy
         self._clock = clock or _system_utc_second
         self._lock = asyncio.Lock()
@@ -597,6 +634,43 @@ class ServiceClaimReleaser:
             terminal.state,
             claim,
         )
+        receipt_record = state.terminal_receipt
+        if (
+            type(receipt_record) is not StoredRecord
+            or type(receipt_record.value) is not ExecutionReceipt
+        ):
+            raise ServiceClaimReleaseError(
+                ServiceClaimReleaseFailureCode.TERMINAL_RECEIPT_INVALID
+            )
+        completion_workflow = self._completion_workflow
+        if completion_workflow is not None:
+            try:
+                completion = await completion_workflow.classify_completion(
+                    root=trusted.root,
+                    service_claim=claim,
+                    receipt=receipt_record.value,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise ServiceClaimReleaseError(
+                    ServiceClaimReleaseFailureCode.CLASSIFICATION_DENIED
+                ) from None
+            expected_kind = {
+                CapabilityAction.PROMOTE_CANDIDATE: CompletionKind.PROMOTION,
+                CapabilityAction.RECOVER_STABLE: CompletionKind.RECOVERY,
+            }.get(receipt_record.value.action)
+            if (
+                type(completion) is not CompletionClassificationV1
+                or completion.status is not CompletionStatus.COMPLETE
+                or completion.request.kind is not expected_kind
+                or completion.request.verification.root_id != trusted.root.root_id
+                or completion.request.verification.service_claim_sha256
+                != canonical_sha256(claim)
+            ):
+                raise ServiceClaimReleaseError(
+                    ServiceClaimReleaseFailureCode.CLASSIFICATION_DENIED
+                )
         classification_request = ServiceClaimClassificationRequestV1(
             schema_version="controlgraph.service-claim-classification-request/v1",
             root_id=trusted.root.root_id,

@@ -99,6 +99,21 @@ class ApplyCanaryCoordinator(Protocol):
     ) -> CanaryDispatchResultV1: ...
 
 
+@runtime_checkable
+class CapabilityTimelineRecorder(Protocol):
+    """Record an issuer-authenticated capability without claiming signature verification."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def record_signed_capability(
+        self,
+        signed: SignedCapability,
+        *,
+        signature_verified: bool,
+    ) -> None: ...
+
+
 class CapabilityIssuanceService:
     """Authenticate the coordinator and invoke the root-derived capability issuer."""
 
@@ -306,6 +321,7 @@ class CanaryRolloutCoordinator:
         capability_client: ApplyCanaryCapabilityClient,
         task_dispatcher: TaskDispatcher,
         clock: Callable[[], datetime] | None = None,
+        timeline_recorder: CapabilityTimelineRecorder | None = None,
     ) -> None:
         if (
             type(target) is not TargetBinding
@@ -316,12 +332,20 @@ class CanaryRolloutCoordinator:
             or not isinstance(capability_client, ApplyCanaryCapabilityClient)
             or type(task_dispatcher) is not TaskDispatcher
             or (clock is not None and not callable(clock))
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(timeline_recorder, CapabilityTimelineRecorder)
+                    or timeline_recorder.target != target
+                )
+            )
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.CONFIGURATION_INVALID)
         self._target = target
         self._capability_client = capability_client
         self._task_dispatcher = task_dispatcher
         self._clock = clock or _now_utc_second
+        self._timeline_recorder = timeline_recorder
 
     async def dispatch(
         self,
@@ -345,6 +369,11 @@ class CanaryRolloutCoordinator:
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
         try:
+            if self._timeline_recorder is not None:
+                await self._timeline_recorder.record_signed_capability(
+                    capability,
+                    signature_verified=False,
+                )
             intent = MutationIntent(
                 schema_version="controlgraph.mutation-intent/v1",
                 request_id=claims.request_id,
@@ -606,6 +635,7 @@ __all__ = [
     "CanaryExecutionErrorCode",
     "CanaryRolloutCoordinator",
     "CapabilityIssuanceService",
+    "CapabilityTimelineRecorder",
     "CoordinatorCanaryRelay",
     "CoordinatorCapabilityClient",
 ]

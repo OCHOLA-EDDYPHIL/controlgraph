@@ -29,6 +29,9 @@ from controlgraph_canary.application.signing import (
     SigningProfile,
     SigningPurpose,
 )
+from controlgraph_canary.application.timeline_recording import (
+    IndependentVerificationTimelineRecorder,
+)
 from controlgraph_canary.contracts.codec import (
     ContractError,
     canonical_json_bytes,
@@ -253,6 +256,7 @@ class CoordinatorIndependentVerificationClient:
         transport: CanonicalInternalTransport,
         signature_verifier: IndependentVerificationSignatureVerifier,
         clock: Callable[[], datetime] | None = None,
+        timeline_recorder: IndependentVerificationTimelineRecorder | None = None,
     ) -> None:
         if (
             type(route) is not CoordinatorInternalRoute
@@ -266,6 +270,16 @@ class CoordinatorIndependentVerificationClient:
             )
             or signature_verifier.project_id != route.project_id
             or (clock is not None and not callable(clock))
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(
+                        timeline_recorder,
+                        IndependentVerificationTimelineRecorder,
+                    )
+                    or timeline_recorder.target.project_id != route.project_id
+                )
+            )
         ):
             raise IndependentVerificationError(
                 IndependentVerificationErrorCode.CONFIGURATION_INVALID
@@ -274,6 +288,7 @@ class CoordinatorIndependentVerificationClient:
         self._transport = transport
         self._signature_verifier = signature_verifier
         self._clock = clock or _system_utc_second
+        self._timeline_recorder = timeline_recorder
 
     async def attest(
         self,
@@ -284,6 +299,10 @@ class CoordinatorIndependentVerificationClient:
         if (
             type(invocation) is not IndependentVerificationInvocationV1
             or invocation.verification.target.project_id != self._route.project_id
+            or (
+                self._timeline_recorder is not None
+                and self._timeline_recorder.target != invocation.verification.target
+            )
         ):
             raise IndependentVerificationError(
                 IndependentVerificationErrorCode.REQUEST_DENIED
@@ -323,7 +342,7 @@ class CoordinatorIndependentVerificationClient:
         try:
             await self._signature_verifier.verify(attestation.signed_evidence)
             verified_at = _timestamp(self._clock())
-            return VerifiedIndependentVerificationEvidenceV1(
+            verified = VerifiedIndependentVerificationEvidenceV1(
                 schema_version=VERIFIED_INDEPENDENT_VERIFICATION_EVIDENCE_V1,
                 signing_request=signing_request,
                 signed_evidence=attestation.signed_evidence,
@@ -335,6 +354,17 @@ class CoordinatorIndependentVerificationClient:
             raise IndependentVerificationError(
                 IndependentVerificationErrorCode.RESPONSE_INVALID
             ) from None
+        recorder = self._timeline_recorder
+        if recorder is not None:
+            try:
+                await recorder.record_independent_verification(verified)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise IndependentVerificationError(
+                    IndependentVerificationErrorCode.UNAVAILABLE
+                ) from None
+        return verified
 
 
 def _is_canonical_p256_der_signature(value: object) -> bool:

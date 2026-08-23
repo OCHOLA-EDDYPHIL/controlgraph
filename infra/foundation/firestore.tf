@@ -1,5 +1,10 @@
 locals {
-  firestore_database_id = "controlgraph-authority"
+  firestore_database_id       = "controlgraph-authority"
+  timeline_raw_collection     = "controlgraph_timeline_raw"
+  timeline_raw_expiry_field   = "expires_at"
+  timeline_raw_retention_days = 30
+  signed_intent_collection    = "controlgraph_signed_intents"
+  signed_intent_expiry_field  = "expires_at"
 
   firestore_readers = toset([
     "issuer",
@@ -14,6 +19,20 @@ locals {
     "resource.name == '${local.firestore_database_resource}'",
     "resource.name.startsWith('${local.firestore_database_resource}/documents/')",
   ])
+}
+
+check "timeline_raw_retention_is_bounded" {
+  assert {
+    condition = (
+      local.timeline_raw_collection == "controlgraph_timeline_raw" &&
+      local.timeline_raw_expiry_field == "expires_at" &&
+      local.timeline_raw_retention_days == 30 &&
+      local.signed_intent_collection == "controlgraph_signed_intents" &&
+      !contains(local.firestore_readers, "api") &&
+      !contains(local.firestore_writers, "api")
+    )
+    error_message = "Raw evidence retention and signed-intent TTL must remain bounded and inaccessible to the API identity."
+  }
 }
 
 check "coordinator_is_the_only_firestore_writer" {
@@ -75,6 +94,61 @@ resource "google_project_iam_member" "firestore_coordinator_writer" {
     title       = "controlgraph_coordinator_authority_database"
     description = "Write the authority database only through the coordinator facade."
     expression  = local.firestore_database_condition
+  }
+
+  depends_on = [google_firestore_database.authority]
+}
+
+resource "google_firestore_field" "timeline_raw_expiry" {
+  project    = var.project_id
+  database   = google_firestore_database.authority.name
+  collection = local.timeline_raw_collection
+  field      = local.timeline_raw_expiry_field
+
+  index_config {}
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_firestore_database.authority]
+}
+
+resource "google_firestore_index" "timeline_raw_retention" {
+  project     = var.project_id
+  database    = google_firestore_database.authority.name
+  collection  = local.timeline_raw_collection
+  query_scope = "COLLECTION"
+
+  fields {
+    field_path = "target_sha256"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = local.timeline_raw_expiry_field
+    order      = "ASCENDING"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_firestore_database.authority]
+}
+
+resource "google_firestore_field" "signed_intent_expiry" {
+  project    = var.project_id
+  database   = google_firestore_database.authority.name
+  collection = local.signed_intent_collection
+  field      = local.signed_intent_expiry_field
+
+  ttl_config {}
+
+  index_config {}
+
+  lifecycle {
+    prevent_destroy = true
   }
 
   depends_on = [google_firestore_database.authority]

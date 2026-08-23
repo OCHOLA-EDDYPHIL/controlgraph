@@ -16,6 +16,7 @@ from controlgraph_canary.application.authority_store import (
     AuthorityStoreUnavailable,
     StoredRecord,
 )
+from controlgraph_canary.application.completion_workflow import VerifiedTargetObservation
 from controlgraph_canary.application.health_orchestration import (
     HealthAttestationVerifier,
     HealthOrchestrationError,
@@ -45,6 +46,7 @@ from controlgraph_canary.application.root_trust import (
     CanonicalInternalTransport,
     CoordinatorInternalRoute,
 )
+from controlgraph_canary.application.timeline_recording import TimelineProjectionRecorder
 from controlgraph_canary.contracts.codec import (
     ContractError,
     canonical_json_bytes,
@@ -84,7 +86,7 @@ from controlgraph_canary.contracts.recovery_execution import (
     create_unhealthy_recovery_command,
 )
 from controlgraph_canary.contracts.root_creation import RolloutRootV3
-from controlgraph_canary.contracts.storage import ServiceClaimStatus
+from controlgraph_canary.contracts.storage import ServiceClaimRecord, ServiceClaimStatus
 
 _CONTROLGRAPH_PROJECT = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _REFERENCE_SERVICE = "controlgraph-reference-target"
@@ -111,6 +113,9 @@ class HealthPipelineErrorCode(StrEnum):
     RESPONSE_INVALID = "HEALTH_PIPELINE_RESPONSE_INVALID"
     RESULT_INVALID = "HEALTH_PIPELINE_RESULT_INVALID"
     RECOVERY_UNAVAILABLE = "HEALTH_PIPELINE_RECOVERY_UNAVAILABLE"
+    INDEPENDENT_VERIFICATION_AMBIGUOUS = (
+        "HEALTH_PIPELINE_INDEPENDENT_VERIFICATION_AMBIGUOUS"
+    )
 
 
 class HealthPipelineError(RuntimeError):
@@ -161,6 +166,22 @@ class HealthEvaluationVerifier(Protocol):
     async def verify(self, signed_proof: SignedHealthDecisionProofV1) -> None: ...
 
 
+@runtime_checkable
+class HealthTargetVerificationWorkflow(Protocol):
+    """Independent configuration and serving-revision gate for health input."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def verify_target(
+        self,
+        *,
+        root: RolloutRootV3,
+        service_claim: ServiceClaimRecord,
+        receipt: ExecutionReceipt,
+    ) -> VerifiedTargetObservation: ...
+
+
 class VerifierHealthProofServiceFactory(Protocol):
     """Build one root-and-anchor-bound stateless verifier service."""
 
@@ -176,6 +197,8 @@ class VerifierHealthProofServiceFactory(Protocol):
 class _TrustedHealthInputs:
     root: RolloutRootV3
     root_revision: int
+    service_claim: ServiceClaimRecord
+    service_claim_revision: int
     authority_revision: int
     receipt: StoredRecord[ExecutionReceipt]
     anchor: PostApplyHealthAnchorV1
@@ -389,6 +412,8 @@ class CoordinatorHealthEvaluationService:
         health_store: HealthChainStore,
         verifier: HealthEvaluationVerifier,
         recovery_coordinator: RecoveryCoordinator,
+        target_verification_workflow: HealthTargetVerificationWorkflow | None = None,
+        timeline_recorder: TimelineProjectionRecorder | None = None,
     ) -> None:
         if (
             not _target_is_exact(target)
@@ -407,6 +432,23 @@ class CoordinatorHealthEvaluationService:
             or not isinstance(health_store, HealthChainStore)
             or not isinstance(verifier, HealthEvaluationVerifier)
             or not isinstance(recovery_coordinator, RecoveryCoordinator)
+            or (
+                target_verification_workflow is not None
+                and (
+                    not isinstance(
+                        target_verification_workflow,
+                        HealthTargetVerificationWorkflow,
+                    )
+                    or target_verification_workflow.target != target
+                )
+            )
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(timeline_recorder, TimelineProjectionRecorder)
+                    or timeline_recorder.target != target
+                )
+            )
             or authority_reader.target != target
             or receipt_reader.target != target
             or health_store.target != target
@@ -421,6 +463,8 @@ class CoordinatorHealthEvaluationService:
         self._health_store = health_store
         self._verifier = verifier
         self._recovery_coordinator = recovery_coordinator
+        self._target_verification_workflow = target_verification_workflow
+        self._timeline_recorder = timeline_recorder
 
     async def evaluate(
         self,
@@ -444,6 +488,53 @@ class CoordinatorHealthEvaluationService:
             raise HealthPipelineError(HealthPipelineErrorCode.COMMAND_DENIED)
 
         trusted = await self._read_trusted_inputs(command)
+        try:
+            existing_snapshot = await self._health_store.read_health_chain(
+                trusted.anchor.anchor_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise HealthPipelineError(HealthPipelineErrorCode.STORE_UNAVAILABLE) from None
+        if existing_snapshot is not None:
+            if type(existing_snapshot) is not HealthChainSnapshot or not (
+                _snapshot_matches_anchor(existing_snapshot, trusted.anchor)
+            ):
+                raise HealthPipelineError(
+                    HealthPipelineErrorCode.TRUSTED_STATE_INVALID
+                )
+            existing_relation = _snapshot_relation(existing_snapshot, command)
+            if existing_relation == "CONFLICT":
+                raise HealthPipelineError(HealthPipelineErrorCode.STORE_CONFLICT)
+            if existing_relation == "ADOPT":
+                return await self._adopt_snapshot(
+                    command,
+                    trusted,
+                    existing_snapshot,
+                )
+
+        workflow = self._target_verification_workflow
+        if workflow is not None:
+            try:
+                target_observation = await workflow.verify_target(
+                    root=trusted.root,
+                    service_claim=trusted.service_claim,
+                    receipt=trusted.receipt.value,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise HealthPipelineError(
+                    HealthPipelineErrorCode.INDEPENDENT_VERIFICATION_AMBIGUOUS
+                ) from None
+            if (
+                type(target_observation) is not VerifiedTargetObservation
+                or not target_observation.matched
+            ):
+                raise HealthPipelineError(
+                    HealthPipelineErrorCode.INDEPENDENT_VERIFICATION_AMBIGUOUS
+                )
+
         try:
             anchor_write = await self._health_store.create_or_adopt_health_anchor(
                 trusted.anchor
@@ -535,6 +626,7 @@ class CoordinatorHealthEvaluationService:
             != verifier_result.signed_proof
         ):
             raise HealthPipelineError(HealthPipelineErrorCode.TRUSTED_STATE_INVALID)
+        await self._record_timeline_proof(verifier_result.signed_proof)
         return await self._complete_result(
             command=command,
             snapshot=appended.snapshot,
@@ -584,6 +676,7 @@ class CoordinatorHealthEvaluationService:
         refreshed = await self._read_trusted_inputs(command)
         if not _trusted_inputs_unchanged(trusted, refreshed):
             raise HealthPipelineError(HealthPipelineErrorCode.AUTHORITY_STALE)
+        await self._record_timeline_proof(snapshot.signed_proofs[-1].value)
         return await self._complete_result(
             command=command,
             snapshot=snapshot,
@@ -611,6 +704,7 @@ class CoordinatorHealthEvaluationService:
                 raise HealthPipelineError(
                     HealthPipelineErrorCode.TRUSTED_STATE_INVALID
                 )
+            await self._record_timeline_recovery_intent(intent.value)
             try:
                 recovery = await self._recovery_coordinator.dispatch(
                     intent.value.command
@@ -627,6 +721,34 @@ class CoordinatorHealthEvaluationService:
             disposition=disposition,
             recovery_dispatch=recovery,
         )
+
+    async def _record_timeline_proof(
+        self,
+        signed_proof: SignedHealthDecisionProofV1,
+    ) -> None:
+        recorder = self._timeline_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.record_signed_health_proof(signed_proof)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise HealthPipelineError(HealthPipelineErrorCode.STORE_UNAVAILABLE) from None
+
+    async def _record_timeline_recovery_intent(
+        self,
+        intent: RecoveryIntentV1,
+    ) -> None:
+        recorder = self._timeline_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.record_recovery_intent(intent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise HealthPipelineError(HealthPipelineErrorCode.STORE_UNAVAILABLE) from None
 
     async def _read_trusted_inputs(
         self,
@@ -657,7 +779,11 @@ class CoordinatorHealthEvaluationService:
                 HealthPipelineErrorCode.TRUSTED_STATE_UNAVAILABLE
             ) from None
         trusted = inspect_root_authority_bundle(bundle, target=self._target)
-        if trusted is None or type(trusted.root) is not RolloutRootV3:
+        if (
+            trusted is None
+            or type(trusted.root) is not RolloutRootV3
+            or type(trusted.service_claim) is not ServiceClaimRecord
+        ):
             raise HealthPipelineError(HealthPipelineErrorCode.TRUSTED_STATE_INVALID)
         root = trusted.root
         if (
@@ -695,6 +821,8 @@ class CoordinatorHealthEvaluationService:
         return _TrustedHealthInputs(
             root=root,
             root_revision=trusted.root_revision,
+            service_claim=trusted.service_claim,
+            service_claim_revision=trusted.service_claim_revision,
             authority_revision=trusted.authority_revision,
             receipt=receipt_record,
             anchor=anchor,
@@ -850,6 +978,8 @@ def _trusted_inputs_unchanged(
     return (
         refreshed.root == initial.root
         and refreshed.root_revision == initial.root_revision
+        and refreshed.service_claim == initial.service_claim
+        and refreshed.service_claim_revision == initial.service_claim_revision
         and refreshed.authority_revision == initial.authority_revision
         and refreshed.receipt == initial.receipt
         and refreshed.anchor == initial.anchor

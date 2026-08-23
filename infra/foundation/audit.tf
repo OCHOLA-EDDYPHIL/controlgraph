@@ -19,6 +19,17 @@ resource "google_project_iam_audit_config" "all_services" {
   }
 }
 
+check "timeline_reads_and_writes_are_audited" {
+  assert {
+    condition = (
+      google_project_iam_audit_config.all_services.service == "allServices" &&
+      toset(google_project_iam_audit_config.all_services.audit_log_config[*].log_type) ==
+      toset(["ADMIN_READ", "DATA_READ", "DATA_WRITE"])
+    )
+    error_message = "Timeline data reads and writes require project-wide Admin Read, Data Read, and Data Write audit logging."
+  }
+}
+
 resource "google_logging_project_bucket_config" "controlgraph" {
   project          = var.project_id
   location         = var.region

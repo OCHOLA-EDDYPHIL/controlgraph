@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,9 @@ from controlgraph_canary.application.identity import (
     RECOVERY_EXECUTION_FACADE_PATH,
     RECOVERY_PRESTATE_ATTESTATION_PATH,
     RECOVERY_RECEIPT_AUTHORITY_PATH,
+    TIMELINE_RAW_EXPORT_PATH,
+    TIMELINE_READ_PATH,
+    TIMELINE_RETENTION_PATH,
     AuthenticationContext,
     AuthenticationDenialCode,
     AuthenticationError,
@@ -130,6 +134,25 @@ from controlgraph_canary.application.service_claim_release_relay import (
     ApiServiceClaimReleaseClient,
     CoordinatorServiceClaimReleaseRelay,
 )
+from controlgraph_canary.application.timeline import (
+    TimelineRawExportError,
+    TimelineRawExportErrorCode,
+    TimelineRawExportGrant,
+    TimelineRawExportService,
+    TimelineReadError,
+    TimelineReadErrorCode,
+    TimelineReadGrant,
+    TimelineReadService,
+    TimelineRetentionError,
+    TimelineRetentionErrorCode,
+    TimelineRetentionGrant,
+    TimelineRetentionService,
+)
+from controlgraph_canary.application.timeline_recording import TimelineRecorder
+from controlgraph_canary.application.timeline_relay import (
+    ApiTimelineClient,
+    CoordinatorTimelineRelay,
+)
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
 from controlgraph_canary.contracts.canary_execution import (
     ApplyCanaryCommandV1,
@@ -171,6 +194,10 @@ from controlgraph_canary.contracts.promotion_execution import (
     PromotionCommandV2,
     PromotionInvocationV2,
 )
+from controlgraph_canary.contracts.receipt_authority import (
+    ReceiptAuthorityOperation,
+    ReceiptAuthorityResponseV1,
+)
 from controlgraph_canary.contracts.recovery_abandonment import (
     RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
     RecoveryAbandonmentClassificationRequestV1,
@@ -210,11 +237,26 @@ from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseInvocationV1,
     ServiceClaimReleaseRelayResponseV1,
 )
+from controlgraph_canary.contracts.timeline import (
+    TIMELINE_PAGE_COMMAND_V1,
+    TIMELINE_RAW_EXPORT_COMMAND_V1,
+    TimelineAudience,
+    TimelinePageCommandV1,
+    TimelineRawExportCommandV1,
+)
+from controlgraph_canary.contracts.timeline_relay import (
+    TimelineRawExportInvocationV1,
+    TimelineReadInvocationV1,
+)
 from controlgraph_canary.http.identity_headers import authentication_header
+from controlgraph_canary.http.operator_csrf import validate_operator_csrf
 
 PRODUCT_CONTRACT_VERSION: Final = "controlgraph.contract/v1"
 SERVICE_SHELL_VERSION: Final = "controlgraph.service-shell/v1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_UINT = re.compile(r"^(?:0|[1-9][0-9]{0,15})$")
+_RAW_EXPORT_CONFIRMATION = "EXPORT_RESTRICTED_EVIDENCE_V1"
 
 
 class ServiceHealth(BaseModel):
@@ -358,6 +400,15 @@ class OperatorObservationDenied(BaseModel):
     correlation_id: str
 
 
+class TimelineDenied(BaseModel):
+    """Payload-free timeline or restricted-export denial."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 class HealthPipelineDenied(BaseModel):
     """Payload-free deterministic health-pipeline denial."""
 
@@ -423,6 +474,16 @@ def create_service_app(
     recovery_receipt_authority_authentication_policy: (RouteAuthenticationPolicy | None) = None,
     recovery_executor_facade_handler: RecoveryExecutorFacadeHandler | None = None,
     recovery_executor_facade_authentication_policy: (RouteAuthenticationPolicy | None) = None,
+    timeline_read_service: TimelineReadService | ApiTimelineClient | None = None,
+    timeline_read_authentication_policy: RouteAuthenticationPolicy | None = None,
+    timeline_security_read_authentication_policy: RouteAuthenticationPolicy | None = None,
+    timeline_raw_export_service: TimelineRawExportService | ApiTimelineClient | None = None,
+    timeline_raw_export_authentication_policy: RouteAuthenticationPolicy | None = None,
+    timeline_retention_service: TimelineRetentionService | None = None,
+    timeline_retention_authentication_policy: RouteAuthenticationPolicy | None = None,
+    coordinator_timeline_relay: CoordinatorTimelineRelay | None = None,
+    timeline_recorder: TimelineRecorder | None = None,
+    operator_console_origin: str | None = None,
     mutation_enabled: bool = False,
 ) -> FastAPI:
     """Create one authenticated role shell with explicitly bounded work."""
@@ -433,6 +494,15 @@ def create_service_app(
         raise ValueError("authenticator and authentication policy must be configured together")
     if authentication_policy is not None and authentication_policy.service_role is not role:
         raise ValueError("authentication policy does not match the service role")
+    if operator_console_origin is not None:
+        expected_console_origin = (
+            f"https://controlgraph-console-{authentication_policy.project_number}"
+            ".us-central1.run.app"
+            if authentication_policy is not None
+            else None
+        )
+        if role is not ServiceRole.API or operator_console_origin != expected_console_origin:
+            raise ValueError("operator console origin does not match the API boundary")
     if verified_task_handler is not None and capability_verifier is None:
         raise ValueError("a protected task handler requires capability verification")
     if verified_task_handler is not None and not mutation_enabled:
@@ -598,6 +668,85 @@ def create_service_app(
         or not mutation_enabled
     ):
         raise ValueError("recovery executor facade is limited to its exact route")
+    if (
+        timeline_read_service is None
+        and (
+            timeline_read_authentication_policy is not None
+            or timeline_security_read_authentication_policy is not None
+        )
+    ) or (
+        timeline_read_service is not None
+        and (
+            timeline_read_authentication_policy is None
+            or timeline_security_read_authentication_policy is None
+        )
+    ):
+        raise ValueError("timeline read service requires both projection policies")
+    if timeline_read_service is not None and (
+        role is not ServiceRole.API
+        or type(timeline_read_service) not in {TimelineReadService, ApiTimelineClient}
+        or type(timeline_read_authentication_policy) is not RouteAuthenticationPolicy
+        or type(timeline_security_read_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or timeline_read_authentication_policy.service_role is not ServiceRole.API
+        or timeline_security_read_authentication_policy.service_role
+        is not ServiceRole.API
+        or timeline_read_authentication_policy.path != TIMELINE_READ_PATH
+        or timeline_security_read_authentication_policy.path != TIMELINE_READ_PATH
+        or timeline_read_authentication_policy.caller.role is not CallerRole.OPERATOR
+        or timeline_security_read_authentication_policy.caller.role
+        is not CallerRole.OPERATOR
+        or timeline_read_authentication_policy.caller
+        == timeline_security_read_authentication_policy.caller
+    ):
+        raise ValueError("timeline reads require distinct operator and audit policies")
+    if (timeline_raw_export_service is None) != (
+        timeline_raw_export_authentication_policy is None
+    ):
+        raise ValueError("timeline raw export requires its exact route policy")
+    if timeline_raw_export_service is not None and (
+        role is not ServiceRole.API
+        or type(timeline_raw_export_service) not in {
+            TimelineRawExportService,
+            ApiTimelineClient,
+        }
+        or type(timeline_raw_export_authentication_policy)
+        is not RouteAuthenticationPolicy
+        or timeline_raw_export_authentication_policy.service_role is not ServiceRole.API
+        or timeline_raw_export_authentication_policy.path != TIMELINE_RAW_EXPORT_PATH
+        or timeline_raw_export_authentication_policy.caller.role
+        is not CallerRole.OPERATOR
+        or timeline_raw_export_authentication_policy.caller
+        in {
+            timeline_read_authentication_policy.caller
+            if timeline_read_authentication_policy is not None
+            else None,
+            timeline_security_read_authentication_policy.caller
+            if timeline_security_read_authentication_policy is not None
+            else None,
+        }
+    ):
+        raise ValueError("raw export requires a distinct restricted identity")
+    if (timeline_retention_service is None) != (timeline_retention_authentication_policy is None):
+        raise ValueError("timeline retention requires its exact route policy")
+    if timeline_retention_service is not None and (
+        role is not ServiceRole.COORDINATOR
+        or type(timeline_retention_service) is not TimelineRetentionService
+        or type(timeline_retention_authentication_policy) is not RouteAuthenticationPolicy
+        or timeline_retention_authentication_policy.service_role is not ServiceRole.COORDINATOR
+        or timeline_retention_authentication_policy.path != TIMELINE_RETENTION_PATH
+        or timeline_retention_authentication_policy.caller.role is not CallerRole.RETENTION_SWEEPER
+    ):
+        raise ValueError("timeline retention is limited to its exact scheduler route")
+    if coordinator_timeline_relay is not None and (
+        role is not ServiceRole.COORDINATOR
+        or type(coordinator_timeline_relay) is not CoordinatorTimelineRelay
+    ):
+        raise ValueError("timeline projection relay is coordinator-limited")
+    if timeline_recorder is not None and (
+        role is not ServiceRole.COORDINATOR or type(timeline_recorder) is not TimelineRecorder
+    ):
+        raise ValueError("timeline recording is coordinator-limited")
     if type(mutation_enabled) is not bool or (
         mutation_enabled and role not in {ServiceRole.EXECUTOR, ServiceRole.RECOVERY}
     ):
@@ -658,6 +807,266 @@ def create_service_app(
             correlation_id=correlation_id,
         )
 
+    def _timeline_query(request: Request, *, raw: bool) -> tuple[int, str | None, int, str]:
+        allowed = {"after_sequence", "after_entry_sha256", "limit"}
+        if not raw:
+            allowed.add("audience")
+        items = tuple(request.query_params.multi_items())
+        names = tuple(name for name, _ in items)
+        if any(name not in allowed for name in names) or len(set(names)) != len(names):
+            raise ValueError("timeline query is invalid")
+        values = dict(items)
+        sequence_text = values.get("after_sequence", "0")
+        limit_text = values.get("limit", "25" if raw else "50")
+        if (
+            _CANONICAL_UINT.fullmatch(sequence_text) is None
+            or _CANONICAL_UINT.fullmatch(limit_text) is None
+        ):
+            raise ValueError("timeline query integer is invalid")
+        sequence = int(sequence_text)
+        limit = int(limit_text)
+        digest = values.get("after_entry_sha256")
+        if (sequence == 0) != (digest is None) or (
+            digest is not None and _SHA256.fullmatch(digest) is None
+        ):
+            raise ValueError("timeline cursor is invalid")
+        audience = values.get("audience", TimelineAudience.OPERATOR.value)
+        if raw:
+            audience = TimelineAudience.RESTRICTED.value
+        elif audience not in {
+            TimelineAudience.PUBLIC_DEMO.value,
+            TimelineAudience.OPERATOR.value,
+            TimelineAudience.SECURITY_AUDIT.value,
+        }:
+            if audience == TimelineAudience.RESTRICTED.value:
+                raise TimelineReadError(TimelineReadErrorCode.ACCESS_DENIED)
+            raise ValueError("timeline audience is invalid")
+        return sequence, digest, limit, audience
+
+    def _timeline_principal(context: AuthenticationContext) -> str:
+        digest = hashlib.sha256(context.subject.encode("ascii")).hexdigest()
+        return f"operator:{digest}"
+
+    async def timeline_read(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        service = timeline_read_service
+        requested_audiences = request.query_params.getlist("audience")
+        route_policy = (
+            timeline_security_read_authentication_policy
+            if requested_audiences == [TimelineAudience.SECURITY_AUDIT.value]
+            else timeline_read_authentication_policy
+        )
+        if (
+            authenticator is None
+            or service is None
+            or type(service) not in {TimelineReadService, ApiTimelineClient}
+            or type(route_policy) is not RouteAuthenticationPolicy
+        ):
+            return _timeline_denial(
+                TimelineReadErrorCode.CONFIGURATION_INVALID.value,
+                correlation_id,
+            )
+        try:
+            context = authenticator.authenticate(
+                authentication_header(request.headers, route_policy),
+                route_policy,
+            )
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if type(context) is not AuthenticationContext or context.role is not CallerRole.OPERATOR:
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            sequence, digest, limit, audience_value = _timeline_query(request, raw=False)
+            command = TimelinePageCommandV1(
+                schema_version=TIMELINE_PAGE_COMMAND_V1,
+                target=service.target,
+                after_sequence=sequence,
+                after_entry_sha256=digest,
+                limit=limit,
+                audience=TimelineAudience(audience_value),
+            )
+            if isinstance(service, ApiTimelineClient):
+                page = await service.read(command, context)
+            else:
+                page = await service.read(
+                    command,
+                    TimelineReadGrant(
+                        target=service.target,
+                        maximum_audience=(
+                            TimelineAudience.SECURITY_AUDIT
+                            if command.audience is TimelineAudience.SECURITY_AUDIT
+                            else TimelineAudience.OPERATOR
+                        ),
+                        principal_id=_timeline_principal(context),
+                    ),
+                )
+        except asyncio.CancelledError:
+            raise
+        except (TypeError, ValueError):
+            return _timeline_denial(
+                TimelineReadErrorCode.CURSOR_INVALID.value,
+                correlation_id,
+            )
+        except TimelineReadError as error:
+            return _timeline_denial(error.code.value, correlation_id)
+        return Response(
+            content=canonical_json_bytes(page),
+            status_code=200,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "X-ControlGraph-Correlation-Id": correlation_id,
+            },
+        )
+
+    async def timeline_raw_export(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        service = timeline_raw_export_service
+        route_policy = timeline_raw_export_authentication_policy
+        if (
+            authenticator is None
+            or service is None
+            or type(service) not in {TimelineRawExportService, ApiTimelineClient}
+            or type(route_policy) is not RouteAuthenticationPolicy
+        ):
+            return _timeline_denial(
+                TimelineRawExportErrorCode.CONFIGURATION_INVALID.value,
+                correlation_id,
+            )
+        try:
+            context = authenticator.authenticate(
+                authentication_header(request.headers, route_policy),
+                route_policy,
+            )
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if type(context) is not AuthenticationContext or context.role is not CallerRole.OPERATOR:
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        confirmations = request.headers.getlist("X-ControlGraph-Raw-Export")
+        if confirmations != [_RAW_EXPORT_CONFIRMATION]:
+            return _timeline_denial(
+                TimelineRawExportErrorCode.ACCESS_DENIED.value,
+                correlation_id,
+            )
+        try:
+            sequence, digest, limit, _ = _timeline_query(request, raw=True)
+            command = TimelineRawExportCommandV1(
+                schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,
+                target=service.target,
+                after_sequence=sequence,
+                after_entry_sha256=digest,
+                limit=limit,
+            )
+            if isinstance(service, ApiTimelineClient):
+                exported = await service.export(command, context)
+            else:
+                exported = await service.export(
+                    command,
+                    TimelineRawExportGrant(
+                        target=service.target,
+                        principal_id=_timeline_principal(context),
+                    ),
+                )
+        except asyncio.CancelledError:
+            raise
+        except (TypeError, ValueError):
+            return _timeline_denial(
+                TimelineRawExportErrorCode.CURSOR_INVALID.value,
+                correlation_id,
+            )
+        except TimelineRawExportError as error:
+            return _timeline_denial(error.code.value, correlation_id)
+        return Response(
+            content=canonical_json_bytes(exported),
+            status_code=200,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "X-ControlGraph-Correlation-Id": correlation_id,
+            },
+        )
+
+    async def timeline_retention(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        service = timeline_retention_service
+        route_policy = timeline_retention_authentication_policy
+        if (
+            authenticator is None
+            or type(service) is not TimelineRetentionService
+            or type(route_policy) is not RouteAuthenticationPolicy
+        ):
+            return _timeline_denial(
+                TimelineRetentionErrorCode.CONFIGURATION_INVALID.value,
+                correlation_id,
+            )
+        try:
+            context = authenticator.authenticate(
+                authentication_header(request.headers, route_policy),
+                route_policy,
+            )
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if (
+            type(context) is not AuthenticationContext
+            or context.role is not CallerRole.RETENTION_SWEEPER
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            if request.query_params:
+                raise TimelineRetentionError(TimelineRetentionErrorCode.ACCESS_DENIED)
+            async for chunk in request.stream():
+                if type(chunk) is not bytes or chunk:
+                    raise TimelineRetentionError(TimelineRetentionErrorCode.ACCESS_DENIED)
+            await service.sweep(
+                TimelineRetentionGrant(
+                    target=service.target,
+                    principal_id=_timeline_principal(context),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimelineRetentionError as error:
+            return _timeline_denial(error.code.value, correlation_id)
+        except Exception:
+            return _timeline_denial(
+                TimelineRetentionErrorCode.STORE_UNAVAILABLE.value,
+                correlation_id,
+            )
+        return Response(
+            status_code=204,
+            headers={
+                "Cache-Control": "no-store",
+                "X-ControlGraph-Correlation-Id": correlation_id,
+            },
+        )
+
     async def protected_work(request: Request) -> Response:
         correlation_id = _correlation_id()
         if authenticator is None or authentication_policy is None:
@@ -687,6 +1096,15 @@ def create_service_app(
                 AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
                 correlation_id,
             )
+        if role is ServiceRole.API:
+            try:
+                validate_operator_csrf(
+                    request.headers,
+                    context,
+                    expected_origin=(operator_console_origin or authentication_policy.audience),
+                )
+            except AuthenticationError as error:
+                return _authentication_denial(error.code, correlation_id)
         request.state.authentication = context
         if role is ServiceRole.API and (
             api_root_creation_client is not None
@@ -855,6 +1273,7 @@ def create_service_app(
             or coordinator_service_claim_release_relay is not None
             or coordinator_recovery_abandonment_relay is not None
             or coordinator_operator_observation_relay is not None
+            or coordinator_timeline_relay is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -866,6 +1285,8 @@ def create_service_app(
                         invocation,
                         context,
                     )
+                    if timeline_recorder is not None:
+                        await timeline_recorder.record_root_creation(root_result)
                     response_body = canonical_json_bytes(root_result)
                 elif type(invocation) is ApplyCanaryInvocationV1:
                     if coordinator_canary_relay is None:
@@ -874,6 +1295,8 @@ def create_service_app(
                         invocation,
                         context,
                     )
+                    if timeline_recorder is not None:
+                        await timeline_recorder.record_canary_dispatch(canary_result)
                     response_body = canonical_json_bytes(canary_result)
                 elif type(invocation) is PromotionInvocationV2:
                     if coordinator_promotion_relay is None:
@@ -882,6 +1305,8 @@ def create_service_app(
                         invocation,
                         context,
                     )
+                    if timeline_recorder is not None:
+                        await timeline_recorder.record_promotion_dispatch(promotion_result)
                     response_body = canonical_json_bytes(promotion_result)
                 elif type(invocation) is HealthEvaluationInvocationV1:
                     if coordinator_health_evaluation_service is None:
@@ -890,6 +1315,13 @@ def create_service_app(
                         invocation,
                         context,
                     )
+                    if (
+                        timeline_recorder is not None
+                        and health_result.recovery_dispatch is not None
+                    ):
+                        await timeline_recorder.record_recovery_dispatch(
+                            health_result.recovery_dispatch
+                        )
                     response_body = canonical_json_bytes(health_result)
                 elif type(invocation) is RecoveryInvocationV2:
                     if coordinator_recovery_relay is None:
@@ -900,6 +1332,8 @@ def create_service_app(
                         invocation,
                         context,
                     )
+                    if timeline_recorder is not None:
+                        await timeline_recorder.record_recovery_dispatch(recovery_result)
                     response_body = canonical_json_bytes(recovery_result)
                 elif type(invocation) is ServiceClaimReleaseInvocationV1:
                     if coordinator_service_claim_release_relay is None:
@@ -918,6 +1352,10 @@ def create_service_app(
                             failure_code=error.code,
                         )
                     else:
+                        if timeline_recorder is not None:
+                            await timeline_recorder.record_service_claim_release(
+                                release_result
+                            )
                         release_outcome = ServiceClaimReleaseRelayResponseV1(
                             schema_version=(SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1),
                             result=release_result,
@@ -941,6 +1379,10 @@ def create_service_app(
                             failure_code=error.code,
                         )
                     else:
+                        if timeline_recorder is not None:
+                            await timeline_recorder.record_recovery_abandonment(
+                                abandonment_result
+                            )
                         abandonment_outcome = RecoveryAbandonmentRelayResponseV1(
                             schema_version=RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
                             result=abandonment_result,
@@ -1000,6 +1442,26 @@ def create_service_app(
                             failure_code=None,
                         )
                     response_body = canonical_json_bytes(proof_outcome)
+                elif type(invocation) is TimelineReadInvocationV1:
+                    if coordinator_timeline_relay is None:
+                        raise TimelineReadError(
+                            TimelineReadErrorCode.CONFIGURATION_INVALID
+                        )
+                    timeline_page = await coordinator_timeline_relay.read(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(timeline_page)
+                elif type(invocation) is TimelineRawExportInvocationV1:
+                    if coordinator_timeline_relay is None:
+                        raise TimelineRawExportError(
+                            TimelineRawExportErrorCode.CONFIGURATION_INVALID
+                        )
+                    timeline_export = await coordinator_timeline_relay.export(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(timeline_export)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
@@ -1017,6 +1479,10 @@ def create_service_app(
                             failure_code=error.code,
                         )
                     else:
+                        if timeline_recorder is not None:
+                            await timeline_recorder.record_epoch_revocation(
+                                revocation_call
+                            )
                         revocation_relay_outcome = EpochRevocationRelayResponseV1(
                             schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
                             outcome=revocation_call,
@@ -1051,6 +1517,10 @@ def create_service_app(
                 )
             except OperatorObservationError as error:
                 return _operator_observation_denial(error.code.value, correlation_id)
+            except TimelineReadError as error:
+                return _timeline_denial(error.code.value, correlation_id)
+            except TimelineRawExportError as error:
+                return _timeline_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -1326,6 +1796,18 @@ def create_service_app(
                 )
             else:
                 response_body = await service.handle_authenticated(body, context)
+            if timeline_recorder is not None:
+                authority_response = decode_contract(
+                    response_body,
+                    ReceiptAuthorityResponseV1,
+                )
+                if (
+                    authority_response.operation is not ReceiptAuthorityOperation.READ
+                    and authority_response.stored_receipt is not None
+                ):
+                    await timeline_recorder.record_execution_receipt(
+                        authority_response.stored_receipt.receipt
+                    )
         except asyncio.CancelledError:
             raise
         except CapabilityVerificationError:
@@ -1663,6 +2145,27 @@ def create_service_app(
 
     for path in protected_paths(role):
         app.add_api_route(path, protected_work, methods=["POST"], include_in_schema=False)
+    if timeline_read_authentication_policy is not None:
+        app.add_api_route(
+            TIMELINE_READ_PATH,
+            timeline_read,
+            methods=["GET"],
+            include_in_schema=False,
+        )
+    if timeline_raw_export_authentication_policy is not None:
+        app.add_api_route(
+            TIMELINE_RAW_EXPORT_PATH,
+            timeline_raw_export,
+            methods=["GET"],
+            include_in_schema=False,
+        )
+    if timeline_retention_authentication_policy is not None:
+        app.add_api_route(
+            TIMELINE_RETENTION_PATH,
+            timeline_retention,
+            methods=["POST"],
+            include_in_schema=False,
+        )
     if receipt_authority_authentication_policy is not None:
         app.add_api_route(
             RECEIPT_AUTHORITY_PATH,
@@ -1808,6 +2311,8 @@ def _decode_coordinator_invocation(
     | TargetTrafficReadInvocationV1
     | HealthEvaluationInvocationV1
     | RecoveryInvocationV2
+    | TimelineReadInvocationV1
+    | TimelineRawExportInvocationV1
     | EpochRevocationProofInvocationV1
     | EpochRevocationInvocationV1
 ):
@@ -1863,6 +2368,16 @@ def _decode_coordinator_invocation(
             raise
     try:
         return decode_contract(body, EpochRevocationProofInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TimelineReadInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, TimelineRawExportInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -1960,7 +2475,12 @@ def _authentication_denial(
         AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
     }:
         status_code = 503
-    elif code is AuthenticationDenialCode.CALLER_DENIED:
+    elif code in {
+        AuthenticationDenialCode.CALLER_DENIED,
+        AuthenticationDenialCode.BROWSER_ORIGIN_DENIED,
+        AuthenticationDenialCode.CSRF_MISSING,
+        AuthenticationDenialCode.CSRF_INVALID,
+    }:
         status_code = 403
     else:
         status_code = 401
@@ -2334,6 +2854,34 @@ def _operator_observation_denial(code: str, correlation_id: str) -> JSONResponse
     )
 
 
+def _timeline_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = TimelineDenied(code=code, correlation_id=correlation_id)
+    if code in {
+        TimelineReadErrorCode.CURSOR_INVALID.value,
+        TimelineRawExportErrorCode.CURSOR_INVALID.value,
+    }:
+        status_code = 400
+    elif code in {
+        TimelineReadErrorCode.ACCESS_DENIED.value,
+        TimelineReadErrorCode.TARGET_DENIED.value,
+        TimelineRawExportErrorCode.ACCESS_DENIED.value,
+        TimelineRawExportErrorCode.TARGET_DENIED.value,
+        TimelineRetentionErrorCode.ACCESS_DENIED.value,
+        TimelineRetentionErrorCode.TARGET_DENIED.value,
+    }:
+        status_code = 403
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={
+            "Cache-Control": "no-store",
+            "X-ControlGraph-Correlation-Id": correlation_id,
+        },
+    )
+
+
 async def _read_contract_body(request: Request) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
@@ -2386,6 +2934,7 @@ __all__ = [
     "ServiceHealth",
     "ServiceMetadata",
     "ServiceRole",
+    "TimelineDenied",
     "VerifiedTaskHandler",
     "create_service_app",
     "protected_paths",

@@ -132,9 +132,14 @@ locals {
       api      = "iamcredentials.googleapis.com"
       boundary = "OIDC tokens for only the two fixed task-caller service accounts"
     }
+    scheduler_oidc_token_mint = {
+      api      = "iamcredentials.googleapis.com"
+      boundary = "OIDC tokens for only the fixed retention-sweeper service account"
+    }
   }
 
   identity_expected_allows = {
+    console = toset([])
     api = toset([
       "kms_capability_public_key_read",
       "kms_capability_version_read",
@@ -203,6 +208,9 @@ locals {
     recovery_task_caller = toset([
       "run_recovery_invoke",
     ])
+    retention_sweeper = toset([
+      "run_coordinator_invoke",
+    ])
     ci_image_builder = toset([
       "artifact_registry_images_write",
       "github_impersonate_image_builder",
@@ -220,6 +228,9 @@ locals {
     ])
     cloud_tasks_service_agent = toset([
       "task_oidc_token_mint",
+    ])
+    cloud_scheduler_service_agent = toset([
+      "scheduler_oidc_token_mint",
     ])
   }
 
@@ -296,6 +307,9 @@ locals {
       recovery_task_caller = toset([
         "run_recovery_invoke",
       ])
+      retention_sweeper = toset([
+        "run_coordinator_invoke",
+      ])
       ci_image_builder = toset([
         "artifact_registry_images_write",
         "github_impersonate_image_builder",
@@ -314,14 +328,18 @@ locals {
       cloud_tasks_service_agent = toset([
         "task_oidc_token_mint",
       ])
+      cloud_scheduler_service_agent = toset([
+        "scheduler_oidc_token_mint",
+      ])
     },
   )
 
   controlgraph_identity_members = merge(
     { for role, account in google_service_account.workloads : role => account.member },
     {
-      operator                  = var.operator_principal
-      cloud_tasks_service_agent = "serviceAccount:service-${var.project_number}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+      operator                      = var.operator_principal
+      cloud_tasks_service_agent     = "serviceAccount:service-${var.project_number}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+      cloud_scheduler_service_agent = "serviceAccount:service-${var.project_number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
     },
   )
 
@@ -450,6 +468,17 @@ check "operator_permissions_are_bounded" {
   }
 }
 
+check "console_has_no_control_plane_permissions" {
+  assert {
+    condition = (
+      local.identity_expected_allows.console == toset([]) &&
+      local.identity_implemented_allows.console == toset([]) &&
+      length(local.iam_permission_matrix.console.expected_denials) == length(local.iam_permission_domains)
+    )
+    error_message = "The public console runtime identity must have no control-plane permissions."
+  }
+}
+
 check "reference_target_act_as_is_closed" {
   assert {
     condition = (
@@ -499,6 +528,22 @@ check "executor_service_invocation_is_closed_to_task_and_recovery_callers" {
       ]) == toset(["execution_task_caller", "recovery"])
     )
     error_message = "Only the execution task caller and recovery worker may invoke the executor service; application policy separates their exact routes."
+  }
+}
+
+check "retention_sweep_permissions_are_closed" {
+  assert {
+    condition = (
+      local.identity_expected_allows.retention_sweeper == toset([
+        "run_coordinator_invoke",
+      ]) &&
+      local.identity_implemented_allows.retention_sweeper == local.identity_expected_allows.retention_sweeper &&
+      local.identity_expected_allows.cloud_scheduler_service_agent == toset([
+        "scheduler_oidc_token_mint",
+      ]) &&
+      local.identity_implemented_allows.cloud_scheduler_service_agent == local.identity_expected_allows.cloud_scheduler_service_agent
+    )
+    error_message = "Retention must be triggered only by the fixed sweeper identity and Scheduler may mint only that identity's OIDC token."
   }
 }
 

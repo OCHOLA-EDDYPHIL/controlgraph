@@ -36,6 +36,12 @@ from controlgraph_canary.authority.replay import (
     mutation_identity,
 )
 from controlgraph_canary.contracts.codec import canonical_json_bytes, decode_contract
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionAssessmentRequestV1,
+    CompletionClassificationV1,
+    CompletionKind,
+    VerificationRequestV1,
+)
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
@@ -134,6 +140,19 @@ def _denied_receipt() -> ExecutionReceipt:
         {
             "outcome": ReceiptOutcome.DENIED,
             "reason_code": ReasonCode.AUTHORITY_UNAVAILABLE,
+            "updated_at": "2026-08-19T12:00:01Z",
+        }
+    )
+    return ExecutionReceipt.model_validate(value)
+
+
+def _stale_denied_receipt() -> ExecutionReceipt:
+    value = _claimed_receipt().model_dump(mode="python")
+    value.update(
+        {
+            "outcome": ReceiptOutcome.DENIED,
+            "reason_code": ReasonCode.EPOCH_MISMATCH,
+            "observed_authority_epoch": 2,
             "updated_at": "2026-08-19T12:00:01Z",
         }
     )
@@ -292,6 +311,31 @@ class _LoopbackTransport:
         return response
 
 
+class _StaleDenialWorkflow:
+    def __init__(self) -> None:
+        self.target = _target()
+        self.calls: list[ExecutionReceipt] = []
+
+    async def classify_stale_denial(
+        self,
+        receipt: ExecutionReceipt,
+    ) -> CompletionClassificationV1:
+        self.calls.append(receipt)
+        verification = VerificationRequestV1.model_construct(
+            root_id=receipt.root_id,
+            root_sha256=receipt.root_sha256,
+            epoch=receipt.epoch,
+            target=receipt.target,
+            plan_sha256=receipt.plan_sha256,
+            request_id=receipt.request_id,
+        )
+        request = CompletionAssessmentRequestV1.model_construct(
+            kind=CompletionKind.STALE_CAPABILITY_DENIAL,
+            verification=verification,
+        )
+        return CompletionClassificationV1.model_construct(request=request)
+
+
 def _client(
     store: _BackingStore,
     *,
@@ -426,6 +470,26 @@ def test_client_implements_remote_read_and_compare_and_set_without_new_authority
     assert updated == StoredRecord(_denied_receipt(), 1)
     assert readback == updated
     assert store.cas_calls == 1
+
+
+def test_stale_denial_is_classified_on_commit_and_retry_read() -> None:
+    store = _BackingStore()
+    workflow = _StaleDenialWorkflow()
+    service = ReceiptAuthorityService(
+        store,
+        completion_workflow=workflow,
+    )
+    client, _ = _client(store, transport=_LoopbackTransport(service))
+    claimed = asyncio.run(client.claim_or_adopt_receipt(_claimed_receipt(), _binding()))
+    assert type(claimed) is ReceiptClaimCreated
+
+    updated = asyncio.run(
+        client.compare_and_set_receipt(claimed.receipt, _stale_denied_receipt())
+    )
+    readback = asyncio.run(client.read_receipt(_binding().idempotency_key))
+
+    assert updated == readback == StoredRecord(_stale_denied_receipt(), 1)
+    assert workflow.calls == [_stale_denied_receipt(), _stale_denied_receipt()]
 
 
 def test_client_resolves_ambiguous_receipt_through_exact_fenced_operation() -> None:

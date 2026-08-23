@@ -25,6 +25,12 @@ from controlgraph_canary.application.capability_issuance import (
     CapabilityIssuerConfiguration,
 )
 from controlgraph_canary.application.capability_verification import VerifiedMutation
+from controlgraph_canary.application.completion_classification import (
+    CoordinatorCompletionClassificationService,
+)
+from controlgraph_canary.application.completion_workflow import (
+    CoordinatorCompletionWorkflow,
+)
 from controlgraph_canary.application.evidence_chain import current_evidence_chain_head
 from controlgraph_canary.application.execution import (
     FinalAuthorityDenial,
@@ -46,6 +52,10 @@ from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64u
 from controlgraph_canary.contracts.evidence import (
     EVIDENCE_CHAIN_HEAD_V1,
     EvidenceChainHeadV1,
+)
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionClassificationV1,
+    CompletionStatus,
 )
 from controlgraph_canary.contracts.models import (
     EvidenceEvent,
@@ -400,8 +410,75 @@ def test_revocation_commits_authority_evidence_head_result_identities_and_audit(
         assert state.idempotency_identity is not None
         assert state.attempt_audit is not None
         assert state.attempt_audit.value.outcome is EpochRevocationAuditOutcome.COMMITTED
-        assert runner.write_result_counts[-2:] == [7, 0]
-        assert len(client.documents) == 12
+        assert runner.write_result_counts[-2:] == [8, 0]
+        assert len(client.documents) == 13
+        indexed = await store.read_signed_epoch_evidence(records.root.root_id, 2)
+        assert indexed is not None
+        assert indexed.value.event == evidence.calls[0]
+
+    asyncio.run(scenario())
+
+
+class _UnusedIndependentVerifier:
+    async def attest(self, invocation):  # type: ignore[no-untyped-def]
+        del invocation
+        raise AssertionError("authority-only classification must not probe the target")
+
+
+class _RevocationTimeline:
+    def __init__(self, target) -> None:  # type: ignore[no-untyped-def]
+        self._target = target
+        self.calls: list[
+            tuple[object, SignedEvidenceEventV1, CompletionClassificationV1]
+        ] = []
+
+    @property
+    def target(self):  # type: ignore[no-untyped-def]
+        return self._target
+
+    async def record_epoch_revocation_completion(
+        self,
+        result,
+        signed_evidence: SignedEvidenceEventV1,
+        classification: CompletionClassificationV1,
+    ) -> None:  # type: ignore[no-untyped-def]
+        self.calls.append((result, signed_evidence, classification))
+
+
+def test_revocation_uses_shared_classifier_before_returning_committed_result() -> None:
+    async def scenario() -> None:
+        store, _, _, untyped_records = await _created_store()
+        records = untyped_records
+        evidence = _EvidenceClient(records.root.content.evidence_signing_key_version)
+        timeline = _RevocationTimeline(records.root.content.target)
+        workflow = CoordinatorCompletionWorkflow(
+            target=records.root.content.target,
+            verifier=_UnusedIndependentVerifier(),
+            classifier=CoordinatorCompletionClassificationService(
+                target=records.root.content.target
+            ),
+            clock=lambda: NOW,
+        )
+        revoker = EpochRevoker(
+            store=store,
+            evidence_client=evidence,
+            operator_policy=_policy(),
+            completion_workflow=workflow,
+            timeline_recorder=timeline,
+            clock=lambda: NOW,
+        )
+        invocation = _invocation(
+            root_id=records.root.root_id,
+            root_sha256=records.root.root_sha256,
+        )
+
+        result = await revoker.revoke(invocation, principal=_principal())
+
+        assert len(timeline.calls) == 1
+        assert timeline.calls[0][0].result == result
+        assert timeline.calls[0][1].event.evidence_id == result.evidence_id
+        assert timeline.calls[0][2].status is CompletionStatus.COMPLETE
+        assert len(evidence.verifications) == 1
 
     asyncio.run(scenario())
 
@@ -1010,6 +1087,22 @@ def test_revocation_appends_after_a_non_authority_evidence_event() -> None:
         assert evidence.calls[-1].sequence == middle_event.sequence + 1
         assert evidence.calls[-1].previous_event_sha256 == canonical_sha256(
             middle_evidence
+        )
+        epoch_two = await store.read_signed_epoch_evidence(
+            records.root.root_id,
+            2,
+        )
+        epoch_three = await store.read_signed_epoch_evidence(
+            records.root.root_id,
+            3,
+        )
+        assert epoch_two is not None
+        assert epoch_two.value.event == evidence.calls[0]
+        assert epoch_three is not None
+        assert epoch_three.value.event == evidence.calls[-1]
+        assert (
+            await store.read_signed_epoch_evidence(records.root.root_id, 4)
+            is None
         )
 
     asyncio.run(scenario())

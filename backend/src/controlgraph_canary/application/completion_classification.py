@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from controlgraph_canary.application.timeline_recording import (
+    CompletionClassificationTimelineRecorder,
+)
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.independent_verification import (
     COMPLETION_CLASSIFICATION_V1,
@@ -24,6 +27,7 @@ from controlgraph_canary.contracts.models import (
     CapabilityAction,
     ReasonCode,
     ReceiptOutcome,
+    TargetBinding,
 )
 
 _MAX_EVIDENCE_ASSESSMENT_LAG_SECONDS = 300
@@ -60,6 +64,51 @@ def classify_completion(bundle: CompletionEvidenceBundleV1) -> CompletionClassif
     )
 
 
+class CoordinatorCompletionClassificationService:
+    """Run the pure classifier and durably record its exact result before return."""
+
+    def __init__(
+        self,
+        *,
+        target: TargetBinding,
+        timeline_recorder: CompletionClassificationTimelineRecorder | None = None,
+    ) -> None:
+        if (
+            type(target) is not TargetBinding
+            or (
+                timeline_recorder is not None
+                and (
+                    not isinstance(
+                        timeline_recorder,
+                        CompletionClassificationTimelineRecorder,
+                    )
+                    or timeline_recorder.target != target
+                )
+            )
+        ):
+            raise ValueError("completion classification service configuration is invalid")
+        self._target = target
+        self._timeline_recorder = timeline_recorder
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def classify(
+        self,
+        bundle: CompletionEvidenceBundleV1,
+    ) -> CompletionClassificationV1:
+        if (
+            type(bundle) is not CompletionEvidenceBundleV1
+            or bundle.request.verification.target != self._target
+        ):
+            raise ValueError("completion classification bundle is outside the configured target")
+        classification = classify_completion(bundle)
+        if self._timeline_recorder is not None:
+            await self._timeline_recorder.record_completion_classification(classification)
+        return classification
+
+
 def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReason:
     request = bundle.request
     verification = request.verification
@@ -77,6 +126,8 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         or execution.epoch != verification.epoch
         or execution.target != verification.target
         or execution.plan_sha256 != verification.plan_sha256
+        or execution.service_claim_sha256 != verification.service_claim_sha256
+        or execution.probe_policy_sha256 != verification.probe_policy_sha256
         or execution.signed_intent_sha256 != verification.signed_intent_sha256
         or execution.request_id != verification.request_id
         or execution.correlation_id != verification.correlation_id
@@ -84,6 +135,10 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         != verification.observation_window_started_at
         or execution.observation_window_ends_at
         != verification.observation_window_ends_at
+        or (
+            request.kind is not CompletionKind.STALE_CAPABILITY_DENIAL
+            and execution.observed_authority_epoch != verification.epoch
+        )
     ):
         return CompletionReason.EVIDENCE_BINDING_MISMATCH
 
@@ -108,6 +163,8 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         if (
             execution.outcome is not ReceiptOutcome.DENIED
             or execution.reason_code is not ReasonCode.EPOCH_MISMATCH
+            or execution.observed_authority_epoch is None
+            or execution.observed_authority_epoch <= execution.epoch
         ):
             return CompletionReason.EXECUTION_EVIDENCE_CONTRADICTORY
         return CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE
@@ -125,6 +182,8 @@ def _classification_reason(bundle: CompletionEvidenceBundleV1) -> CompletionReas
         or execution.reason_code is not None
     ):
         return CompletionReason.EXECUTION_EVIDENCE_CONTRADICTORY
+    if _assessment_is_stale(bundle):
+        return CompletionReason.EVIDENCE_STALE
 
     configuration = bundle.configuration
     if configuration is None:
@@ -193,6 +252,8 @@ def _evidence_matches(
         and signed.epoch == expected.epoch
         and signed.target == expected.target
         and signed.plan_sha256 == expected.plan_sha256
+        and signed.service_claim_sha256 == expected.service_claim_sha256
+        and signed.probe_policy_sha256 == expected.probe_policy_sha256
         and signed.signed_intent_sha256 == expected.signed_intent_sha256
         and signed.action is expected.action
         and signed.stable_revision == expected.stable_revision
@@ -219,11 +280,18 @@ def _authority_matches(
 ) -> bool:
     authority = bundle.authority
     expected = bundle.request.verification
+    execution = bundle.execution
+    expected_epoch = (
+        execution.observed_authority_epoch
+        if kind is AuthorityCompletionKind.EPOCH_ADVANCEMENT
+        and execution is not None
+        else expected.epoch
+    )
     return authority is not None and (
         authority.kind is kind
         and authority.root_id == expected.root_id
         and authority.root_sha256 == expected.root_sha256
-        and authority.epoch == expected.epoch
+        and authority.epoch == expected_epoch
         and authority.target == expected.target
         and authority.plan_sha256 == expected.plan_sha256
         and authority.request_id == expected.request_id
@@ -259,4 +327,4 @@ def _parse_utc(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
 
-__all__ = ["classify_completion"]
+__all__ = ["CoordinatorCompletionClassificationService", "classify_completion"]

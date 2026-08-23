@@ -44,10 +44,16 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     decode_contract,
 )
+from controlgraph_canary.contracts.independent_verification import (
+    CompletionClassificationV1,
+    CompletionKind,
+)
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
     ExecutionReceipt,
+    ReasonCode,
+    ReceiptOutcome,
     TargetBinding,
 )
 from controlgraph_canary.contracts.receipt_authority import (
@@ -118,17 +124,48 @@ class AmbiguousReceiptResolutionBackingStore(Protocol):
     ) -> StoredRecord[ExecutionReceipt]: ...
 
 
+@runtime_checkable
+class StaleDenialCompletionWorkflow(Protocol):
+    """Coordinator-owned classifier for persisted epoch-mismatch receipts."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def classify_stale_denial(
+        self,
+        receipt: ExecutionReceipt,
+    ) -> CompletionClassificationV1: ...
+
+
 class ReceiptAuthorityService:
     """Serve canonical receipt operations through the coordinator's writer identity."""
 
-    def __init__(self, store: ReceiptAuthorityBackingStore) -> None:
+    def __init__(
+        self,
+        store: ReceiptAuthorityBackingStore,
+        *,
+        completion_workflow: StaleDenialCompletionWorkflow | None = None,
+    ) -> None:
         if not isinstance(store, ReceiptAuthorityBackingStore):
             raise TypeError("an exact receipt authority backing store is required")
         target = store.target
-        if type(target) is not TargetBinding:
+        if (
+            type(target) is not TargetBinding
+            or (
+                completion_workflow is not None
+                and (
+                    not isinstance(
+                        completion_workflow,
+                        StaleDenialCompletionWorkflow,
+                    )
+                    or completion_workflow.target != target
+                )
+            )
+        ):
             raise TypeError("receipt authority backing store must be target-bound")
         self._store = store
         self._target = target
+        self._completion_workflow = completion_workflow
 
     @property
     def target(self) -> TargetBinding:
@@ -211,10 +248,39 @@ class ReceiptAuthorityService:
             )
         else:
             raise AuthorityStoreCorruptRecord
+        await self._classify_stale_denial(response)
         try:
             return canonical_json_bytes(response)
         except (ContractError, TypeError, ValueError):
             raise AuthorityStoreCorruptRecord from None
+
+    async def _classify_stale_denial(
+        self,
+        response: ReceiptAuthorityResponseV1,
+    ) -> None:
+        workflow = self._completion_workflow
+        stored = response.stored_receipt
+        if workflow is None or stored is None:
+            return
+        receipt = stored.receipt
+        if not (
+            receipt.outcome is ReceiptOutcome.DENIED
+            and receipt.reason_code is ReasonCode.EPOCH_MISMATCH
+        ):
+            return
+        classification = await workflow.classify_stale_denial(receipt)
+        if (
+            type(classification) is not CompletionClassificationV1
+            or classification.request.kind
+            is not CompletionKind.STALE_CAPABILITY_DENIAL
+            or classification.request.verification.root_id != receipt.root_id
+            or classification.request.verification.root_sha256 != receipt.root_sha256
+            or classification.request.verification.epoch != receipt.epoch
+            or classification.request.verification.target != receipt.target
+            or classification.request.verification.plan_sha256 != receipt.plan_sha256
+            or classification.request.verification.request_id != receipt.request_id
+        ):
+            raise AuthorityStoreCorruptRecord
 
     async def _claim(
         self,

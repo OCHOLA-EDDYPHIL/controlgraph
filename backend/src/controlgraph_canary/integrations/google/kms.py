@@ -837,6 +837,7 @@ class GoogleKmsCapabilityTrustLoader:
         client: object | None = None,
     ) -> None:
         if type(service_role) is not ServiceRole or service_role not in {
+            ServiceRole.COORDINATOR,
             ServiceRole.EXECUTOR,
             ServiceRole.RECOVERY,
         }:

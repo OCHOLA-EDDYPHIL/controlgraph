@@ -23,6 +23,22 @@ variable "description" {
   type        = string
 }
 
+variable "custom_audiences" {
+  description = "Additional exact ID-token audiences accepted by this service."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for audience in var.custom_audiences :
+      length(audience) >= 1 &&
+      length(audience) <= 256 &&
+      audience == trimspace(audience)
+    ]) && length(jsonencode(var.custom_audiences)) <= 32768
+    error_message = "custom_audiences must contain bounded, non-empty exact values."
+  }
+}
+
 variable "container_image" {
   description = "Controller image pinned by digest."
   type        = string

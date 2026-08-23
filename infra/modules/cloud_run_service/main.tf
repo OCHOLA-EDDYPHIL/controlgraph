@@ -4,6 +4,7 @@ resource "google_cloud_run_v2_service" "service" {
   name                 = var.service_name
   description          = var.description
   ingress              = var.ingress
+  custom_audiences     = var.custom_audiences
   invoker_iam_disabled = false
   deletion_protection  = true
   labels               = var.labels

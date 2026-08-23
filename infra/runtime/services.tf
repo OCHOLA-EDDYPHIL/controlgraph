@@ -176,6 +176,10 @@ module "coordinator" {
     CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256 = var.reference_target_candidate_configuration_sha256
     CONTROLGRAPH_OPERATOR_EMAIL                          = local.runtime_identity_emails.operator
     CONTROLGRAPH_OPERATOR_SUBJECT                        = local.runtime_identity_subjects.operator
+    CONTROLGRAPH_SECURITY_AUDITOR_EMAIL                  = local.runtime_identity_emails.security_auditor
+    CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT                = local.runtime_identity_subjects.security_auditor
+    CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL               = local.runtime_identity_emails.restricted_exporter
+    CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT             = local.runtime_identity_subjects.restricted_exporter
     CONTROLGRAPH_EXECUTOR_URL                            = local.service_audiences.executor
     CONTROLGRAPH_RECOVERY_URL                            = local.service_audiences.recovery
     CONTROLGRAPH_EXECUTION_QUEUE                         = local.execution_queue.name
@@ -186,6 +190,8 @@ module "coordinator" {
     CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT             = tostring(local.service_subjects.executor)
     CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL      = local.service_accounts.executor
     CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT    = tostring(local.service_subjects.executor)
+    CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL         = local.runtime_identity_emails.retention_sweeper
+    CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT       = local.runtime_identity_subjects.retention_sweeper
   })
 }
 
@@ -201,18 +207,54 @@ module "api" {
   container_image = var.controller_image
   service_account = local.service_accounts.api
   ingress         = "INGRESS_TRAFFIC_ALL"
-  timeout         = "60s"
-  network         = data.terraform_remote_state.foundation.outputs.network.network_id
-  subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
-  vpc_egress      = "ALL_TRAFFIC"
-  labels          = merge(local.common_labels, { component = "api" })
+  custom_audiences = [
+    var.operator_oauth_client_audience,
+  ]
+  timeout    = "60s"
+  network    = data.terraform_remote_state.foundation.outputs.network.network_id
+  subnetwork = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
+  vpc_egress = "ALL_TRAFFIC"
+  labels     = merge(local.common_labels, { component = "api" })
   environment = merge(local.common_environment, local.identity_environment.api, {
     CONTROLGRAPH_ROLE                           = "api"
     CONTROLGRAPH_SERVICE_NAME                   = local.service_names.api
     CONTROLGRAPH_CONTROLLER_ID                  = "${var.project_id}:${var.region}:api"
     CONTROLGRAPH_COORDINATOR_URL                = local.service_audiences.coordinator
+    CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN        = local.console_origin
     CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE = var.operator_oauth_client_audience
+    CONTROLGRAPH_SECURITY_AUDITOR_EMAIL         = local.runtime_identity_emails.security_auditor
+    CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT       = local.runtime_identity_subjects.security_auditor
+    CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL      = local.runtime_identity_emails.restricted_exporter
+    CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT    = local.runtime_identity_subjects.restricted_exporter
     CONTROLGRAPH_CAPABILITY_KEY_VERSION         = data.terraform_remote_state.foundation.outputs.signing_keys.capability.version
     CONTROLGRAPH_EVIDENCE_KEY_VERSION           = data.terraform_remote_state.foundation.outputs.signing_keys.evidence.version
   })
+}
+
+module "console" {
+  source = "../modules/cloud_run_service"
+
+  depends_on = [google_artifact_registry_repository_iam_member.cloud_run_image_reader]
+
+  project_id      = var.project_id
+  region          = var.region
+  service_name    = local.console_service_name
+  description     = "Public static operator console and fixed private-API relay."
+  container_image = var.console_image
+  service_account = local.service_accounts.console
+  ingress         = "INGRESS_TRAFFIC_ALL"
+  custom_audiences = [
+    var.operator_oauth_client_audience,
+  ]
+  timeout     = "65s"
+  concurrency = 20
+  network     = data.terraform_remote_state.foundation.outputs.network.network_id
+  subnetwork  = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
+  vpc_egress  = "PRIVATE_RANGES_ONLY"
+  labels      = merge(local.common_labels, { component = "console" })
+  environment = {
+    CONTROLGRAPH_CONSOLE_ORIGIN                 = local.console_origin
+    CONTROLGRAPH_OPERATOR_API_ORIGIN            = local.service_audiences.api
+    CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE = var.operator_oauth_client_audience
+  }
 }

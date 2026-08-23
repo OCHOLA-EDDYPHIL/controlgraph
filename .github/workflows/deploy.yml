@@ -20,6 +20,7 @@ jobs:
       id-token: write
     outputs:
       controller_image: ${{ steps.publish.outputs.controller_image }}
+      console_image: ${{ steps.publish.outputs.console_image }}
       reference_target_stable_image: ${{ steps.publish.outputs.reference_target_stable_image }}
       reference_target_candidate_image: ${{ steps.publish.outputs.reference_target_candidate_image }}
     env:
@@ -68,24 +69,24 @@ jobs:
           registry="${CONTROLGRAPH_REGION}-docker.pkg.dev/${CONTROLGRAPH_PROJECT_ID}/${CONTROLGRAPH_ARTIFACT_REPOSITORY}"
           image_tag="sha-${GITHUB_SHA}"
           images=(
-            "controller:controller"
-            "reference-stable:reference-stable"
-            "reference-candidate:reference-candidate"
+            "controller|controller|backend/Dockerfile|backend"
+            "console|runtime|web/Dockerfile|web"
+            "reference-stable|reference-stable|backend/Dockerfile|backend"
+            "reference-candidate|reference-candidate|backend/Dockerfile|backend"
           )
 
           for image_target in "${images[@]}"; do
-            image_name="${image_target%%:*}"
-            target="${image_target##*:}"
+            IFS='|' read -r image_name target dockerfile context <<< "$image_target"
             image="${registry}/${image_name}:${image_tag}"
             docker build \
               --pull \
               --platform linux/amd64 \
-              --file backend/Dockerfile \
+              --file "$dockerfile" \
               --target "$target" \
               --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
               --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
               --tag "$image" \
-              backend
+              "$context"
             [[ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" == "$GITHUB_SHA" ]]
           done
 
@@ -122,6 +123,7 @@ jobs:
           image_tag="sha-${GITHUB_SHA}"
           images=(
             "controller:controller_image"
+            "console:console_image"
             "reference-stable:reference_target_stable_image"
             "reference-candidate:reference_target_candidate_image"
           )
@@ -153,9 +155,7 @@ jobs:
             references+=("${output_name} = \"${immutable_reference}\"")
           done
 
-          [[ "${digests[0]}" != "${digests[1]}" ]]
-          [[ "${digests[0]}" != "${digests[2]}" ]]
-          [[ "${digests[1]}" != "${digests[2]}" ]]
+          [[ "$(printf '%s\n' "${digests[@]}" | sort -u | wc -l)" -eq "${#digests[@]}" ]]
 
           {
             printf '### Immutable runtime image inputs\n\n'

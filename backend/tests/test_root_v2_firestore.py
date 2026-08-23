@@ -135,8 +135,12 @@ def test_root_v3_bundle_is_one_six_record_commit_and_coherent_read() -> None:
 
         created = await _create(store, records)
         read = await store.read_root_creation_bundle(records.root.root_id)
+        signed = await store.read_signed_evidence_event(
+            records.signed_evidence.event.evidence_id
+        )
 
         assert created.result.outcome == "CREATED"
+        assert signed == StoredRecord(records.signed_evidence, 0)
         assert read == created.bundle == RootCreationBundle(
             root=StoredRecord(records.root, 0),
             service_claim=StoredRecord(records.service_claim, 0),
@@ -164,6 +168,9 @@ def test_root_v3_bundle_is_one_six_record_commit_and_coherent_read() -> None:
             f"{root_creation_result_v2_document_id(records.root.root_id)}",
         }
         assert set(client.documents) == expected_paths
+
+        missing = await store.read_signed_evidence_event("cgev:missing-evidence")
+        assert missing is None
 
     asyncio.run(scenario())
 

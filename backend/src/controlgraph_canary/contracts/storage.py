@@ -1128,7 +1128,7 @@ def evidence_chain_head_document_id(root_id: str) -> str:
 def epoch_revocation_identity_logical_id(kind: str, identity_value: str) -> str:
     """Return the collision domain for one revocation request identity."""
 
-    if kind not in {"REQUEST", "IDEMPOTENCY"}:
+    if kind not in {"REQUEST", "IDEMPOTENCY", "EPOCH"}:
         raise ValueError("revocation identity kind is invalid")
     return f"{kind}:{_LogicalIdentity(value=identity_value).value}"
 

@@ -51,6 +51,16 @@ check "controller_image_is_isolated" {
   }
 }
 
+check "console_image_is_isolated" {
+  assert {
+    condition = startswith(
+      var.console_image,
+      "${var.region}-docker.pkg.dev/${var.project_id}/${data.terraform_remote_state.foundation.outputs.artifact_repository.repository_id}/console@sha256:",
+    )
+    error_message = "console_image must be the dedicated immutable console image."
+  }
+}
+
 check "reference_target_images_are_isolated" {
   assert {
     condition = (

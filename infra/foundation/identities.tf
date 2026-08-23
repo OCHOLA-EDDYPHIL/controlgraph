@@ -1,5 +1,10 @@
 locals {
   workload_service_accounts = {
+    console = {
+      account_id   = "controlgraph-console"
+      display_name = "ControlGraph operator console"
+      description  = "Public static console host with no control-plane permissions."
+    }
     api = {
       account_id   = "controlgraph-api"
       display_name = "ControlGraph API"
@@ -49,6 +54,11 @@ locals {
       account_id   = "cg-recovery-task-caller"
       display_name = "ControlGraph recovery task caller"
       description  = "OIDC caller identity for the recovery queue."
+    }
+    retention_sweeper = {
+      account_id   = "cg-retention-sweeper"
+      display_name = "ControlGraph retention sweeper"
+      description  = "OIDC caller identity for the bounded raw-evidence retention sweep."
     }
     ci_image_builder = {
       account_id   = "cg-ci-image-builder"

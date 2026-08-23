@@ -31,6 +31,9 @@ INDEPENDENT_VERIFICATION_EVIDENCE_PATH = (
 RECOVERY_PRESTATE_ATTESTATION_PATH = (
     "/v1/internal/evidence/recovery-prestate/attest"
 )
+TIMELINE_READ_PATH = "/v1/operator/timeline"
+TIMELINE_RAW_EXPORT_PATH = "/v1/operator/timeline/raw-export"
+TIMELINE_RETENTION_PATH = "/v1/internal/timeline/retention"
 
 _PROJECT_ID = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _PROJECT_NUMBER = re.compile(r"^[1-9][0-9]{5,31}$")
@@ -63,6 +66,7 @@ class CallerRole(StrEnum):
     EVIDENCE_WRITER = "evidence_writer"
     EXECUTION_TASK_CALLER = "execution_task_caller"
     RECOVERY_TASK_CALLER = "recovery_task_caller"
+    RETENTION_SWEEPER = "retention_sweeper"
 
 
 class AuthenticationDenialCode(StrEnum):
@@ -78,6 +82,9 @@ class AuthenticationDenialCode(StrEnum):
     TOKEN_EXPIRED = "AUTH_TOKEN_EXPIRED"
     TOKEN_NOT_YET_VALID = "AUTH_TOKEN_NOT_YET_VALID"
     TOKEN_LIFETIME_DENIED = "AUTH_TOKEN_LIFETIME_DENIED"
+    BROWSER_ORIGIN_DENIED = "AUTH_BROWSER_ORIGIN_DENIED"
+    CSRF_MISSING = "AUTH_CSRF_MISSING"
+    CSRF_INVALID = "AUTH_CSRF_INVALID"
     VERIFICATION_UNAVAILABLE = "AUTH_VERIFICATION_UNAVAILABLE"
 
 
@@ -148,6 +155,13 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EXECUTOR
             and self.path == RECOVERY_EXECUTION_FACADE_PATH
         )
+        timeline_api_route = (
+            self.service_role is ServiceRole.API
+            and self.path in {TIMELINE_READ_PATH, TIMELINE_RAW_EXPORT_PATH}
+        )
+        timeline_retention_route = (
+            self.service_role is ServiceRole.COORDINATOR and self.path == TIMELINE_RETENTION_PATH
+        )
         if (
             not executor_receipt_authority_route
             and not recovery_receipt_authority_route
@@ -156,6 +170,8 @@ class RouteAuthenticationPolicy:
             and not independent_verification_evidence_route
             and not recovery_prestate_attestation_route
             and not recovery_execution_facade_route
+            and not timeline_api_route
+            and not timeline_retention_route
             and self.path != protected_path(self.service_role)
         ):
             raise ValueError("protected path does not match the service role")
@@ -176,7 +192,9 @@ class RouteAuthenticationPolicy:
                     CallerRole.RECOVERY
                     if recovery_execution_facade_route
                     else (
-                        CallerRole.VERIFIER
+                        CallerRole.OPERATOR
+                        if timeline_api_route
+                        else CallerRole.VERIFIER
                         if (
                             classification_evidence_route
                             or health_attestation_route
@@ -188,6 +206,8 @@ class RouteAuthenticationPolicy:
                 )
             )
         )
+        if timeline_retention_route:
+            expected_caller_role = CallerRole.RETENTION_SWEEPER
         if self.caller.role is not expected_caller_role:
             raise ValueError("caller role does not match the protected route")
         if self.caller.role is CallerRole.OPERATOR:
@@ -207,6 +227,7 @@ class AuthenticationContext:
     audience: str
     issued_at: int
     expires_at: int
+    operator_session_nonce: str | None = None
 
 
 class IdentityAuthenticator(Protocol):
@@ -229,6 +250,7 @@ _SERVICE_ACCOUNT_IDS: dict[CallerRole, str] = {
     CallerRole.EVIDENCE_WRITER: "cg-evidence-writer",
     CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
     CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
+    CallerRole.RETENTION_SWEEPER: "cg-retention-sweeper",
 }
 
 _SERVICE_NAMES: dict[ServiceRole, str] = {
@@ -454,6 +476,8 @@ __all__ = [
     "RECOVERY_EXECUTION_FACADE_PATH",
     "RECOVERY_PRESTATE_ATTESTATION_PATH",
     "RECOVERY_RECEIPT_AUTHORITY_PATH",
+    "TIMELINE_RAW_EXPORT_PATH",
+    "TIMELINE_READ_PATH",
     "AuthenticationContext",
     "AuthenticationDenialCode",
     "AuthenticationError",

@@ -12,6 +12,7 @@ locals {
 
   capability_version_readers = toset([
     "api",
+    "coordinator",
     "executor",
     "issuer",
     "recovery",
@@ -94,6 +95,7 @@ resource "google_kms_crypto_key_iam_member" "evidence_signer" {
 resource "google_kms_crypto_key_iam_member" "capability_public_key_viewer" {
   for_each = toset([
     "api",
+    "coordinator",
     "executor",
     "recovery",
     "verifier",

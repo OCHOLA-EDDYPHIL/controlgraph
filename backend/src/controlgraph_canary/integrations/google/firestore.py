@@ -185,6 +185,17 @@ _KNOWN_CONTENTION = (
 )
 
 
+def _epoch_revocation_identity_value(root_id: str, epoch: int) -> str:
+    if (
+        type(root_id) is not str
+        or re.fullmatch(r"cgroot:[0-9a-f]{64}", root_id) is None
+        or type(epoch) is not int
+        or not 2 <= epoch <= 2**53 - 1
+    ):
+        raise ValueError("revocation epoch identity is invalid")
+    return f"{root_id}:epoch:{epoch}"
+
+
 class _DocumentReferencePort(Protocol):
     path: str
 
@@ -4590,6 +4601,34 @@ class FirestoreAuthorityStore:
             revision=0,
             value=commit.idempotency_identity,
         )
+        epoch_identity_value = _epoch_revocation_identity_value(
+            commit.result.root_id,
+            commit.result.new_epoch,
+        )
+        epoch_identity = EpochRevocationIdentityV1(
+            schema_version=commit.request_identity.schema_version,
+            identity_kind=EpochRevocationIdentityKind.EPOCH,
+            identity_value=epoch_identity_value,
+            root_id=commit.result.root_id,
+            root_sha256=commit.result.root_sha256,
+            request_sha256=commit.result.request_sha256,
+            result_id=commit.result.result_id,
+            claimed_at=commit.result.committed_at,
+        )
+        epoch_identity_logical_id = epoch_revocation_identity_logical_id(
+            epoch_identity.identity_kind.value,
+            epoch_identity.identity_value,
+        )
+        epoch_identity_document = _prepared_document(
+            kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+            logical_id=epoch_identity_logical_id,
+            document_id=epoch_revocation_identity_document_id(
+                epoch_identity.identity_kind.value,
+                epoch_identity.identity_value,
+            ),
+            revision=0,
+            value=epoch_identity,
+        )
         audit_document = _prepared_document(
             kind=AuthorityStorageKind.EPOCH_REVOCATION_AUDIT,
             logical_id=commit.audit.audit_id,
@@ -4604,6 +4643,7 @@ class FirestoreAuthorityStore:
             result_document,
             request_identity_document,
             idempotency_identity_document,
+            epoch_identity_document,
             audit_document,
         )
 
@@ -4698,6 +4738,18 @@ class FirestoreAuthorityStore:
                 document_id=idempotency_identity_document.document_id,
                 model_type=EpochRevocationIdentityV1,
             )
+            current_epoch_identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                    epoch_identity_document.document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                logical_id=epoch_identity_logical_id,
+                document_id=epoch_identity_document.document_id,
+                model_type=EpochRevocationIdentityV1,
+            )
             current_result = await self._transaction_read(
                 transaction,
                 reference=self._reference(
@@ -4740,6 +4792,7 @@ class FirestoreAuthorityStore:
                     else current_idempotency_identity.stored
                 )
                 != expected.idempotency_identity
+                or current_epoch_identity is not None
                 or (None if current_result is None else current_result.stored) != expected.result
                 or (None if current_audit is None else current_audit.stored)
                 != expected.attempt_audit
@@ -4781,6 +4834,7 @@ class FirestoreAuthorityStore:
                 result_document,
                 request_identity_document,
                 idempotency_identity_document,
+                epoch_identity_document,
                 audit_document,
             ):
                 transaction.create(
@@ -4879,6 +4933,136 @@ class FirestoreAuthorityStore:
         if decoded is not None and decoded.value.target != self._target:
             raise AuthorityStoreCorruptRecord
         return None if decoded is None else decoded.stored
+
+    async def read_signed_evidence_event(
+        self,
+        evidence_id: str,
+    ) -> StoredRecord[SignedEvidenceEventV1] | None:
+        """Strongly read one exact signed authority evidence record by logical id."""
+
+        decoded = await self._strong_read(
+            kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+            logical_id=evidence_id,
+            document_id=signed_evidence_event_document_id(evidence_id),
+            model_type=SignedEvidenceEventV1,
+        )
+        if decoded is not None and decoded.value.event.target != self._target:
+            raise AuthorityStoreCorruptRecord
+        return None if decoded is None else decoded.stored
+
+    async def read_signed_epoch_evidence(
+        self,
+        root_id: str,
+        epoch: int,
+    ) -> StoredRecord[SignedEvidenceEventV1] | None:
+        """Read one immutable revocation event by its root-and-epoch index."""
+
+        identity_value = _epoch_revocation_identity_value(root_id, epoch)
+        decoded_evidence: _DecodedDocument[SignedEvidenceEventV1] | None = None
+        completed = False
+
+        async def read(transaction: _TransactionPort) -> None:
+            nonlocal completed, decoded_evidence
+            client = await self._client()
+            identity_logical_id = epoch_revocation_identity_logical_id(
+                EpochRevocationIdentityKind.EPOCH.value,
+                identity_value,
+            )
+            identity_document_id = epoch_revocation_identity_document_id(
+                EpochRevocationIdentityKind.EPOCH.value,
+                identity_value,
+            )
+            identity = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                    identity_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_IDENTITY,
+                logical_id=identity_logical_id,
+                document_id=identity_document_id,
+                model_type=EpochRevocationIdentityV1,
+            )
+            if identity is None:
+                completed = True
+                return
+            indexed = identity.value
+            if (
+                identity.wrapper.revision != 0
+                or indexed.identity_kind is not EpochRevocationIdentityKind.EPOCH
+                or indexed.identity_value != identity_value
+                or indexed.root_id != root_id
+            ):
+                raise AuthorityStoreCorruptRecord
+            result_document_id = epoch_revocation_result_document_id(
+                indexed.result_id
+            )
+            result = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                    result_document_id,
+                ),
+                kind=AuthorityStorageKind.EPOCH_REVOCATION_RESULT,
+                logical_id=indexed.result_id,
+                document_id=result_document_id,
+                model_type=EpochRevocationResultV1,
+            )
+            if result is None:
+                raise AuthorityStoreCorruptRecord
+            committed = result.value
+            evidence_document_id = signed_evidence_event_document_id(
+                committed.evidence_id
+            )
+            evidence = await self._transaction_read(
+                transaction,
+                reference=self._reference(
+                    client,
+                    AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                    evidence_document_id,
+                ),
+                kind=AuthorityStorageKind.SIGNED_EVIDENCE_EVENT,
+                logical_id=committed.evidence_id,
+                document_id=evidence_document_id,
+                model_type=SignedEvidenceEventV1,
+            )
+            if evidence is None:
+                raise AuthorityStoreCorruptRecord
+            signed = evidence.value
+            event = signed.event
+            if (
+                result.wrapper.revision != 0
+                or evidence.wrapper.revision != 0
+                or committed.result_id != indexed.result_id
+                or committed.request_sha256 != indexed.request_sha256
+                or committed.root_id != indexed.root_id
+                or committed.root_sha256 != indexed.root_sha256
+                or committed.target != self._target
+                or committed.new_epoch != epoch
+                or committed.previous_epoch + 1 != epoch
+                or committed.committed_at != indexed.claimed_at
+                or committed.evidence_sha256 != canonical_sha256(signed)
+                or event.kind is not EvidenceKind.EPOCH_ADVANCED
+                or event.evidence_id != committed.evidence_id
+                or event.root_id != committed.root_id
+                or event.root_sha256 != committed.root_sha256
+                or event.target != committed.target
+                or event.epoch != epoch
+                or event.request_id != committed.request_id
+                or event.occurred_at != committed.committed_at
+                or event.subject_sha256
+                != canonical_sha256(committed.evidence_subject)
+            ):
+                raise AuthorityStoreCorruptRecord
+            decoded_evidence = evidence
+            completed = True
+
+        await self._run_consistent_read(read)
+        if not completed:
+            raise AuthorityStoreUnavailable
+        return None if decoded_evidence is None else decoded_evidence.stored
 
     async def read_issuance_state(
         self,

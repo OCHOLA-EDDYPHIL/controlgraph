@@ -10,6 +10,12 @@ resource "google_project_service_identity" "cloud_tasks" {
   service  = "cloudtasks.googleapis.com"
 }
 
+resource "google_project_service_identity" "cloud_scheduler" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "cloudscheduler.googleapis.com"
+}
+
 resource "google_artifact_registry_repository_iam_member" "cloud_run_image_reader" {
   project    = var.project_id
   location   = var.region
@@ -74,6 +80,12 @@ resource "google_service_account_iam_member" "cloud_tasks_token_creator" {
   member             = google_project_service_identity.cloud_tasks.member
 }
 
+resource "google_service_account_iam_member" "cloud_scheduler_token_creator" {
+  service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names.retention_sweeper
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = google_project_service_identity.cloud_scheduler.member
+}
+
 resource "google_service_account_iam_member" "executor_reference_target_act_as" {
   service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names.reference
   role               = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.task_oidc_actor
@@ -86,6 +98,14 @@ locals {
       service = module.api.service.name
       member  = var.operator_principal
     }
+    api_security_auditor = {
+      service = module.api.service.name
+      member  = var.security_auditor_principal
+    }
+    api_restricted_exporter = {
+      service = module.api.service.name
+      member  = var.restricted_exporter_principal
+    }
     coordinator = {
       service = module.coordinator.service.name
       member  = "serviceAccount:${local.service_accounts.api}"
@@ -93,6 +113,10 @@ locals {
     coordinator_receipts = {
       service = module.coordinator.service.name
       member  = "serviceAccount:${local.service_accounts.executor}"
+    }
+    coordinator_retention = {
+      service = module.coordinator.service.name
+      member  = "serviceAccount:${local.service_accounts.retention_sweeper}"
     }
     issuer = {
       service = module.issuer.service.name
@@ -134,8 +158,11 @@ check "runtime_invoker_map_is_closed" {
     condition = (
       toset(keys(local.run_invokers)) == toset([
         "api",
+        "api_security_auditor",
+        "api_restricted_exporter",
         "coordinator",
         "coordinator_receipts",
+        "coordinator_retention",
         "issuer",
         "executor",
         "executor_recovery_facade",
@@ -147,6 +174,10 @@ check "runtime_invoker_map_is_closed" {
       ]) &&
       local.run_invokers.coordinator_receipts.service == module.coordinator.service.name &&
       local.run_invokers.coordinator_receipts.member == "serviceAccount:${local.service_accounts.executor}" &&
+      local.run_invokers.coordinator_retention.service == module.coordinator.service.name &&
+      local.run_invokers.coordinator_retention.member == "serviceAccount:${local.service_accounts.retention_sweeper}" &&
+      local.run_invokers.api_security_auditor.service == module.api.service.name &&
+      local.run_invokers.api_restricted_exporter.service == module.api.service.name &&
       local.run_invokers.executor_recovery_facade.service == module.executor.service.name &&
       local.run_invokers.executor_recovery_facade.member == "serviceAccount:${local.service_accounts.recovery}" &&
       local.run_invokers.evidence_writer.service == module.evidence_writer.service.name &&
@@ -158,6 +189,19 @@ check "runtime_invoker_map_is_closed" {
   }
 }
 
+check "retention_scheduler_identity_is_closed" {
+  assert {
+    condition = (
+      google_service_account_iam_member.cloud_scheduler_token_creator.service_account_id == data.terraform_remote_state.foundation.outputs.service_account_names.retention_sweeper &&
+      google_service_account_iam_member.cloud_scheduler_token_creator.role == "roles/iam.serviceAccountTokenCreator" &&
+      google_service_account_iam_member.cloud_scheduler_token_creator.member == google_project_service_identity.cloud_scheduler.member &&
+      local.run_invokers.coordinator_retention.service == module.coordinator.service.name &&
+      local.run_invokers.coordinator_retention.member == "serviceAccount:${local.service_accounts.retention_sweeper}"
+    )
+    error_message = "Scheduler token minting and coordinator invocation must remain bound to the fixed retention-sweeper identity."
+  }
+}
+
 resource "google_cloud_run_v2_service_iam_member" "invoker" {
   for_each = local.run_invokers
 
@@ -166,6 +210,26 @@ resource "google_cloud_run_v2_service_iam_member" "invoker" {
   name     = each.value.service
   role     = "roles/run.invoker"
   member   = each.value.member
+}
+
+resource "google_cloud_run_v2_service_iam_member" "operator_console_public" {
+  project  = var.project_id
+  location = var.region
+  name     = module.console.service.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+check "operator_console_has_no_control_plane_identity" {
+  assert {
+    condition = (
+      local.service_accounts.console == "controlgraph-console@${var.project_id}.iam.gserviceaccount.com" &&
+      google_cloud_run_v2_service_iam_member.operator_console_public.name == module.console.service.name &&
+      google_cloud_run_v2_service_iam_member.operator_console_public.member == "allUsers" &&
+      local.run_invokers.api.member == var.operator_principal
+    )
+    error_message = "The public console must remain separate from the exact human API invoker boundary."
+  }
 }
 
 resource "google_cloud_run_v2_service_iam_member" "verifier_target_snapshot" {
