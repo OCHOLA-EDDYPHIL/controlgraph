@@ -29,6 +29,12 @@ OPERATOR_EMAIL = "operator@example.com"
 
 EXPECTED_CALLERS = {
     CallerRole.OPERATOR: OPERATOR_EMAIL,
+    CallerRole.SECURITY_AUDITOR: (
+        f"cg-security-auditor@{PROJECT_ID}.iam.gserviceaccount.com"
+    ),
+    CallerRole.RESTRICTED_EXPORTER: (
+        f"cg-restricted-exporter@{PROJECT_ID}.iam.gserviceaccount.com"
+    ),
     CallerRole.API: f"controlgraph-api@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.COORDINATOR: f"controlgraph-coordinator@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.ISSUER: f"controlgraph-issuer@{PROJECT_ID}.iam.gserviceaccount.com",

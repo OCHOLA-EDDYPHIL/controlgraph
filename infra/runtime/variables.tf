@@ -125,46 +125,6 @@ variable "operator_subject" {
   }
 }
 
-variable "security_auditor_principal" {
-  description = "Exact human principal allowed to request security-audit timeline projections."
-  type        = string
-
-  validation {
-    condition     = can(regex("^user:[^@[:space:]]+@[^@[:space:]]+$", var.security_auditor_principal))
-    error_message = "security_auditor_principal must be one explicit user email principal."
-  }
-}
-
-variable "security_auditor_subject" {
-  description = "Exact Google identity subject allowed to request security-audit projections."
-  type        = string
-
-  validation {
-    condition     = can(regex("^[1-9][0-9]{5,31}$", var.security_auditor_subject))
-    error_message = "security_auditor_subject must be one explicit numeric Google identity subject."
-  }
-}
-
-variable "restricted_exporter_principal" {
-  description = "Exact human principal allowed to export restricted timeline evidence."
-  type        = string
-
-  validation {
-    condition     = can(regex("^user:[^@[:space:]]+@[^@[:space:]]+$", var.restricted_exporter_principal))
-    error_message = "restricted_exporter_principal must be one explicit user email principal."
-  }
-}
-
-variable "restricted_exporter_subject" {
-  description = "Exact Google identity subject allowed to export restricted timeline evidence."
-  type        = string
-
-  validation {
-    condition     = can(regex("^[1-9][0-9]{5,31}$", var.restricted_exporter_subject))
-    error_message = "restricted_exporter_subject must be one explicit numeric Google identity subject."
-  }
-}
-
 variable "operator_oauth_client_audience" {
   description = "Exact non-secret Google OAuth client audience emitted for the approved human operator."
   type        = string

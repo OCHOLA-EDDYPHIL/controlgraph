@@ -1877,7 +1877,7 @@ def _operator_timeline_policy(
         type(base) is not RouteAuthenticationPolicy
         or base.service_role is not ServiceRole.API
         or base.caller.role is not CallerRole.OPERATOR
-        or path not in {TIMELINE_READ_PATH, TIMELINE_RAW_EXPORT_PATH}
+        or path != TIMELINE_READ_PATH
     ):
         raise ValueError("operator timeline path is invalid")
     return RouteAuthenticationPolicy(
@@ -1896,6 +1896,7 @@ def _security_audit_timeline_policy(
     return _privileged_timeline_policy(
         settings,
         path=TIMELINE_READ_PATH,
+        role=CallerRole.SECURITY_AUDITOR,
         email=settings.security_auditor_identity,
         subject=settings.security_auditor_subject,
     )
@@ -1907,6 +1908,7 @@ def _restricted_export_timeline_policy(
     return _privileged_timeline_policy(
         settings,
         path=TIMELINE_RAW_EXPORT_PATH,
+        role=CallerRole.RESTRICTED_EXPORTER,
         email=settings.restricted_exporter_identity,
         subject=settings.restricted_exporter_subject,
     )
@@ -1938,6 +1940,7 @@ def _privileged_timeline_policy(
     settings: ControllerSettings,
     *,
     path: str,
+    role: CallerRole,
     email: str | None,
     subject: str | None,
 ) -> RouteAuthenticationPolicy:
@@ -1950,7 +1953,7 @@ def _privileged_timeline_policy(
         path=path,
         audience=_service_audience(ServiceRole.API, settings.project_number),
         caller=CallerBinding(
-            role=CallerRole.OPERATOR,
+            role=role,
             email=email,
             subject=subject,
         ),

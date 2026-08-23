@@ -38,9 +38,13 @@ from controlgraph_canary.http.service import create_service_app
 PROJECT_NUMBER = "123456789012"
 OPERATOR_EMAIL = "operator@example.com"
 OPERATOR_SUBJECT = "123456789012345678901"
-SECURITY_EMAIL = "security@example.com"
+SECURITY_EMAIL = (
+    f"cg-security-auditor@{TARGET.project_id}.iam.gserviceaccount.com"
+)
 SECURITY_SUBJECT = "223456789012345678901"
-EXPORTER_EMAIL = "exporter@example.com"
+EXPORTER_EMAIL = (
+    f"cg-restricted-exporter@{TARGET.project_id}.iam.gserviceaccount.com"
+)
 EXPORTER_SUBJECT = "323456789012345678901"
 AUDIENCE = (
     f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
@@ -60,19 +64,9 @@ OPERATOR_HEADERS = {
     ),
 }
 SECURITY_TOKEN = "Bearer security.payload.signature"
-SECURITY_HEADERS = {
-    CONTROLGRAPH_AUTHORIZATION_HEADER: SECURITY_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: (
-        "bearer security.payload.SIGNATURE_REMOVED_BY_GOOGLE"
-    ),
-}
+SECURITY_HEADERS = {"Authorization": SECURITY_TOKEN}
 EXPORT_TOKEN = "Bearer exporter.payload.signature"
-EXPORT_HEADERS = {
-    CONTROLGRAPH_AUTHORIZATION_HEADER: EXPORT_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: (
-        "bearer exporter.payload.SIGNATURE_REMOVED_BY_GOOGLE"
-    ),
-}
+EXPORT_HEADERS = {"Authorization": EXPORT_TOKEN}
 RETENTION_TOKEN = "Bearer retention.payload.signature"
 RETENTION_HEADERS = {"Authorization": RETENTION_TOKEN}
 
@@ -80,6 +74,7 @@ RETENTION_HEADERS = {"Authorization": RETENTION_TOKEN}
 def _policy(
     path: str,
     *,
+    role: CallerRole = CallerRole.OPERATOR,
     email: str = OPERATOR_EMAIL,
     subject: str = OPERATOR_SUBJECT,
 ) -> RouteAuthenticationPolicy:
@@ -90,7 +85,7 @@ def _policy(
         path=path,
         audience=AUDIENCE,
         caller=CallerBinding(
-            role=CallerRole.OPERATOR,
+            role=role,
             email=email,
             subject=subject,
         ),
@@ -125,8 +120,16 @@ class _Authenticator:
     ) -> AuthenticationContext:
         identities = {
             FULL_TOKEN: (OPERATOR_EMAIL, OPERATOR_SUBJECT, CallerRole.OPERATOR),
-            SECURITY_TOKEN: (SECURITY_EMAIL, SECURITY_SUBJECT, CallerRole.OPERATOR),
-            EXPORT_TOKEN: (EXPORTER_EMAIL, EXPORTER_SUBJECT, CallerRole.OPERATOR),
+            SECURITY_TOKEN: (
+                SECURITY_EMAIL,
+                SECURITY_SUBJECT,
+                CallerRole.SECURITY_AUDITOR,
+            ),
+            EXPORT_TOKEN: (
+                EXPORTER_EMAIL,
+                EXPORTER_SUBJECT,
+                CallerRole.RESTRICTED_EXPORTER,
+            ),
             RETENTION_TOKEN: (
                 RETENTION_EMAIL,
                 RETENTION_SUBJECT,
@@ -212,12 +215,14 @@ def _client() -> tuple[TestClient, _Authenticator, _TimelineStore]:
         timeline_read_authentication_policy=_policy(TIMELINE_READ_PATH),
         timeline_security_read_authentication_policy=_policy(
             TIMELINE_READ_PATH,
+            role=CallerRole.SECURITY_AUDITOR,
             email=SECURITY_EMAIL,
             subject=SECURITY_SUBJECT,
         ),
         timeline_raw_export_service=TimelineRawExportService(target=TARGET, store=store),
         timeline_raw_export_authentication_policy=_policy(
             TIMELINE_RAW_EXPORT_PATH,
+            role=CallerRole.RESTRICTED_EXPORTER,
             email=EXPORTER_EMAIL,
             subject=EXPORTER_SUBJECT,
         ),
@@ -274,7 +279,7 @@ def test_timeline_get_rejects_target_override_ambiguous_cursor_and_elevation() -
     assert duplicate.status_code == 400
     assert incomplete_cursor.status_code == 400
     assert elevated.status_code == 403
-    assert audit_denied.status_code == 403
+    assert audit_denied.status_code == 401
     assert audit_accepted.status_code == 200
     assert [item.audience.value for item in store.page_commands] == ["SECURITY_AUDIT"]
 
@@ -311,8 +316,8 @@ def test_raw_export_requires_separate_confirmation_and_is_no_store() -> None:
         },
     )
 
-    assert denied.status_code == 403
-    assert denied.json()["code"] == "AUTH_CALLER_DENIED"
+    assert denied.status_code == 401
+    assert denied.json()["code"] == "AUTH_CREDENTIAL_MALFORMED"
     assert unconfirmed.status_code == 403
     assert unconfirmed.json()["code"] == "TIMELINE_RAW_EXPORT_ACCESS_DENIED"
     assert accepted.status_code == 200

@@ -41,8 +41,8 @@ locals {
 
   runtime_identity_emails = {
     operator              = trimprefix(var.operator_principal, "user:")
-    security_auditor      = trimprefix(var.security_auditor_principal, "user:")
-    restricted_exporter   = trimprefix(var.restricted_exporter_principal, "user:")
+    security_auditor      = local.service_accounts.security_auditor
+    restricted_exporter   = local.service_accounts.restricted_exporter
     api                   = local.service_accounts.api
     coordinator           = local.service_accounts.coordinator
     issuer                = local.service_accounts.issuer
@@ -57,8 +57,8 @@ locals {
 
   runtime_identity_subjects = {
     operator              = var.operator_subject
-    security_auditor      = var.security_auditor_subject
-    restricted_exporter   = var.restricted_exporter_subject
+    security_auditor      = tostring(local.service_subjects.security_auditor)
+    restricted_exporter   = tostring(local.service_subjects.restricted_exporter)
     api                   = tostring(local.service_subjects.api)
     coordinator           = tostring(local.service_subjects.coordinator)
     issuer                = tostring(local.service_subjects.issuer)

@@ -695,7 +695,7 @@ def create_service_app(
         or timeline_security_read_authentication_policy.path != TIMELINE_READ_PATH
         or timeline_read_authentication_policy.caller.role is not CallerRole.OPERATOR
         or timeline_security_read_authentication_policy.caller.role
-        is not CallerRole.OPERATOR
+        is not CallerRole.SECURITY_AUDITOR
         or timeline_read_authentication_policy.caller
         == timeline_security_read_authentication_policy.caller
     ):
@@ -715,7 +715,7 @@ def create_service_app(
         or timeline_raw_export_authentication_policy.service_role is not ServiceRole.API
         or timeline_raw_export_authentication_policy.path != TIMELINE_RAW_EXPORT_PATH
         or timeline_raw_export_authentication_policy.caller.role
-        is not CallerRole.OPERATOR
+        is not CallerRole.RESTRICTED_EXPORTER
         or timeline_raw_export_authentication_policy.caller
         in {
             timeline_read_authentication_policy.caller
@@ -878,7 +878,12 @@ def create_service_app(
                 AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
                 correlation_id,
             )
-        if type(context) is not AuthenticationContext or context.role is not CallerRole.OPERATOR:
+        expected_role = (
+            CallerRole.SECURITY_AUDITOR
+            if route_policy is timeline_security_read_authentication_policy
+            else CallerRole.OPERATOR
+        )
+        if type(context) is not AuthenticationContext or context.role is not expected_role:
             return _authentication_denial(
                 AuthenticationDenialCode.CALLER_DENIED,
                 correlation_id,
@@ -954,7 +959,10 @@ def create_service_app(
                 AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
                 correlation_id,
             )
-        if type(context) is not AuthenticationContext or context.role is not CallerRole.OPERATOR:
+        if (
+            type(context) is not AuthenticationContext
+            or context.role is not CallerRole.RESTRICTED_EXPORTER
+        ):
             return _authentication_denial(
                 AuthenticationDenialCode.CALLER_DENIED,
                 correlation_id,
