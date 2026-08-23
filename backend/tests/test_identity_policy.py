@@ -8,6 +8,7 @@ from controlgraph_canary.application.identity import (
     RECEIPT_AUTHORITY_PATH,
     RECOVERY_EXECUTION_FACADE_PATH,
     RECOVERY_RECEIPT_AUTHORITY_PATH,
+    TIMELINE_RETENTION_PATH,
     AuthenticationDenialCode,
     AuthenticationError,
     CallerBinding,
@@ -41,6 +42,7 @@ EXPECTED_CALLERS = {
     CallerRole.RECOVERY_TASK_CALLER: (
         f"cg-recovery-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
     ),
+    CallerRole.RETENTION_SWEEPER: (f"cg-retention-sweeper@{PROJECT_ID}.iam.gserviceaccount.com"),
 }
 
 ROUTE_CALLERS = {
@@ -165,10 +167,7 @@ def test_receipt_authority_routes_bind_distinct_execution_callers(
         project_number=PROJECT_NUMBER,
         service_role=ServiceRole.COORDINATOR,
         path=path,
-        audience=(
-            f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
-            "us-central1.run.app"
-        ),
+        audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
         caller=CallerBinding(
             role=caller_role,
             email=EXPECTED_CALLERS[caller_role],
@@ -180,6 +179,32 @@ def test_receipt_authority_routes_bind_distinct_execution_callers(
     assert policy.caller.role is caller_role
 
 
+def test_timeline_retention_route_binds_only_the_sweeper_identity() -> None:
+    policy = RouteAuthenticationPolicy(
+        project_id=PROJECT_ID,
+        project_number=PROJECT_NUMBER,
+        service_role=ServiceRole.COORDINATOR,
+        path=TIMELINE_RETENTION_PATH,
+        audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
+        caller=CallerBinding(
+            role=CallerRole.RETENTION_SWEEPER,
+            email=EXPECTED_CALLERS[CallerRole.RETENTION_SWEEPER],
+            subject=SUBJECT,
+        ),
+    )
+
+    assert policy.path == TIMELINE_RETENTION_PATH
+    with pytest.raises(ValueError, match="caller role"):
+        replace(
+            policy,
+            caller=CallerBinding(
+                role=CallerRole.API,
+                email=EXPECTED_CALLERS[CallerRole.API],
+                subject=SUBJECT,
+            ),
+        )
+
+
 def test_recovery_cannot_use_either_executor_receipt_authority_route() -> None:
     with pytest.raises(ValueError, match="caller role"):
         RouteAuthenticationPolicy(
@@ -187,10 +212,7 @@ def test_recovery_cannot_use_either_executor_receipt_authority_route() -> None:
             project_number=PROJECT_NUMBER,
             service_role=ServiceRole.COORDINATOR,
             path=RECEIPT_AUTHORITY_PATH,
-            audience=(
-                f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
-                "us-central1.run.app"
-            ),
+            audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
             caller=CallerBinding(
                 role=CallerRole.RECOVERY,
                 email=EXPECTED_CALLERS[CallerRole.RECOVERY],
@@ -204,10 +226,7 @@ def test_recovery_cannot_use_either_executor_receipt_authority_route() -> None:
             project_number=PROJECT_NUMBER,
             service_role=ServiceRole.COORDINATOR,
             path=RECOVERY_RECEIPT_AUTHORITY_PATH,
-            audience=(
-                f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
-                "us-central1.run.app"
-            ),
+            audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
             caller=CallerBinding(
                 role=CallerRole.RECOVERY,
                 email=EXPECTED_CALLERS[CallerRole.RECOVERY],
@@ -222,9 +241,7 @@ def test_recovery_executor_facade_has_one_exact_caller_and_path() -> None:
         project_number=PROJECT_NUMBER,
         service_role=ServiceRole.EXECUTOR,
         path=RECOVERY_EXECUTION_FACADE_PATH,
-        audience=(
-            f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
-        ),
+        audience=(f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"),
         caller=CallerBinding(
             role=CallerRole.RECOVERY,
             email=EXPECTED_CALLERS[CallerRole.RECOVERY],

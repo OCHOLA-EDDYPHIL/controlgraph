@@ -31,7 +31,7 @@ check "timeline_raw_retention_is_bounded" {
       !contains(local.firestore_readers, "api") &&
       !contains(local.firestore_writers, "api")
     )
-    error_message = "Raw evidence and signed intents must be TTL-bound and inaccessible to the API identity."
+    error_message = "Raw evidence retention and signed-intent TTL must remain bounded and inaccessible to the API identity."
   }
 }
 
@@ -105,9 +105,30 @@ resource "google_firestore_field" "timeline_raw_expiry" {
   collection = local.timeline_raw_collection
   field      = local.timeline_raw_expiry_field
 
-  ttl_config {}
-
   index_config {}
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_firestore_database.authority]
+}
+
+resource "google_firestore_index" "timeline_raw_retention" {
+  project     = var.project_id
+  database    = google_firestore_database.authority.name
+  collection  = local.timeline_raw_collection
+  query_scope = "COLLECTION"
+
+  fields {
+    field_path = "target_sha256"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = local.timeline_raw_expiry_field
+    order      = "ASCENDING"
+  }
 
   lifecycle {
     prevent_destroy = true

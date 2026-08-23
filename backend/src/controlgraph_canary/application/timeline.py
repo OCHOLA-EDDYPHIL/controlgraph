@@ -39,6 +39,7 @@ from controlgraph_canary.contracts.timeline import (
 )
 
 REDACTED_DISPLAY_VALUE = "[REDACTED]"
+TIMELINE_RETENTION_SWEEP_LIMIT = 25
 
 _AUDIENCE_RANK = {
     TimelineAudience.PUBLIC_DEMO: 0,
@@ -157,6 +158,24 @@ class TimelineRawExportError(RuntimeError):
     def __init__(self, code: TimelineRawExportErrorCode) -> None:
         if type(code) is not TimelineRawExportErrorCode:
             raise TypeError("an exact timeline raw export error code is required")
+        self.code = code
+        super().__init__(code.value)
+
+
+class TimelineRetentionErrorCode(StrEnum):
+    CONFIGURATION_INVALID = "TIMELINE_RETENTION_CONFIGURATION_INVALID"
+    ACCESS_DENIED = "TIMELINE_RETENTION_ACCESS_DENIED"
+    TARGET_DENIED = "TIMELINE_RETENTION_TARGET_DENIED"
+    STORE_UNAVAILABLE = "TIMELINE_RETENTION_STORE_UNAVAILABLE"
+    RESPONSE_INVALID = "TIMELINE_RETENTION_RESPONSE_INVALID"
+
+
+class TimelineRetentionError(RuntimeError):
+    """Bounded failure for the dedicated raw-evidence retention path."""
+
+    def __init__(self, code: TimelineRetentionErrorCode) -> None:
+        if type(code) is not TimelineRetentionErrorCode:
+            raise TypeError("an exact timeline retention error code is required")
         self.code = code
         super().__init__(code.value)
 
@@ -364,6 +383,23 @@ class TimelineRawExportGrant:
             raise ValueError("timeline raw export grant is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class TimelineRetentionGrant:
+    """Target-bound authority derived only from the retention scheduler identity."""
+
+    target: TargetBinding
+    principal_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target) is not TargetBinding
+            or type(self.principal_id) is not str
+            or not self.principal_id
+            or len(self.principal_id) > 128
+        ):
+            raise ValueError("timeline retention grant is invalid")
+
+
 @runtime_checkable
 class TimelineStore(Protocol):
     """Exact get/create/update surface; no list, query, delete, or raw export."""
@@ -408,6 +444,20 @@ class TimelineRawBatchStore(Protocol):
     ) -> tuple[TimelineAppendResult, ...]: ...
 
 
+@runtime_checkable
+class TimelineRetentionStore(Protocol):
+    """Bounded lifecycle surface separate from timeline reads and writes."""
+
+    @property
+    def target(self) -> TargetBinding: ...
+
+    async def sweep_expired_raw(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[TimelineRawDeletionReceiptV1, ...]: ...
+
+
 def _is_visible(data_class: TimelineAudience, audience: TimelineAudience) -> bool:
     return _AUDIENCE_RANK[data_class] <= _AUDIENCE_RANK[audience]
 
@@ -428,8 +478,7 @@ def project_timeline_entry(
     event = content.event
     actor_id = (
         event.actor_id
-        if _is_visible(event.actor_data_class, audience)
-        and not _is_secret_shaped(event.actor_id)
+        if _is_visible(event.actor_data_class, audience) and not _is_secret_shaped(event.actor_id)
         else None
     )
     correlations = tuple(
@@ -440,18 +489,13 @@ def project_timeline_entry(
             data_class=item.data_class,
         )
         for item in event.correlations
-        if _is_visible(item.data_class, audience)
-        and not _is_secret_shaped(item.correlation_id)
+        if _is_visible(item.data_class, audience) and not _is_secret_shaped(item.correlation_id)
     )
     display_fields = tuple(
         TimelineDisplayFieldV1(
             schema_version=TIMELINE_DISPLAY_FIELD_V1,
             name=item.name,
-            value=(
-                REDACTED_DISPLAY_VALUE
-                if _is_secret_shaped(item.value)
-                else item.value
-            ),
+            value=(REDACTED_DISPLAY_VALUE if _is_secret_shaped(item.value) else item.value),
             data_class=item.data_class,
         )
         for item in event.display_fields
@@ -619,15 +663,9 @@ def project_timeline_raw_export(read: TimelineRawReadSlice) -> TimelineRawExport
                     else TimelineRawLifecycleStatus.AVAILABLE
                 ),
                 canonical_record=(
-                    None
-                    if deleted
-                    else source.canonical_record
-                    if source is not None
-                    else None
+                    None if deleted else source.canonical_record if source is not None else None
                 ),
-                deletion_receipt_id=(
-                    receipt.receipt_id if receipt is not None else None
-                ),
+                deletion_receipt_id=(receipt.receipt_id if receipt is not None else None),
                 deletion_receipt_sha256=(
                     canonical_sha256(receipt) if receipt is not None else None
                 ),
@@ -710,9 +748,7 @@ class TimelineRawExportService:
             or not isinstance(store, TimelineRawStore)
             or store.target != target
         ):
-            raise TimelineRawExportError(
-                TimelineRawExportErrorCode.CONFIGURATION_INVALID
-            )
+            raise TimelineRawExportError(TimelineRawExportErrorCode.CONFIGURATION_INVALID)
         self._target = target
         self._store = store
 
@@ -740,13 +776,49 @@ class TimelineRawExportService:
         except TimelineCursorInvalid:
             raise TimelineRawExportError(TimelineRawExportErrorCode.CURSOR_INVALID) from None
         except TimelineStoreError:
-            raise TimelineRawExportError(
-                TimelineRawExportErrorCode.STORE_UNAVAILABLE
-            ) from None
+            raise TimelineRawExportError(TimelineRawExportErrorCode.STORE_UNAVAILABLE) from None
         except (TypeError, ValueError):
-            raise TimelineRawExportError(
-                TimelineRawExportErrorCode.RESPONSE_INVALID
-            ) from None
+            raise TimelineRawExportError(TimelineRawExportErrorCode.RESPONSE_INVALID) from None
+
+
+class TimelineRetentionService:
+    """Authorize one fixed-size sweep without exposing target or limit controls."""
+
+    def __init__(self, *, target: TargetBinding, store: TimelineRetentionStore) -> None:
+        if (
+            type(target) is not TargetBinding
+            or not isinstance(store, TimelineRetentionStore)
+            or store.target != target
+        ):
+            raise TimelineRetentionError(TimelineRetentionErrorCode.CONFIGURATION_INVALID)
+        self._target = target
+        self._store = store
+
+    @property
+    def target(self) -> TargetBinding:
+        return self._target
+
+    async def sweep(self, grant: TimelineRetentionGrant) -> int:
+        if type(grant) is not TimelineRetentionGrant:
+            raise TimelineRetentionError(TimelineRetentionErrorCode.ACCESS_DENIED)
+        if grant.target != self._target:
+            raise TimelineRetentionError(TimelineRetentionErrorCode.TARGET_DENIED)
+        try:
+            receipts = await self._store.sweep_expired_raw(limit=TIMELINE_RETENTION_SWEEP_LIMIT)
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreError:
+            raise TimelineRetentionError(TimelineRetentionErrorCode.STORE_UNAVAILABLE) from None
+        if (
+            type(receipts) is not tuple
+            or len(receipts) > TIMELINE_RETENTION_SWEEP_LIMIT
+            or any(
+                type(receipt) is not TimelineRawDeletionReceiptV1 or receipt.target != self._target
+                for receipt in receipts
+            )
+        ):
+            raise TimelineRetentionError(TimelineRetentionErrorCode.RESPONSE_INVALID)
+        return len(receipts)
 
 
 class TimelineWriteService:
@@ -770,9 +842,7 @@ class TimelineWriteService:
         self._target = target
         self._policy_set = policy_set
         self._policy_sha256 = canonical_sha256(policy_set)
-        self._policies = {
-            policy.evidence_class: policy for policy in policy_set.policies
-        }
+        self._policies = {policy.evidence_class: policy for policy in policy_set.policies}
         self._store = store
 
     @property
@@ -824,9 +894,7 @@ class TimelineWriteService:
         ):
             raise TimelineWriteError(TimelineWriteErrorCode.TARGET_DENIED)
         policy = self._policies[event.evidence_class]
-        signature_sha256 = (
-            None if event.signature is None else event.signature.signature_sha256
-        )
+        signature_sha256 = None if event.signature is None else event.signature.signature_sha256
         if grant.writer_role not in policy.writer_roles:
             raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
         if (
@@ -879,9 +947,7 @@ class TimelineWriteService:
             ):
                 raise TimelineWriteError(TimelineWriteErrorCode.TARGET_DENIED)
             policy = self._policies[event.evidence_class]
-            signature_sha256 = (
-                None if event.signature is None else event.signature.signature_sha256
-            )
+            signature_sha256 = None if event.signature is None else event.signature.signature_sha256
             if grant.writer_role not in policy.writer_roles:
                 raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
             if (
@@ -909,6 +975,7 @@ class TimelineWriteService:
 
 __all__ = [
     "REDACTED_DISPLAY_VALUE",
+    "TIMELINE_RETENTION_SWEEP_LIMIT",
     "TimelineAppendAdopted",
     "TimelineAppendCreated",
     "TimelineAppendResult",
@@ -925,6 +992,11 @@ __all__ = [
     "TimelineReadGrant",
     "TimelineReadService",
     "TimelineReadSlice",
+    "TimelineRetentionError",
+    "TimelineRetentionErrorCode",
+    "TimelineRetentionGrant",
+    "TimelineRetentionService",
+    "TimelineRetentionStore",
     "TimelineStore",
     "TimelineStoreConflict",
     "TimelineStoreCorruptRecord",

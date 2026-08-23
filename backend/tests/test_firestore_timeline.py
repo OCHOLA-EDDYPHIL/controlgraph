@@ -125,6 +125,76 @@ class _Reference:
         return _Snapshot(self, data)
 
 
+class _Query:
+    def __init__(self, client: _Client, collection: str) -> None:
+        self.client = client
+        self.collection = collection
+        self.filters: list[tuple[str, str, object]] = []
+        self.orders: list[str] = []
+        self.maximum: int | None = None
+
+    def where(self, *, filter: object) -> _Query:
+        values = vars(filter)
+        self.filters.append(
+            (
+                str(values["field_path"]),
+                str(values["op_string"]),
+                values["value"],
+            )
+        )
+        return self
+
+    def order_by(self, field_path: str, direction: object | None = None) -> _Query:
+        del direction
+        self.orders.append(field_path)
+        return self
+
+    def limit(self, count: int) -> _Query:
+        self.maximum = count
+        return self
+
+    def stream(
+        self,
+        transaction: object | None = None,
+        retry: object | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[object]:
+        del transaction, retry, timeout
+        prefix = f"{self.collection}/"
+        selected = [
+            (path, data)
+            for path, data in self.client.documents.items()
+            if path.startswith(prefix) and "/" not in path[len(prefix) :]
+        ]
+        for field_path, operation, expected in self.filters:
+            if operation == "==":
+                selected = [item for item in selected if item[1].get(field_path) == expected]
+            elif operation == "<=":
+                selected = [
+                    item
+                    for item in selected
+                    if item[1].get(field_path) is not None and item[1][field_path] <= expected
+                ]
+            else:
+                raise AssertionError(operation)
+        selected.sort(key=lambda item: (item[1]["expires_at"], item[0]))
+        if self.maximum is not None:
+            selected = selected[: self.maximum]
+        if self.client.reverse_query:
+            selected.reverse()
+        if self.client.duplicate_query and selected:
+            selected.append(selected[0])
+        self.client.query_calls.append(
+            (self.collection, tuple(self.filters), tuple(self.orders), self.maximum)
+        )
+
+        async def snapshots() -> AsyncIterator[object]:
+            for path, data in selected:
+                yield _Snapshot(self.client.document(*path.split("/")), data)
+
+        return snapshots()
+
+
 class _Transaction:
     def __init__(self, client: _Client) -> None:
         self.client = client
@@ -162,10 +232,15 @@ class _Client:
         self.documents: dict[str, dict[str, Any]] = {}
         self.get_calls: list[str] = []
         self.batch_calls: list[tuple[str, ...]] = []
+        self.query_calls: list[
+            tuple[str, tuple[tuple[str, str, object], ...], tuple[str, ...], int | None]
+        ] = []
         self.write_count = 0
         self.transaction_count = 0
         self.reverse_batch = True
         self.duplicate_batch = False
+        self.reverse_query = False
+        self.duplicate_query = False
         self.lose_next_commit = False
         self.lock = asyncio.Lock()
 
@@ -175,6 +250,9 @@ class _Client:
 
     def document(self, *document_path: str) -> _Reference:
         return _Reference(self, "/".join(document_path))
+
+    def collection(self, collection_path: str) -> _Query:
+        return _Query(self, collection_path)
 
     def get_all(
         self,
@@ -404,9 +482,7 @@ async def test_cursor_outside_head_or_with_wrong_digest_fails_closed() -> None:
     created = await store.append(timeline_event(28))
 
     with pytest.raises(TimelineCursorInvalid):
-        await store.read_page(
-            _command(after_sequence=1, after_entry_sha256="f" * 64)
-        )
+        await store.read_page(_command(after_sequence=1, after_entry_sha256="f" * 64))
     with pytest.raises(TimelineCursorInvalid):
         await store.read_page(
             _command(after_sequence=2, after_entry_sha256=created.entry.entry_sha256)
@@ -431,10 +507,7 @@ async def test_missing_or_duplicate_exact_get_results_are_corruption() -> None:
     await store.append(timeline_event(29))
     await store.append(timeline_event(30))
 
-    missing_path = (
-        f"{TIMELINE_ENTRY_COLLECTION}/"
-        f"{timeline_entry_document_id(TARGET, 2)}"
-    )
+    missing_path = f"{TIMELINE_ENTRY_COLLECTION}/{timeline_entry_document_id(TARGET, 2)}"
     removed = client.documents.pop(missing_path)
     with pytest.raises(TimelineStoreCorruptRecord):
         await store.read_page(_command())
@@ -466,10 +539,7 @@ async def test_raw_append_is_atomic_replay_safe_and_exact_id_exported() -> None:
     assert replay.entry == created.entry
     assert client.write_count == 4
     assert client.transaction_count == 1
-    raw_path = (
-        f"{TIMELINE_RAW_COLLECTION}/"
-        f"{timeline_raw_document_id(TARGET, event.source_id)}"
-    )
+    raw_path = f"{TIMELINE_RAW_COLLECTION}/{timeline_raw_document_id(TARGET, event.source_id)}"
     stored_raw = client.documents[raw_path]
     assert stored_raw["expires_at"] == NOW + timedelta(days=30)
 
@@ -684,8 +754,7 @@ async def test_signed_intent_is_read_by_receipt_bound_envelope_digest() -> None:
 
     assert projection.event.source_id == timeline_capability_source_id(digest)
     intent_path = (
-        f"{TIMELINE_SIGNED_INTENT_COLLECTION}/"
-        f"{timeline_signed_intent_document_id(TARGET, digest)}"
+        f"{TIMELINE_SIGNED_INTENT_COLLECTION}/{timeline_signed_intent_document_id(TARGET, digest)}"
     )
     assert intent_path in client.documents
     assert signed.signature not in projection.raw_source.canonical_record
@@ -694,7 +763,7 @@ async def test_signed_intent_is_read_by_receipt_bound_envelope_digest() -> None:
 
 
 @_async_test
-async def test_write_replay_retires_expired_raw_and_export_replays_without_writes() -> None:
+async def test_retention_sweep_retires_expired_raw_and_export_replays_without_writes() -> None:
     now = [NOW]
     client = _Client()
     store = _store(client, clock=lambda: now[0])
@@ -709,19 +778,27 @@ async def test_write_replay_retires_expired_raw_and_export_replays_without_write
     )
 
     now[0] = NOW + timedelta(days=30)
-    retained = await store.append_with_raw(event, raw_source)
-    assert isinstance(retained, TimelineAppendAdopted)
+    receipts = await store.sweep_expired_raw(limit=25)
+    assert len(receipts) == 1
 
-    raw_path = (
-        f"{TIMELINE_RAW_COLLECTION}/"
-        f"{timeline_raw_document_id(TARGET, event.source_id)}"
-    )
+    raw_path = f"{TIMELINE_RAW_COLLECTION}/{timeline_raw_document_id(TARGET, event.source_id)}"
     assert raw_path not in client.documents
     tombstone_path = (
         f"{TIMELINE_RAW_TOMBSTONE_COLLECTION}/"
         f"{timeline_raw_tombstone_document_id(TARGET, event.source_id)}"
     )
     assert tombstone_path in client.documents
+    assert client.query_calls == [
+        (
+            TIMELINE_RAW_COLLECTION,
+            (
+                ("target_sha256", "==", canonical_sha256(TARGET)),
+                ("expires_at", "<=", NOW + timedelta(days=30)),
+            ),
+            ("expires_at", "__name__"),
+            25,
+        )
+    ]
     retained_write_count = client.write_count
     retained_transaction_count = client.transaction_count
 
@@ -744,15 +821,31 @@ async def test_write_replay_retires_expired_raw_and_export_replays_without_write
 
 
 @_async_test
+async def test_retention_sweep_rejects_duplicate_or_unordered_query_results() -> None:
+    for query_fault in ("duplicate_query", "reverse_query"):
+        now = [NOW]
+        client = _Client()
+        store = _store(client, clock=lambda now=now: now[0])
+        for ordinal in (35, 36):
+            event, raw_source = timeline_event_with_raw(ordinal)
+            await store.append_with_raw(event, raw_source)
+        writes_before_sweep = client.write_count
+        setattr(client, query_fault, True)
+        now[0] = NOW + timedelta(days=30)
+
+        with pytest.raises(TimelineStoreCorruptRecord):
+            await store.sweep_expired_raw(limit=25)
+
+        assert client.write_count == writes_before_sweep
+
+
+@_async_test
 async def test_raw_export_fails_closed_for_early_deletion_cursor_and_target() -> None:
     client = _Client()
     store = _store(client)
     event, raw_source = timeline_event_with_raw(34)
     created = await store.append_with_raw(event, raw_source)
-    raw_path = (
-        f"{TIMELINE_RAW_COLLECTION}/"
-        f"{timeline_raw_document_id(TARGET, event.source_id)}"
-    )
+    raw_path = f"{TIMELINE_RAW_COLLECTION}/{timeline_raw_document_id(TARGET, event.source_id)}"
     del client.documents[raw_path]
     initial = TimelineRawExportCommandV1(
         schema_version=TIMELINE_RAW_EXPORT_COMMAND_V1,

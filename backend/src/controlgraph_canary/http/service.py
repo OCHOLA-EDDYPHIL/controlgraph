@@ -57,6 +57,7 @@ from controlgraph_canary.application.identity import (
     RECOVERY_RECEIPT_AUTHORITY_PATH,
     TIMELINE_RAW_EXPORT_PATH,
     TIMELINE_READ_PATH,
+    TIMELINE_RETENTION_PATH,
     AuthenticationContext,
     AuthenticationDenialCode,
     AuthenticationError,
@@ -142,6 +143,10 @@ from controlgraph_canary.application.timeline import (
     TimelineReadErrorCode,
     TimelineReadGrant,
     TimelineReadService,
+    TimelineRetentionError,
+    TimelineRetentionErrorCode,
+    TimelineRetentionGrant,
+    TimelineRetentionService,
 )
 from controlgraph_canary.application.timeline_recording import TimelineRecorder
 from controlgraph_canary.application.timeline_relay import (
@@ -453,9 +458,7 @@ def create_service_app(
     independent_verification_service: IndependentVerificationService | None = None,
     classification_evidence_signing_service: (ClassificationEvidenceSigningService | None) = None,
     classification_evidence_authentication_policy: (RouteAuthenticationPolicy | None) = None,
-    independent_verification_signing_service: (
-        IndependentVerificationSigningService | None
-    ) = None,
+    independent_verification_signing_service: (IndependentVerificationSigningService | None) = None,
     independent_verification_evidence_authentication_policy: (
         RouteAuthenticationPolicy | None
     ) = None,
@@ -474,6 +477,8 @@ def create_service_app(
     timeline_security_read_authentication_policy: RouteAuthenticationPolicy | None = None,
     timeline_raw_export_service: TimelineRawExportService | ApiTimelineClient | None = None,
     timeline_raw_export_authentication_policy: RouteAuthenticationPolicy | None = None,
+    timeline_retention_service: TimelineRetentionService | None = None,
+    timeline_retention_authentication_policy: RouteAuthenticationPolicy | None = None,
     coordinator_timeline_relay: CoordinatorTimelineRelay | None = None,
     timeline_recorder: TimelineRecorder | None = None,
     operator_console_origin: str | None = None,
@@ -679,36 +684,30 @@ def create_service_app(
         role is not ServiceRole.API
         or type(timeline_read_service) not in {TimelineReadService, ApiTimelineClient}
         or type(timeline_read_authentication_policy) is not RouteAuthenticationPolicy
-        or type(timeline_security_read_authentication_policy)
-        is not RouteAuthenticationPolicy
+        or type(timeline_security_read_authentication_policy) is not RouteAuthenticationPolicy
         or timeline_read_authentication_policy.service_role is not ServiceRole.API
-        or timeline_security_read_authentication_policy.service_role
-        is not ServiceRole.API
+        or timeline_security_read_authentication_policy.service_role is not ServiceRole.API
         or timeline_read_authentication_policy.path != TIMELINE_READ_PATH
         or timeline_security_read_authentication_policy.path != TIMELINE_READ_PATH
         or timeline_read_authentication_policy.caller.role is not CallerRole.OPERATOR
-        or timeline_security_read_authentication_policy.caller.role
-        is not CallerRole.OPERATOR
+        or timeline_security_read_authentication_policy.caller.role is not CallerRole.OPERATOR
         or timeline_read_authentication_policy.caller
         == timeline_security_read_authentication_policy.caller
     ):
         raise ValueError("timeline reads require distinct operator and audit policies")
-    if (timeline_raw_export_service is None) != (
-        timeline_raw_export_authentication_policy is None
-    ):
+    if (timeline_raw_export_service is None) != (timeline_raw_export_authentication_policy is None):
         raise ValueError("timeline raw export requires its exact route policy")
     if timeline_raw_export_service is not None and (
         role is not ServiceRole.API
-        or type(timeline_raw_export_service) not in {
+        or type(timeline_raw_export_service)
+        not in {
             TimelineRawExportService,
             ApiTimelineClient,
         }
-        or type(timeline_raw_export_authentication_policy)
-        is not RouteAuthenticationPolicy
+        or type(timeline_raw_export_authentication_policy) is not RouteAuthenticationPolicy
         or timeline_raw_export_authentication_policy.service_role is not ServiceRole.API
         or timeline_raw_export_authentication_policy.path != TIMELINE_RAW_EXPORT_PATH
-        or timeline_raw_export_authentication_policy.caller.role
-        is not CallerRole.OPERATOR
+        or timeline_raw_export_authentication_policy.caller.role is not CallerRole.OPERATOR
         or timeline_raw_export_authentication_policy.caller
         in {
             timeline_read_authentication_policy.caller
@@ -720,6 +719,17 @@ def create_service_app(
         }
     ):
         raise ValueError("raw export requires a distinct restricted identity")
+    if (timeline_retention_service is None) != (timeline_retention_authentication_policy is None):
+        raise ValueError("timeline retention requires its exact route policy")
+    if timeline_retention_service is not None and (
+        role is not ServiceRole.COORDINATOR
+        or type(timeline_retention_service) is not TimelineRetentionService
+        or type(timeline_retention_authentication_policy) is not RouteAuthenticationPolicy
+        or timeline_retention_authentication_policy.service_role is not ServiceRole.COORDINATOR
+        or timeline_retention_authentication_policy.path != TIMELINE_RETENTION_PATH
+        or timeline_retention_authentication_policy.caller.role is not CallerRole.RETENTION_SWEEPER
+    ):
+        raise ValueError("timeline retention is limited to its exact scheduler route")
     if coordinator_timeline_relay is not None and (
         role is not ServiceRole.COORDINATOR
         or type(coordinator_timeline_relay) is not CoordinatorTimelineRelay
@@ -980,6 +990,69 @@ def create_service_app(
             content=canonical_json_bytes(exported),
             status_code=200,
             media_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "X-ControlGraph-Correlation-Id": correlation_id,
+            },
+        )
+
+    async def timeline_retention(request: Request) -> Response:
+        correlation_id = _correlation_id()
+        service = timeline_retention_service
+        route_policy = timeline_retention_authentication_policy
+        if (
+            authenticator is None
+            or type(service) is not TimelineRetentionService
+            or type(route_policy) is not RouteAuthenticationPolicy
+        ):
+            return _timeline_denial(
+                TimelineRetentionErrorCode.CONFIGURATION_INVALID.value,
+                correlation_id,
+            )
+        try:
+            context = authenticator.authenticate(
+                authentication_header(request.headers, route_policy),
+                route_policy,
+            )
+        except AuthenticationError as error:
+            return _authentication_denial(error.code, correlation_id)
+        except Exception:
+            return _authentication_denial(
+                AuthenticationDenialCode.VERIFICATION_UNAVAILABLE,
+                correlation_id,
+            )
+        if (
+            type(context) is not AuthenticationContext
+            or context.role is not CallerRole.RETENTION_SWEEPER
+        ):
+            return _authentication_denial(
+                AuthenticationDenialCode.CALLER_DENIED,
+                correlation_id,
+            )
+        request.state.authentication = context
+        try:
+            if request.query_params:
+                raise TimelineRetentionError(TimelineRetentionErrorCode.ACCESS_DENIED)
+            async for chunk in request.stream():
+                if type(chunk) is not bytes or chunk:
+                    raise TimelineRetentionError(TimelineRetentionErrorCode.ACCESS_DENIED)
+            await service.sweep(
+                TimelineRetentionGrant(
+                    target=service.target,
+                    principal_id=_timeline_principal(context),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimelineRetentionError as error:
+            return _timeline_denial(error.code.value, correlation_id)
+        except Exception:
+            return _timeline_denial(
+                TimelineRetentionErrorCode.STORE_UNAVAILABLE.value,
+                correlation_id,
+            )
+        return Response(
+            status_code=204,
             headers={
                 "Cache-Control": "no-store",
                 "X-ControlGraph-Correlation-Id": correlation_id,
@@ -1272,9 +1345,7 @@ def create_service_app(
                         )
                     else:
                         if timeline_recorder is not None:
-                            await timeline_recorder.record_service_claim_release(
-                                release_result
-                            )
+                            await timeline_recorder.record_service_claim_release(release_result)
                         release_outcome = ServiceClaimReleaseRelayResponseV1(
                             schema_version=(SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1),
                             result=release_result,
@@ -1299,9 +1370,7 @@ def create_service_app(
                         )
                     else:
                         if timeline_recorder is not None:
-                            await timeline_recorder.record_recovery_abandonment(
-                                abandonment_result
-                            )
+                            await timeline_recorder.record_recovery_abandonment(abandonment_result)
                         abandonment_outcome = RecoveryAbandonmentRelayResponseV1(
                             schema_version=RECOVERY_ABANDONMENT_RELAY_RESPONSE_V1,
                             result=abandonment_result,
@@ -1363,9 +1432,7 @@ def create_service_app(
                     response_body = canonical_json_bytes(proof_outcome)
                 elif type(invocation) is TimelineReadInvocationV1:
                     if coordinator_timeline_relay is None:
-                        raise TimelineReadError(
-                            TimelineReadErrorCode.CONFIGURATION_INVALID
-                        )
+                        raise TimelineReadError(TimelineReadErrorCode.CONFIGURATION_INVALID)
                     timeline_page = await coordinator_timeline_relay.read(
                         invocation,
                         context,
@@ -1399,9 +1466,7 @@ def create_service_app(
                         )
                     else:
                         if timeline_recorder is not None:
-                            await timeline_recorder.record_epoch_revocation(
-                                revocation_call
-                            )
+                            await timeline_recorder.record_epoch_revocation(revocation_call)
                         revocation_relay_outcome = EpochRevocationRelayResponseV1(
                             schema_version=EPOCH_REVOCATION_RELAY_RESPONSE_V1,
                             outcome=revocation_call,
@@ -1578,11 +1643,9 @@ def create_service_app(
                             )
                         )
                     else:
-                        verification_result = (
-                            await independent_verification_service.attest_probe(
-                                verifier_request.verification,
-                                context,
-                            )
+                        verification_result = await independent_verification_service.attest_probe(
+                            verifier_request.verification,
+                            context,
                         )
                     response_body = canonical_json_bytes(verification_result)
                 else:
@@ -2076,6 +2139,13 @@ def create_service_app(
             TIMELINE_RAW_EXPORT_PATH,
             timeline_raw_export,
             methods=["GET"],
+            include_in_schema=False,
+        )
+    if timeline_retention_authentication_policy is not None:
+        app.add_api_route(
+            TIMELINE_RETENTION_PATH,
+            timeline_retention,
+            methods=["POST"],
             include_in_schema=False,
         )
     if receipt_authority_authentication_policy is not None:
@@ -2778,6 +2848,8 @@ def _timeline_denial(code: str, correlation_id: str) -> JSONResponse:
         TimelineReadErrorCode.TARGET_DENIED.value,
         TimelineRawExportErrorCode.ACCESS_DENIED.value,
         TimelineRawExportErrorCode.TARGET_DENIED.value,
+        TimelineRetentionErrorCode.ACCESS_DENIED.value,
+        TimelineRetentionErrorCode.TARGET_DENIED.value,
     }:
         status_code = 403
     else:

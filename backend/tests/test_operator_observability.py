@@ -107,31 +107,19 @@ OPERATOR_SUBJECT = "123456789012345678901"
 API_SUBJECT = "234567890123456789012"
 COORDINATOR_SUBJECT = "345678901234567890123"
 API_IDENTITY = f"controlgraph-api@{PROJECT}.iam.gserviceaccount.com"
-COORDINATOR_IDENTITY = (
-    f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
-)
+COORDINATOR_IDENTITY = f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
 VERIFIER_IDENTITY = f"controlgraph-verifier@{PROJECT}.iam.gserviceaccount.com"
 API_AUDIENCE = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
-COORDINATOR_AUDIENCE = (
-    f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
-)
-VERIFIER_AUDIENCE = (
-    f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
-)
+COORDINATOR_AUDIENCE = f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+VERIFIER_AUDIENCE = f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
 ISSUED_AT = 1_776_236_400
 EXPIRES_AT = ISSUED_AT + 600
 EVIDENCE_WRITER_AUDIENCE = (
     f"https://controlgraph-evidence-writer-{PROJECT_NUMBER}.us-central1.run.app"
 )
-ISSUER_AUDIENCE = (
-    f"https://controlgraph-issuer-{PROJECT_NUMBER}.us-central1.run.app"
-)
-EXECUTOR_AUDIENCE = (
-    f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
-)
-RECOVERY_AUDIENCE = (
-    f"https://controlgraph-recovery-{PROJECT_NUMBER}.us-central1.run.app"
-)
+ISSUER_AUDIENCE = f"https://controlgraph-issuer-{PROJECT_NUMBER}.us-central1.run.app"
+EXECUTOR_AUDIENCE = f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+RECOVERY_AUDIENCE = f"https://controlgraph-recovery-{PROJECT_NUMBER}.us-central1.run.app"
 
 
 def _identity_environment(role: ServiceRole) -> dict[str, str]:
@@ -198,13 +186,11 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                     f"projects/{PROJECT}/global/networks/controlgraph-network"
                 ),
                 "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE": (
-                    f"projects/{PROJECT}/regions/us-central1/"
-                    "subnetworks/controlgraph-runtime"
+                    f"projects/{PROJECT}/regions/us-central1/subnetworks/controlgraph-runtime"
                 ),
                 "CONTROLGRAPH_EVIDENCE_WRITER_URL": EVIDENCE_WRITER_AUDIENCE,
                 "CONTROLGRAPH_REFERENCE_TARGET_URL": (
-                    f"https://controlgraph-reference-target-{PROJECT_NUMBER}"
-                    ".us-central1.run.app"
+                    f"https://controlgraph-reference-target-{PROJECT_NUMBER}.us-central1.run.app"
                 ),
                 "CONTROLGRAPH_EVIDENCE_KEY_VERSION": _evidence_key_version(),
             }
@@ -241,9 +227,11 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL": (
                     f"controlgraph-executor@{PROJECT}.iam.gserviceaccount.com"
                 ),
-                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT": (
-                    "456789012345678901234"
+                "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT": ("456789012345678901234"),
+                "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL": (
+                    f"cg-retention-sweeper@{PROJECT}.iam.gserviceaccount.com"
                 ),
+                "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT": ("556789012345678901234"),
             }
         )
     return environment
@@ -348,9 +336,7 @@ def _receipt(
     receipt_id: str | None = None,
 ) -> ExecutionReceipt:
     request_id = (
-        "apply-request-001"
-        if action is CapabilityAction.APPLY_CANARY
-        else "promote-request-001"
+        "apply-request-001" if action is CapabilityAction.APPLY_CANARY else "promote-request-001"
     )
     idempotency_key = (
         "apply-idempotency-001"
@@ -379,12 +365,8 @@ def _receipt(
         dispatch_not_after="2026-08-19T12:10:00Z",
         outcome=outcome,
         reason_code=reason_code,
-        provider_operation=(
-            "operations/apply-001" if outcome is ReceiptOutcome.VERIFIED else None
-        ),
-        observed_etag=(
-            "service-etag-8" if outcome is ReceiptOutcome.VERIFIED else None
-        ),
+        provider_operation=("operations/apply-001" if outcome is ReceiptOutcome.VERIFIED else None),
+        observed_etag=("service-etag-8" if outcome is ReceiptOutcome.VERIFIED else None),
         observed_authority_epoch=observed_epoch,
         created_at="2026-08-19T12:01:00Z",
         updated_at="2026-08-19T12:02:00Z",
@@ -488,9 +470,7 @@ def _state(
     ):
         if percent == 0 and not include_zero:
             continue
-        allocations.append(
-            CloudRunTrafficAllocation(revision=revision, percent=percent, tag=None)
-        )
+        allocations.append(CloudRunTrafficAllocation(revision=revision, percent=percent, tag=None))
         statuses.append(
             CloudRunTrafficStatus(
                 revision=revision,
@@ -689,9 +669,7 @@ def test_target_traffic_observation_supports_only_rollout_states(
     candidate_percent: int,
     include_zero: bool,
 ) -> None:
-    reader = _Reader(
-        _state(stable_percent, candidate_percent, include_zero=include_zero)
-    )
+    reader = _Reader(_state(stable_percent, candidate_percent, include_zero=include_zero))
 
     result = asyncio.run(
         _traffic_service(reader).observe(
@@ -786,9 +764,7 @@ def test_target_traffic_observation_rejects_unsafe_or_ambiguous_state(
             concurrency=9,
             configuration=replace(stable_revision.configuration, concurrency=9),
         )
-    reader = _Reader(
-        replace(state, service=service, stable_revision=stable_revision)
-    )
+    reader = _Reader(replace(state, service=service, stable_revision=stable_revision))
 
     with pytest.raises(OperatorObservationError) as denied:
         asyncio.run(
@@ -806,19 +782,14 @@ def test_verified_apply_receipt_returns_exact_promotion_locator() -> None:
     invocation = _invocation(_receipt_command(receipt))
     assert type(invocation) is ExecutionReceiptReadInvocationV1
 
-    result = asyncio.run(
-        _relay(store).read_receipt(invocation, _context(CallerRole.API))
-    )
+    result = asyncio.run(_relay(store).read_receipt(invocation, _context(CallerRole.API)))
 
     assert result.receipt == receipt
     assert result.receipt_sha256 == canonical_sha256(receipt)
     assert result.verified_apply_receipt is not None
     assert result.verified_apply_receipt.receipt_id == receipt.receipt_id
     assert result.verified_apply_receipt.receipt_sha256 == canonical_sha256(receipt)
-    assert (
-        decode_contract(canonical_json_bytes(result), ExecutionReceiptReadResultV1)
-        == result
-    )
+    assert decode_contract(canonical_json_bytes(result), ExecutionReceiptReadResultV1) == result
 
 
 def test_stale_promotion_denial_is_readable_without_promotion_locator() -> None:
@@ -848,9 +819,7 @@ def test_stale_promotion_denial_is_readable_without_promotion_locator() -> None:
 def test_receipt_absence_and_every_exact_binding_mismatch_share_one_denial(
     case: str,
 ) -> None:
-    receipt = _receipt(
-        receipt_id=("misidentified-receipt" if case == "receipt_id" else None)
-    )
+    receipt = _receipt(receipt_id=("misidentified-receipt" if case == "receipt_id" else None))
     command = _receipt_command(receipt)
     if case == "binding":
         command = command.model_copy(update={"capability_sha256": "9" * 64})
@@ -906,9 +875,7 @@ def test_clients_forward_only_canonical_invocations_and_reject_digest_substituti
     )
 
     assert (
-        asyncio.run(
-            api.capture_snapshot(_snapshot_command(), _context(CallerRole.OPERATOR))
-        )
+        asyncio.run(api.capture_snapshot(_snapshot_command(), _context(CallerRole.OPERATOR)))
         == snapshot_result
     )
     forwarded = decode_contract(
@@ -925,9 +892,7 @@ def test_clients_forward_only_canonical_invocations_and_reject_digest_substituti
     )
     traffic_transport = _Transport(
         canonical_json_bytes(
-            traffic_result.model_copy(
-                update={"target_configuration_sha256": "f" * 64}
-            )
+            traffic_result.model_copy(update={"target_configuration_sha256": "f" * 64})
         )
     )
     traffic_client = CoordinatorTargetTrafficClient(
@@ -1002,9 +967,7 @@ def test_coordinator_http_receipt_mismatch_is_one_payload_free_not_found() -> No
     )
 
     assert response.status_code == 404
-    assert response.json()["code"] == (
-        OperatorObservationErrorCode.RECEIPT_NOT_FOUND.value
-    )
+    assert response.json()["code"] == (OperatorObservationErrorCode.RECEIPT_NOT_FOUND.value)
     assert set(response.json()) == {"code", "correlation_id"}
 
 
@@ -1078,14 +1041,8 @@ def test_runtime_composes_observation_components_for_all_three_roles() -> None:
         coordinator.state.controlgraph_completion_classification,
         CoordinatorCompletionClassificationService,
     )
-    assert (
-        coordinator.state.controlgraph_independent_verification_client._timeline_recorder
-        is None
-    )
-    assert (
-        coordinator.state.controlgraph_completion_classification._timeline_recorder
-        is None
-    )
+    assert coordinator.state.controlgraph_independent_verification_client._timeline_recorder is None
+    assert coordinator.state.controlgraph_completion_classification._timeline_recorder is None
     assert (
         coordinator.state.controlgraph_completion_workflow._timeline_recorder
         is coordinator.state.controlgraph_timeline_recorder

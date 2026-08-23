@@ -52,6 +52,7 @@ locals {
     evidence_writer       = local.service_accounts.evidence_writer
     execution_task_caller = local.service_accounts.execution_task_caller
     recovery_task_caller  = local.service_accounts.recovery_task_caller
+    retention_sweeper     = local.service_accounts.retention_sweeper
   }
 
   runtime_identity_subjects = {
@@ -67,6 +68,7 @@ locals {
     evidence_writer       = tostring(local.service_subjects.evidence_writer)
     execution_task_caller = tostring(local.service_subjects.execution_task_caller)
     recovery_task_caller  = tostring(local.service_subjects.recovery_task_caller)
+    retention_sweeper     = tostring(local.service_subjects.retention_sweeper)
   }
 
   route_caller_roles = {
@@ -121,6 +123,7 @@ check "runtime_identity_map_is_closed" {
         "evidence_writer",
         "execution_task_caller",
         "recovery_task_caller",
+        "retention_sweeper",
       ]) &&
       toset(keys(local.runtime_identity_subjects)) == toset(keys(local.runtime_identity_emails)) &&
       toset(keys(local.route_caller_roles)) == toset(keys(local.service_names))

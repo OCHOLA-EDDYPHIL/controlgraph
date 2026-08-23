@@ -59,6 +59,8 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT",
     "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL",
     "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT",
+    "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL",
+    "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT",
 )
 
 API_ROOT_ENVIRONMENT_KEYS = (
@@ -184,6 +186,8 @@ class ControllerSettings:
     security_auditor_subject: str | None
     restricted_exporter_identity: str | None
     restricted_exporter_subject: str | None
+    timeline_retention_caller_identity: str | None
+    timeline_retention_caller_subject: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
@@ -271,6 +275,8 @@ class ControllerSettings:
         security_auditor_subject: str | None = None
         restricted_exporter_identity: str | None = None
         restricted_exporter_subject: str | None = None
+        timeline_retention_caller_identity: str | None = None
+        timeline_retention_caller_subject: str | None = None
         executor_enabled = service_role is ServiceRole.EXECUTOR and mutations_enabled
         recovery_enabled = service_role is ServiceRole.RECOVERY and mutations_enabled
         if service_role is ServiceRole.API or executor_enabled:
@@ -299,18 +305,10 @@ class ControllerSettings:
                 raise ValueError("CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE is invalid")
             operator_oauth_client_audience = raw_operator_oauth_client_audience
         if service_role in {ServiceRole.API, ServiceRole.COORDINATOR}:
-            security_auditor_identity = source[
-                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"
-            ].strip()
-            security_auditor_subject = source[
-                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"
-            ].strip()
-            restricted_exporter_identity = source[
-                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL"
-            ].strip()
-            restricted_exporter_subject = source[
-                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT"
-            ].strip()
+            security_auditor_identity = source["CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"].strip()
+            security_auditor_subject = source["CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"].strip()
+            restricted_exporter_identity = source["CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL"].strip()
+            restricted_exporter_subject = source["CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT"].strip()
             _validate_operator_identity(security_auditor_identity)
             _validate_operator_identity(restricted_exporter_identity)
             if (
@@ -328,13 +326,16 @@ class ControllerSettings:
                 if service_role is ServiceRole.API
                 else source["CONTROLGRAPH_OPERATOR_SUBJECT"].strip()
             )
-            if len(
-                {
-                    (ordinary_identity, ordinary_subject),
-                    (security_auditor_identity, security_auditor_subject),
-                    (restricted_exporter_identity, restricted_exporter_subject),
-                }
-            ) != 3:
+            if (
+                len(
+                    {
+                        (ordinary_identity, ordinary_subject),
+                        (security_auditor_identity, security_auditor_subject),
+                        (restricted_exporter_identity, restricted_exporter_subject),
+                    }
+                )
+                != 3
+            ):
                 raise ValueError("timeline privileged reader identities must be distinct")
         if (
             service_role
@@ -443,6 +444,18 @@ class ControllerSettings:
             ].strip()
             if _PROJECT_NUMBER.fullmatch(recovery_receipt_authority_caller_subject) is None:
                 raise ValueError("recovery receipt authority caller subject is invalid")
+            timeline_retention_caller_identity = source[
+                "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL"
+            ].strip()
+            if timeline_retention_caller_identity != (
+                f"cg-retention-sweeper@{project_id}.iam.gserviceaccount.com"
+            ):
+                raise ValueError("timeline retention caller identity is invalid")
+            timeline_retention_caller_subject = source[
+                "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT"
+            ].strip()
+            if _PROJECT_NUMBER.fullmatch(timeline_retention_caller_subject) is None:
+                raise ValueError("timeline retention caller subject is invalid")
         if service_role is ServiceRole.ISSUER:
             recovery_url = source["CONTROLGRAPH_RECOVERY_URL"].strip()
             _validate_service_url(recovery_url, ServiceRole.RECOVERY, project_number)
@@ -541,6 +554,8 @@ class ControllerSettings:
             security_auditor_subject=security_auditor_subject,
             restricted_exporter_identity=restricted_exporter_identity,
             restricted_exporter_subject=restricted_exporter_subject,
+            timeline_retention_caller_identity=timeline_retention_caller_identity,
+            timeline_retention_caller_subject=timeline_retention_caller_subject,
         )
 
 
@@ -577,10 +592,7 @@ def _validate_target_resource(value: str, *, prefix: str) -> None:
 
 
 def _validate_reference_target_url(value: str, project_number: str) -> None:
-    expected = (
-        f"https://controlgraph-reference-target-{project_number}"
-        ".us-central1.run.app"
-    )
+    expected = f"https://controlgraph-reference-target-{project_number}.us-central1.run.app"
     try:
         parsed = urlsplit(value)
         port = parsed.port

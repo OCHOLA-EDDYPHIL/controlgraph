@@ -10,6 +10,12 @@ resource "google_project_service_identity" "cloud_tasks" {
   service  = "cloudtasks.googleapis.com"
 }
 
+resource "google_project_service_identity" "cloud_scheduler" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "cloudscheduler.googleapis.com"
+}
+
 resource "google_artifact_registry_repository_iam_member" "cloud_run_image_reader" {
   project    = var.project_id
   location   = var.region
@@ -74,6 +80,12 @@ resource "google_service_account_iam_member" "cloud_tasks_token_creator" {
   member             = google_project_service_identity.cloud_tasks.member
 }
 
+resource "google_service_account_iam_member" "cloud_scheduler_token_creator" {
+  service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names.retention_sweeper
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = google_project_service_identity.cloud_scheduler.member
+}
+
 resource "google_service_account_iam_member" "executor_reference_target_act_as" {
   service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names.reference
   role               = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.task_oidc_actor
@@ -101,6 +113,10 @@ locals {
     coordinator_receipts = {
       service = module.coordinator.service.name
       member  = "serviceAccount:${local.service_accounts.executor}"
+    }
+    coordinator_retention = {
+      service = module.coordinator.service.name
+      member  = "serviceAccount:${local.service_accounts.retention_sweeper}"
     }
     issuer = {
       service = module.issuer.service.name
@@ -146,6 +162,7 @@ check "runtime_invoker_map_is_closed" {
         "api_restricted_exporter",
         "coordinator",
         "coordinator_receipts",
+        "coordinator_retention",
         "issuer",
         "executor",
         "executor_recovery_facade",
@@ -157,6 +174,8 @@ check "runtime_invoker_map_is_closed" {
       ]) &&
       local.run_invokers.coordinator_receipts.service == module.coordinator.service.name &&
       local.run_invokers.coordinator_receipts.member == "serviceAccount:${local.service_accounts.executor}" &&
+      local.run_invokers.coordinator_retention.service == module.coordinator.service.name &&
+      local.run_invokers.coordinator_retention.member == "serviceAccount:${local.service_accounts.retention_sweeper}" &&
       local.run_invokers.api_security_auditor.service == module.api.service.name &&
       local.run_invokers.api_restricted_exporter.service == module.api.service.name &&
       local.run_invokers.executor_recovery_facade.service == module.executor.service.name &&
@@ -167,6 +186,19 @@ check "runtime_invoker_map_is_closed" {
       local.run_invokers.evidence_writer_verifier.member == "serviceAccount:${local.service_accounts.verifier}"
     )
     error_message = "Runtime invocation must remain closed and evidence-writer callers must remain coordinator and verifier only."
+  }
+}
+
+check "retention_scheduler_identity_is_closed" {
+  assert {
+    condition = (
+      google_service_account_iam_member.cloud_scheduler_token_creator.service_account_id == data.terraform_remote_state.foundation.outputs.service_account_names.retention_sweeper &&
+      google_service_account_iam_member.cloud_scheduler_token_creator.role == "roles/iam.serviceAccountTokenCreator" &&
+      google_service_account_iam_member.cloud_scheduler_token_creator.member == google_project_service_identity.cloud_scheduler.member &&
+      local.run_invokers.coordinator_retention.service == module.coordinator.service.name &&
+      local.run_invokers.coordinator_retention.member == "serviceAccount:${local.service_accounts.retention_sweeper}"
+    )
+    error_message = "Scheduler token minting and coordinator invocation must remain bound to the fixed retention-sweeper identity."
   }
 }
 

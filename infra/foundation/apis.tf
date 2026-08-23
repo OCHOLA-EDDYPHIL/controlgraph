@@ -10,6 +10,7 @@ locals {
     "billingbudgets.googleapis.com",
     "cloudbilling.googleapis.com",
     "cloudkms.googleapis.com",
+    "cloudscheduler.googleapis.com",
     "cloudtasks.googleapis.com",
     "compute.googleapis.com",
     "datastore.googleapis.com",

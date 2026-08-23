@@ -15,6 +15,7 @@ from google.api_core import exceptions as api_exceptions
 from google.cloud import firestore_v1
 
 from controlgraph_canary.application.timeline import (
+    TIMELINE_RETENTION_SWEEP_LIMIT,
     TimelineAppendAdopted,
     TimelineAppendCreated,
     TimelineAppendResult,
@@ -72,6 +73,7 @@ from controlgraph_canary.contracts.timeline import (
     timeline_raw_document_id,
     timeline_raw_tombstone_document_id,
     timeline_signed_intent_document_id,
+    timeline_target_sha256,
 )
 
 FIRESTORE_TIMELINE_DATABASE: Final = "controlgraph-authority"
@@ -93,6 +95,7 @@ _RAW_DOCUMENT_FIELDS: Final = frozenset(
         "canonical_payload",
         "payload_sha256",
         "expires_at",
+        "target_sha256",
     }
 )
 _SIGNED_INTENT_DOCUMENT_FIELDS: Final = frozenset(
@@ -136,6 +139,25 @@ class TimelineProviderSnapshotPort(Protocol):
     def to_dict(self) -> dict[str, Any] | None: ...
 
 
+class TimelineQueryPort(Protocol):
+    def where(self, *, filter: object) -> TimelineQueryPort: ...
+
+    def order_by(
+        self,
+        field_path: str,
+        direction: object | None = None,
+    ) -> TimelineQueryPort: ...
+
+    def limit(self, count: int) -> TimelineQueryPort: ...
+
+    def stream(
+        self,
+        transaction: object | None = None,
+        retry: object | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[object]: ...
+
+
 class TimelineWriteResultPort(Protocol):
     update_time: datetime
 
@@ -167,6 +189,8 @@ class AsyncFirestoreTimelineClientPort(Protocol):
     def _database_string(self) -> str: ...
 
     def document(self, *document_path: str) -> TimelineDocumentReferencePort: ...
+
+    def collection(self, collection_path: str) -> TimelineQueryPort: ...
 
     def get_all(
         self,
@@ -379,6 +403,7 @@ def _raw_document_data(raw: TimelineRawEvidenceV1) -> dict[str, Any]:
         "canonical_payload": canonical_json_bytes(raw).decode("utf-8"),
         "payload_sha256": canonical_sha256(raw),
         "expires_at": _parse_utc_second(raw.expires_at),
+        "target_sha256": timeline_target_sha256(raw.target),
     }
     if set(data) != _RAW_DOCUMENT_FIELDS:
         raise TimelineStoreCorruptRecord
@@ -386,10 +411,7 @@ def _raw_document_data(raw: TimelineRawEvidenceV1) -> dict[str, Any]:
 
 
 def _signed_intent_logical_id(target: TargetBinding, capability_sha256: str) -> str:
-    return (
-        "cgsigned-intent:"
-        f"{timeline_signed_intent_document_id(target, capability_sha256)}"
-    )
+    return f"cgsigned-intent:{timeline_signed_intent_document_id(target, capability_sha256)}"
 
 
 def _signed_intent_document_data(
@@ -421,8 +443,7 @@ def _raw_deletion_receipt(
 ) -> TimelineRawDeletionReceiptV1:
     event = entry.content.event
     expires_at = _utc_second(
-        _parse_utc_second(entry.content.recorded_at)
-        + timedelta(days=event.raw_retention_days)
+        _parse_utc_second(entry.content.recorded_at) + timedelta(days=event.raw_retention_days)
     )
     return TimelineRawDeletionReceiptV1(
         schema_version=TIMELINE_RAW_DELETION_RECEIPT_V1,
@@ -523,8 +544,7 @@ class FirestoreTimelineStore:
         self._configured_project_id = configured_project_id
         self._policy_sha256 = canonical_sha256(policy_set)
         self._retention_by_class = {
-            policy.evidence_class: policy.raw_retention_days
-            for policy in policy_set.policies
+            policy.evidence_class: policy.raw_retention_days for policy in policy_set.policies
         }
         self._client_factory = client_factory
         self._transaction_runner = transaction_runner
@@ -663,6 +683,7 @@ class FirestoreTimelineStore:
             if (
                 data.get("schema_version") != _RAW_STORAGE_VERSION
                 or data.get("logical_id") != _raw_logical_id(self._target, source_id)
+                or data.get("target_sha256") != timeline_target_sha256(self._target)
                 or type(data.get("canonical_payload")) is not str
                 or type(data.get("payload_sha256")) is not str
             ):
@@ -702,6 +723,96 @@ class FirestoreTimelineStore:
             reference=reference,
             source_id=source_id,
         )
+
+    def _decode_raw_query_snapshot(
+        self,
+        snapshot: object,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+    ) -> TimelineRawEvidenceV1:
+        try:
+            provider = cast(TimelineProviderSnapshotPort, snapshot)
+            data = provider.to_dict()
+            if type(data) is not dict or type(data.get("canonical_payload")) is not str:
+                raise ValueError("timeline raw query result is invalid")
+            raw = decode_contract(data["canonical_payload"], TimelineRawEvidenceV1)
+            reference = self._reference(
+                client,
+                TIMELINE_RAW_COLLECTION,
+                timeline_raw_document_id(self._target, raw.source_id),
+            )
+            decoded = self._decode_raw_snapshot(
+                snapshot,
+                reference=reference,
+                source_id=raw.source_id,
+            )
+            if decoded is None:
+                raise ValueError("timeline raw query returned a missing record")
+            return decoded
+        except TimelineStoreError:
+            raise
+        except Exception:
+            raise TimelineStoreCorruptRecord from None
+
+    async def _query_expired_raw(
+        self,
+        *,
+        client: AsyncFirestoreTimelineClientPort,
+        evaluated_at: datetime,
+        limit: int,
+    ) -> tuple[TimelineRawEvidenceV1, ...]:
+        """Return only the oldest expired records for this exact target."""
+
+        try:
+            query = (
+                client.collection(TIMELINE_RAW_COLLECTION)
+                .where(
+                    filter=firestore_v1.FieldFilter(
+                        "target_sha256",
+                        "==",
+                        timeline_target_sha256(self._target),
+                    )
+                )
+                .where(
+                    filter=firestore_v1.FieldFilter(
+                        "expires_at",
+                        "<=",
+                        evaluated_at,
+                    )
+                )
+                .order_by("expires_at", direction=firestore_v1.Query.ASCENDING)
+                .order_by("__name__", direction=firestore_v1.Query.ASCENDING)
+                .limit(limit)
+            )
+            snapshots = query.stream(
+                transaction=None,
+                retry=None,
+                timeout=FIRESTORE_TIMELINE_TIMEOUT_SECONDS,
+            )
+            selected: list[TimelineRawEvidenceV1] = []
+            keys: list[tuple[datetime, str]] = []
+            seen: set[str] = set()
+            async with asyncio.timeout(FIRESTORE_TIMELINE_TIMEOUT_SECONDS):
+                async for snapshot in snapshots:
+                    provider = cast(TimelineProviderSnapshotPort, snapshot)
+                    if provider.reference.path in seen or len(selected) >= limit:
+                        raise TimelineStoreCorruptRecord
+                    raw = self._decode_raw_query_snapshot(snapshot, client=client)
+                    expiry = _parse_utc_second(raw.expires_at)
+                    if expiry > evaluated_at:
+                        raise TimelineStoreCorruptRecord
+                    seen.add(provider.reference.path)
+                    keys.append((expiry, provider.reference.path))
+                    selected.append(raw)
+            if keys != sorted(keys):
+                raise TimelineStoreCorruptRecord
+            return tuple(selected)
+        except asyncio.CancelledError:
+            raise
+        except TimelineStoreError:
+            raise
+        except Exception:
+            raise TimelineStoreUnavailable from None
 
     def _decode_signed_intent_snapshot(
         self,
@@ -960,9 +1071,7 @@ class FirestoreTimelineStore:
         entry: TimelineEntryV1,
         raw_source: TimelineRawSourceV1,
     ) -> None:
-        expires_at = _parse_utc_second(
-            _raw_evidence(entry=entry, raw_source=raw_source).expires_at
-        )
+        expires_at = _parse_utc_second(_raw_evidence(entry=entry, raw_source=raw_source).expires_at)
         evaluated_at = _utc_second(self._clock())
         if _parse_utc_second(evaluated_at) < expires_at:
             await self._require_existing_raw(
@@ -1286,9 +1395,7 @@ class FirestoreTimelineStore:
             if len(adopted_prefix) == len(items):
                 return adopted_prefix
             if adopted_prefix:
-                appended = await self.append_many_with_raw(
-                    items[len(adopted_prefix) :]
-                )
+                appended = await self.append_many_with_raw(items[len(adopted_prefix) :])
                 return adopted_prefix + appended
             raise
         except TimelineStoreCorruptRecord:
@@ -1306,9 +1413,7 @@ class FirestoreTimelineStore:
             if len(adopted_prefix) == len(items):
                 return adopted_prefix
             if adopted_prefix:
-                appended = await self.append_many_with_raw(
-                    items[len(adopted_prefix) :]
-                )
+                appended = await self.append_many_with_raw(items[len(adopted_prefix) :])
                 return adopted_prefix + appended
             if _is_contention(error):
                 raise TimelineStoreConflict from None
@@ -1327,13 +1432,10 @@ class FirestoreTimelineStore:
             type(event) is not TimelineEventV1
             or event.target != self._target
             or event.policy_sha256 != self._policy_sha256
-            or event.raw_retention_days
-            != self._retention_by_class[event.evidence_class]
+            or event.raw_retention_days != self._retention_by_class[event.evidence_class]
         ):
             raise ValueError("timeline event does not match configured target and policy")
-        signature_sha256 = (
-            None if event.signature is None else event.signature.signature_sha256
-        )
+        signature_sha256 = None if event.signature is None else event.signature.signature_sha256
         if raw_source is not None and (
             raw_source.raw_source_id != event.raw_source_id
             or raw_source.source_schema_version != event.source_schema_version
@@ -1685,9 +1787,7 @@ class FirestoreTimelineStore:
         last = min(head.value.sequence, command.after_sequence + command.limit)
         requested = tuple(range(first, last + 1))
         read_sequences = (
-            (command.after_sequence, *requested)
-            if command.after_sequence > 0
-            else requested
+            (command.after_sequence, *requested) if command.after_sequence > 0 else requested
         )
         decoded = await self._batch_read_entries(client=client, sequences=read_sequences)
         predecessor = command.after_entry_sha256
@@ -1732,8 +1832,7 @@ class FirestoreTimelineStore:
     ) -> bool:
         event = entry.content.event
         expected_expiry = _utc_second(
-            _parse_utc_second(entry.content.recorded_at)
-            + timedelta(days=event.raw_retention_days)
+            _parse_utc_second(entry.content.recorded_at) + timedelta(days=event.raw_retention_days)
         )
         return (
             receipt.target == self._target
@@ -1773,9 +1872,8 @@ class FirestoreTimelineStore:
         )
         if stored is None:
             return None
-        if (
-            stored.wrapper.revision != 0
-            or not self._deletion_receipt_matches_entry(stored.value, entry)
+        if stored.wrapper.revision != 0 or not self._deletion_receipt_matches_entry(
+            stored.value, entry
         ):
             raise TimelineStoreCorruptRecord
         return stored.value
@@ -1879,6 +1977,46 @@ class FirestoreTimelineStore:
             raise TimelineStoreOutcomeUnknown
         return selected
 
+    async def sweep_expired_raw(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[TimelineRawDeletionReceiptV1, ...]:
+        """Retire a bounded target-scoped batch and preserve deletion evidence."""
+
+        if type(limit) is not int or not 1 <= limit <= TIMELINE_RETENTION_SWEEP_LIMIT:
+            raise ValueError("timeline retention sweep limit is invalid")
+        client = await self._client()
+        evaluated = self._clock().astimezone(UTC).replace(microsecond=0)
+        raw_records = await self._query_expired_raw(
+            client=client,
+            evaluated_at=evaluated,
+            limit=limit,
+        )
+        if not raw_records:
+            return ()
+        sequences = tuple(raw.sequence for raw in raw_records)
+        if len(set(sequences)) != len(sequences):
+            raise TimelineStoreCorruptRecord
+        entries = await self._batch_read_entries(client=client, sequences=sequences)
+        receipts: list[TimelineRawDeletionReceiptV1] = []
+        confirmed_at = _utc_second(evaluated)
+        for raw in raw_records:
+            entry = entries[raw.sequence]
+            if raw != _raw_evidence(
+                entry=entry, raw_source=raw.raw_source
+            ) or evaluated < _parse_utc_second(raw.expires_at):
+                raise TimelineStoreCorruptRecord
+            receipts.append(
+                await self._delete_expired_raw(
+                    client=client,
+                    entry=entry,
+                    raw_source=raw.raw_source,
+                    confirmed_at=confirmed_at,
+                )
+            )
+        return tuple(receipts)
+
     async def read_raw_export(
         self,
         command: TimelineRawExportCommandV1,
@@ -1899,6 +2037,7 @@ class FirestoreTimelineStore:
         client = await self._client()
         evaluated_at = _utc_second(self._clock())
         try:
+
             async def read_lifecycle(
                 entry: TimelineEntryV1,
             ) -> tuple[TimelineRawEvidenceV1 | None, TimelineRawDeletionReceiptV1 | None]:
@@ -1916,9 +2055,7 @@ class FirestoreTimelineStore:
                 )
                 return raw, receipt
 
-            lifecycle = await asyncio.gather(
-                *(read_lifecycle(entry) for entry in summary.entries)
-            )
+            lifecycle = await asyncio.gather(*(read_lifecycle(entry) for entry in summary.entries))
             return TimelineRawReadSlice(
                 command=command,
                 head=summary.head,

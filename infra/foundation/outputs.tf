@@ -77,10 +77,11 @@ output "firestore_authority" {
     location         = google_firestore_database.authority.location_id
     concurrency_mode = google_firestore_database.authority.concurrency_mode
     timeline_raw = {
-      collection     = local.timeline_raw_collection
-      expiry_field   = local.timeline_raw_expiry_field
-      retention_days = local.timeline_raw_retention_days
-      ttl_field_id   = google_firestore_field.timeline_raw_expiry.id
+      collection         = local.timeline_raw_collection
+      expiry_field       = local.timeline_raw_expiry_field
+      retention_days     = local.timeline_raw_retention_days
+      expiry_field_id    = google_firestore_field.timeline_raw_expiry.id
+      retention_index_id = google_firestore_index.timeline_raw_retention.id
     }
     signed_intent = {
       collection   = local.signed_intent_collection

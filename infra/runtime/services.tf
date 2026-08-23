@@ -190,6 +190,8 @@ module "coordinator" {
     CONTROLGRAPH_RECEIPT_AUTH_CALLER_SUBJECT             = tostring(local.service_subjects.executor)
     CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_EMAIL      = local.service_accounts.executor
     CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT    = tostring(local.service_subjects.executor)
+    CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL         = local.runtime_identity_emails.retention_sweeper
+    CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT       = local.runtime_identity_subjects.retention_sweeper
   })
 }
 

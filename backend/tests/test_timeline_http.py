@@ -6,6 +6,7 @@ from timeline_test_data import TARGET
 from controlgraph_canary.application.identity import (
     TIMELINE_RAW_EXPORT_PATH,
     TIMELINE_READ_PATH,
+    TIMELINE_RETENTION_PATH,
     AuthenticationContext,
     AuthenticationDenialCode,
     AuthenticationError,
@@ -20,6 +21,7 @@ from controlgraph_canary.application.timeline import (
     TimelineRawReadSlice,
     TimelineReadService,
     TimelineReadSlice,
+    TimelineRetentionService,
 )
 from controlgraph_canary.contracts.timeline import (
     TimelineEventV1,
@@ -40,30 +42,29 @@ SECURITY_EMAIL = "security@example.com"
 SECURITY_SUBJECT = "223456789012345678901"
 EXPORTER_EMAIL = "exporter@example.com"
 EXPORTER_SUBJECT = "323456789012345678901"
-AUDIENCE = (
-    f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
-)
+AUDIENCE = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
+COORDINATOR_AUDIENCE = f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+API_EMAIL = f"controlgraph-api@{TARGET.project_id}.iam.gserviceaccount.com"
+API_SUBJECT = "423456789012345678901"
+RETENTION_EMAIL = f"cg-retention-sweeper@{TARGET.project_id}.iam.gserviceaccount.com"
+RETENTION_SUBJECT = "523456789012345678901"
 FULL_TOKEN = "Bearer header.payload.signature"
 OPERATOR_HEADERS = {
     CONTROLGRAPH_AUTHORIZATION_HEADER: FULL_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: (
-        "bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
-    ),
+    SERVERLESS_AUTHORIZATION_HEADER: ("bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
 }
 SECURITY_TOKEN = "Bearer security.payload.signature"
 SECURITY_HEADERS = {
     CONTROLGRAPH_AUTHORIZATION_HEADER: SECURITY_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: (
-        "bearer security.payload.SIGNATURE_REMOVED_BY_GOOGLE"
-    ),
+    SERVERLESS_AUTHORIZATION_HEADER: ("bearer security.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
 }
 EXPORT_TOKEN = "Bearer exporter.payload.signature"
 EXPORT_HEADERS = {
     CONTROLGRAPH_AUTHORIZATION_HEADER: EXPORT_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: (
-        "bearer exporter.payload.SIGNATURE_REMOVED_BY_GOOGLE"
-    ),
+    SERVERLESS_AUTHORIZATION_HEADER: ("bearer exporter.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
 }
+RETENTION_TOKEN = "Bearer retention.payload.signature"
+RETENTION_HEADERS = {"Authorization": RETENTION_TOKEN}
 
 
 def _policy(
@@ -86,6 +87,23 @@ def _policy(
     )
 
 
+def _coordinator_policy(
+    path: str,
+    *,
+    role: CallerRole = CallerRole.API,
+    email: str = API_EMAIL,
+    subject: str = API_SUBJECT,
+) -> RouteAuthenticationPolicy:
+    return RouteAuthenticationPolicy(
+        project_id=TARGET.project_id,
+        project_number=PROJECT_NUMBER,
+        service_role=ServiceRole.COORDINATOR,
+        path=path,
+        audience=COORDINATOR_AUDIENCE,
+        caller=CallerBinding(role=role, email=email, subject=subject),
+    )
+
+
 class _Authenticator:
     def __init__(self) -> None:
         self.paths: list[str] = []
@@ -96,20 +114,25 @@ class _Authenticator:
         policy: RouteAuthenticationPolicy,
     ) -> AuthenticationContext:
         identities = {
-            FULL_TOKEN: (OPERATOR_EMAIL, OPERATOR_SUBJECT),
-            SECURITY_TOKEN: (SECURITY_EMAIL, SECURITY_SUBJECT),
-            EXPORT_TOKEN: (EXPORTER_EMAIL, EXPORTER_SUBJECT),
+            FULL_TOKEN: (OPERATOR_EMAIL, OPERATOR_SUBJECT, CallerRole.OPERATOR),
+            SECURITY_TOKEN: (SECURITY_EMAIL, SECURITY_SUBJECT, CallerRole.OPERATOR),
+            EXPORT_TOKEN: (EXPORTER_EMAIL, EXPORTER_SUBJECT, CallerRole.OPERATOR),
+            RETENTION_TOKEN: (
+                RETENTION_EMAIL,
+                RETENTION_SUBJECT,
+                CallerRole.RETENTION_SWEEPER,
+            ),
         }
         identity = identities.get(authorization_header or "")
-        if identity != (policy.caller.email, policy.caller.subject):
+        if identity is None or identity[:2] != (policy.caller.email, policy.caller.subject):
             raise AuthenticationError(AuthenticationDenialCode.CALLER_DENIED)
         self.paths.append(policy.path)
         return AuthenticationContext(
-            role=CallerRole.OPERATOR,
+            role=identity[2],
             email=identity[0],
             subject=identity[1],
             issuer="accounts.google.com",
-            audience=AUDIENCE,
+            audience=policy.audience,
             issued_at=1_700_000_000,
             expires_at=1_700_003_600,
         )
@@ -153,6 +176,19 @@ class _TimelineStore:
             deletion_receipts=(),
             evaluated_at="2026-08-21T12:00:00Z",
         )
+
+
+class _RetentionStore:
+    def __init__(self) -> None:
+        self.limits: list[int] = []
+
+    @property
+    def target(self):  # type: ignore[no-untyped-def]
+        return TARGET
+
+    async def sweep_expired_raw(self, *, limit: int):  # type: ignore[no-untyped-def]
+        self.limits.append(limit)
+        return ()
 
 
 def _client() -> tuple[TestClient, _Authenticator, _TimelineStore]:
@@ -275,3 +311,51 @@ def test_raw_export_requires_separate_confirmation_and_is_no_store() -> None:
     assert len(store.raw_commands) == 1
     assert store.raw_commands[0].target == TARGET
     assert authenticator.paths == [TIMELINE_RAW_EXPORT_PATH, TIMELINE_RAW_EXPORT_PATH]
+
+
+def test_retention_sweep_requires_exact_identity_and_has_no_caller_controls() -> None:
+    authenticator = _Authenticator()
+    store = _RetentionStore()
+    app = create_service_app(
+        ServiceRole.COORDINATOR,
+        authenticator=authenticator,
+        authentication_policy=_coordinator_policy(protected_path(ServiceRole.COORDINATOR)),
+        timeline_retention_service=TimelineRetentionService(
+            target=TARGET,
+            store=store,
+        ),
+        timeline_retention_authentication_policy=_coordinator_policy(
+            TIMELINE_RETENTION_PATH,
+            role=CallerRole.RETENTION_SWEEPER,
+            email=RETENTION_EMAIL,
+            subject=RETENTION_SUBJECT,
+        ),
+    )
+    client = TestClient(app)
+
+    denied_identity = client.post(
+        TIMELINE_RETENTION_PATH,
+        headers={"Authorization": FULL_TOKEN},
+    )
+    denied_query = client.post(
+        f"{TIMELINE_RETENTION_PATH}?limit=100",
+        headers=RETENTION_HEADERS,
+    )
+    denied_body = client.post(
+        TIMELINE_RETENTION_PATH,
+        headers=RETENTION_HEADERS,
+        content=b"{}",
+    )
+    accepted = client.post(TIMELINE_RETENTION_PATH, headers=RETENTION_HEADERS)
+
+    assert denied_identity.status_code == 403
+    assert denied_query.status_code == 403
+    assert denied_body.status_code == 403
+    assert accepted.status_code == 204
+    assert accepted.headers["cache-control"] == "no-store"
+    assert store.limits == [25]
+    assert authenticator.paths == [
+        TIMELINE_RETENTION_PATH,
+        TIMELINE_RETENTION_PATH,
+        TIMELINE_RETENTION_PATH,
+    ]
