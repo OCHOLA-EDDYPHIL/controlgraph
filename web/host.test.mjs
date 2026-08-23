@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 import {
   createConsoleServer,
@@ -35,6 +36,12 @@ function raw(serverless = FULL) {
 }
 
 describe("operator console host boundary", () => {
+  it("makes the host entrypoint readable by the unprivileged runtime user", () => {
+    const dockerfile = readFileSync(new URL("./Dockerfile", import.meta.url), "utf8");
+
+    expect(dockerfile).toContain("COPY --chown=node:node --chmod=0444 host.mjs ./host.mjs");
+  });
+
   it("restores the untouched credential after Cloud Run removes its proxy signature", () => {
     for (const serverless of [FULL, REWRITTEN]) {
       const headers = operatorProxyHeaders(raw(serverless), "POST");
