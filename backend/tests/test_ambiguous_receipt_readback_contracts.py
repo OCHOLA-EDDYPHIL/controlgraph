@@ -97,9 +97,14 @@ def _command(receipt: ExecutionReceipt) -> AmbiguousReceiptReadbackCommandV1:
     )
 
 
-def test_command_is_strict_versioned_apply_only_and_requires_confirmation() -> None:
+def test_command_is_strict_versioned_and_allows_only_apply_or_recovery() -> None:
     command = _command(_receipt())
     payload = command.model_dump(mode="python")
+
+    recovery = AmbiguousReceiptReadbackCommandV1.model_validate(
+        {**payload, "action": CapabilityAction.RECOVER_STABLE}
+    )
+    assert recovery.action is CapabilityAction.RECOVER_STABLE
 
     for changes in (
         {"confirmation": "APPLY"},

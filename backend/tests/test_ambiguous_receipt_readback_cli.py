@@ -34,13 +34,15 @@ from controlgraph_canary.contracts.receipt_authority import StoredExecutionRecei
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 
 
-def _command() -> AmbiguousReceiptReadbackCommandV1:
+def _command(
+    action: CapabilityAction = CapabilityAction.APPLY_CANARY,
+) -> AmbiguousReceiptReadbackCommandV1:
     return AmbiguousReceiptReadbackCommandV1(
         schema_version=AMBIGUOUS_RECEIPT_READBACK_COMMAND_V1,
         root_id=f"cgroot:{'1' * 64}",
         expected_root_sha256="1" * 64,
         expected_epoch=1,
-        action=CapabilityAction.APPLY_CANARY,
+        action=action,
         request_id="request-001",
         idempotency_key="idempotency-001",
         capability_sha256="2" * 64,
@@ -128,12 +130,17 @@ class _DeniedResolver:
 
 
 class _DeniedFactory:
+    def __init__(self) -> None:
+        self.actions: list[CapabilityAction] = []
+
     def __call__(
         self,
         *,
+        action: CapabilityAction,
         environment: Mapping[str, str] | None = None,
     ) -> _DeniedResolver:
         del environment
+        self.actions.append(action)
         return _DeniedResolver()
 
 
@@ -156,9 +163,11 @@ class _SuccessfulFactory:
     def __call__(
         self,
         *,
+        action: CapabilityAction,
         environment: Mapping[str, str] | None = None,
     ) -> _SuccessfulResolver:
         del environment
+        assert action is self.result.command.action
         return _SuccessfulResolver(self.result)
 
 
@@ -212,6 +221,30 @@ def test_cli_reads_the_fixed_bounded_environment_source(
         )
         == 4
     )
+    assert json.loads(capsys.readouterr().out) == {
+        "code": AmbiguousReceiptReadbackErrorCode.AUTHORITY_STALE.value
+    }
+
+
+def test_cli_passes_recovery_action_to_runtime_composition(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command = _command(CapabilityAction.RECOVER_STABLE)
+    factory = _DeniedFactory()
+
+    assert (
+        main(
+            ["--command-environment"],
+            environment={
+                AMBIGUOUS_RECEIPT_READBACK_COMMAND_ENV: canonical_json_bytes(
+                    command
+                ).decode("utf-8")
+            },
+            resolver_factory=factory,
+        )
+        == 4
+    )
+    assert factory.actions == [CapabilityAction.RECOVER_STABLE]
     assert json.loads(capsys.readouterr().out) == {
         "code": AmbiguousReceiptReadbackErrorCode.AUTHORITY_STALE.value
     }

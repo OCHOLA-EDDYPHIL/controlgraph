@@ -46,7 +46,7 @@ class AmbiguousReceiptReadbackDisposition(StrEnum):
 
 
 class AmbiguousReceiptReadbackCommandV1(StrictContractModel):
-    """Exact locator for one already-stored ambiguous apply-canary receipt."""
+    """Exact locator for one supported already-stored ambiguous receipt."""
 
     schema_version: Literal[
         "controlgraph.ambiguous-receipt-readback-command/v1"
@@ -54,7 +54,10 @@ class AmbiguousReceiptReadbackCommandV1(StrictContractModel):
     root_id: Identifier
     expected_root_sha256: Sha256Digest
     expected_epoch: PositiveSafeInteger
-    action: Literal[CapabilityAction.APPLY_CANARY]
+    action: Literal[
+        CapabilityAction.APPLY_CANARY,
+        CapabilityAction.RECOVER_STABLE,
+    ]
     request_id: Identifier
     idempotency_key: Identifier
     capability_sha256: Sha256Digest

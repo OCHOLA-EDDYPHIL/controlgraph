@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
 from root_v2_support import root_bundle, target_binding
 
 import controlgraph_canary.application.ambiguous_receipt_readback as resolver_module
@@ -9,7 +10,13 @@ import controlgraph_canary.services.ambiguous_receipt_readback as composition_mo
 from controlgraph_canary.application.ambiguous_receipt_readback import (
     AmbiguousReceiptReadbackResolver,
 )
+from controlgraph_canary.application.cloud_run import CloudRunMutationPurpose
+from controlgraph_canary.application.identity import (
+    RECEIPT_AUTHORITY_PATH,
+    RECOVERY_RECEIPT_AUTHORITY_PATH,
+)
 from controlgraph_canary.application.receipt_execution import ReceiptReadbackResult
+from controlgraph_canary.contracts.models import CapabilityAction
 from controlgraph_canary.services.ambiguous_receipt_readback import (
     create_ambiguous_receipt_readback_resolver,
 )
@@ -105,8 +112,15 @@ class _TargetReadback:
         return ReceiptReadbackResult(state=None, observed_etag=None)
 
 
+class _Transport:
+    async def post(self, route: object, body: bytes) -> bytes:
+        del route, body
+        raise AssertionError("composition test transport must not run")
+
+
 def test_one_shot_composition_is_executor_only_and_uses_injected_read_dependencies() -> None:
     resolver = create_ambiguous_receipt_readback_resolver(
+        action=CapabilityAction.APPLY_CANARY,
         environment=_environment(),
         root_reader=_RootReader(),
         receipt_store=_ReceiptStore(),
@@ -124,6 +138,7 @@ def test_one_shot_composition_rejects_disabled_executor() -> None:
 
     try:
         create_ambiguous_receipt_readback_resolver(
+            action=CapabilityAction.APPLY_CANARY,
             environment=environment,
             root_reader=_RootReader(),
             receipt_store=_ReceiptStore(),
@@ -134,6 +149,65 @@ def test_one_shot_composition_rejects_disabled_executor() -> None:
         assert "enabled executor" in str(error)
     else:
         raise AssertionError("disabled executor was admitted")
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_path", "expected_purpose"),
+    [
+        (
+            CapabilityAction.APPLY_CANARY,
+            RECEIPT_AUTHORITY_PATH,
+            CloudRunMutationPurpose.STANDARD_EXECUTION,
+        ),
+        (
+            CapabilityAction.RECOVER_STABLE,
+            RECOVERY_RECEIPT_AUTHORITY_PATH,
+            CloudRunMutationPurpose.STABLE_RECOVERY,
+        ),
+    ],
+)
+def test_composition_selects_action_specific_receipt_and_readback_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    action: CapabilityAction,
+    expected_path: str,
+    expected_purpose: CloudRunMutationPurpose,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def receipt_store(**kwargs: object) -> _ReceiptStore:
+        captured["route"] = kwargs["route"]
+        return _ReceiptStore()
+
+    def target_readback(**kwargs: object) -> _TargetReadback:
+        captured["purpose"] = kwargs["mutation_purpose"]
+        return _TargetReadback()
+
+    monkeypatch.setattr(composition_module, "ReceiptAuthorityClient", receipt_store)
+    monkeypatch.setattr(composition_module, "CloudRunV2ReceiptReadback", target_readback)
+
+    resolver = create_ambiguous_receipt_readback_resolver(
+        action=action,
+        environment=_environment(),
+        root_reader=_RootReader(),
+        operation_readback=_OperationReadback(),
+        internal_transport=_Transport(),
+    )
+
+    assert type(resolver) is AmbiguousReceiptReadbackResolver
+    assert captured["route"].path == expected_path
+    assert captured["purpose"] is expected_purpose
+
+
+def test_composition_rejects_promotion_action() -> None:
+    with pytest.raises(ValueError, match="action is not supported"):
+        create_ambiguous_receipt_readback_resolver(
+            action=CapabilityAction.PROMOTE_CANDIDATE,
+            environment=_environment(),
+            root_reader=_RootReader(),
+            receipt_store=_ReceiptStore(),
+            operation_readback=_OperationReadback(),
+            target_readback=_TargetReadback(),
+        )
 
 
 def test_readback_composition_has_no_provider_mutation_or_dispatch_import_surface() -> None:

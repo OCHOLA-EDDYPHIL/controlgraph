@@ -347,12 +347,17 @@ class AmbiguousReceiptReadbackResolver:
         receipt = stored.value
         root = trusted.root
         plan = root.content.rollout_plan
+        stable_percent, candidate_percent = (
+            (100, 0)
+            if command.action is CapabilityAction.RECOVER_STABLE
+            else (plan.stable_percent, plan.candidate_percent)
+        )
         expected = TargetConfigurationProjection(
             target=self._target,
             stable_revision=plan.stable_revision,
             candidate_revision=plan.candidate_revision,
-            stable_percent=plan.stable_percent,
-            candidate_percent=plan.candidate_percent,
+            stable_percent=stable_percent,
+            candidate_percent=candidate_percent,
             concurrency=plan.concurrency,
         )
         if (
@@ -361,9 +366,13 @@ class AmbiguousReceiptReadbackResolver:
             or receipt.root_id != root.root_id
             or receipt.root_sha256 != root.root_sha256
             or receipt.target != root.content.target
-            or receipt.action is not CapabilityAction.APPLY_CANARY
+            or receipt.action is not command.action
             or receipt.plan_sha256 != canonical_sha256(plan)
-            or receipt.provider_etag != root.content.stable_snapshot.provider_etag
+            or (
+                command.action is CapabilityAction.APPLY_CANARY
+                and receipt.provider_etag
+                != root.content.stable_snapshot.provider_etag
+            )
             or receipt.expected_poststate_sha256
             != target_configuration_projection_sha256(expected)
         ):
