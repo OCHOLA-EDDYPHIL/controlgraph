@@ -24,6 +24,7 @@ from controlgraph_canary.application.timeline import (
     TimelineRawExportService,
     TimelineStoreConflict,
     TimelineStoreCorruptRecord,
+    TimelineStoreUnavailable,
     TimelineWriteError,
     TimelineWriteErrorCode,
     TimelineWriteGrant,
@@ -33,7 +34,12 @@ from controlgraph_canary.application.timeline_projectors import (
     project_signed_capability,
 )
 from controlgraph_canary.application.timeline_recording import TimelineRecorder
-from controlgraph_canary.contracts.codec import canonical_sha256, encode_base64url
+from controlgraph_canary.contracts.codec import (
+    canonical_json_bytes,
+    canonical_sha256,
+    decode_contract,
+    encode_base64url,
+)
 from controlgraph_canary.contracts.models import (
     CAPABILITY_CLAIMS_V1,
     SIGNED_CAPABILITY_V1,
@@ -54,6 +60,7 @@ from controlgraph_canary.contracts.timeline import (
     TimelineDisplayFieldName,
     TimelineDisplayFieldV1,
     TimelinePageCommandV1,
+    TimelineRawEvidenceV1,
     TimelineRawExportCommandV1,
     TimelineRawLifecycleStatus,
     standard_timeline_evidence_policy_set,
@@ -63,8 +70,10 @@ from controlgraph_canary.contracts.timeline import (
     timeline_raw_tombstone_document_id,
     timeline_signed_intent_document_id,
 )
+from controlgraph_canary.integrations.google import firestore_timeline
 from controlgraph_canary.integrations.google.firestore_timeline import (
     FIRESTORE_TIMELINE_DATABASE,
+    FIRESTORE_TIMELINE_RETENTION_SWEEP_TIMEOUT_SECONDS,
     AsyncFirestoreTimelineClientPort,
     FirestoreTimelineStore,
     FirestoreTimelineTransactionRunner,
@@ -189,8 +198,12 @@ class _Query:
         )
 
         async def snapshots() -> AsyncIterator[object]:
+            if self.client.query_delay_seconds is not None:
+                await asyncio.sleep(self.client.query_delay_seconds)
             for path, data in selected:
                 yield _Snapshot(self.client.document(*path.split("/")), data)
+                if self.client.delete_raw_after_query:
+                    self.client.documents.pop(path, None)
 
         return snapshots()
 
@@ -241,6 +254,8 @@ class _Client:
         self.duplicate_batch = False
         self.reverse_query = False
         self.duplicate_query = False
+        self.delete_raw_after_query = False
+        self.query_delay_seconds: float | None = None
         self.lose_next_commit = False
         self.lock = asyncio.Lock()
 
@@ -482,7 +497,9 @@ async def test_cursor_outside_head_or_with_wrong_digest_fails_closed() -> None:
     created = await store.append(timeline_event(28))
 
     with pytest.raises(TimelineCursorInvalid):
-        await store.read_page(_command(after_sequence=1, after_entry_sha256="f" * 64))
+        await store.read_page(
+            _command(after_sequence=1, after_entry_sha256="f" * 64)
+        )
     with pytest.raises(TimelineCursorInvalid):
         await store.read_page(
             _command(after_sequence=2, after_entry_sha256=created.entry.entry_sha256)
@@ -507,7 +524,10 @@ async def test_missing_or_duplicate_exact_get_results_are_corruption() -> None:
     await store.append(timeline_event(29))
     await store.append(timeline_event(30))
 
-    missing_path = f"{TIMELINE_ENTRY_COLLECTION}/{timeline_entry_document_id(TARGET, 2)}"
+    missing_path = (
+        f"{TIMELINE_ENTRY_COLLECTION}/"
+        f"{timeline_entry_document_id(TARGET, 2)}"
+    )
     removed = client.documents.pop(missing_path)
     with pytest.raises(TimelineStoreCorruptRecord):
         await store.read_page(_command())
@@ -539,7 +559,10 @@ async def test_raw_append_is_atomic_replay_safe_and_exact_id_exported() -> None:
     assert replay.entry == created.entry
     assert client.write_count == 4
     assert client.transaction_count == 1
-    raw_path = f"{TIMELINE_RAW_COLLECTION}/{timeline_raw_document_id(TARGET, event.source_id)}"
+    raw_path = (
+        f"{TIMELINE_RAW_COLLECTION}/"
+        f"{timeline_raw_document_id(TARGET, event.source_id)}"
+    )
     stored_raw = client.documents[raw_path]
     assert stored_raw["expires_at"] == NOW + timedelta(days=30)
 
@@ -754,7 +777,8 @@ async def test_signed_intent_is_read_by_receipt_bound_envelope_digest() -> None:
 
     assert projection.event.source_id == timeline_capability_source_id(digest)
     intent_path = (
-        f"{TIMELINE_SIGNED_INTENT_COLLECTION}/{timeline_signed_intent_document_id(TARGET, digest)}"
+        f"{TIMELINE_SIGNED_INTENT_COLLECTION}/"
+        f"{timeline_signed_intent_document_id(TARGET, digest)}"
     )
     assert intent_path in client.documents
     assert signed.signature not in projection.raw_source.canonical_record
@@ -837,6 +861,92 @@ async def test_retention_sweep_rejects_duplicate_or_unordered_query_results() ->
             await store.sweep_expired_raw(limit=25)
 
         assert client.write_count == writes_before_sweep
+
+
+@_async_test
+async def test_retention_sweep_rejects_raw_missing_inside_delete_transaction() -> None:
+    now = [NOW]
+    client = _Client()
+    store = _store(client, clock=lambda: now[0])
+    event, raw_source = timeline_event_with_raw(37)
+    await store.append_with_raw(event, raw_source)
+    writes_before_sweep = client.write_count
+    client.delete_raw_after_query = True
+    now[0] = NOW + timedelta(days=30)
+
+    with pytest.raises(TimelineStoreCorruptRecord):
+        await store.sweep_expired_raw(limit=25)
+
+    tombstone_path = (
+        f"{TIMELINE_RAW_TOMBSTONE_COLLECTION}/"
+        f"{timeline_raw_tombstone_document_id(TARGET, event.source_id)}"
+    )
+    assert tombstone_path not in client.documents
+    assert client.write_count == writes_before_sweep
+
+
+@_async_test
+async def test_retention_sweep_rejects_coherently_encoded_raw_binding_mismatch() -> None:
+    now = [NOW]
+    client = _Client()
+    store = _store(client, clock=lambda: now[0])
+    event, raw_source = timeline_event_with_raw(38)
+    await store.append_with_raw(event, raw_source)
+    raw_path = (
+        f"{TIMELINE_RAW_COLLECTION}/"
+        f"{timeline_raw_document_id(TARGET, event.source_id)}"
+    )
+    stored = client.documents[raw_path]
+    raw = decode_contract(stored["canonical_payload"], TimelineRawEvidenceV1)
+    corrupted = raw.model_copy(
+        update={
+            "raw_source": raw.raw_source.model_copy(
+                update={"payload_sha256": "f" * 64}
+            )
+        }
+    )
+    stored["canonical_payload"] = canonical_json_bytes(corrupted).decode("utf-8")
+    stored["payload_sha256"] = canonical_sha256(corrupted)
+    writes_before_sweep = client.write_count
+    now[0] = NOW + timedelta(days=30)
+
+    with pytest.raises(TimelineStoreCorruptRecord):
+        await store.sweep_expired_raw(limit=25)
+
+    assert raw_path in client.documents
+    assert client.write_count == writes_before_sweep
+
+
+@_async_test
+async def test_retention_sweep_timeout_is_below_scheduler_deadline_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert 0 < FIRESTORE_TIMELINE_RETENTION_SWEEP_TIMEOUT_SECONDS < 60
+    client = _Client()
+    client.query_delay_seconds = 0.02
+    store = _store(client)
+    monkeypatch.setattr(
+        firestore_timeline,
+        "FIRESTORE_TIMELINE_RETENTION_SWEEP_TIMEOUT_SECONDS",
+        0.001,
+    )
+
+    with pytest.raises(TimelineStoreUnavailable):
+        await store.sweep_expired_raw(limit=25)
+
+    assert client.write_count == 0
+
+
+@_async_test
+async def test_retention_sweep_rejects_a_naive_clock_before_querying() -> None:
+    client = _Client()
+    store = _store(client, clock=lambda: datetime(2026, 8, 21, 0, 10))
+
+    with pytest.raises(ValueError, match="provider timestamp is invalid"):
+        await store.sweep_expired_raw(limit=25)
+
+    assert client.query_calls == []
+    assert client.write_count == 0
 
 
 @_async_test

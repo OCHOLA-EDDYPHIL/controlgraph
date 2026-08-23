@@ -313,7 +313,7 @@ class TimelineRawReadSlice:
             if raw is not None and (
                 evaluated >= expires
                 or receipt is not None
-                or not _raw_matches_entry(raw, entry, expires_at=_utc_second(expires))
+                or not timeline_raw_evidence_matches_entry(raw, entry)
             ):
                 raise ValueError("timeline raw evidence does not match its entry")
             sequence += 1
@@ -478,7 +478,8 @@ def project_timeline_entry(
     event = content.event
     actor_id = (
         event.actor_id
-        if _is_visible(event.actor_data_class, audience) and not _is_secret_shaped(event.actor_id)
+        if _is_visible(event.actor_data_class, audience)
+        and not _is_secret_shaped(event.actor_id)
         else None
     )
     correlations = tuple(
@@ -489,13 +490,18 @@ def project_timeline_entry(
             data_class=item.data_class,
         )
         for item in event.correlations
-        if _is_visible(item.data_class, audience) and not _is_secret_shaped(item.correlation_id)
+        if _is_visible(item.data_class, audience)
+        and not _is_secret_shaped(item.correlation_id)
     )
     display_fields = tuple(
         TimelineDisplayFieldV1(
             schema_version=TIMELINE_DISPLAY_FIELD_V1,
             name=item.name,
-            value=(REDACTED_DISPLAY_VALUE if _is_secret_shaped(item.value) else item.value),
+            value=(
+                REDACTED_DISPLAY_VALUE
+                if _is_secret_shaped(item.value)
+                else item.value
+            ),
             data_class=item.data_class,
         )
         for item in event.display_fields
@@ -574,12 +580,12 @@ def _raw_expires_at(entry: TimelineEntryV1) -> datetime:
     )
 
 
-def _raw_matches_entry(
+def timeline_raw_evidence_matches_entry(
     raw: TimelineRawEvidenceV1,
     entry: TimelineEntryV1,
-    *,
-    expires_at: str,
 ) -> bool:
+    """Require every raw-source and lifecycle field to match its immutable entry."""
+
     event = entry.content.event
     source = raw.raw_source
     signature_sha256 = None if event.signature is None else event.signature.signature_sha256
@@ -590,7 +596,7 @@ def _raw_matches_entry(
         and raw.entry_sha256 == entry.entry_sha256
         and raw.source_id == event.source_id
         and raw.recorded_at == entry.content.recorded_at
-        and raw.expires_at == expires_at
+        and raw.expires_at == _utc_second(_raw_expires_at(entry))
         and source.raw_source_id == event.raw_source_id
         and source.source_schema_version == event.source_schema_version
         and source.target == event.target
@@ -663,9 +669,15 @@ def project_timeline_raw_export(read: TimelineRawReadSlice) -> TimelineRawExport
                     else TimelineRawLifecycleStatus.AVAILABLE
                 ),
                 canonical_record=(
-                    None if deleted else source.canonical_record if source is not None else None
+                    None
+                    if deleted
+                    else source.canonical_record
+                    if source is not None
+                    else None
                 ),
-                deletion_receipt_id=(receipt.receipt_id if receipt is not None else None),
+                deletion_receipt_id=(
+                    receipt.receipt_id if receipt is not None else None
+                ),
                 deletion_receipt_sha256=(
                     canonical_sha256(receipt) if receipt is not None else None
                 ),
@@ -748,7 +760,9 @@ class TimelineRawExportService:
             or not isinstance(store, TimelineRawStore)
             or store.target != target
         ):
-            raise TimelineRawExportError(TimelineRawExportErrorCode.CONFIGURATION_INVALID)
+            raise TimelineRawExportError(
+                TimelineRawExportErrorCode.CONFIGURATION_INVALID
+            )
         self._target = target
         self._store = store
 
@@ -776,9 +790,13 @@ class TimelineRawExportService:
         except TimelineCursorInvalid:
             raise TimelineRawExportError(TimelineRawExportErrorCode.CURSOR_INVALID) from None
         except TimelineStoreError:
-            raise TimelineRawExportError(TimelineRawExportErrorCode.STORE_UNAVAILABLE) from None
+            raise TimelineRawExportError(
+                TimelineRawExportErrorCode.STORE_UNAVAILABLE
+            ) from None
         except (TypeError, ValueError):
-            raise TimelineRawExportError(TimelineRawExportErrorCode.RESPONSE_INVALID) from None
+            raise TimelineRawExportError(
+                TimelineRawExportErrorCode.RESPONSE_INVALID
+            ) from None
 
 
 class TimelineRetentionService:
@@ -842,7 +860,9 @@ class TimelineWriteService:
         self._target = target
         self._policy_set = policy_set
         self._policy_sha256 = canonical_sha256(policy_set)
-        self._policies = {policy.evidence_class: policy for policy in policy_set.policies}
+        self._policies = {
+            policy.evidence_class: policy for policy in policy_set.policies
+        }
         self._store = store
 
     @property
@@ -894,7 +914,9 @@ class TimelineWriteService:
         ):
             raise TimelineWriteError(TimelineWriteErrorCode.TARGET_DENIED)
         policy = self._policies[event.evidence_class]
-        signature_sha256 = None if event.signature is None else event.signature.signature_sha256
+        signature_sha256 = (
+            None if event.signature is None else event.signature.signature_sha256
+        )
         if grant.writer_role not in policy.writer_roles:
             raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
         if (
@@ -947,7 +969,9 @@ class TimelineWriteService:
             ):
                 raise TimelineWriteError(TimelineWriteErrorCode.TARGET_DENIED)
             policy = self._policies[event.evidence_class]
-            signature_sha256 = None if event.signature is None else event.signature.signature_sha256
+            signature_sha256 = (
+                None if event.signature is None else event.signature.signature_sha256
+            )
             if grant.writer_role not in policy.writer_roles:
                 raise TimelineWriteError(TimelineWriteErrorCode.ACCESS_DENIED)
             if (
@@ -1011,4 +1035,5 @@ __all__ = [
     "project_timeline_entry",
     "project_timeline_page",
     "project_timeline_raw_export",
+    "timeline_raw_evidence_matches_entry",
 ]

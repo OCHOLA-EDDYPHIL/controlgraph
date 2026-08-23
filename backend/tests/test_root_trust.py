@@ -97,8 +97,12 @@ CANDIDATE = f"{SERVICE}-candidate-v4"
 VERIFIER_IDENTITY = f"controlgraph-verifier@{PROJECT}.iam.gserviceaccount.com"
 COORDINATOR_IDENTITY = f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
 SUBJECT = "123456789012345678901"
-VERIFIER_AUDIENCE = f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
-EVIDENCE_AUDIENCE = f"https://controlgraph-evidence-writer-{PROJECT_NUMBER}.us-central1.run.app"
+VERIFIER_AUDIENCE = (
+    f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
+)
+EVIDENCE_AUDIENCE = (
+    f"https://controlgraph-evidence-writer-{PROJECT_NUMBER}.us-central1.run.app"
+)
 EVIDENCE_KEY_VERSION = (
     f"projects/{PROJECT}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
@@ -166,7 +170,9 @@ def _revision_configuration(*, digest: str) -> CloudRunRevisionConfiguration:
         network_interfaces=(
             CloudRunNetworkInterface(
                 network=f"projects/{PROJECT}/global/networks/controlgraph",
-                subnetwork=(f"projects/{PROJECT}/regions/us-central1/subnetworks/controlgraph"),
+                subnetwork=(
+                    f"projects/{PROJECT}/regions/us-central1/subnetworks/controlgraph"
+                ),
                 tags=(),
             ),
         ),
@@ -181,7 +187,9 @@ def _service(*, generation: int = 7, etag: str = "service-etag-7") -> CloudRunSe
     target = _target()
     return CloudRunServiceState(
         target=target,
-        resource_name=(f"projects/{PROJECT}/locations/us-central1/services/{SERVICE}"),
+        resource_name=(
+            f"projects/{PROJECT}/locations/us-central1/services/{SERVICE}"
+        ),
         uid="service-uid-1",
         etag=etag,
         generation=generation,
@@ -192,7 +200,9 @@ def _service(*, generation: int = 7, etag: str = "service-etag-7") -> CloudRunSe
         latest_created_revision=CANDIDATE,
         template_revision=CANDIDATE,
         template_concurrency=8,
-        traffic=(CloudRunTrafficAllocation(revision=STABLE, percent=100, tag="stable"),),
+        traffic=(
+            CloudRunTrafficAllocation(revision=STABLE, percent=100, tag="stable"),
+        ),
         traffic_statuses=(
             CloudRunTrafficStatus(
                 revision=STABLE,
@@ -268,7 +278,9 @@ def _candidate_contract(*, captured_at: str = "2026-08-19T12:00:00Z") -> RootCan
         schema_version=ROOT_CANDIDATE_ATTESTATION_V1,
         target=_target(),
         candidate_revision=CANDIDATE,
-        configuration_sha256=(cloud_run_revision_configuration_sha256(CANDIDATE_CONFIGURATION)),
+        configuration_sha256=(
+            cloud_run_revision_configuration_sha256(CANDIDATE_CONFIGURATION)
+        ),
         generation=1,
         etag=f"{CANDIDATE}-etag",
         concurrency=8,
@@ -479,14 +491,10 @@ class _KmsClient:
         self.version_algorithm = "EC_SIGN_P256_SHA256"
         self.public_name = EVIDENCE_KEY_VERSION
         self.public_algorithm = "EC_SIGN_P256_SHA256"
-        self.pem = (
-            private_key.public_key()
-            .public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-            .decode("ascii")
-        )
+        self.pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("ascii")
 
     async def get_crypto_key_version(
         self,
@@ -573,7 +581,9 @@ def test_verifier_denies_drift_and_wrong_caller_without_candidate_read() -> None
 
     baseline = _service()
     final_drift = _service(generation=8, etag="service-etag-8")
-    changed_after_candidate = _Reader(services=[baseline, baseline, final_drift, final_drift])
+    changed_after_candidate = _Reader(
+        services=[baseline, baseline, final_drift, final_drift]
+    )
     with pytest.raises(RootPreflightError) as final_mismatch:
         asyncio.run(
             _preflight_service(changed_after_candidate).preflight(
@@ -630,14 +640,18 @@ def test_coordinator_preflight_client_binds_request_and_converts_trusted_result(
     assert trusted.candidate_revision == CandidateRevisionAttestation(
         target=_target(),
         candidate_revision=CANDIDATE,
-        configuration_sha256=(cloud_run_revision_configuration_sha256(CANDIDATE_CONFIGURATION)),
+        configuration_sha256=(
+            cloud_run_revision_configuration_sha256(CANDIDATE_CONFIGURATION)
+        ),
         generation=1,
         etag=f"{CANDIDATE}-etag",
         concurrency=8,
         reader_identity=VERIFIER_IDENTITY,
         captured_at="2026-08-19T12:00:00Z",
     )
-    assert transport.calls == [(_route(ServiceRole.VERIFIER), canonical_json_bytes(request))]
+    assert transport.calls == [
+        (_route(ServiceRole.VERIFIER), canonical_json_bytes(request))
+    ]
 
     other = _request(candidate_revision=f"{SERVICE}-candidate-v5")
     substituted = _Transport(canonical_json_bytes(_result()))
@@ -728,7 +742,9 @@ def test_one_shot_oidc_transport_does_not_serialize_blocking_token_fetches() -> 
 
     async def post_concurrently() -> tuple[bytes, ...]:
         return tuple(
-            await asyncio.gather(*(transport.post(route, b"{}") for _ in range(concurrent_calls)))
+            await asyncio.gather(
+                *(transport.post(route, b"{}") for _ in range(concurrent_calls))
+            )
         )
 
     assert asyncio.run(post_concurrently()) == (b"{}",) * concurrent_calls
@@ -759,8 +775,12 @@ def test_evidence_client_verifies_exact_ecdsa_signature_and_key_version(
     )
 
     assert asyncio.run(client.sign(_event())) == signed
-    assert kms.version_calls == [({"name": EVIDENCE_KEY_VERSION}, None, 5.0)]
-    assert kms.public_calls == [({"name": EVIDENCE_KEY_VERSION}, None, 5.0)]
+    assert kms.version_calls == [
+        ({"name": EVIDENCE_KEY_VERSION}, None, 5.0)
+    ]
+    assert kms.public_calls == [
+        ({"name": EVIDENCE_KEY_VERSION}, None, 5.0)
+    ]
 
     forged = SignedEvidenceEventV1(
         schema_version=signed.schema_version,
@@ -841,7 +861,9 @@ def _coordinator_environment() -> dict[str, str]:
             f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
         ),
         "CONTROLGRAPH_AUTH_CALLER_ROLE": "api",
-        "CONTROLGRAPH_AUTH_CALLER_EMAIL": (f"controlgraph-api@{PROJECT}.iam.gserviceaccount.com"),
+        "CONTROLGRAPH_AUTH_CALLER_EMAIL": (
+            f"controlgraph-api@{PROJECT}.iam.gserviceaccount.com"
+        ),
         "CONTROLGRAPH_AUTH_CALLER_SUBJECT": SUBJECT,
         "CONTROLGRAPH_ISSUER_URL": (
             f"https://controlgraph-issuer-{PROJECT_NUMBER}.us-central1.run.app"

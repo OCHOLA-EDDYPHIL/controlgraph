@@ -83,7 +83,9 @@ def _credential_headers(role: ServiceRole, value: str) -> dict[str, str]:
         assert prefix and separator and signature
         return {
             CONTROLGRAPH_AUTHORIZATION_HEADER: value,
-            SERVERLESS_AUTHORIZATION_HEADER: (f"bearer {prefix}.SIGNATURE_REMOVED_BY_GOOGLE"),
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                f"bearer {prefix}.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         }
     return {"Authorization": value}
 
@@ -144,7 +146,8 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 ),
                 "CONTROLGRAPH_SIGNING_ALGORITHM": "EC_SIGN_P256_SHA256",
                 "CONTROLGRAPH_RECOVERY_URL": (
-                    f"https://controlgraph-recovery-{PROJECT_NUMBER}.us-central1.run.app"
+                    f"https://controlgraph-recovery-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
                 ),
             }
         )
@@ -152,7 +155,8 @@ def _environment(role: ServiceRole) -> dict[str, str]:
         environment.update(
             {
                 "CONTROLGRAPH_COORDINATOR_URL": (
-                    f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+                    f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
                 ),
                 "CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE": (
                     "32555940559.apps.googleusercontent.com"
@@ -170,13 +174,15 @@ def _environment(role: ServiceRole) -> dict[str, str]:
         environment.update(
             {
                 "CONTROLGRAPH_ISSUER_URL": (
-                    f"https://controlgraph-issuer-{PROJECT_NUMBER}.us-central1.run.app"
+                    f"https://controlgraph-issuer-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
                 ),
                 "CONTROLGRAPH_VERIFIER_URL": (
                     f"https://controlgraph-verifier-{PROJECT_NUMBER}.us-central1.run.app"
                 ),
                 "CONTROLGRAPH_EVIDENCE_WRITER_URL": (
-                    f"https://controlgraph-evidence-writer-{PROJECT_NUMBER}.us-central1.run.app"
+                    "https://controlgraph-evidence-writer-"
+                    f"{PROJECT_NUMBER}.us-central1.run.app"
                 ),
                 "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
                     f"projects/{PROJECT_ID}/locations/us-central1/"
@@ -196,10 +202,12 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
                 "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
                 "CONTROLGRAPH_EXECUTOR_URL": (
-                    f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+                    f"https://controlgraph-executor-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
                 ),
                 "CONTROLGRAPH_RECOVERY_URL": (
-                    f"https://controlgraph-recovery-{PROJECT_NUMBER}.us-central1.run.app"
+                    f"https://controlgraph-recovery-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
                 ),
                 "CONTROLGRAPH_EXECUTION_QUEUE": "controlgraph-execution",
                 "CONTROLGRAPH_RECOVERY_QUEUE": "controlgraph-recovery",
@@ -230,13 +238,16 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     f"projects/{PROJECT_ID}/global/networks/controlgraph"
                 ),
                 "CONTROLGRAPH_TARGET_SUBNETWORK_RESOURCE": (
-                    f"projects/{PROJECT_ID}/regions/us-central1/subnetworks/controlgraph"
+                    f"projects/{PROJECT_ID}/regions/us-central1/"
+                    "subnetworks/controlgraph"
                 ),
                 "CONTROLGRAPH_EVIDENCE_WRITER_URL": (
-                    f"https://controlgraph-evidence-writer-{PROJECT_NUMBER}.us-central1.run.app"
+                    "https://controlgraph-evidence-writer-"
+                    f"{PROJECT_NUMBER}.us-central1.run.app"
                 ),
                 "CONTROLGRAPH_REFERENCE_TARGET_URL": (
-                    f"https://controlgraph-reference-target-{PROJECT_NUMBER}.us-central1.run.app"
+                    "https://controlgraph-reference-target-"
+                    f"{PROJECT_NUMBER}.us-central1.run.app"
                 ),
                 "CONTROLGRAPH_EVIDENCE_KEY_VERSION": (
                     f"projects/{PROJECT_ID}/locations/us-central1/"
@@ -559,7 +570,10 @@ def test_runtime_composition_uses_startup_policy_for_google_verification() -> No
         "http://controlgraph-reference-target-123456789012.us-central1.run.app",
         "https://controlgraph-reference-target-999999999999.us-central1.run.app",
         "https://controlgraph-reference-target-123456789012.us-central1.run.app/",
-        ("https://controlgraph-reference-target-123456789012.us-central1.run.app/v1/probe"),
+        (
+            "https://controlgraph-reference-target-123456789012.us-central1.run.app"
+            "/v1/probe"
+        ),
         (
             "https://controlgraph-reference-target-123456789012.us-central1.run.app"
             "?destination=https://example.test"
@@ -753,7 +767,9 @@ def test_operator_envelope_admits_cloud_run_signature_removal() -> None:
         protected_paths(role)[0],
         headers={
             CONTROLGRAPH_AUTHORIZATION_HEADER: credential,
-            SERVERLESS_AUTHORIZATION_HEADER: ("bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
+            SERVERLESS_AUTHORIZATION_HEADER: (
+                "bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+            ),
         },
     )
 

@@ -42,8 +42,12 @@ SECURITY_EMAIL = "security@example.com"
 SECURITY_SUBJECT = "223456789012345678901"
 EXPORTER_EMAIL = "exporter@example.com"
 EXPORTER_SUBJECT = "323456789012345678901"
-AUDIENCE = f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
-COORDINATOR_AUDIENCE = f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+AUDIENCE = (
+    f"https://controlgraph-api-{PROJECT_NUMBER}.us-central1.run.app"
+)
+COORDINATOR_AUDIENCE = (
+    f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"
+)
 API_EMAIL = f"controlgraph-api@{TARGET.project_id}.iam.gserviceaccount.com"
 API_SUBJECT = "423456789012345678901"
 RETENTION_EMAIL = f"cg-retention-sweeper@{TARGET.project_id}.iam.gserviceaccount.com"
@@ -51,17 +55,23 @@ RETENTION_SUBJECT = "523456789012345678901"
 FULL_TOKEN = "Bearer header.payload.signature"
 OPERATOR_HEADERS = {
     CONTROLGRAPH_AUTHORIZATION_HEADER: FULL_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: ("bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
+    SERVERLESS_AUTHORIZATION_HEADER: (
+        "bearer header.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+    ),
 }
 SECURITY_TOKEN = "Bearer security.payload.signature"
 SECURITY_HEADERS = {
     CONTROLGRAPH_AUTHORIZATION_HEADER: SECURITY_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: ("bearer security.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
+    SERVERLESS_AUTHORIZATION_HEADER: (
+        "bearer security.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+    ),
 }
 EXPORT_TOKEN = "Bearer exporter.payload.signature"
 EXPORT_HEADERS = {
     CONTROLGRAPH_AUTHORIZATION_HEADER: EXPORT_TOKEN,
-    SERVERLESS_AUTHORIZATION_HEADER: ("bearer exporter.payload.SIGNATURE_REMOVED_BY_GOOGLE"),
+    SERVERLESS_AUTHORIZATION_HEADER: (
+        "bearer exporter.payload.SIGNATURE_REMOVED_BY_GOOGLE"
+    ),
 }
 RETENTION_TOKEN = "Bearer retention.payload.signature"
 RETENTION_HEADERS = {"Authorization": RETENTION_TOKEN}

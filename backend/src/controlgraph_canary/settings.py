@@ -305,10 +305,18 @@ class ControllerSettings:
                 raise ValueError("CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE is invalid")
             operator_oauth_client_audience = raw_operator_oauth_client_audience
         if service_role in {ServiceRole.API, ServiceRole.COORDINATOR}:
-            security_auditor_identity = source["CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"].strip()
-            security_auditor_subject = source["CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"].strip()
-            restricted_exporter_identity = source["CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL"].strip()
-            restricted_exporter_subject = source["CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT"].strip()
+            security_auditor_identity = source[
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"
+            ].strip()
+            security_auditor_subject = source[
+                "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"
+            ].strip()
+            restricted_exporter_identity = source[
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL"
+            ].strip()
+            restricted_exporter_subject = source[
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT"
+            ].strip()
             _validate_operator_identity(security_auditor_identity)
             _validate_operator_identity(restricted_exporter_identity)
             if (
@@ -326,16 +334,13 @@ class ControllerSettings:
                 if service_role is ServiceRole.API
                 else source["CONTROLGRAPH_OPERATOR_SUBJECT"].strip()
             )
-            if (
-                len(
-                    {
-                        (ordinary_identity, ordinary_subject),
-                        (security_auditor_identity, security_auditor_subject),
-                        (restricted_exporter_identity, restricted_exporter_subject),
-                    }
-                )
-                != 3
-            ):
+            if len(
+                {
+                    (ordinary_identity, ordinary_subject),
+                    (security_auditor_identity, security_auditor_subject),
+                    (restricted_exporter_identity, restricted_exporter_subject),
+                }
+            ) != 3:
                 raise ValueError("timeline privileged reader identities must be distinct")
         if (
             service_role
@@ -592,7 +597,10 @@ def _validate_target_resource(value: str, *, prefix: str) -> None:
 
 
 def _validate_reference_target_url(value: str, project_number: str) -> None:
-    expected = f"https://controlgraph-reference-target-{project_number}.us-central1.run.app"
+    expected = (
+        f"https://controlgraph-reference-target-{project_number}"
+        ".us-central1.run.app"
+    )
     try:
         parsed = urlsplit(value)
         port = parsed.port

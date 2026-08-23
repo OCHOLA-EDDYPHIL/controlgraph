@@ -40,6 +40,8 @@ check "timeline_retention_schedule_is_fixed" {
     condition = (
       google_cloud_scheduler_job.timeline_retention.schedule == "*/5 * * * *" &&
       google_cloud_scheduler_job.timeline_retention.time_zone == "Etc/UTC" &&
+      google_cloud_scheduler_job.timeline_retention.attempt_deadline == "60s" &&
+      google_cloud_scheduler_job.timeline_retention.retry_config[0].retry_count == 3 &&
       google_cloud_scheduler_job.timeline_retention.http_target[0].uri == "${local.service_audiences.coordinator}/v1/internal/timeline/retention" &&
       google_cloud_scheduler_job.timeline_retention.http_target[0].oidc_token[0].service_account_email == local.service_accounts.retention_sweeper &&
       google_cloud_scheduler_job.timeline_retention.http_target[0].oidc_token[0].audience == local.service_audiences.coordinator

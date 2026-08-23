@@ -167,7 +167,10 @@ def test_receipt_authority_routes_bind_distinct_execution_callers(
         project_number=PROJECT_NUMBER,
         service_role=ServiceRole.COORDINATOR,
         path=path,
-        audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
+        audience=(
+            f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+            "us-central1.run.app"
+        ),
         caller=CallerBinding(
             role=caller_role,
             email=EXPECTED_CALLERS[caller_role],
@@ -212,7 +215,10 @@ def test_recovery_cannot_use_either_executor_receipt_authority_route() -> None:
             project_number=PROJECT_NUMBER,
             service_role=ServiceRole.COORDINATOR,
             path=RECEIPT_AUTHORITY_PATH,
-            audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
+            audience=(
+                f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+                "us-central1.run.app"
+            ),
             caller=CallerBinding(
                 role=CallerRole.RECOVERY,
                 email=EXPECTED_CALLERS[CallerRole.RECOVERY],
@@ -226,7 +232,10 @@ def test_recovery_cannot_use_either_executor_receipt_authority_route() -> None:
             project_number=PROJECT_NUMBER,
             service_role=ServiceRole.COORDINATOR,
             path=RECOVERY_RECEIPT_AUTHORITY_PATH,
-            audience=(f"https://controlgraph-coordinator-{PROJECT_NUMBER}.us-central1.run.app"),
+            audience=(
+                f"https://controlgraph-coordinator-{PROJECT_NUMBER}."
+                "us-central1.run.app"
+            ),
             caller=CallerBinding(
                 role=CallerRole.RECOVERY,
                 email=EXPECTED_CALLERS[CallerRole.RECOVERY],
@@ -241,7 +250,9 @@ def test_recovery_executor_facade_has_one_exact_caller_and_path() -> None:
         project_number=PROJECT_NUMBER,
         service_role=ServiceRole.EXECUTOR,
         path=RECOVERY_EXECUTION_FACADE_PATH,
-        audience=(f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"),
+        audience=(
+            f"https://controlgraph-executor-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
         caller=CallerBinding(
             role=CallerRole.RECOVERY,
             email=EXPECTED_CALLERS[CallerRole.RECOVERY],

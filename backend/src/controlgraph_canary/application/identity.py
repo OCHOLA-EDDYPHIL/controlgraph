@@ -25,8 +25,12 @@ RECOVERY_RECEIPT_AUTHORITY_PATH = "/v1/internal/authority/recovery-receipts"
 RECOVERY_EXECUTION_FACADE_PATH = "/v1/internal/execute/recovery"
 CLASSIFICATION_EVIDENCE_PATH = "/v1/internal/evidence/classifications/sign"
 HEALTH_ATTESTATION_PATH = "/v1/internal/evidence/health/attest"
-INDEPENDENT_VERIFICATION_EVIDENCE_PATH = "/v1/internal/evidence/independent-verification/sign"
-RECOVERY_PRESTATE_ATTESTATION_PATH = "/v1/internal/evidence/recovery-prestate/attest"
+INDEPENDENT_VERIFICATION_EVIDENCE_PATH = (
+    "/v1/internal/evidence/independent-verification/sign"
+)
+RECOVERY_PRESTATE_ATTESTATION_PATH = (
+    "/v1/internal/evidence/recovery-prestate/attest"
+)
 TIMELINE_READ_PATH = "/v1/operator/timeline"
 TIMELINE_RAW_EXPORT_PATH = "/v1/operator/timeline/raw-export"
 TIMELINE_RETENTION_PATH = "/v1/internal/timeline/retention"
@@ -124,7 +128,8 @@ class RouteAuthenticationPolicy:
         if type(self.service_role) is not ServiceRole:
             raise ValueError("service role is invalid")
         executor_receipt_authority_route = (
-            self.service_role is ServiceRole.COORDINATOR and self.path == RECEIPT_AUTHORITY_PATH
+            self.service_role is ServiceRole.COORDINATOR
+            and self.path == RECEIPT_AUTHORITY_PATH
         )
         recovery_receipt_authority_route = (
             self.service_role is ServiceRole.COORDINATOR
@@ -150,10 +155,10 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EXECUTOR
             and self.path == RECOVERY_EXECUTION_FACADE_PATH
         )
-        timeline_api_route = self.service_role is ServiceRole.API and self.path in {
-            TIMELINE_READ_PATH,
-            TIMELINE_RAW_EXPORT_PATH,
-        }
+        timeline_api_route = (
+            self.service_role is ServiceRole.API
+            and self.path in {TIMELINE_READ_PATH, TIMELINE_RAW_EXPORT_PATH}
+        )
         timeline_retention_route = (
             self.service_role is ServiceRole.COORDINATOR and self.path == TIMELINE_RETENTION_PATH
         )
@@ -178,33 +183,31 @@ class RouteAuthenticationPolicy:
         if self.audience != expected_audience:
             raise ValueError("route audience does not match its project coordinates")
         expected_caller_role = (
-            CallerRole.RETENTION_SWEEPER
-            if timeline_retention_route
+            CallerRole.EXECUTOR
+            if executor_receipt_authority_route
             else (
                 CallerRole.EXECUTOR
-                if executor_receipt_authority_route
+                if recovery_receipt_authority_route
                 else (
-                    CallerRole.EXECUTOR
-                    if recovery_receipt_authority_route
+                    CallerRole.RECOVERY
+                    if recovery_execution_facade_route
                     else (
-                        CallerRole.RECOVERY
-                        if recovery_execution_facade_route
-                        else (
-                            CallerRole.OPERATOR
-                            if timeline_api_route
-                            else CallerRole.VERIFIER
-                            if (
-                                classification_evidence_route
-                                or health_attestation_route
-                                or independent_verification_evidence_route
-                                or recovery_prestate_attestation_route
-                            )
-                            else expected_route_caller_role(self.service_role)
+                        CallerRole.OPERATOR
+                        if timeline_api_route
+                        else CallerRole.VERIFIER
+                        if (
+                            classification_evidence_route
+                            or health_attestation_route
+                            or independent_verification_evidence_route
+                            or recovery_prestate_attestation_route
                         )
+                        else expected_route_caller_role(self.service_role)
                     )
                 )
             )
         )
+        if timeline_retention_route:
+            expected_caller_role = CallerRole.RETENTION_SWEEPER
         if self.caller.role is not expected_caller_role:
             raise ValueError("caller role does not match the protected route")
         if self.caller.role is CallerRole.OPERATOR:

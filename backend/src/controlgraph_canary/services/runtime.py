@@ -395,10 +395,14 @@ def create_runtime_service_app(
         independent_verification_evidence_authentication_policy = (
             _independent_verification_evidence_policy(settings)
         )
-        independent_verification_signing_service = IndependentVerificationSigningService(
-            project_id=settings.project_id,
-            authentication_policy=(independent_verification_evidence_authentication_policy),
-            signer=evidence_signing_backend,
+        independent_verification_signing_service = (
+            IndependentVerificationSigningService(
+                project_id=settings.project_id,
+                authentication_policy=(
+                    independent_verification_evidence_authentication_policy
+                ),
+                signer=evidence_signing_backend,
+            )
         )
         health_attestation_authentication_policy = _health_attestation_policy(settings)
         health_attestation_signing_service = HealthAttestationSigningService(
@@ -658,8 +662,10 @@ def create_runtime_service_app(
         ) -> CloudRunV2SnapshotReader:
             if (
                 request.target != target
-                or request.stable_revision != "controlgraph-reference-target-stable-v4"
-                or request.candidate_revision != "controlgraph-reference-target-candidate-v4"
+                or request.stable_revision
+                != "controlgraph-reference-target-stable-v4"
+                or request.candidate_revision
+                != "controlgraph-reference-target-candidate-v4"
                 or request.concurrency != 8
             ):
                 raise ValueError("independent verification request is not configured")
@@ -1242,7 +1248,9 @@ def create_runtime_service_app(
             target=target,
             store=timeline_store,
         )
-        timeline_retention_authentication_policy = _timeline_retention_policy(settings)
+        timeline_retention_authentication_policy = _timeline_retention_policy(
+            settings
+        )
         coordinator_timeline_relay = CoordinatorTimelineRelay(
             authentication_policy=policy,
             operator_policy=_operator_timeline_policy(
@@ -1257,20 +1265,24 @@ def create_runtime_service_app(
                 store=timeline_store,
             ),
         )
-        coordinator_independent_verification_client = CoordinatorIndependentVerificationClient(
-            route=verifier_route,
-            transport=selected_transport,
-            signature_verifier=(
-                GoogleKmsIndependentVerificationEvidenceVerifier(
-                    project_id=settings.project_id,
-                    service_role=ServiceRole.COORDINATOR,
-                    key_version=settings.evidence_key_version,
-                    client=kms_client,
-                )
-            ),
+        coordinator_independent_verification_client = (
+            CoordinatorIndependentVerificationClient(
+                route=verifier_route,
+                transport=selected_transport,
+                signature_verifier=(
+                    GoogleKmsIndependentVerificationEvidenceVerifier(
+                        project_id=settings.project_id,
+                        service_role=ServiceRole.COORDINATOR,
+                        key_version=settings.evidence_key_version,
+                        client=kms_client,
+                    )
+                ),
+            )
         )
-        coordinator_completion_classification_service = CoordinatorCompletionClassificationService(
-            target=target,
+        coordinator_completion_classification_service = (
+            CoordinatorCompletionClassificationService(
+                target=target,
+            )
         )
         completion_intent_verifier = (
             TrustBundleCapabilityVerifier(
@@ -1368,7 +1380,9 @@ def create_runtime_service_app(
         receipt_authority_service = ReceiptAuthorityService(
             selected_store,
             completion_workflow=(
-                coordinator_completion_workflow if stale_authority_reader is not None else None
+                coordinator_completion_workflow
+                if stale_authority_reader is not None
+                else None
             ),
         )
         receipt_authority_authentication_policy = _receipt_authority_policy(settings)
@@ -1654,7 +1668,9 @@ def create_runtime_service_app(
         classification_evidence_authentication_policy=(
             classification_evidence_authentication_policy
         ),
-        independent_verification_signing_service=(independent_verification_signing_service),
+        independent_verification_signing_service=(
+            independent_verification_signing_service
+        ),
         independent_verification_evidence_authentication_policy=(
             independent_verification_evidence_authentication_policy
         ),
@@ -1704,7 +1720,9 @@ def create_runtime_service_app(
             else None
         ),
         timeline_security_read_authentication_policy=(
-            _security_audit_timeline_policy(settings) if timeline_read_service is not None else None
+            _security_audit_timeline_policy(settings)
+            if timeline_read_service is not None
+            else None
         ),
         timeline_raw_export_service=timeline_raw_export_service,
         timeline_raw_export_authentication_policy=(
@@ -1713,7 +1731,9 @@ def create_runtime_service_app(
             else None
         ),
         timeline_retention_service=timeline_retention_service,
-        timeline_retention_authentication_policy=(timeline_retention_authentication_policy),
+        timeline_retention_authentication_policy=(
+            timeline_retention_authentication_policy
+        ),
         coordinator_timeline_relay=coordinator_timeline_relay,
         timeline_recorder=timeline_recorder,
         operator_console_origin=(
