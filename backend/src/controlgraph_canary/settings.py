@@ -317,8 +317,16 @@ class ControllerSettings:
             restricted_exporter_subject = source[
                 "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT"
             ].strip()
-            _validate_operator_identity(security_auditor_identity)
-            _validate_operator_identity(restricted_exporter_identity)
+            _validate_timeline_reader_identity(
+                security_auditor_identity,
+                project_id=project_id,
+                account_id="cg-security-auditor",
+            )
+            _validate_timeline_reader_identity(
+                restricted_exporter_identity,
+                project_id=project_id,
+                account_id="cg-restricted-exporter",
+            )
             if (
                 _PROJECT_NUMBER.fullmatch(security_auditor_subject) is None
                 or _PROJECT_NUMBER.fullmatch(restricted_exporter_subject) is None
@@ -636,3 +644,13 @@ def _validate_operator_identity(value: str) -> None:
         value,
     ) is None or value.endswith(".iam.gserviceaccount.com"):
         raise ValueError("CONTROLGRAPH_OPERATOR_EMAIL is invalid")
+
+
+def _validate_timeline_reader_identity(
+    value: str,
+    *,
+    project_id: str,
+    account_id: str,
+) -> None:
+    if value != f"{account_id}@{project_id}.iam.gserviceaccount.com":
+        raise ValueError("timeline privileged reader identity is invalid")

@@ -86,6 +86,17 @@ resource "google_service_account_iam_member" "cloud_scheduler_token_creator" {
   member             = google_project_service_identity.cloud_scheduler.member
 }
 
+resource "google_service_account_iam_member" "operator_timeline_reader_oidc_creator" {
+  for_each = toset([
+    "security_auditor",
+    "restricted_exporter",
+  ])
+
+  service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names[each.value]
+  role               = "roles/iam.serviceAccountOpenIdTokenCreator"
+  member             = var.operator_principal
+}
+
 resource "google_service_account_iam_member" "executor_reference_target_act_as" {
   service_account_id = data.terraform_remote_state.foundation.outputs.service_account_names.reference
   role               = data.terraform_remote_state.foundation.outputs.custom_iam_role_names.task_oidc_actor
@@ -100,11 +111,11 @@ locals {
     }
     api_security_auditor = {
       service = module.api.service.name
-      member  = var.security_auditor_principal
+      member  = "serviceAccount:${local.service_accounts.security_auditor}"
     }
     api_restricted_exporter = {
       service = module.api.service.name
-      member  = var.restricted_exporter_principal
+      member  = "serviceAccount:${local.service_accounts.restricted_exporter}"
     }
     coordinator = {
       service = module.coordinator.service.name
@@ -150,6 +161,21 @@ locals {
       service = module.reference_target.target.name
       member  = "serviceAccount:${local.service_accounts.verifier}"
     }
+  }
+}
+
+
+check "timeline_reader_invocation_is_sealed" {
+  assert {
+    condition = (
+      google_service_account_iam_member.operator_timeline_reader_oidc_creator["security_auditor"].role == "roles/iam.serviceAccountOpenIdTokenCreator" &&
+      google_service_account_iam_member.operator_timeline_reader_oidc_creator["security_auditor"].member == var.operator_principal &&
+      google_service_account_iam_member.operator_timeline_reader_oidc_creator["restricted_exporter"].role == "roles/iam.serviceAccountOpenIdTokenCreator" &&
+      google_service_account_iam_member.operator_timeline_reader_oidc_creator["restricted_exporter"].member == var.operator_principal &&
+      local.run_invokers.api_security_auditor.member == "serviceAccount:${local.service_accounts.security_auditor}" &&
+      local.run_invokers.api_restricted_exporter.member == "serviceAccount:${local.service_accounts.restricted_exporter}"
+    )
+    error_message = "Timeline reader invocation and OIDC minting must remain bound to the two dedicated reader service accounts."
   }
 }
 

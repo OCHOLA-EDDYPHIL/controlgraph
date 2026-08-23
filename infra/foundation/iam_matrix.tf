@@ -136,6 +136,10 @@ locals {
       api      = "iamcredentials.googleapis.com"
       boundary = "OIDC tokens for only the fixed retention-sweeper service account"
     }
+    timeline_reader_oidc_token_mint = {
+      api      = "iamcredentials.googleapis.com"
+      boundary = "OIDC tokens for only the security-audit and restricted-export service accounts"
+    }
   }
 
   identity_expected_allows = {
@@ -201,6 +205,12 @@ locals {
       "kms_evidence_sign",
       "kms_evidence_version_read",
     ])
+    security_auditor = toset([
+      "run_api_invoke",
+    ])
+    restricted_exporter = toset([
+      "run_api_invoke",
+    ])
     reference = toset([])
     execution_task_caller = toset([
       "run_executor_invoke",
@@ -225,6 +235,7 @@ locals {
     operator = toset([
       "run_api_invoke",
       "tasks_queue_control",
+      "timeline_reader_oidc_token_mint",
     ])
     cloud_tasks_service_agent = toset([
       "task_oidc_token_mint",
@@ -301,6 +312,12 @@ locals {
         "kms_evidence_sign",
         "kms_evidence_version_read",
       ])
+      security_auditor = toset([
+        "run_api_invoke",
+      ])
+      restricted_exporter = toset([
+        "run_api_invoke",
+      ])
       execution_task_caller = toset([
         "run_executor_invoke",
       ])
@@ -324,6 +341,7 @@ locals {
       operator = toset([
         "run_api_invoke",
         "tasks_queue_control",
+        "timeline_reader_oidc_token_mint",
       ])
       cloud_tasks_service_agent = toset([
         "task_oidc_token_mint",
@@ -461,10 +479,27 @@ check "operator_permissions_are_bounded" {
       local.identity_expected_allows.operator == toset([
         "run_api_invoke",
         "tasks_queue_control",
+        "timeline_reader_oidc_token_mint",
       ]) &&
       local.identity_implemented_allows.operator == local.identity_expected_allows.operator
     )
     error_message = "The operator may invoke the API and control only the fixed execution queue."
+  }
+}
+
+check "timeline_reader_permissions_are_read_only" {
+  assert {
+    condition = (
+      local.identity_expected_allows.security_auditor == toset([
+        "run_api_invoke",
+      ]) &&
+      local.identity_implemented_allows.security_auditor == local.identity_expected_allows.security_auditor &&
+      local.identity_expected_allows.restricted_exporter == toset([
+        "run_api_invoke",
+      ]) &&
+      local.identity_implemented_allows.restricted_exporter == local.identity_expected_allows.restricted_exporter
+    )
+    error_message = "Timeline reader service accounts may only invoke the operator API."
   }
 }
 

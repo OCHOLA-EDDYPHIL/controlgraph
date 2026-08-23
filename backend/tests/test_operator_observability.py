@@ -185,9 +185,13 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN": (
                     f"https://controlgraph-console-{PROJECT_NUMBER}.us-central1.run.app"
                 ),
-                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": (
+                    f"cg-security-auditor@{PROJECT}.iam.gserviceaccount.com"
+                ),
                 "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
-                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": (
+                    f"cg-restricted-exporter@{PROJECT}.iam.gserviceaccount.com"
+                ),
                 "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
             }
         )
@@ -220,9 +224,13 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256": "b" * 64,
                 "CONTROLGRAPH_OPERATOR_EMAIL": OPERATOR_EMAIL,
                 "CONTROLGRAPH_OPERATOR_SUBJECT": OPERATOR_SUBJECT,
-                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+                "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": (
+                    f"cg-security-auditor@{PROJECT}.iam.gserviceaccount.com"
+                ),
                 "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
-                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+                "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": (
+                    f"cg-restricted-exporter@{PROJECT}.iam.gserviceaccount.com"
+                ),
                 "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
                 "CONTROLGRAPH_EXECUTOR_URL": EXECUTOR_AUDIENCE,
                 "CONTROLGRAPH_RECOVERY_URL": RECOVERY_AUDIENCE,

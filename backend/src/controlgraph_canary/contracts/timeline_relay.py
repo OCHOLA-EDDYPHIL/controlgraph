@@ -24,9 +24,13 @@ TIMELINE_RAW_EXPORT_INVOCATION_V1: Final = (
 )
 
 _CONTROLGRAPH_PROJECT = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
-_HUMAN_EMAIL = re.compile(
+_TIMELINE_READER_EMAIL = re.compile(
     r"^[a-z0-9][a-z0-9._%+\-]{0,63}@"
     r"[a-z0-9](?:[a-z0-9.\-]{0,251}[a-z0-9])?$"
+)
+_TIMELINE_READER_SERVICE_ACCOUNT = re.compile(
+    r"^cg-(?:security-auditor|restricted-exporter)@"
+    r"(?P<project>controlgraph-canary-[a-z0-9]{6,10})\.iam\.gserviceaccount\.com$"
 )
 _API_AUDIENCE = re.compile(
     r"^https://controlgraph-api-[1-9][0-9]{5,31}\.us-central1\.run\.app$"
@@ -53,8 +57,11 @@ class TimelineReaderIdentityV1(StrictContractModel):
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
         if (
-            _HUMAN_EMAIL.fullmatch(self.email) is None
-            or self.email.endswith(".iam.gserviceaccount.com")
+            _TIMELINE_READER_EMAIL.fullmatch(self.email) is None
+            or (
+                self.email.endswith(".iam.gserviceaccount.com")
+                and _TIMELINE_READER_SERVICE_ACCOUNT.fullmatch(self.email) is None
+            )
             or _API_AUDIENCE.fullmatch(self.audience) is None
             or self.issued_at >= self.expires_at
             or self.expires_at - self.issued_at > _MAX_ID_TOKEN_LIFETIME_SECONDS
@@ -71,12 +78,19 @@ class TimelineReadInvocationV1(StrictContractModel):
     @model_validator(mode="after")
     def validate_target(self) -> Self:
         target = self.command.target
+        reader_service_account = _TIMELINE_READER_SERVICE_ACCOUNT.fullmatch(
+            self.reader.email
+        )
         if (
             _CONTROLGRAPH_PROJECT.fullmatch(target.project_id) is None
             or "reconcile" in target.project_id
             or target.region != "us-central1"
             or target.environment != "nonprod"
             or target.service_name != _REFERENCE_SERVICE
+            or (
+                reader_service_account is not None
+                and reader_service_account.group("project") != target.project_id
+            )
         ):
             raise ValueError("timeline read invocation target is invalid")
         return self
@@ -90,12 +104,19 @@ class TimelineRawExportInvocationV1(StrictContractModel):
     @model_validator(mode="after")
     def validate_target(self) -> Self:
         target = self.command.target
+        reader_service_account = _TIMELINE_READER_SERVICE_ACCOUNT.fullmatch(
+            self.reader.email
+        )
         if (
             _CONTROLGRAPH_PROJECT.fullmatch(target.project_id) is None
             or "reconcile" in target.project_id
             or target.region != "us-central1"
             or target.environment != "nonprod"
             or target.service_name != _REFERENCE_SERVICE
+            or (
+                reader_service_account is not None
+                and reader_service_account.group("project") != target.project_id
+            )
         ):
             raise ValueError("timeline raw export invocation target is invalid")
         return self

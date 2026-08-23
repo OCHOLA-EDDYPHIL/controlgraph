@@ -67,6 +67,8 @@ class CallerRole(StrEnum):
     EXECUTION_TASK_CALLER = "execution_task_caller"
     RECOVERY_TASK_CALLER = "recovery_task_caller"
     RETENTION_SWEEPER = "retention_sweeper"
+    SECURITY_AUDITOR = "security_auditor"
+    RESTRICTED_EXPORTER = "restricted_exporter"
 
 
 class AuthenticationDenialCode(StrEnum):
@@ -155,9 +157,16 @@ class RouteAuthenticationPolicy:
             self.service_role is ServiceRole.EXECUTOR
             and self.path == RECOVERY_EXECUTION_FACADE_PATH
         )
-        timeline_api_route = (
-            self.service_role is ServiceRole.API
-            and self.path in {TIMELINE_READ_PATH, TIMELINE_RAW_EXPORT_PATH}
+        timeline_api_route = self.service_role is ServiceRole.API and (
+            (
+                self.path == TIMELINE_READ_PATH
+                and self.caller.role
+                in {CallerRole.OPERATOR, CallerRole.SECURITY_AUDITOR}
+            )
+            or (
+                self.path == TIMELINE_RAW_EXPORT_PATH
+                and self.caller.role is CallerRole.RESTRICTED_EXPORTER
+            )
         )
         timeline_retention_route = (
             self.service_role is ServiceRole.COORDINATOR and self.path == TIMELINE_RETENTION_PATH
@@ -192,7 +201,7 @@ class RouteAuthenticationPolicy:
                     CallerRole.RECOVERY
                     if recovery_execution_facade_route
                     else (
-                        CallerRole.OPERATOR
+                        self.caller.role
                         if timeline_api_route
                         else CallerRole.VERIFIER
                         if (
@@ -251,6 +260,8 @@ _SERVICE_ACCOUNT_IDS: dict[CallerRole, str] = {
     CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
     CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
     CallerRole.RETENTION_SWEEPER: "cg-retention-sweeper",
+    CallerRole.SECURITY_AUDITOR: "cg-security-auditor",
+    CallerRole.RESTRICTED_EXPORTER: "cg-restricted-exporter",
 }
 
 _SERVICE_NAMES: dict[ServiceRole, str] = {

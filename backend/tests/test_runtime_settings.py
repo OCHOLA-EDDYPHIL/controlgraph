@@ -49,9 +49,15 @@ def _api_environment() -> dict[str, str]:
             "CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN": (
                 "https://controlgraph-console-123456789012.us-central1.run.app"
             ),
-            "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": "security@example.com",
+            "CONTROLGRAPH_SECURITY_AUDITOR_EMAIL": (
+                "cg-security-auditor@controlgraph-canary-abc123."
+                "iam.gserviceaccount.com"
+            ),
             "CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT": "223456789012345678901",
-            "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": "exporter@example.com",
+            "CONTROLGRAPH_RESTRICTED_EXPORTER_EMAIL": (
+                "cg-restricted-exporter@controlgraph-canary-abc123."
+                "iam.gserviceaccount.com"
+            ),
             "CONTROLGRAPH_RESTRICTED_EXPORTER_SUBJECT": "323456789012345678901",
         }
     )
@@ -179,20 +185,20 @@ def test_api_requires_and_binds_exact_operator_oauth_client_audience() -> None:
         settings.operator_console_origin
         == environment["CONTROLGRAPH_OPERATOR_CONSOLE_ORIGIN"]
     )
-    assert settings.security_auditor_identity == "security@example.com"
-    assert settings.restricted_exporter_identity == "exporter@example.com"
+    assert settings.security_auditor_identity == (
+        "cg-security-auditor@controlgraph-canary-abc123.iam.gserviceaccount.com"
+    )
+    assert settings.restricted_exporter_identity == (
+        "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
+    )
 
 
-def test_api_rejects_reused_privileged_timeline_identity() -> None:
+def test_api_rejects_human_privileged_timeline_identity() -> None:
     environment = _api_environment()
     environment["CONTROLGRAPH_SECURITY_AUDITOR_EMAIL"] = environment[
         "CONTROLGRAPH_AUTH_CALLER_EMAIL"
     ]
-    environment["CONTROLGRAPH_SECURITY_AUDITOR_SUBJECT"] = environment[
-        "CONTROLGRAPH_AUTH_CALLER_SUBJECT"
-    ]
-
-    with pytest.raises(ValueError, match="must be distinct"):
+    with pytest.raises(ValueError, match="privileged reader identity"):
         ControllerSettings.from_environment(environment)
 
 

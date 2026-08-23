@@ -59,7 +59,12 @@ COORDINATOR_AUDIENCE = (
 )
 
 
-def _policy(path: str, email: str, subject: str) -> RouteAuthenticationPolicy:
+def _policy(
+    path: str,
+    email: str,
+    subject: str,
+    role: CallerRole,
+) -> RouteAuthenticationPolicy:
     return RouteAuthenticationPolicy(
         project_id=TARGET.project_id,
         project_number=PROJECT_NUMBER,
@@ -67,21 +72,36 @@ def _policy(path: str, email: str, subject: str) -> RouteAuthenticationPolicy:
         path=path,
         audience=API_AUDIENCE,
         caller=CallerBinding(
-            role=CallerRole.OPERATOR,
+            role=role,
             email=email,
             subject=subject,
         ),
     )
 
 
-OPERATOR_POLICY = _policy(TIMELINE_READ_PATH, "operator@example.com", "123456789012")
-SECURITY_POLICY = _policy(TIMELINE_READ_PATH, "security@example.com", "223456789012")
-EXPORT_POLICY = _policy(TIMELINE_RAW_EXPORT_PATH, "exporter@example.com", "323456789012")
+OPERATOR_POLICY = _policy(
+    TIMELINE_READ_PATH,
+    "operator@example.com",
+    "123456789012",
+    CallerRole.OPERATOR,
+)
+SECURITY_POLICY = _policy(
+    TIMELINE_READ_PATH,
+    f"cg-security-auditor@{TARGET.project_id}.iam.gserviceaccount.com",
+    "223456789012",
+    CallerRole.SECURITY_AUDITOR,
+)
+EXPORT_POLICY = _policy(
+    TIMELINE_RAW_EXPORT_PATH,
+    f"cg-restricted-exporter@{TARGET.project_id}.iam.gserviceaccount.com",
+    "323456789012",
+    CallerRole.RESTRICTED_EXPORTER,
+)
 
 
 def _context(policy: RouteAuthenticationPolicy) -> AuthenticationContext:
     return AuthenticationContext(
-        role=CallerRole.OPERATOR,
+        role=policy.caller.role,
         email=policy.caller.email,
         subject=policy.caller.subject,
         issuer="https://accounts.google.com",

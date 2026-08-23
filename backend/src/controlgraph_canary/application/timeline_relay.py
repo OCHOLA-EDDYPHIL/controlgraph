@@ -111,6 +111,11 @@ class ApiTimelineClient:
         transport: CanonicalInternalTransport,
     ) -> None:
         policies = (operator_policy, security_audit_policy, restricted_export_policy)
+        expected_roles = (
+            CallerRole.OPERATOR,
+            CallerRole.SECURITY_AUDITOR,
+            CallerRole.RESTRICTED_EXPORTER,
+        )
         identities = {(item.caller.email, item.caller.subject) for item in policies}
         if (
             type(target) is not TargetBinding
@@ -120,11 +125,11 @@ class ApiTimelineClient:
             or any(
                 type(item) is not RouteAuthenticationPolicy
                 or item.service_role is not ServiceRole.API
-                or item.caller.role is not CallerRole.OPERATOR
+                or item.caller.role is not expected_role
                 or item.project_id != target.project_id
                 or item.project_id != route.project_id
                 or item.project_number != route.project_number
-                for item in policies
+                for item, expected_role in zip(policies, expected_roles, strict=True)
             )
             or operator_policy.path != TIMELINE_READ_PATH
             or security_audit_policy.path != TIMELINE_READ_PATH
@@ -160,7 +165,15 @@ class ApiTimelineClient:
             type(command) is not TimelinePageCommandV1
             or command.target != self._target
             or policy is None
-            or not _context_matches_policy(principal, policy, role=CallerRole.OPERATOR)
+            or not _context_matches_policy(
+                principal,
+                policy,
+                role=(
+                    CallerRole.SECURITY_AUDITOR
+                    if command.audience is TimelineAudience.SECURITY_AUDIT
+                    else CallerRole.OPERATOR
+                ),
+            )
         ):
             raise TimelineReadError(TimelineReadErrorCode.ACCESS_DENIED)
         invocation = TimelineReadInvocationV1(
@@ -195,7 +208,7 @@ class ApiTimelineClient:
             or not _context_matches_policy(
                 principal,
                 self._restricted_export_policy,
-                role=CallerRole.OPERATOR,
+                role=CallerRole.RESTRICTED_EXPORTER,
             )
         ):
             raise TimelineRawExportError(TimelineRawExportErrorCode.ACCESS_DENIED)
@@ -239,6 +252,11 @@ class CoordinatorTimelineRelay:
         raw_export_service: TimelineRawExportService,
     ) -> None:
         policies = (operator_policy, security_audit_policy, restricted_export_policy)
+        expected_roles = (
+            CallerRole.OPERATOR,
+            CallerRole.SECURITY_AUDITOR,
+            CallerRole.RESTRICTED_EXPORTER,
+        )
         if (
             type(authentication_policy) is not RouteAuthenticationPolicy
             or authentication_policy.service_role is not ServiceRole.COORDINATOR
@@ -246,10 +264,10 @@ class CoordinatorTimelineRelay:
             or any(
                 type(item) is not RouteAuthenticationPolicy
                 or item.service_role is not ServiceRole.API
-                or item.caller.role is not CallerRole.OPERATOR
+                or item.caller.role is not expected_role
                 or item.project_id != authentication_policy.project_id
                 or item.project_number != authentication_policy.project_number
-                for item in policies
+                for item, expected_role in zip(policies, expected_roles, strict=True)
             )
             or operator_policy.path != TIMELINE_READ_PATH
             or security_audit_policy.path != TIMELINE_READ_PATH
