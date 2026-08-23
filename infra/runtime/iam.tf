@@ -129,6 +129,10 @@ locals {
       service = module.coordinator.service.name
       member  = "serviceAccount:${local.service_accounts.retention_sweeper}"
     }
+    advisor = {
+      service = module.advisor.service.name
+      member  = "serviceAccount:${local.service_accounts.coordinator}"
+    }
     issuer = {
       service = module.issuer.service.name
       member  = "serviceAccount:${local.service_accounts.coordinator}"
@@ -189,6 +193,7 @@ check "runtime_invoker_map_is_closed" {
         "coordinator",
         "coordinator_receipts",
         "coordinator_retention",
+        "advisor",
         "issuer",
         "executor",
         "executor_recovery_facade",
@@ -204,6 +209,8 @@ check "runtime_invoker_map_is_closed" {
       local.run_invokers.coordinator_retention.member == "serviceAccount:${local.service_accounts.retention_sweeper}" &&
       local.run_invokers.api_security_auditor.service == module.api.service.name &&
       local.run_invokers.api_restricted_exporter.service == module.api.service.name &&
+      local.run_invokers.advisor.service == module.advisor.service.name &&
+      local.run_invokers.advisor.member == "serviceAccount:${local.service_accounts.coordinator}" &&
       local.run_invokers.executor_recovery_facade.service == module.executor.service.name &&
       local.run_invokers.executor_recovery_facade.member == "serviceAccount:${local.service_accounts.recovery}" &&
       local.run_invokers.evidence_writer.service == module.evidence_writer.service.name &&
@@ -225,6 +232,19 @@ check "retention_scheduler_identity_is_closed" {
       local.run_invokers.coordinator_retention.member == "serviceAccount:${local.service_accounts.retention_sweeper}"
     )
     error_message = "Scheduler token minting and coordinator invocation must remain bound to the fixed retention-sweeper identity."
+  }
+}
+
+check "advisor_invocation_is_coordinator_only" {
+  assert {
+    condition = (
+      toset([
+        for binding, route in local.run_invokers : binding
+        if route.service == module.advisor.service.name
+      ]) == toset(["advisor"]) &&
+      local.run_invokers.advisor.member == "serviceAccount:${local.service_accounts.coordinator}"
+    )
+    error_message = "Only the coordinator workload identity may invoke the advisor service."
   }
 }
 

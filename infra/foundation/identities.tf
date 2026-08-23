@@ -15,6 +15,11 @@ locals {
       display_name = "ControlGraph coordinator"
       description  = "Rollout coordination workload identity."
     }
+    advisor = {
+      account_id   = "controlgraph-advisor"
+      display_name = "ControlGraph read-only advisor"
+      description  = "Model assistance identity without rollout mutation authority."
+    }
     issuer = {
       account_id   = "controlgraph-issuer"
       display_name = "ControlGraph capability issuer"

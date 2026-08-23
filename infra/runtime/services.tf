@@ -144,6 +144,43 @@ module "evidence_writer" {
   })
 }
 
+module "advisor" {
+  source = "../modules/cloud_run_service"
+
+  depends_on = [google_artifact_registry_repository_iam_member.cloud_run_image_reader]
+
+  project_id        = var.project_id
+  region            = var.region
+  service_name      = local.service_names.advisor
+  description       = "Private read-only ControlGraph rollout advisor."
+  container_image   = var.advisor_image
+  service_account   = local.service_accounts.advisor
+  ingress           = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  timeout           = "30s"
+  minimum_instances = 0
+  maximum_instances = 1
+  concurrency       = 1
+  network           = data.terraform_remote_state.foundation.outputs.network.network_id
+  subnetwork        = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
+  vpc_egress        = "ALL_TRAFFIC"
+  labels            = merge(local.common_labels, { component = "advisor" })
+  environment = merge(local.common_environment, local.identity_environment.advisor, {
+    CONTROLGRAPH_ROLE                      = "advisor"
+    CONTROLGRAPH_SERVICE_NAME              = local.service_names.advisor
+    CONTROLGRAPH_CONTROLLER_ID             = "${var.project_id}:${var.region}:advisor"
+    CONTROLGRAPH_BUILD_DIGEST              = "sha256:${local.advisor_digest}"
+    CONTROLGRAPH_ADVISOR_MODEL             = "gemini-3.5-flash"
+    CONTROLGRAPH_ADVISOR_MODEL_LOCATION    = "global"
+    CONTROLGRAPH_ADVISOR_API_VERSION       = "v1"
+    CONTROLGRAPH_ADVISOR_PROMPT_VERSION    = "controlgraph.rollout-advisor-prompt/v1"
+    CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS   = "20"
+    CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS     = "4"
+    CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS = "2048"
+    ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS   = "false"
+    GOOGLE_GENAI_USE_ENTERPRISE            = "true"
+  })
+}
+
 module "coordinator" {
   source = "../modules/cloud_run_service"
 
@@ -192,6 +229,7 @@ module "coordinator" {
     CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT    = tostring(local.service_subjects.executor)
     CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL         = local.runtime_identity_emails.retention_sweeper
     CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT       = local.runtime_identity_subjects.retention_sweeper
+    CONTROLGRAPH_ADVISOR_URL                             = local.service_audiences.advisor
   })
 }
 

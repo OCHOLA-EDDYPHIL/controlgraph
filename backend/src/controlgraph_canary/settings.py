@@ -10,6 +10,13 @@ from urllib.parse import urlsplit
 
 from controlgraph_canary.application.identity import ServiceRole, runtime_service_name
 from controlgraph_canary.application.signing import SIGNING_ALGORITHM
+from controlgraph_canary.contracts.model_assistance import (
+    MAX_LLM_CALLS,
+    MAX_MODEL_OUTPUT_TOKENS,
+    MODEL_ID,
+    MODEL_LOCATION,
+    PROMPT_VERSION,
+)
 
 REQUIRED_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_PROJECT_ID",
@@ -61,6 +68,19 @@ COORDINATOR_TRUST_ENVIRONMENT_KEYS = (
     "CONTROLGRAPH_RECOVERY_RECEIPT_AUTH_CALLER_SUBJECT",
     "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_EMAIL",
     "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT",
+    "CONTROLGRAPH_ADVISOR_URL",
+)
+
+ADVISOR_ENVIRONMENT_KEYS = (
+    "CONTROLGRAPH_ADVISOR_MODEL",
+    "CONTROLGRAPH_ADVISOR_MODEL_LOCATION",
+    "CONTROLGRAPH_ADVISOR_API_VERSION",
+    "CONTROLGRAPH_ADVISOR_PROMPT_VERSION",
+    "CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS",
+    "CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS",
+    "CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS",
+    "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS",
+    "GOOGLE_GENAI_USE_ENTERPRISE",
 )
 
 API_ROOT_ENVIRONMENT_KEYS = (
@@ -123,6 +143,8 @@ def required_environment_keys(environment: Mapping[str, str]) -> tuple[str, ...]
         return REQUIRED_ENVIRONMENT_KEYS + API_ROOT_ENVIRONMENT_KEYS
     if type(role) is str and role.strip() == ServiceRole.ISSUER.value:
         return REQUIRED_ENVIRONMENT_KEYS + ISSUER_ENVIRONMENT_KEYS
+    if type(role) is str and role.strip() == ServiceRole.ADVISOR.value:
+        return REQUIRED_ENVIRONMENT_KEYS + ADVISOR_ENVIRONMENT_KEYS
     mutations_enabled = environment.get("CONTROLGRAPH_MUTATIONS_ENABLED")
     if type(role) is str and type(mutations_enabled) is str:
         selected_role = role.strip()
@@ -188,6 +210,14 @@ class ControllerSettings:
     restricted_exporter_subject: str | None
     timeline_retention_caller_identity: str | None
     timeline_retention_caller_subject: str | None
+    advisor_url: str | None
+    advisor_model: str | None
+    advisor_model_location: str | None
+    advisor_api_version: str | None
+    advisor_prompt_version: str | None
+    advisor_timeout_seconds: int | None
+    advisor_max_llm_calls: int | None
+    advisor_max_output_tokens: int | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> ControllerSettings:
@@ -277,6 +307,14 @@ class ControllerSettings:
         restricted_exporter_subject: str | None = None
         timeline_retention_caller_identity: str | None = None
         timeline_retention_caller_subject: str | None = None
+        advisor_url: str | None = None
+        advisor_model: str | None = None
+        advisor_model_location: str | None = None
+        advisor_api_version: str | None = None
+        advisor_prompt_version: str | None = None
+        advisor_timeout_seconds: int | None = None
+        advisor_max_llm_calls: int | None = None
+        advisor_max_output_tokens: int | None = None
         executor_enabled = service_role is ServiceRole.EXECUTOR and mutations_enabled
         recovery_enabled = service_role is ServiceRole.RECOVERY and mutations_enabled
         if service_role is ServiceRole.API or executor_enabled:
@@ -401,6 +439,8 @@ class ControllerSettings:
                 ServiceRole.EVIDENCE_WRITER,
                 project_number,
             )
+            advisor_url = source["CONTROLGRAPH_ADVISOR_URL"].strip()
+            _validate_service_url(advisor_url, ServiceRole.ADVISOR, project_number)
             candidate_revision_configuration_sha256 = source[
                 "CONTROLGRAPH_CANDIDATE_REVISION_CONFIGURATION_SHA256"
             ].strip()
@@ -521,6 +561,40 @@ class ControllerSettings:
                 target_subnetwork_resource,
                 prefix=f"projects/{project_id}/regions/us-central1/subnetworks/",
             )
+        if service_role is ServiceRole.ADVISOR:
+            advisor_model = source["CONTROLGRAPH_ADVISOR_MODEL"].strip()
+            advisor_model_location = source[
+                "CONTROLGRAPH_ADVISOR_MODEL_LOCATION"
+            ].strip()
+            advisor_api_version = source["CONTROLGRAPH_ADVISOR_API_VERSION"].strip()
+            advisor_prompt_version = source[
+                "CONTROLGRAPH_ADVISOR_PROMPT_VERSION"
+            ].strip()
+            try:
+                advisor_timeout_seconds = int(
+                    source["CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS"].strip()
+                )
+                advisor_max_llm_calls = int(
+                    source["CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS"].strip()
+                )
+                advisor_max_output_tokens = int(
+                    source["CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS"].strip()
+                )
+            except ValueError:
+                raise ValueError("advisor numeric bounds are invalid") from None
+            if (
+                advisor_model != MODEL_ID
+                or advisor_model_location != MODEL_LOCATION
+                or advisor_api_version != "v1"
+                or advisor_prompt_version != PROMPT_VERSION
+                or advisor_timeout_seconds != 20
+                or advisor_max_llm_calls != MAX_LLM_CALLS
+                or advisor_max_output_tokens != MAX_MODEL_OUTPUT_TOKENS
+                or source["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"].strip().lower()
+                != "false"
+                or source["GOOGLE_GENAI_USE_ENTERPRISE"].strip().lower() != "true"
+            ):
+                raise ValueError("advisor model configuration is outside its bounds")
 
         return cls(
             project_id=project_id,
@@ -569,6 +643,14 @@ class ControllerSettings:
             restricted_exporter_subject=restricted_exporter_subject,
             timeline_retention_caller_identity=timeline_retention_caller_identity,
             timeline_retention_caller_subject=timeline_retention_caller_subject,
+            advisor_url=advisor_url,
+            advisor_model=advisor_model,
+            advisor_model_location=advisor_model_location,
+            advisor_api_version=advisor_api_version,
+            advisor_prompt_version=advisor_prompt_version,
+            advisor_timeout_seconds=advisor_timeout_seconds,
+            advisor_max_llm_calls=advisor_max_llm_calls,
+            advisor_max_output_tokens=advisor_max_output_tokens,
         )
 
 

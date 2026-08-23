@@ -6,6 +6,7 @@ locals {
   service_names = {
     api             = "controlgraph-api"
     coordinator     = "controlgraph-coordinator"
+    advisor         = "controlgraph-advisor"
     issuer          = "controlgraph-issuer"
     executor        = "controlgraph-executor"
     recovery        = "controlgraph-recovery"
@@ -14,6 +15,7 @@ locals {
   }
 
   controller_digest = regex("sha256:([0-9a-f]{64})$", var.controller_image)[0]
+  advisor_digest    = regex("sha256:([0-9a-f]{64})$", var.advisor_image)[0]
 
   common_labels = {
     application = "controlgraph"
@@ -50,6 +52,7 @@ locals {
     recovery              = local.service_accounts.recovery
     verifier              = local.service_accounts.verifier
     evidence_writer       = local.service_accounts.evidence_writer
+    advisor               = local.service_accounts.advisor
     execution_task_caller = local.service_accounts.execution_task_caller
     recovery_task_caller  = local.service_accounts.recovery_task_caller
     retention_sweeper     = local.service_accounts.retention_sweeper
@@ -66,6 +69,7 @@ locals {
     recovery              = tostring(local.service_subjects.recovery)
     verifier              = tostring(local.service_subjects.verifier)
     evidence_writer       = tostring(local.service_subjects.evidence_writer)
+    advisor               = tostring(local.service_subjects.advisor)
     execution_task_caller = tostring(local.service_subjects.execution_task_caller)
     recovery_task_caller  = tostring(local.service_subjects.recovery_task_caller)
     retention_sweeper     = tostring(local.service_subjects.retention_sweeper)
@@ -79,6 +83,7 @@ locals {
     recovery        = "recovery_task_caller"
     verifier        = "coordinator"
     evidence_writer = "coordinator"
+    advisor         = "coordinator"
   }
 
   identity_environment = {
@@ -116,6 +121,7 @@ check "runtime_identity_map_is_closed" {
         "restricted_exporter",
         "api",
         "coordinator",
+        "advisor",
         "issuer",
         "executor",
         "recovery",

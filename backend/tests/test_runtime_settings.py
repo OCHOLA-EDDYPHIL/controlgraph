@@ -64,6 +64,39 @@ def _api_environment() -> dict[str, str]:
     return environment
 
 
+def _advisor_environment() -> dict[str, str]:
+    environment = _environment()
+    environment.update(
+        {
+            "CONTROLGRAPH_SERVICE_NAME": "controlgraph-advisor",
+            "CONTROLGRAPH_CONTROLLER_ID": (
+                "controlgraph-canary-abc123:us-central1:advisor"
+            ),
+            "CONTROLGRAPH_ROLE": "advisor",
+            "CONTROLGRAPH_AUTH_AUDIENCE": (
+                "https://controlgraph-advisor-123456789012.us-central1.run.app"
+            ),
+            "CONTROLGRAPH_AUTH_CALLER_ROLE": "coordinator",
+            "CONTROLGRAPH_AUTH_CALLER_EMAIL": (
+                "controlgraph-coordinator@controlgraph-canary-abc123."
+                "iam.gserviceaccount.com"
+            ),
+            "CONTROLGRAPH_ADVISOR_MODEL": "gemini-3.5-flash",
+            "CONTROLGRAPH_ADVISOR_MODEL_LOCATION": "global",
+            "CONTROLGRAPH_ADVISOR_API_VERSION": "v1",
+            "CONTROLGRAPH_ADVISOR_PROMPT_VERSION": (
+                "controlgraph.rollout-advisor-prompt/v1"
+            ),
+            "CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS": "20",
+            "CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS": "4",
+            "CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS": "2048",
+            "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS": "false",
+            "GOOGLE_GENAI_USE_ENTERPRISE": "true",
+        }
+    )
+    return environment
+
+
 def test_runtime_settings_bind_role_and_environment() -> None:
     settings = ControllerSettings.from_environment(_environment())
 
@@ -226,6 +259,43 @@ def test_api_rejects_absent_operator_oauth_client_audience() -> None:
     del environment["CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE"]
 
     with pytest.raises(ValueError, match="missing environment variables"):
+        ControllerSettings.from_environment(environment)
+
+
+def test_advisor_settings_are_exact_and_mutation_disabled() -> None:
+    settings = ControllerSettings.from_environment(_advisor_environment())
+
+    assert settings.role == "advisor"
+    assert settings.mutations_enabled is False
+    assert settings.advisor_model == "gemini-3.5-flash"
+    assert settings.advisor_model_location == "global"
+    assert settings.advisor_api_version == "v1"
+    assert settings.advisor_timeout_seconds == 20
+    assert settings.advisor_max_llm_calls == 4
+    assert settings.advisor_max_output_tokens == 2048
+    assert settings.capability_key_version is None
+    assert settings.evidence_key_version is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("CONTROLGRAPH_ADVISOR_MODEL", "gemini-flash-latest"),
+        ("CONTROLGRAPH_ADVISOR_MODEL_LOCATION", "us-central1"),
+        ("CONTROLGRAPH_ADVISOR_API_VERSION", "v1beta1"),
+        ("CONTROLGRAPH_ADVISOR_PROMPT_VERSION", "unversioned"),
+        ("CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS", "31"),
+        ("CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS", "5"),
+        ("CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS", "4096"),
+        ("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "true"),
+        ("GOOGLE_GENAI_USE_ENTERPRISE", "false"),
+    ],
+)
+def test_advisor_rejects_substituted_model_configuration(key: str, value: str) -> None:
+    environment = _advisor_environment()
+    environment[key] = value
+
+    with pytest.raises(ValueError, match="advisor model configuration"):
         ControllerSettings.from_environment(environment)
 
 

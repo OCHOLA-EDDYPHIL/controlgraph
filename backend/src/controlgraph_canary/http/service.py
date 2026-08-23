@@ -75,6 +75,12 @@ from controlgraph_canary.application.independent_verification import (
 from controlgraph_canary.application.independent_verification_signing import (
     IndependentVerificationSigningService,
 )
+from controlgraph_canary.application.model_assistance import (
+    AdvisorWorkflowError,
+    AdvisorWorkflowErrorCode,
+    ApiAdvisorClient,
+    CoordinatorAdvisorWorkflow,
+)
 from controlgraph_canary.application.operator_observability import (
     ApiOperatorObservationClient,
     CoordinatorOperatorObservationRelay,
@@ -177,6 +183,12 @@ from controlgraph_canary.contracts.independent_verification import (
     IndependentVerificationInvocationV1,
     IndependentVerificationKind,
     IndependentVerificationSigningRequestV1,
+)
+from controlgraph_canary.contracts.model_assistance import (
+    AdvisorDispositionCommandV1,
+    AdvisorDispositionInvocationV1,
+    AdvisorOperatorCommandV1,
+    AdvisorOperatorInvocationV1,
 )
 from controlgraph_canary.contracts.models import EvidenceEvent, ReasonCode
 from controlgraph_canary.contracts.operator_observability import (
@@ -418,6 +430,15 @@ class HealthPipelineDenied(BaseModel):
     correlation_id: str
 
 
+class AdvisorWorkflowDenied(BaseModel):
+    """Payload-free model-assistance workflow denial."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    correlation_id: str
+
+
 type VerifiedTaskHandler = Callable[[VerifiedMutation], Awaitable[Response]]
 type RecoveryExecutorFacadeHandler = Callable[[bytes, AuthenticationContext], Awaitable[bytes]]
 
@@ -454,6 +475,8 @@ def create_service_app(
     coordinator_service_claim_release_relay: (CoordinatorServiceClaimReleaseRelay | None) = None,
     api_recovery_abandonment_client: ApiRecoveryAbandonmentClient | None = None,
     coordinator_recovery_abandonment_relay: (CoordinatorRecoveryAbandonmentRelay | None) = None,
+    api_advisor_client: ApiAdvisorClient | None = None,
+    coordinator_advisor_workflow: CoordinatorAdvisorWorkflow | None = None,
     service_claim_classification_service: (ServiceClaimClassificationService | None) = None,
     independent_verification_service: IndependentVerificationService | None = None,
     classification_evidence_signing_service: (ClassificationEvidenceSigningService | None) = None,
@@ -562,6 +585,10 @@ def create_service_app(
         raise ValueError("recovery abandonment is limited to the API route")
     if coordinator_recovery_abandonment_relay is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("recovery abandonment coordination is coordinator-limited")
+    if api_advisor_client is not None and role is not ServiceRole.API:
+        raise ValueError("operator advice is limited to the API route")
+    if coordinator_advisor_workflow is not None and role is not ServiceRole.COORDINATOR:
+        raise ValueError("advice coordination is coordinator-limited")
     if service_claim_classification_service is not None and role is not ServiceRole.VERIFIER:
         raise ValueError("claim classification is limited to the verifier route")
     if independent_verification_service is not None and role is not ServiceRole.VERIFIER:
@@ -1124,6 +1151,7 @@ def create_service_app(
             or api_service_claim_release_client is not None
             or api_recovery_abandonment_client is not None
             or api_operator_observation_client is not None
+            or api_advisor_client is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -1222,6 +1250,23 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(revocation_proof)
+                elif type(command) is AdvisorOperatorCommandV1:
+                    if api_advisor_client is None:
+                        raise AdvisorWorkflowError(
+                            code=AdvisorWorkflowErrorCode.CONFIGURATION_INVALID
+                        )
+                    advisor_result = await api_advisor_client.advise(command, context)
+                    response_body = canonical_json_bytes(advisor_result)
+                elif type(command) is AdvisorDispositionCommandV1:
+                    if api_advisor_client is None:
+                        raise AdvisorWorkflowError(
+                            code=AdvisorWorkflowErrorCode.CONFIGURATION_INVALID
+                        )
+                    disposition_result = await api_advisor_client.record_disposition(
+                        command,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(disposition_result)
                 else:
                     if type(command) is not EpochRevocationCommandV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
@@ -1260,6 +1305,8 @@ def create_service_app(
                 )
             except OperatorObservationError as error:
                 return _operator_observation_denial(error.code.value, correlation_id)
+            except AdvisorWorkflowError as error:
+                return _advisor_workflow_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -1282,6 +1329,7 @@ def create_service_app(
             or coordinator_recovery_abandonment_relay is not None
             or coordinator_operator_observation_relay is not None
             or coordinator_timeline_relay is not None
+            or coordinator_advisor_workflow is not None
         ):
             try:
                 body = await _read_contract_body(request)
@@ -1470,6 +1518,28 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(timeline_export)
+                elif type(invocation) is AdvisorOperatorInvocationV1:
+                    if coordinator_advisor_workflow is None:
+                        raise AdvisorWorkflowError(
+                            AdvisorWorkflowErrorCode.CONFIGURATION_INVALID
+                        )
+                    advisor_result = await coordinator_advisor_workflow.advise(
+                        invocation,
+                        context,
+                    )
+                    response_body = canonical_json_bytes(advisor_result)
+                elif type(invocation) is AdvisorDispositionInvocationV1:
+                    if coordinator_advisor_workflow is None:
+                        raise AdvisorWorkflowError(
+                            AdvisorWorkflowErrorCode.CONFIGURATION_INVALID
+                        )
+                    disposition_result = (
+                        await coordinator_advisor_workflow.record_disposition(
+                            invocation,
+                            context,
+                        )
+                    )
+                    response_body = canonical_json_bytes(disposition_result)
                 else:
                     if type(invocation) is not EpochRevocationInvocationV1:
                         raise EpochRevocationError(EpochRevocationFailureCode.COMMAND_DENIED)
@@ -1529,6 +1599,8 @@ def create_service_app(
                 return _timeline_denial(error.code.value, correlation_id)
             except TimelineRawExportError as error:
                 return _timeline_denial(error.code.value, correlation_id)
+            except AdvisorWorkflowError as error:
+                return _advisor_workflow_denial(error.code.value, correlation_id)
             except Exception:
                 return _canary_execution_denial(
                     CanaryExecutionErrorCode.DISPATCH_UNAVAILABLE.value,
@@ -2245,6 +2317,8 @@ def _decode_api_command(
     | TargetTrafficReadCommandV1
     | HealthEvaluationCommandV1
     | RecoveryCommandV2
+    | AdvisorOperatorCommandV1
+    | AdvisorDispositionCommandV1
     | EpochRevocationProofCommandV1
     | EpochRevocationCommandV1
 ):
@@ -2303,6 +2377,16 @@ def _decode_api_command(
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
+    try:
+        return decode_contract(body, AdvisorOperatorCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, AdvisorDispositionCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
     return decode_contract(body, EpochRevocationCommandV1)
 
 
@@ -2321,6 +2405,8 @@ def _decode_coordinator_invocation(
     | RecoveryInvocationV2
     | TimelineReadInvocationV1
     | TimelineRawExportInvocationV1
+    | AdvisorOperatorInvocationV1
+    | AdvisorDispositionInvocationV1
     | EpochRevocationProofInvocationV1
     | EpochRevocationInvocationV1
 ):
@@ -2386,6 +2472,16 @@ def _decode_coordinator_invocation(
             raise
     try:
         return decode_contract(body, TimelineRawExportInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, AdvisorOperatorInvocationV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, AdvisorDispositionInvocationV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise
@@ -2887,6 +2983,19 @@ def _timeline_denial(code: str, correlation_id: str) -> JSONResponse:
             "Cache-Control": "no-store",
             "X-ControlGraph-Correlation-Id": correlation_id,
         },
+    )
+
+
+def _advisor_workflow_denial(code: str, correlation_id: str) -> JSONResponse:
+    response = AdvisorWorkflowDenied(code=code, correlation_id=correlation_id)
+    if code.endswith(("CALLER_DENIED", "OPERATOR_DENIED", "COMMAND_DENIED")):
+        status_code = 403
+    else:
+        status_code = 503
+    return JSONResponse(
+        status_code=status_code,
+        content=response.model_dump(mode="json"),
+        headers={"X-ControlGraph-Correlation-Id": correlation_id},
     )
 
 

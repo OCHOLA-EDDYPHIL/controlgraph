@@ -4,6 +4,7 @@ state_bucket_name = "controlgraph-canary-1234abcd-tfstate"
 
 controller_image                                     = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/controller@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 console_image                                        = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/console@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+advisor_image                                        = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/advisor@sha256:4444444444444444444444444444444444444444444444444444444444444444"
 reference_target_stable_image                        = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/reference-stable@sha256:1111111111111111111111111111111111111111111111111111111111111111"
 reference_target_candidate_image                     = "us-central1-docker.pkg.dev/controlgraph-canary-1234abcd/controlgraph-canary/reference-candidate@sha256:2222222222222222222222222222222222222222222222222222222222222222"
 reference_target_candidate_configuration_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"

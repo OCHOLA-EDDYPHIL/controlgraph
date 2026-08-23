@@ -38,6 +38,14 @@ locals {
         "monitoring.timeSeries.list",
       ]
     }
+    vertex_advisor = {
+      role_id     = "controlgraph.vertexAdvisor"
+      title       = "ControlGraph Vertex advisor"
+      description = "Invoke a configured Vertex model without model administration permissions."
+      permissions = [
+        "aiplatform.endpoints.predict",
+      ]
+    }
     tasks_enqueuer = {
       role_id     = "controlgraph.tasksEnqueuer"
       title       = "ControlGraph task enqueuer"
@@ -144,6 +152,18 @@ check "monitoring_health_reader_is_time_series_list_only" {
       ])
     )
     error_message = "The Monitoring health reader role must contain only time-series list permission."
+  }
+}
+
+check "vertex_advisor_is_prediction_only" {
+  assert {
+    condition = (
+      local.custom_iam_roles.vertex_advisor.role_id == "controlgraph.vertexAdvisor" &&
+      toset(local.custom_iam_roles.vertex_advisor.permissions) == toset([
+        "aiplatform.endpoints.predict",
+      ])
+    )
+    error_message = "The Vertex advisor role must contain only endpoint prediction permission."
   }
 }
 

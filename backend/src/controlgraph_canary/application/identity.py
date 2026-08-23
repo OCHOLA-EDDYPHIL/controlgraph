@@ -51,6 +51,7 @@ class ServiceRole(StrEnum):
     RECOVERY = "recovery"
     VERIFIER = "verifier"
     EVIDENCE_WRITER = "evidence_writer"
+    ADVISOR = "advisor"
 
 
 class CallerRole(StrEnum):
@@ -64,6 +65,7 @@ class CallerRole(StrEnum):
     RECOVERY = "recovery"
     VERIFIER = "verifier"
     EVIDENCE_WRITER = "evidence_writer"
+    ADVISOR = "advisor"
     EXECUTION_TASK_CALLER = "execution_task_caller"
     RECOVERY_TASK_CALLER = "recovery_task_caller"
     RETENTION_SWEEPER = "retention_sweeper"
@@ -257,6 +259,7 @@ _SERVICE_ACCOUNT_IDS: dict[CallerRole, str] = {
     CallerRole.RECOVERY: "controlgraph-recovery",
     CallerRole.VERIFIER: "controlgraph-verifier",
     CallerRole.EVIDENCE_WRITER: "cg-evidence-writer",
+    CallerRole.ADVISOR: "controlgraph-advisor",
     CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
     CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
     CallerRole.RETENTION_SWEEPER: "cg-retention-sweeper",
@@ -272,6 +275,7 @@ _SERVICE_NAMES: dict[ServiceRole, str] = {
     ServiceRole.RECOVERY: "controlgraph-recovery",
     ServiceRole.VERIFIER: "controlgraph-verifier",
     ServiceRole.EVIDENCE_WRITER: "controlgraph-evidence-writer",
+    ServiceRole.ADVISOR: "controlgraph-advisor",
 }
 
 _PROTECTED_PATHS: dict[ServiceRole, str] = {
@@ -282,6 +286,7 @@ _PROTECTED_PATHS: dict[ServiceRole, str] = {
     ServiceRole.RECOVERY: RECOVERY_HANDLER_PATH,
     ServiceRole.VERIFIER: "/v1/internal/verify",
     ServiceRole.EVIDENCE_WRITER: "/v1/internal/evidence/sign",
+    ServiceRole.ADVISOR: "/v1/internal/advise",
 }
 
 _ROUTE_CALLER_ROLES: dict[ServiceRole, CallerRole] = {
@@ -292,6 +297,7 @@ _ROUTE_CALLER_ROLES: dict[ServiceRole, CallerRole] = {
     ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
     ServiceRole.VERIFIER: CallerRole.COORDINATOR,
     ServiceRole.EVIDENCE_WRITER: CallerRole.COORDINATOR,
+    ServiceRole.ADVISOR: CallerRole.COORDINATOR,
 }
 
 

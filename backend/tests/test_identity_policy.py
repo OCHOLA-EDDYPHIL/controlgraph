@@ -42,6 +42,7 @@ EXPECTED_CALLERS = {
     CallerRole.RECOVERY: f"controlgraph-recovery@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.VERIFIER: f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.EVIDENCE_WRITER: f"cg-evidence-writer@{PROJECT_ID}.iam.gserviceaccount.com",
+    CallerRole.ADVISOR: f"controlgraph-advisor@{PROJECT_ID}.iam.gserviceaccount.com",
     CallerRole.EXECUTION_TASK_CALLER: (
         f"cg-execution-task-caller@{PROJECT_ID}.iam.gserviceaccount.com"
     ),
@@ -59,6 +60,7 @@ ROUTE_CALLERS = {
     ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
     ServiceRole.VERIFIER: CallerRole.COORDINATOR,
     ServiceRole.EVIDENCE_WRITER: CallerRole.COORDINATOR,
+    ServiceRole.ADVISOR: CallerRole.COORDINATOR,
 }
 
 
