@@ -14,6 +14,9 @@ module "issuer" {
   subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "issuer" })
+
+  concurrency       = 1
+  maximum_instances = 4
   environment = merge(local.common_environment, local.identity_environment.issuer, {
     CONTROLGRAPH_ROLE                   = "issuer"
     CONTROLGRAPH_SERVICE_NAME           = local.service_names.issuer
@@ -157,6 +160,9 @@ module "coordinator" {
   subnetwork      = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress      = "ALL_TRAFFIC"
   labels          = merge(local.common_labels, { component = "coordinator" })
+
+  concurrency       = 1
+  maximum_instances = 4
   environment = merge(local.common_environment, local.identity_environment.coordinator, {
     CONTROLGRAPH_ROLE                                    = "coordinator"
     CONTROLGRAPH_SERVICE_NAME                            = local.service_names.coordinator
