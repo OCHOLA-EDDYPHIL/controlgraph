@@ -24,6 +24,7 @@ from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
     decode_contract,
 )
+from controlgraph_canary.contracts.models import CapabilityAction
 from controlgraph_canary.services.ambiguous_receipt_readback import (
     create_ambiguous_receipt_readback_resolver,
 )
@@ -39,6 +40,7 @@ class ResolverFactory(Protocol):
     def __call__(
         self,
         *,
+        action: CapabilityAction,
         environment: Mapping[str, str] | None = None,
     ) -> AmbiguousReceiptReadbackResolver: ...
 
@@ -84,7 +86,7 @@ def main(
         return 2
     try:
         factory = resolver_factory or create_ambiguous_receipt_readback_resolver
-        resolver = factory(environment=environment)
+        resolver = factory(action=command.action, environment=environment)
     except Exception:
         _print_error("AMBIGUOUS_RECEIPT_READBACK_CONFIGURATION_INVALID")
         return 3

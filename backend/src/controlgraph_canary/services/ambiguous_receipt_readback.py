@@ -10,9 +10,13 @@ from controlgraph_canary.application.ambiguous_receipt_readback import (
     AmbiguousReceiptResolutionStore,
     TargetBoundProviderOperationReadback,
 )
-from controlgraph_canary.application.cloud_run import CloudRunTargetConfiguration
+from controlgraph_canary.application.cloud_run import (
+    CloudRunMutationPurpose,
+    CloudRunTargetConfiguration,
+)
 from controlgraph_canary.application.identity import (
     RECEIPT_AUTHORITY_PATH,
+    RECOVERY_RECEIPT_AUTHORITY_PATH,
     CallerRole,
     ServiceRole,
 )
@@ -25,7 +29,7 @@ from controlgraph_canary.application.root_trust import (
     CanonicalInternalTransport,
     CoordinatorInternalRoute,
 )
-from controlgraph_canary.contracts.models import TargetBinding
+from controlgraph_canary.contracts.models import CapabilityAction, TargetBinding
 from controlgraph_canary.integrations.google.cloud_run import (
     CloudRunV2OperationReadback,
     CloudRunV2ReceiptReadback,
@@ -41,6 +45,7 @@ from controlgraph_canary.settings import ControllerSettings
 
 def create_ambiguous_receipt_readback_resolver(
     *,
+    action: CapabilityAction,
     environment: Mapping[str, str] | None = None,
     root_reader: RootAuthorityBundleReader | None = None,
     receipt_store: AmbiguousReceiptResolutionStore | None = None,
@@ -53,6 +58,11 @@ def create_ambiguous_receipt_readback_resolver(
 ) -> AmbiguousReceiptReadbackResolver:
     """Compose only the read/CAS dependencies available to the executor identity."""
 
+    if type(action) is not CapabilityAction or action not in {
+        CapabilityAction.APPLY_CANARY,
+        CapabilityAction.RECOVER_STABLE,
+    }:
+        raise ValueError("ambiguous receipt readback action is not supported")
     settings = ControllerSettings.from_environment(environment)
     if settings.role != ServiceRole.EXECUTOR.value or not settings.mutations_enabled:
         raise ValueError("ambiguous receipt readback requires the enabled executor role")
@@ -80,6 +90,11 @@ def create_ambiguous_receipt_readback_resolver(
         )
     selected_receipt_store = receipt_store
     if selected_receipt_store is None:
+        receipt_authority_path = (
+            RECOVERY_RECEIPT_AUTHORITY_PATH
+            if action is CapabilityAction.RECOVER_STABLE
+            else RECEIPT_AUTHORITY_PATH
+        )
         selected_transport = internal_transport or GoogleOneShotOidcTransport(
             project_id=settings.project_id,
             caller_role=CallerRole.EXECUTOR,
@@ -92,7 +107,7 @@ def create_ambiguous_receipt_readback_resolver(
                 caller_role=CallerRole.EXECUTOR,
                 service_role=ServiceRole.COORDINATOR,
                 audience=settings.coordinator_url,
-                override_path=RECEIPT_AUTHORITY_PATH,
+                override_path=receipt_authority_path,
             ),
             transport=selected_transport,
         )
@@ -104,6 +119,11 @@ def create_ambiguous_receipt_readback_resolver(
     selected_target_readback = target_readback or CloudRunV2ReceiptReadback(
         configuration=cloud_run_configuration,
         configured_project_id=settings.project_id,
+        mutation_purpose=(
+            CloudRunMutationPurpose.STABLE_RECOVERY
+            if action is CapabilityAction.RECOVER_STABLE
+            else CloudRunMutationPurpose.STANDARD_EXECUTION
+        ),
         services_client_factory=services_client_factory,
     )
     return AmbiguousReceiptReadbackResolver(

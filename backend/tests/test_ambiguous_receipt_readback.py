@@ -51,7 +51,9 @@ def _replace_receipt(
     )
 
 
-def _records() -> tuple[RootBundle, ExecutionReceipt]:
+def _records(
+    action: CapabilityAction = CapabilityAction.APPLY_CANARY,
+) -> tuple[RootBundle, ExecutionReceipt]:
     root, anchor, claim, authority = root_records(concurrency=8)
     bundle = root_bundle(
         root=root,
@@ -60,22 +62,24 @@ def _records() -> tuple[RootBundle, ExecutionReceipt]:
         authority=authority,
     )
     plan = root.content.rollout_plan
+    recovery = action is CapabilityAction.RECOVER_STABLE
     expected = TargetConfigurationProjection(
         target=root.content.target,
         stable_revision=plan.stable_revision,
         candidate_revision=plan.candidate_revision,
-        stable_percent=plan.stable_percent,
-        candidate_percent=plan.candidate_percent,
+        stable_percent=100 if recovery else plan.stable_percent,
+        candidate_percent=0 if recovery else plan.candidate_percent,
         concurrency=plan.concurrency,
     )
+    action_name = "recover-stable" if recovery else "apply-canary"
     receipt = ExecutionReceipt(
         schema_version="controlgraph.execution-receipt/v1",
         receipt_id=execution_receipt_logical_id(
             root.content.target,
-            "idempotency-apply-001",
+            f"idempotency-{action_name}-001",
         ),
-        request_id="request-apply-001",
-        idempotency_key="idempotency-apply-001",
+        request_id=f"request-{action_name}-001",
+        idempotency_key=f"idempotency-{action_name}-001",
         capability_sha256=CAPABILITY_DIGEST,
         mutation_sha256=MUTATION_DIGEST,
         plan_sha256=canonical_sha256(plan),
@@ -84,14 +88,18 @@ def _records() -> tuple[RootBundle, ExecutionReceipt]:
         root_id=root.root_id,
         root_sha256=root.root_sha256,
         epoch=1,
-        action=CapabilityAction.APPLY_CANARY,
-        provider_etag=root.content.stable_snapshot.provider_etag,
+        action=action,
+        provider_etag=(
+            "etag-canary-before-recovery"
+            if recovery
+            else root.content.stable_snapshot.provider_etag
+        ),
         dispatch_not_after="2026-08-19T12:10:00Z",
         outcome=ReceiptOutcome.AMBIGUOUS,
         reason_code=ReasonCode.PROVIDER_OUTCOME_AMBIGUOUS,
         provider_operation=(
             f"projects/{root.content.target.project_id}/locations/us-central1/"
-            "operations/apply-canary-001"
+            f"operations/{action_name}-001"
         ),
         observed_etag="etag-ambiguous-7",
         observed_authority_epoch=1,
@@ -109,7 +117,7 @@ def _command(stored: StoredRecord[ExecutionReceipt]) -> AmbiguousReceiptReadback
         root_id=receipt.root_id,
         expected_root_sha256=receipt.root_sha256,
         expected_epoch=receipt.epoch,
-        action=CapabilityAction.APPLY_CANARY,
+        action=receipt.action,
         request_id=receipt.request_id,
         idempotency_key=receipt.idempotency_key,
         capability_sha256=receipt.capability_sha256,
@@ -121,14 +129,18 @@ def _command(stored: StoredRecord[ExecutionReceipt]) -> AmbiguousReceiptReadback
     )
 
 
-def _expected(bundle: RootBundle) -> TargetConfigurationProjection:
+def _expected(
+    bundle: RootBundle,
+    action: CapabilityAction = CapabilityAction.APPLY_CANARY,
+) -> TargetConfigurationProjection:
     plan = bundle.root.value.content.rollout_plan
+    recovery = action is CapabilityAction.RECOVER_STABLE
     return TargetConfigurationProjection(
         target=bundle.root.value.content.target,
         stable_revision=plan.stable_revision,
         candidate_revision=plan.candidate_revision,
-        stable_percent=plan.stable_percent,
-        candidate_percent=plan.candidate_percent,
+        stable_percent=100 if recovery else plan.stable_percent,
+        candidate_percent=0 if recovery else plan.candidate_percent,
         concurrency=plan.concurrency,
     )
 
@@ -310,6 +322,28 @@ def test_exact_ambiguous_receipt_is_monotonically_resolved_without_dispatch() ->
     ]
 
 
+def test_recovery_receipt_uses_only_the_captured_stable_poststate() -> None:
+    bundle, receipt = _records(CapabilityAction.RECOVER_STABLE)
+    stored = StoredRecord(receipt, 2)
+    command = _command(stored)
+    events: list[str] = []
+    store = _Store(stored, events)
+    operation = _OperationReadback(True, events)
+    expected = _expected(bundle, CapabilityAction.RECOVER_STABLE)
+    target = _TargetReadback(
+        ReceiptReadbackResult(state=expected, observed_etag="etag-stable-recovered"),
+        events,
+    )
+
+    result = asyncio.run(_resolver(bundle, store, operation, target, events).resolve(command))
+
+    assert result.disposition is AmbiguousReceiptReadbackDisposition.RESOLVED
+    assert result.stored_receipt.receipt.action is CapabilityAction.RECOVER_STABLE
+    assert target.calls == [expected]
+    assert expected.stable_percent == 100
+    assert expected.candidate_percent == 0
+
+
 def test_exact_marked_verified_receipt_is_adopted_before_mutable_readback() -> None:
     bundle, receipt = _records()
     ambiguous = StoredRecord(receipt, 2)
@@ -468,6 +502,58 @@ def test_exact_locator_digest_and_root_bindings_are_required_before_provider_rea
         _OperationReadback(True, events),
         _TargetReadback(
             ReceiptReadbackResult(state=_expected(bundle), observed_etag="etag-canary-8"),
+            events,
+        ),
+        events,
+    )
+
+    assert _run_error(resolver, _command(stored)) is (
+        AmbiguousReceiptReadbackErrorCode.ROOT_BINDING_MISMATCH
+    )
+    assert events == ["receipt-read", "root-read"]
+
+
+def test_apply_receipt_still_requires_the_root_snapshot_provider_etag() -> None:
+    bundle, receipt = _records()
+    changed = _replace_receipt(receipt, provider_etag="etag-not-root-snapshot")
+    stored = StoredRecord(changed, 2)
+    events: list[str] = []
+    resolver = _resolver(
+        bundle,
+        _Store(stored, events),
+        _OperationReadback(True, events),
+        _TargetReadback(
+            ReceiptReadbackResult(state=_expected(bundle), observed_etag="etag-canary-8"),
+            events,
+        ),
+        events,
+    )
+
+    assert _run_error(resolver, _command(stored)) is (
+        AmbiguousReceiptReadbackErrorCode.ROOT_BINDING_MISMATCH
+    )
+    assert events == ["receipt-read", "root-read"]
+
+
+def test_recovery_receipt_rejects_a_nonstable_poststate() -> None:
+    bundle, receipt = _records(CapabilityAction.RECOVER_STABLE)
+    changed = _replace_receipt(
+        receipt,
+        expected_poststate_sha256=target_configuration_projection_sha256(
+            _expected(bundle)
+        ),
+    )
+    stored = StoredRecord(changed, 2)
+    events: list[str] = []
+    resolver = _resolver(
+        bundle,
+        _Store(stored, events),
+        _OperationReadback(True, events),
+        _TargetReadback(
+            ReceiptReadbackResult(
+                state=_expected(bundle, CapabilityAction.RECOVER_STABLE),
+                observed_etag="etag-stable-recovered",
+            ),
             events,
         ),
         events,
