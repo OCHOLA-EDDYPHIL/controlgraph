@@ -288,10 +288,11 @@ describe("operator console", () => {
         fields: [field("WINDOW", "1 of 2")],
       }),
     ];
+    const reconnectQueryIndex = api.queries.length;
     fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
 
     expect(await screen.findByRole("heading", { name: "Health window 1 of 2" })).toBeTruthy();
-    expect(api.queries.at(-1)).toMatchObject({
+    expect(api.queries[reconnectQueryIndex]).toMatchObject({
       afterSequence: 1,
       afterEntrySha256: previousHead.entrySha256,
     });
