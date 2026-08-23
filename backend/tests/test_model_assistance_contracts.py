@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import pytest
-from model_assistance_test_data import invocation, recommendation, snapshot
+from model_assistance_test_data import evidence_summary, invocation, recommendation, snapshot
 from pydantic import ValidationError
 
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.model_assistance import (
-    DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
     MAX_TOOL_CALLS,
     MAX_TOOL_RESPONSE_BYTES,
     AdvisorRecommendationV1,
@@ -77,33 +76,24 @@ def test_snapshot_rejects_unbound_or_out_of_policy_state(
 
 
 def test_evidence_contract_has_no_free_form_capability_or_token_field() -> None:
+    value = evidence_summary(DiagnosticEvidenceKind.ROOT, digest_character="a")
     with pytest.raises(ValidationError, match="Extra inputs"):
-        DiagnosticEvidenceSummaryV1(
-            schema_version=DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
-            evidence_kind=DiagnosticEvidenceKind.ROOT,
-            evidence_ids=("root-record",),
-            source_sha256="a" * 64,
-            observed_at="2026-08-22T09:59:00Z",
-            fresh_until="2026-08-22T10:05:00Z",
-            summary_code=DiagnosticEvidenceSummaryCode.ROOT_RECORD_VERIFIED,
-            summary="Bearer synthetic-secret-token-value",
-            redacted=True,
-            untrusted_model_context=True,
+        DiagnosticEvidenceSummaryV1.model_validate(
+            {
+                **value.model_dump(mode="python"),
+                "summary": "Bearer synthetic-secret-token-value",
+            }
         )
 
 
 def test_evidence_contract_rejects_a_summary_code_from_another_record_family() -> None:
+    value = evidence_summary(DiagnosticEvidenceKind.ROOT, digest_character="a")
     with pytest.raises(ValidationError, match="evidence class"):
-        DiagnosticEvidenceSummaryV1(
-            schema_version=DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
-            evidence_kind=DiagnosticEvidenceKind.ROOT,
-            evidence_ids=("root-record",),
-            source_sha256="a" * 64,
-            observed_at="2026-08-22T09:59:00Z",
-            fresh_until="2026-08-22T10:05:00Z",
-            summary_code=DiagnosticEvidenceSummaryCode.HEALTH_EVIDENCE_VERIFIED,
-            redacted=True,
-            untrusted_model_context=True,
+        DiagnosticEvidenceSummaryV1.model_validate(
+            {
+                **value.model_dump(mode="python"),
+                "summary_code": DiagnosticEvidenceSummaryCode.HEALTH_EVIDENCE_VERIFIED,
+            }
         )
 
 
@@ -147,3 +137,13 @@ def test_request_digest_changes_with_evidence_consistency() -> None:
     incomplete = invocation(consistency=EvidenceConsistency.INCOMPLETE)
 
     assert canonical_sha256(consistent) != canonical_sha256(incomplete)
+
+
+def test_snapshot_allows_immutable_root_evidence_to_predate_dynamic_freshness() -> None:
+    value = snapshot()
+    payload = value.model_dump(mode="python")
+    payload["root_summary"]["observed_at"] = "2025-08-22T09:59:00Z"
+
+    validated = value.__class__.model_validate(payload)
+
+    assert validated.root_summary.observed_at == "2025-08-22T09:59:00Z"

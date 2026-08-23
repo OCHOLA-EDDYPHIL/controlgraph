@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 from controlgraph_canary.application.authority_store import RootCreationBundle
@@ -11,11 +12,14 @@ from controlgraph_canary.application.timeline import TimelineReadSlice
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.model_assistance import (
     ADVISOR_INVOCATION_REQUEST_V1,
+    DIAGNOSTIC_EVIDENCE_FACT_V1,
     DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
     DIAGNOSTIC_SNAPSHOT_V1,
     AdvisorInvocationRequestV1,
     AdvisorOperatorCommandV1,
     AdvisoryHealth,
+    DiagnosticEvidenceFactName,
+    DiagnosticEvidenceFactV1,
     DiagnosticEvidenceKind,
     DiagnosticEvidenceSummaryCode,
     DiagnosticEvidenceSummaryV1,
@@ -67,6 +71,7 @@ class M6DiagnosticSnapshotAssembler:
         target: TargetBinding,
         authority: M6AuthorityReader,
         timeline: M6TimelineReader,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
             type(target) is not TargetBinding
@@ -74,11 +79,13 @@ class M6DiagnosticSnapshotAssembler:
             or authority.target != target
             or not isinstance(timeline, M6TimelineReader)
             or timeline.target != target
+            or (clock is not None and not callable(clock))
         ):
             raise ValueError("M6 diagnostic snapshot configuration is invalid")
         self._target = target
         self._authority = authority
         self._timeline = timeline
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def assemble(
         self,
@@ -129,6 +136,7 @@ class M6DiagnosticSnapshotAssembler:
             raise ValueError("advisor timeline evidence is inconsistent")
 
         root_entries = _verified_entries(entries, TimelineEventType.AUTHORITY_ROOT_CREATED)
+        monitoring_entries = _verified_entries(entries, TimelineEventType.HEALTH_OBSERVED)
         health_entries = _verified_entries(entries, TimelineEventType.HEALTH_DECIDED)
         verifier_entries = _verified_entries(entries, TimelineEventType.VERIFICATION_RECORDED)
         receipt_entries = tuple(
@@ -144,9 +152,16 @@ class M6DiagnosticSnapshotAssembler:
             in {
                 TimelineVerificationStatus.VERIFIED,
                 TimelineVerificationStatus.AMBIGUOUS,
+                TimelineVerificationStatus.NOT_APPLICABLE,
             }
         )
-        if not root_entries or not health_entries or not verifier_entries or not receipt_entries:
+        if (
+            not root_entries
+            or not monitoring_entries
+            or not health_entries
+            or not verifier_entries
+            or not receipt_entries
+        ):
             raise ValueError("advisor evidence set is incomplete")
 
         plan = root.content.rollout_plan
@@ -164,10 +179,32 @@ class M6DiagnosticSnapshotAssembler:
             authority_revoked=authority.current_epoch > plan.initial_epoch,
             health=health,
         )
-        observed_at = command.requested_at
-        fresh_until = _utc_text(_utc(observed_at) + timedelta(seconds=_SNAPSHOT_LIFETIME_SECONDS))
-        target_entries = verifier_entries[-2:]
+        assembly_time = self._clock()
+        assembled_at = _utc_text(assembly_time)
+        fresh_until = _utc_text(
+            assembly_time.astimezone(UTC) + timedelta(seconds=_SNAPSHOT_LIFETIME_SECONDS)
+        )
+        target_entries = _latest_verification_entries(verifier_entries)
         receipt_entry = receipt_entries[-1]
+        monitoring_entry = monitoring_entries[-1]
+        if (
+            monitoring_entry.content.event.payload_sha256
+            != health_entry.content.event.payload_sha256
+        ):
+            raise ValueError("advisor health evidence is inconsistent")
+        health_evidence = (monitoring_entry, health_entry)
+        terminal_entry = _latest_terminal_entry(entries)
+        timeline_entries = tuple(
+            sorted(
+                {item.entry_id: item for item in (terminal_entry, entries[-1])}.values(),
+                key=lambda item: item.content.sequence,
+            )
+        )
+        consistency = _evidence_consistency(
+            target_entries,
+            terminal_entry=terminal_entry,
+            health=health,
+        )
         snapshot = DiagnosticSnapshotV1(
             schema_version=DIAGNOSTIC_SNAPSHOT_V1,
             snapshot_id=_snapshot_id(
@@ -190,50 +227,98 @@ class M6DiagnosticSnapshotAssembler:
             health=health,
             terminal_health=terminal_health,
             health_policy_sha256=plan.health_policy_sha256,
-            evidence_consistency=EvidenceConsistency.CONSISTENT,
-            assembled_at=observed_at,
+            evidence_consistency=consistency,
+            assembled_at=assembled_at,
             expires_at=fresh_until,
             root_summary=_summary(
                 DiagnosticEvidenceKind.ROOT,
                 root_entries[-1:],
                 source_sha256=root.root_sha256,
-                observed_at=observed_at,
                 fresh_until=fresh_until,
+                facts=(
+                    (
+                        root_entries[-1],
+                        DiagnosticEvidenceFactName.CANDIDATE_REVISION,
+                        plan.candidate_revision,
+                    ),
+                    (
+                        root_entries[-1],
+                        DiagnosticEvidenceFactName.INITIAL_EPOCH,
+                        str(plan.initial_epoch),
+                    ),
+                    (
+                        root_entries[-1],
+                        DiagnosticEvidenceFactName.STABLE_REVISION,
+                        plan.stable_revision,
+                    ),
+                ),
             ),
             target_summary=_summary(
                 DiagnosticEvidenceKind.TARGET,
                 target_entries,
                 source_sha256=_entry_set_sha256(target_entries),
-                observed_at=observed_at,
                 fresh_until=fresh_until,
+                facts=_verification_facts(target_entries),
             ),
             health_summary=_summary(
                 DiagnosticEvidenceKind.HEALTH,
-                health_entries[-1:],
-                source_sha256=health_entry.content.event.payload_sha256,
-                observed_at=observed_at,
+                health_evidence,
+                source_sha256=_entry_set_sha256(health_evidence),
                 fresh_until=fresh_until,
+                facts=(
+                    (
+                        health_entry,
+                        DiagnosticEvidenceFactName.HEALTH_STATUS,
+                        _required_display_value(health_entry, "OUTCOME"),
+                    ),
+                    (
+                        monitoring_entry,
+                        DiagnosticEvidenceFactName.MONITORING_COMPLETENESS,
+                        _required_display_value(monitoring_entry, "OBSERVATION"),
+                    ),
+                    (
+                        monitoring_entry,
+                        DiagnosticEvidenceFactName.MONITORING_WINDOW,
+                        _required_display_value(monitoring_entry, "WINDOW"),
+                    ),
+                ),
             ),
             receipt_summary=_summary(
                 DiagnosticEvidenceKind.RECEIPT,
                 receipt_entries[-1:],
                 source_sha256=receipt_entry.content.event.payload_sha256,
-                observed_at=observed_at,
                 fresh_until=fresh_until,
+                facts=_receipt_facts(receipt_entry),
             ),
             timeline_summary=_summary(
                 DiagnosticEvidenceKind.TIMELINE,
-                entries[-1:],
+                timeline_entries,
                 source_sha256=page.head.entry_sha256,
-                observed_at=observed_at,
                 fresh_until=fresh_until,
+                facts=(
+                    (
+                        entries[-1],
+                        DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
+                        str(page.head.sequence),
+                    ),
+                    (
+                        entries[-1],
+                        DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT,
+                        entries[-1].content.event.event_type.value,
+                    ),
+                    (
+                        terminal_entry,
+                        DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION,
+                        terminal_entry.content.event.terminal_classification.value,
+                    ),
+                ),
             ),
             verifier_summary=_summary(
                 DiagnosticEvidenceKind.VERIFIER,
-                verifier_entries[-2:],
-                source_sha256=_entry_set_sha256(verifier_entries[-2:]),
-                observed_at=observed_at,
+                target_entries,
+                source_sha256=_entry_set_sha256(target_entries),
                 fresh_until=fresh_until,
+                facts=_verification_facts(target_entries),
             ),
         )
         return AdvisorInvocationRequestV1(
@@ -276,6 +361,8 @@ def _rollout_state(
         return RolloutPhase.PROMOTED, 0, 100
     if terminal is TimelineTerminalClassification.RECOVERED:
         return RolloutPhase.STABLE, 100, 0
+    if terminal is TimelineTerminalClassification.AMBIGUOUS:
+        return RolloutPhase.UNKNOWN, 90, 10
     if authority_revoked:
         return RolloutPhase.REVOKED, 90, 10
     if health is AdvisoryHealth.UNHEALTHY:
@@ -288,8 +375,8 @@ def _summary(
     entries: tuple[TimelineEntryV1, ...],
     *,
     source_sha256: str,
-    observed_at: str,
     fresh_until: str,
+    facts: tuple[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str], ...],
 ) -> DiagnosticEvidenceSummaryV1:
     if not entries:
         raise ValueError("diagnostic summary source is empty")
@@ -300,16 +387,32 @@ def _summary(
             strict=True,
         )
     )[kind]
+    evidence_ids = {entry.entry_id: _evidence_id(kind, entry) for entry in entries}
     return DiagnosticEvidenceSummaryV1(
         schema_version=DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
         evidence_kind=kind,
-        evidence_ids=tuple(
-            f"cgdiag:{kind.value}:{entry.entry_sha256[:24]}" for entry in entries
-        ),
+        evidence_ids=tuple(evidence_ids[entry.entry_id] for entry in entries),
         source_sha256=source_sha256,
-        observed_at=observed_at,
+        observed_at=min(
+            (entry.content.event.occurred_at for entry in entries),
+            key=_utc,
+        ),
         fresh_until=fresh_until,
         summary_code=summary_code,
+        facts=tuple(
+            sorted(
+                (
+                    DiagnosticEvidenceFactV1(
+                        schema_version=DIAGNOSTIC_EVIDENCE_FACT_V1,
+                        evidence_id=evidence_ids[entry.entry_id],
+                        name=name,
+                        value=value,
+                    )
+                    for entry, name, value in facts
+                ),
+                key=lambda item: (item.evidence_id, item.name.value),
+            )
+        ),
         redacted=True,
         untrusted_model_context=True,
     )
@@ -320,6 +423,88 @@ def _entry_set_sha256(entries: tuple[TimelineEntryV1, ...]) -> str:
     for entry in entries:
         digest.update(bytes.fromhex(entry.entry_sha256))
     return digest.hexdigest()
+
+
+def _evidence_id(kind: DiagnosticEvidenceKind, entry: TimelineEntryV1) -> str:
+    return f"cgdiag:{kind.value}:{entry.entry_sha256[:24]}"
+
+
+def _verification_facts(
+    entries: tuple[TimelineEntryV1, ...],
+) -> tuple[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str], ...]:
+    facts: list[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str]] = []
+    for entry in entries:
+        facts.extend(
+            (
+                (
+                    entry,
+                    DiagnosticEvidenceFactName.VERIFICATION_KIND,
+                    _required_display_value(entry, "OBSERVATION"),
+                ),
+                (
+                    entry,
+                    DiagnosticEvidenceFactName.VERIFICATION_VERDICT,
+                    _required_display_value(entry, "OUTCOME"),
+                ),
+            )
+        )
+    return tuple(facts)
+
+
+def _receipt_facts(
+    entry: TimelineEntryV1,
+) -> tuple[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str], ...]:
+    return (
+        (
+            entry,
+            DiagnosticEvidenceFactName.RECEIPT_OUTCOME,
+            _required_display_value(entry, "OUTCOME"),
+        ),
+    )
+
+
+def _latest_verification_entries(
+    entries: tuple[TimelineEntryV1, ...],
+) -> tuple[TimelineEntryV1, ...]:
+    selected: dict[str, TimelineEntryV1] = {}
+    for entry in entries:
+        kind = _display_value(entry, "OBSERVATION")
+        if kind in {"CONFIGURATION", "PROBE"}:
+            selected[kind] = entry
+    if set(selected) != {"CONFIGURATION", "PROBE"}:
+        raise ValueError("advisor target evidence is incomplete")
+    return tuple(sorted(selected.values(), key=lambda item: item.content.sequence))
+
+
+def _latest_terminal_entry(entries: tuple[TimelineEntryV1, ...]) -> TimelineEntryV1:
+    return next(
+        (
+            entry
+            for entry in reversed(entries)
+            if entry.content.event.event_type is TimelineEventType.TERMINAL_CLASSIFIED
+        ),
+        entries[-1],
+    )
+
+
+def _evidence_consistency(
+    verifier_entries: tuple[TimelineEntryV1, ...],
+    *,
+    terminal_entry: TimelineEntryV1,
+    health: AdvisoryHealth,
+) -> EvidenceConsistency:
+    terminal = terminal_entry.content.event.terminal_classification
+    verdicts = {_required_display_value(entry, "OUTCOME") for entry in verifier_entries}
+    if "MISMATCH" in verdicts:
+        return EvidenceConsistency.CONFLICTING
+    if (
+        terminal is TimelineTerminalClassification.AMBIGUOUS
+        or terminal is TimelineTerminalClassification.NONE
+        or health in {AdvisoryHealth.UNKNOWN, AdvisoryHealth.AMBIGUOUS}
+        or verdicts.intersection({"UNAVAILABLE", "INCONCLUSIVE"})
+    ):
+        return EvidenceConsistency.INCOMPLETE
+    return EvidenceConsistency.CONSISTENT
 
 
 def _snapshot_id(root_sha256: str, epoch: int, head_sha256: str, request_id: str) -> str:
@@ -347,12 +532,21 @@ def _display_value(entry: TimelineEntryV1, name: str) -> str | None:
     )
 
 
+def _required_display_value(entry: TimelineEntryV1, name: str) -> str:
+    value = _display_value(entry, name)
+    if value is None:
+        raise ValueError("advisor evidence field is unavailable")
+    return value
+
+
 def _utc(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
 
 def _utc_text(value: datetime) -> str:
-    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("advisor assembly clock must be timezone-aware")
+    return value.astimezone(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 __all__ = ["M6DiagnosticSnapshotAssembler"]

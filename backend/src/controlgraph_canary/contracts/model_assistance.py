@@ -25,12 +25,10 @@ from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.models import TargetBinding
 
 DIAGNOSTIC_EVIDENCE_SUMMARY_V1: Final = "controlgraph.diagnostic-evidence-summary/v1"
+DIAGNOSTIC_EVIDENCE_FACT_V1: Final = "controlgraph.diagnostic-evidence-fact/v1"
 DIAGNOSTIC_SNAPSHOT_V1: Final = "controlgraph.diagnostic-snapshot/v1"
 DIAGNOSTIC_TOOL_INPUT_V1: Final = "controlgraph.diagnostic-tool-input/v1"
 DIAGNOSTIC_TOOL_RESULT_V1: Final = "controlgraph.diagnostic-tool-result/v1"
-VERIFIED_DIAGNOSTIC_EVIDENCE_V1: Final = (
-    "controlgraph.verified-diagnostic-evidence/v1"
-)
 DIAGNOSTIC_TOOL_DEFINITION_V1: Final = "controlgraph.diagnostic-tool-definition/v1"
 DIAGNOSTIC_REGISTRY_V1: Final = "controlgraph.diagnostic-registry/v1"
 ADVISOR_INVOCATION_REQUEST_V1: Final = "controlgraph.advisor-invocation-request/v1"
@@ -100,6 +98,23 @@ class DiagnosticEvidenceSummaryCode(StrEnum):
     RECEIPT_RECORD_VERIFIED = "receipt_record_verified"
     TIMELINE_PROJECTION_VERIFIED = "timeline_projection_verified"
     VERIFIER_EVIDENCE_VERIFIED = "verifier_evidence_verified"
+
+
+class DiagnosticEvidenceFactName(StrEnum):
+    """Closed fact names that may be exposed from verified M6 records."""
+
+    STABLE_REVISION = "stable_revision"
+    CANDIDATE_REVISION = "candidate_revision"
+    INITIAL_EPOCH = "initial_epoch"
+    VERIFICATION_KIND = "verification_kind"
+    VERIFICATION_VERDICT = "verification_verdict"
+    MONITORING_COMPLETENESS = "monitoring_completeness"
+    MONITORING_WINDOW = "monitoring_window"
+    HEALTH_STATUS = "health_status"
+    RECEIPT_OUTCOME = "receipt_outcome"
+    TIMELINE_HEAD_SEQUENCE = "timeline_head_sequence"
+    TIMELINE_LATEST_EVENT = "timeline_latest_event"
+    TERMINAL_CLASSIFICATION = "terminal_classification"
 
 
 class DiagnosticToolId(StrEnum):
@@ -200,6 +215,13 @@ class ModelAssistanceLifecycle(StrEnum):
     DISPOSITION_REPLAYED = "disposition_replayed"
 
 
+class ModelAssistanceActorRole(StrEnum):
+    """Authenticated actor class responsible for one audit lifecycle event."""
+
+    ADVISOR = "advisor"
+    OPERATOR = "operator"
+
+
 class ToolCallStatus(StrEnum):
     """Sanitized outcome of one allowlisted tool call."""
 
@@ -208,8 +230,102 @@ class ToolCallStatus(StrEnum):
     FAILED = "failed"
 
 
+class DiagnosticEvidenceFactV1(StrictContractModel):
+    """One bounded fact copied from an identified M6 record."""
+
+    schema_version: Literal["controlgraph.diagnostic-evidence-fact/v1"]
+    evidence_id: Identifier
+    name: DiagnosticEvidenceFactName
+    value: ShortText
+
+    @model_validator(mode="after")
+    def validate_value(self) -> Self:
+        closed_values = {
+            DiagnosticEvidenceFactName.VERIFICATION_KIND: {
+                "CONFIGURATION",
+                "PROBE",
+            },
+            DiagnosticEvidenceFactName.VERIFICATION_VERDICT: {
+                "MATCH",
+                "MISMATCH",
+                "UNAVAILABLE",
+                "INCONCLUSIVE",
+            },
+            DiagnosticEvidenceFactName.MONITORING_COMPLETENESS: {
+                "COMPLETE",
+                "PARTIAL",
+                "MISSING",
+            },
+            DiagnosticEvidenceFactName.HEALTH_STATUS: {
+                "healthy",
+                "unhealthy",
+                "wait",
+                "insufficient-evidence",
+            },
+            DiagnosticEvidenceFactName.RECEIPT_OUTCOME: {
+                "CLAIMED",
+                "DENIED",
+                "APPLIED",
+                "VERIFIED",
+                "FAILED_SAFE",
+                "AMBIGUOUS",
+            },
+            DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT: {
+                "AUTHORITY_ROOT_CREATED",
+                "AUTHORITY_EPOCH_ADVANCED",
+                "CAPABILITY_ISSUED",
+                "TASK_CREATED",
+                "TASK_DELIVERED",
+                "HEALTH_OBSERVED",
+                "HEALTH_DECIDED",
+                "MUTATION_REQUESTED",
+                "MUTATION_APPLIED",
+                "MUTATION_DENIED",
+                "MUTATION_AMBIGUOUS",
+                "RECOVERY_INTENT_CREATED",
+                "RECOVERY_TASK_CREATED",
+                "RECOVERY_APPLIED",
+                "VERIFICATION_RECORDED",
+                "TERMINAL_CLASSIFIED",
+                "MODEL_ASSISTANCE_RECORDED",
+                "OPERATOR_ACTION_RECORDED",
+            },
+            DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION: {
+                "NONE",
+                "PROMOTED",
+                "RECOVERED",
+                "REVOKED",
+                "DENIED",
+                "FAILED_SAFE",
+                "AMBIGUOUS",
+            },
+        }
+        if self.name in closed_values and self.value not in closed_values[self.name]:
+            raise ValueError("diagnostic evidence fact value is outside its domain")
+        if self.name in {
+            DiagnosticEvidenceFactName.INITIAL_EPOCH,
+            DiagnosticEvidenceFactName.MONITORING_WINDOW,
+            DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
+        } and (not self.value.isascii() or not self.value.isdigit()):
+            raise ValueError("diagnostic evidence numeric fact is invalid")
+        if (
+            self.name
+            in {
+                DiagnosticEvidenceFactName.STABLE_REVISION,
+                DiagnosticEvidenceFactName.CANDIDATE_REVISION,
+            }
+            and re.fullmatch(
+                r"controlgraph-reference-target-(?:stable|candidate)(?:-v[1-9][0-9]*)?",
+                self.value,
+            )
+            is None
+        ):
+            raise ValueError("diagnostic evidence revision fact is invalid")
+        return self
+
+
 class DiagnosticEvidenceSummaryV1(StrictContractModel):
-    """One content-free reference to validated records from an M6 evidence class."""
+    """Bounded facts and citations from one validated M6 evidence class."""
 
     schema_version: Literal["controlgraph.diagnostic-evidence-summary/v1"]
     evidence_kind: DiagnosticEvidenceKind
@@ -218,6 +334,7 @@ class DiagnosticEvidenceSummaryV1(StrictContractModel):
     observed_at: UtcSecond
     fresh_until: UtcSecond
     summary_code: DiagnosticEvidenceSummaryCode
+    facts: Annotated[tuple[DiagnosticEvidenceFactV1, ...], Field(min_length=1, max_length=16)]
     redacted: Literal[True]
     untrusted_model_context: Literal[True]
 
@@ -236,38 +353,43 @@ class DiagnosticEvidenceSummaryV1(StrictContractModel):
         )[self.evidence_kind]
         if self.summary_code is not expected_code:
             raise ValueError("diagnostic summary code does not match its evidence class")
-        return self
-
-
-class VerifiedDiagnosticEvidenceV1(StrictContractModel):
-    """Metadata returned only after a durable M6 signature has been verified."""
-
-    schema_version: Literal["controlgraph.verified-diagnostic-evidence/v1"]
-    evidence: DiagnosticEvidenceSummaryV1
-    durable_record_sha256: Sha256Digest
-    signature_sha256: Sha256Digest
-    signing_key_version: Annotated[
-        str,
-        StringConstraints(
-            min_length=64,
-            max_length=512,
-            pattern=(
-                r"^projects/controlgraph-canary-[a-z0-9]{6,10}/locations/us-central1/"
-                r"keyRings/[a-z0-9-]+/cryptoKeys/evidence-signing/cryptoKeyVersions/"
-                r"[1-9][0-9]*$"
-            ),
-        ),
-    ]
-    verified_at: UtcSecond
-    verification_status: Literal["verified"]
-
-    @model_validator(mode="after")
-    def validate_proof(self) -> Self:
+        fact_keys = tuple((fact.evidence_id, fact.name.value) for fact in self.facts)
         if (
-            self.durable_record_sha256 != self.evidence.source_sha256
-            or _utc(self.verified_at) < _utc(self.evidence.observed_at)
+            any(fact.evidence_id not in self.evidence_ids for fact in self.facts)
+            or len(set(fact_keys)) != len(fact_keys)
+            or fact_keys != tuple(sorted(fact_keys))
         ):
-            raise ValueError("verified diagnostic evidence binding is invalid")
+            raise ValueError("diagnostic evidence facts are not canonically bound")
+        required = {
+            DiagnosticEvidenceKind.ROOT: {
+                DiagnosticEvidenceFactName.STABLE_REVISION,
+                DiagnosticEvidenceFactName.CANDIDATE_REVISION,
+                DiagnosticEvidenceFactName.INITIAL_EPOCH,
+            },
+            DiagnosticEvidenceKind.TARGET: {
+                DiagnosticEvidenceFactName.VERIFICATION_KIND,
+                DiagnosticEvidenceFactName.VERIFICATION_VERDICT,
+            },
+            DiagnosticEvidenceKind.HEALTH: {
+                DiagnosticEvidenceFactName.MONITORING_COMPLETENESS,
+                DiagnosticEvidenceFactName.MONITORING_WINDOW,
+                DiagnosticEvidenceFactName.HEALTH_STATUS,
+            },
+            DiagnosticEvidenceKind.RECEIPT: {
+                DiagnosticEvidenceFactName.RECEIPT_OUTCOME,
+            },
+            DiagnosticEvidenceKind.TIMELINE: {
+                DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
+                DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT,
+                DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION,
+            },
+            DiagnosticEvidenceKind.VERIFIER: {
+                DiagnosticEvidenceFactName.VERIFICATION_KIND,
+                DiagnosticEvidenceFactName.VERIFICATION_VERDICT,
+            },
+        }[self.evidence_kind]
+        if not required.issubset({fact.name for fact in self.facts}):
+            raise ValueError("diagnostic evidence facts are incomplete")
         return self
 
 
@@ -360,11 +482,11 @@ class DiagnosticSnapshotV1(StrictContractModel):
                 raise ValueError("diagnostic evidence class is misplaced")
             observed_at = _utc(summary.observed_at)
             fresh_until = _utc(summary.fresh_until)
+            if observed_at > assembled_at or fresh_until < expires_at:
+                raise ValueError("diagnostic evidence is stale or future-dated")
             if (
-                observed_at > assembled_at
-                or fresh_until < expires_at
-                or int((assembled_at - observed_at).total_seconds())
-                > MAX_EVIDENCE_AGE_SECONDS
+                expected_kind is not DiagnosticEvidenceKind.ROOT
+                and int((assembled_at - observed_at).total_seconds()) > MAX_EVIDENCE_AGE_SECONDS
             ):
                 raise ValueError("diagnostic evidence is stale or future-dated")
             all_ids.extend(summary.evidence_ids)
@@ -513,10 +635,7 @@ class AdvisorInvocationRequestV1(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_request(self) -> Self:
-        if (
-            self.snapshot_sha256 != canonical_sha256(self.snapshot)
-            or self.requested_at != self.snapshot.assembled_at
-        ):
+        if self.snapshot_sha256 != canonical_sha256(self.snapshot):
             raise ValueError("advisor request is not bound to its exact snapshot")
         return self
 
@@ -839,6 +958,8 @@ class ModelAssistanceTimelineAuditV1(StrictContractModel):
     epoch: PositiveSafeInteger
     request_id: Identifier
     interaction_id: Identifier
+    actor_role: ModelAssistanceActorRole
+    actor_id: Identifier
     occurred_at: UtcSecond
     command_sha256: Sha256Digest
     response_sha256: Sha256Digest
@@ -852,6 +973,15 @@ class ModelAssistanceTimelineAuditV1(StrictContractModel):
             self.root_id != f"cgroot:{self.root_sha256}"
             or self.interaction_id != self.audit.interaction_id
             or self.epoch <= 0
+            or re.fullmatch(r"actor:[0-9a-f]{64}", self.actor_id) is None
+            or (
+                self.lifecycle
+                in {
+                    ModelAssistanceLifecycle.DISPOSITION_RECORDED,
+                    ModelAssistanceLifecycle.DISPOSITION_REPLAYED,
+                }
+            )
+            != (self.actor_role is ModelAssistanceActorRole.OPERATOR)
             or (
                 self.lifecycle is ModelAssistanceLifecycle.COMPLETED
                 and (not completed or self.disposition is not OperatorDisposition.PENDING_REVIEW)
@@ -944,6 +1074,7 @@ __all__ = [
     "ADVISOR_RESPONSE_V1",
     "ADVISOR_TOOL_CALL_AUDIT_V1",
     "ADVISOR_VALIDATION_V1",
+    "DIAGNOSTIC_EVIDENCE_FACT_V1",
     "DIAGNOSTIC_EVIDENCE_SUMMARY_V1",
     "DIAGNOSTIC_REGISTRY_V1",
     "DIAGNOSTIC_SNAPSHOT_V1",
@@ -959,7 +1090,6 @@ __all__ = [
     "MODEL_ID",
     "MODEL_LOCATION",
     "PROMPT_VERSION",
-    "VERIFIED_DIAGNOSTIC_EVIDENCE_V1",
     "AdvisorDispositionCommandV1",
     "AdvisorDispositionInvocationV1",
     "AdvisorDispositionResultV1",
@@ -974,6 +1104,8 @@ __all__ = [
     "AdvisorToolCallAuditV1",
     "AdvisorValidationV1",
     "AdvisoryHealth",
+    "DiagnosticEvidenceFactName",
+    "DiagnosticEvidenceFactV1",
     "DiagnosticEvidenceKind",
     "DiagnosticEvidenceSummaryCode",
     "DiagnosticEvidenceSummaryV1",
@@ -987,6 +1119,7 @@ __all__ = [
     "DiagnosticToolResultV1",
     "EvidenceCitationV1",
     "EvidenceConsistency",
+    "ModelAssistanceActorRole",
     "ModelAssistanceLifecycle",
     "ModelAssistanceTimelineAuditV1",
     "OperatorDisposition",
@@ -994,7 +1127,6 @@ __all__ = [
     "RequestedOperatorAction",
     "RolloutPhase",
     "ToolCallStatus",
-    "VerifiedDiagnosticEvidenceV1",
     "diagnostic_model_context",
     "diagnostic_registry_v1",
 ]

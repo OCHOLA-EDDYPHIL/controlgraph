@@ -21,7 +21,10 @@ from controlgraph_canary.contracts.independent_verification import (
     SignedIndependentVerificationEvidenceV1,
     VerifiedIndependentVerificationEvidenceV1,
 )
-from controlgraph_canary.contracts.model_assistance import ModelAssistanceTimelineAuditV1
+from controlgraph_canary.contracts.model_assistance import (
+    ModelAssistanceActorRole,
+    ModelAssistanceTimelineAuditV1,
+)
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
@@ -225,6 +228,7 @@ def _projection(
     display_fields: tuple[TimelineDisplayFieldV1, ...],
     policy_set: TimelineEvidencePolicySetV1,
     retained_source: StrictContractModel | None = None,
+    actor_id: str | None = None,
 ) -> TimelineProjection:
     evidence_class = _EVENT_CLASS[event_type]
     if target != policy_set.target:
@@ -251,7 +255,7 @@ def _projection(
         evidence_class=evidence_class,
         target=target,
         actor_role=actor_role,
-        actor_id=_actor_id(actor),
+        actor_id=actor_id or _actor_id(actor),
         actor_data_class=TimelineAudience.SECURITY_AUDIT,
         root_id=root_id,
         root_sha256=root_sha256,
@@ -1400,10 +1404,12 @@ def project_model_assistance(
         source_id=audit.event_id,
         event_type=TimelineEventType.MODEL_ASSISTANCE_RECORDED,
         target=audit.target,
-        actor_role=TimelineActorRole.ADVISOR,
-        actor=(
-            f"controlgraph-advisor@{audit.target.project_id}.iam.gserviceaccount.com"
+        actor_role=(
+            TimelineActorRole.OPERATOR
+            if audit.actor_role is ModelAssistanceActorRole.OPERATOR
+            else TimelineActorRole.ADVISOR
         ),
+        actor=audit.actor_id,
         root_id=audit.root_id,
         root_sha256=audit.root_sha256,
         epoch=audit.epoch,
@@ -1446,6 +1452,7 @@ def project_model_assistance(
             )
         ),
         policy_set=policy_set,
+        actor_id=audit.actor_id,
     )
 
 

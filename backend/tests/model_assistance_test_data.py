@@ -12,12 +12,14 @@ from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.model_assistance import (
     ADVISOR_INVOCATION_REQUEST_V1,
     ADVISOR_RECOMMENDATION_V1,
+    DIAGNOSTIC_EVIDENCE_FACT_V1,
     DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
     DIAGNOSTIC_SNAPSHOT_V1,
-    VERIFIED_DIAGNOSTIC_EVIDENCE_V1,
     AdvisorInvocationRequestV1,
     AdvisorRecommendationV1,
     AdvisoryHealth,
+    DiagnosticEvidenceFactName,
+    DiagnosticEvidenceFactV1,
     DiagnosticEvidenceKind,
     DiagnosticEvidenceSummaryCode,
     DiagnosticEvidenceSummaryV1,
@@ -27,7 +29,6 @@ from controlgraph_canary.contracts.model_assistance import (
     EvidenceConsistency,
     RequestedOperatorAction,
     RolloutPhase,
-    VerifiedDiagnosticEvidenceV1,
 )
 from controlgraph_canary.contracts.models import TargetBinding
 
@@ -61,14 +62,59 @@ def evidence_summary(
             strict=True,
         )
     )[kind]
+    evidence_id = f"{kind.value}-record-1"
+    fact_values = {
+        DiagnosticEvidenceKind.ROOT: (
+            (
+                DiagnosticEvidenceFactName.CANDIDATE_REVISION,
+                "controlgraph-reference-target-candidate",
+            ),
+            (DiagnosticEvidenceFactName.INITIAL_EPOCH, "1"),
+            (DiagnosticEvidenceFactName.STABLE_REVISION, "controlgraph-reference-target-stable"),
+        ),
+        DiagnosticEvidenceKind.TARGET: (
+            (DiagnosticEvidenceFactName.VERIFICATION_KIND, "CONFIGURATION"),
+            (DiagnosticEvidenceFactName.VERIFICATION_VERDICT, "MATCH"),
+        ),
+        DiagnosticEvidenceKind.HEALTH: (
+            (DiagnosticEvidenceFactName.HEALTH_STATUS, "healthy"),
+            (DiagnosticEvidenceFactName.MONITORING_COMPLETENESS, "COMPLETE"),
+            (DiagnosticEvidenceFactName.MONITORING_WINDOW, "1"),
+        ),
+        DiagnosticEvidenceKind.RECEIPT: ((DiagnosticEvidenceFactName.RECEIPT_OUTCOME, "VERIFIED"),),
+        DiagnosticEvidenceKind.TIMELINE: (
+            (DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION, "PROMOTED"),
+            (DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE, "1"),
+            (DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT, "TERMINAL_CLASSIFIED"),
+        ),
+        DiagnosticEvidenceKind.VERIFIER: (
+            (DiagnosticEvidenceFactName.VERIFICATION_KIND, "PROBE"),
+            (DiagnosticEvidenceFactName.VERIFICATION_VERDICT, "MATCH"),
+        ),
+    }[kind]
+    facts = tuple(
+        sorted(
+            (
+                DiagnosticEvidenceFactV1(
+                    schema_version=DIAGNOSTIC_EVIDENCE_FACT_V1,
+                    evidence_id=evidence_id,
+                    name=name,
+                    value=value,
+                )
+                for name, value in fact_values
+            ),
+            key=lambda fact: (fact.evidence_id, fact.name.value),
+        )
+    )
     return DiagnosticEvidenceSummaryV1(
         schema_version=DIAGNOSTIC_EVIDENCE_SUMMARY_V1,
         evidence_kind=kind,
-        evidence_ids=(f"{kind.value}-record-1",),
+        evidence_ids=(evidence_id,),
         source_sha256=digest_character * 64,
         observed_at="2026-08-22T09:59:00Z",
         fresh_until="2026-08-22T10:05:00Z",
         summary_code=summary_code,
+        facts=facts,
         redacted=True,
         untrusted_model_context=True,
     )
@@ -124,23 +170,12 @@ class VerifiedEvidenceReader:
         self,
         request: AdvisorInvocationRequestV1,
         evidence_kind: DiagnosticEvidenceKind,
-    ) -> VerifiedDiagnosticEvidenceV1:
+    ) -> DiagnosticEvidenceSummaryV1:
         self.calls.append(evidence_kind)
         summary = {
             item.evidence_kind: item for item in request.snapshot.evidence_summaries
         }[evidence_kind]
-        return VerifiedDiagnosticEvidenceV1(
-            schema_version=VERIFIED_DIAGNOSTIC_EVIDENCE_V1,
-            evidence=summary,
-            durable_record_sha256=summary.source_sha256,
-            signature_sha256="d" * 64,
-            signing_key_version=(
-                f"projects/{PROJECT_ID}/locations/us-central1/keyRings/controlgraph-signing/"
-                "cryptoKeys/evidence-signing/cryptoKeyVersions/1"
-            ),
-            verified_at="2026-08-22T10:00:00Z",
-            verification_status="verified",
-        )
+        return summary
 
 
 def verified_evidence_reader() -> VerifiedEvidenceReader:

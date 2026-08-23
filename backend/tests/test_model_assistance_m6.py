@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
+import pytest
 from root_v2_test_data import make_root_v3_records
 from timeline_test_data import timeline_event
 
@@ -77,25 +79,62 @@ def test_assembler_projects_one_current_m6_root_and_timeline() -> None:
         creation_result=StoredRecord(records.creation_result, 0),
     )
     shapes = (
-        (TimelineEventType.AUTHORITY_ROOT_CREATED, "EVIDENCE", "created"),
-        (TimelineEventType.MUTATION_APPLIED, None, "VERIFIED"),
-        (TimelineEventType.HEALTH_DECIDED, "HEALTH_ATTESTATION", "healthy"),
+        (
+            TimelineEventType.AUTHORITY_ROOT_CREATED,
+            "EVIDENCE",
+            (_field(TimelineDisplayFieldName.OUTCOME, "created"),),
+        ),
+        (
+            TimelineEventType.MUTATION_APPLIED,
+            None,
+            (_field(TimelineDisplayFieldName.OUTCOME, "VERIFIED"),),
+        ),
+        (
+            TimelineEventType.HEALTH_OBSERVED,
+            "HEALTH_ATTESTATION",
+            (
+                _field(TimelineDisplayFieldName.OBSERVATION, "COMPLETE"),
+                _field(TimelineDisplayFieldName.WINDOW, "1"),
+            ),
+        ),
+        (
+            TimelineEventType.HEALTH_DECIDED,
+            "HEALTH_ATTESTATION",
+            (_field(TimelineDisplayFieldName.OUTCOME, "healthy"),),
+        ),
         (
             TimelineEventType.VERIFICATION_RECORDED,
             "INDEPENDENT_VERIFICATION",
-            "VERIFIED",
+            (
+                _field(TimelineDisplayFieldName.OBSERVATION, "CONFIGURATION"),
+                _field(TimelineDisplayFieldName.OUTCOME, "MATCH"),
+            ),
+        ),
+        (
+            TimelineEventType.VERIFICATION_RECORDED,
+            "INDEPENDENT_VERIFICATION",
+            (
+                _field(TimelineDisplayFieldName.OBSERVATION, "PROBE"),
+                _field(TimelineDisplayFieldName.OUTCOME, "MATCH"),
+            ),
         ),
     )
     entries = []
     predecessor = None
-    for sequence, (event_type, purpose, outcome) in enumerate(shapes, start=1):
+    health_payload_sha256 = None
+    for sequence, (event_type, purpose, fields) in enumerate(shapes, start=1):
         base = timeline_event(
             sequence,
             target=target,
             event_type=event_type,
-            display_fields=(
-                _field(TimelineDisplayFieldName.OUTCOME, outcome),
-                _field(TimelineDisplayFieldName.SUMMARY, "Bound M6 evidence"),
+            display_fields=tuple(
+                sorted(
+                    (
+                        *fields,
+                        _field(TimelineDisplayFieldName.SUMMARY, "Bound M6 evidence"),
+                    ),
+                    key=lambda field: field.name.value,
+                )
             ),
         )
         signature = base.signature
@@ -103,12 +142,22 @@ def test_assembler_projects_one_current_m6_root_and_timeline() -> None:
             signature = signature.model_copy(update={"purpose": purpose})
         if purpose is None:
             signature = None
+        payload_sha256 = base.payload_sha256
+        if event_type is TimelineEventType.HEALTH_OBSERVED:
+            health_payload_sha256 = payload_sha256
+        elif event_type is TimelineEventType.HEALTH_DECIDED:
+            assert health_payload_sha256 is not None
+            payload_sha256 = health_payload_sha256
+            assert signature is not None
+            signature = signature.model_copy(update={"payload_sha256": payload_sha256})
         event = TimelineEventV1.model_validate(
             {
                 **base.model_dump(mode="python"),
                 "root_id": root.root_id,
                 "root_sha256": root.root_sha256,
                 "epoch": records.authority.current_epoch,
+                "occurred_at": f"2026-08-22T09:59:{sequence:02d}Z",
+                "payload_sha256": payload_sha256,
                 "signature": signature,
                 "verification_status": TimelineVerificationStatus.VERIFIED,
             }
@@ -138,7 +187,7 @@ def test_assembler_projects_one_current_m6_root_and_timeline() -> None:
         root_id=root.root_id,
         expected_root_sha256=root.root_sha256,
         expected_epoch=records.authority.current_epoch,
-        requested_at="2026-08-22T10:00:00Z",
+        requested_at="2026-08-22T09:58:00Z",
     )
 
     request = asyncio.run(
@@ -146,11 +195,63 @@ def test_assembler_projects_one_current_m6_root_and_timeline() -> None:
             target=target,
             authority=_Authority(bundle),
             timeline=_Timeline(head, tuple(entries)),
+            clock=lambda: datetime(2026, 8, 22, 10, 0, tzinfo=UTC),
         ).assemble(command)
     )
 
     assert request.snapshot.root_sha256 == root.root_sha256
     assert request.snapshot.health is AdvisoryHealth.HEALTHY
     assert request.snapshot.rollout_phase is RolloutPhase.CANARY
-    assert request.snapshot.evidence_consistency.value == "consistent"
+    assert request.snapshot.evidence_consistency.value == "incomplete"
     assert len(request.snapshot.evidence_summaries) == 6
+    assert request.snapshot.assembled_at == "2026-08-22T10:00:00Z"
+    assert request.requested_at == "2026-08-22T09:58:00Z"
+    assert request.snapshot.health_summary.observed_at == "2026-08-22T09:59:03Z"
+    assert request.snapshot.target_summary.observed_at == "2026-08-22T09:59:05Z"
+    assert {
+        (fact.name.value, fact.value) for fact in request.snapshot.target_summary.facts
+    } == {
+        ("verification_kind", "CONFIGURATION"),
+        ("verification_kind", "PROBE"),
+        ("verification_verdict", "MATCH"),
+    }
+    assert {
+        (fact.name.value, fact.value) for fact in request.snapshot.health_summary.facts
+    } == {
+        ("health_status", "healthy"),
+        ("monitoring_completeness", "COMPLETE"),
+        ("monitoring_window", "1"),
+    }
+
+    stale_events = [entry.content.event for entry in entries]
+    stale_events[-2] = stale_events[-2].model_copy(
+        update={"occurred_at": "2026-08-22T09:54:59Z"}
+    )
+    stale_entries = []
+    stale_predecessor = None
+    for sequence, event in enumerate(stale_events, start=1):
+        entry = timeline_entry(
+            event,
+            sequence=sequence,
+            previous_entry_sha256=stale_predecessor,
+            recorded_at=f"2026-08-22T09:59:{sequence:02d}Z",
+        )
+        stale_entries.append(entry)
+        stale_predecessor = entry.entry_sha256
+    assert stale_predecessor is not None
+    stale_head = head.model_copy(
+        update={
+            "entry_id": stale_entries[-1].entry_id,
+            "entry_sha256": stale_predecessor,
+        }
+    )
+
+    with pytest.raises(ValueError, match="stale or future-dated"):
+        asyncio.run(
+            M6DiagnosticSnapshotAssembler(
+                target=target,
+                authority=_Authority(bundle),
+                timeline=_Timeline(stale_head, tuple(stale_entries)),
+                clock=lambda: datetime(2026, 8, 22, 10, 0, tzinfo=UTC),
+            ).assemble(command)
+        )

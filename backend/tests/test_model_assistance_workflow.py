@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -394,6 +395,14 @@ def test_disposition_is_compare_and_set_and_audits_replay() -> None:
     assert tuple(event.lifecycle for event in timeline.events[-2:]) == (
         ModelAssistanceLifecycle.DISPOSITION_RECORDED,
         ModelAssistanceLifecycle.DISPOSITION_REPLAYED,
+    )
+    projected = project_model_assistance(
+        timeline.events[-1],
+        policy_set=standard_timeline_evidence_policy_set(interaction.target),
+    )
+    assert projected.event.actor_role is TimelineActorRole.OPERATOR
+    assert projected.event.actor_id == (
+        f"actor:{hashlib.sha256(principal.email.encode('utf-8')).hexdigest()}"
     )
 
 

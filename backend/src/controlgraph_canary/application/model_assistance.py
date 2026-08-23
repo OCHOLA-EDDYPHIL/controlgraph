@@ -62,6 +62,7 @@ from controlgraph_canary.contracts.model_assistance import (
     DiagnosticToolInputV1,
     DiagnosticToolResultV1,
     EvidenceConsistency,
+    ModelAssistanceActorRole,
     ModelAssistanceLifecycle,
     ModelAssistanceTimelineAuditV1,
     OperatorDisposition,
@@ -69,7 +70,6 @@ from controlgraph_canary.contracts.model_assistance import (
     RequestedOperatorAction,
     RolloutPhase,
     ToolCallStatus,
-    VerifiedDiagnosticEvidenceV1,
     diagnostic_model_context,
     diagnostic_registry_v1,
 )
@@ -100,25 +100,13 @@ class DiagnosticToolError(RuntimeError):
 
 @runtime_checkable
 class VerifiedDiagnosticEvidenceReader(Protocol):
-    """Read only durable M6 records whose evidence signatures were verified."""
+    """Read one coordinator-verified, invocation-bound M6 evidence summary."""
 
     async def read_verified(
         self,
         request: AdvisorInvocationRequestV1,
         evidence_kind: DiagnosticEvidenceKind,
-    ) -> VerifiedDiagnosticEvidenceV1 | DiagnosticEvidenceSummaryV1: ...
-
-
-class UnavailableDiagnosticEvidenceReader:
-    """Fail closed until a durable M6 evidence adapter is composed."""
-
-    async def read_verified(
-        self,
-        request: AdvisorInvocationRequestV1,
-        evidence_kind: DiagnosticEvidenceKind,
-    ) -> VerifiedDiagnosticEvidenceV1:
-        del request, evidence_kind
-        raise DiagnosticToolError("verified diagnostic evidence is unavailable")
+    ) -> DiagnosticEvidenceSummaryV1: ...
 
 
 class SnapshotDiagnosticEvidenceReader:
@@ -221,14 +209,9 @@ class InvocationDiagnosticRegistry:
                 or len(self._calls) >= MAX_TOOL_CALLS
             ):
                 raise DiagnosticToolError("diagnostic tool call is outside its scope")
-            verified = await self._evidence_reader.read_verified(
+            summary = await self._evidence_reader.read_verified(
                 self._request,
                 definition.evidence_source,
-            )
-            summary = (
-                verified.evidence
-                if type(verified) is VerifiedDiagnosticEvidenceV1
-                else verified
             )
             if (
                 type(summary) is not DiagnosticEvidenceSummaryV1
@@ -834,6 +817,8 @@ class CoordinatorAdvisorWorkflow:
             ),
             disposition=result.disposition,
             occurred_at=command.recorded_at,
+            actor_role=ModelAssistanceActorRole.OPERATOR,
+            actor_identity=invocation.operator_identity,
         )
         await self._record_event(event)
         return result
@@ -880,6 +865,10 @@ class CoordinatorAdvisorWorkflow:
                 lifecycle=original_lifecycle,
                 disposition=OperatorDisposition.PENDING_REVIEW,
                 occurred_at=command.requested_at,
+                actor_role=ModelAssistanceActorRole.ADVISOR,
+                actor_identity=(
+                    f"controlgraph-advisor@{result.target.project_id}.iam.gserviceaccount.com"
+                ),
             )
         )
         if replay:
@@ -890,6 +879,10 @@ class CoordinatorAdvisorWorkflow:
                     lifecycle=ModelAssistanceLifecycle.REPLAYED,
                     disposition=OperatorDisposition.PENDING_REVIEW,
                     occurred_at=command.requested_at,
+                    actor_role=ModelAssistanceActorRole.ADVISOR,
+                    actor_identity=(
+                        f"controlgraph-advisor@{result.target.project_id}.iam.gserviceaccount.com"
+                    ),
                 )
             )
 
@@ -1107,6 +1100,8 @@ def _timeline_audit_event(
     lifecycle: ModelAssistanceLifecycle,
     disposition: OperatorDisposition,
     occurred_at: str,
+    actor_role: ModelAssistanceActorRole,
+    actor_identity: str,
 ) -> ModelAssistanceTimelineAuditV1:
     material = (
         f"{lifecycle.value}\0{result.interaction_id}\0{command.request_id}\0"
@@ -1123,6 +1118,8 @@ def _timeline_audit_event(
         epoch=result.epoch,
         request_id=command.request_id,
         interaction_id=result.interaction_id,
+        actor_role=actor_role,
+        actor_id=f"actor:{hashlib.sha256(actor_identity.encode('utf-8')).hexdigest()}",
         occurred_at=occurred_at,
         command_sha256=canonical_sha256(command),
         response_sha256=canonical_sha256(result.response),
@@ -1210,7 +1207,6 @@ __all__ = [
     "ModelAssistanceTimelineRecorder",
     "ReadOnlyAdvisorService",
     "SnapshotDiagnosticEvidenceReader",
-    "UnavailableDiagnosticEvidenceReader",
     "VerifiedDiagnosticEvidenceReader",
     "validate_recommendation",
 ]
