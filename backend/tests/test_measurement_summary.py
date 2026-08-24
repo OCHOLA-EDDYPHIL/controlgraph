@@ -107,7 +107,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, Any], dict[str, Any]
             ],
             "source_commit": "d" * 40,
             "target": {
-                "environment": "acceptance",
+                "environment": "nonprod",
                 "candidate_revision": "controlgraph-reference-target-candidate-v4",
                 "project_id": "controlgraph-canary-abc123",
                 "region": "us-central1",
