@@ -2223,7 +2223,7 @@ def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcom
     run.unreleased_root_ids.add(root_result.root.root_id)
     root = root_result.root
     terminal_idempotency_key: str | None = None
-    release_attempted = False
+    released = False
     try:
         load, apply_dispatch, apply_receipt, health = _health_load(
             run, case, mode="healthy", root_result=root_result
@@ -2257,7 +2257,6 @@ def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcom
             or promotion_receipt.receipt.observed_etag != traffic.provider_etag
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_PROMOTION_INVALID")
-        release_attempted = True
         release = _release_claim(
             run,
             case,
@@ -2266,6 +2265,7 @@ def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcom
             terminal_idempotency_key=terminal_idempotency_key,
             label="healthy",
         )
+        released = True
         run.unreleased_root_ids.discard(root.root_id)
         pages, raw = _read_timeline_evidence(run)
         terminal_result = _terminal_result(
@@ -2292,7 +2292,7 @@ def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcom
             terminal_result=terminal_result,
         )
     finally:
-        if terminal_idempotency_key is not None and not release_attempted:
+        if terminal_idempotency_key is not None and not released:
             try:
                 _release_claim(
                     run,
@@ -2313,7 +2313,7 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
     run.unreleased_root_ids.add(root_result.root.root_id)
     root = root_result.root
     terminal_idempotency_key: str | None = None
-    release_attempted = False
+    released = False
     try:
         load, apply_dispatch, apply_receipt, health = _health_load(
             run, case, mode="unhealthy", root_result=root_result
@@ -2341,7 +2341,6 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
         terminal_idempotency_key = recovery.idempotency_key
         traffic = _read_traffic(run, case, "recovered")
         _require_split(traffic, run.spec, stable=100, candidate=0)
-        release_attempted = True
         release = _release_claim(
             run,
             case,
@@ -2350,6 +2349,7 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
             terminal_idempotency_key=terminal_idempotency_key,
             label="unhealthy",
         )
+        released = True
         run.unreleased_root_ids.discard(root.root_id)
         pages, raw = _read_timeline_evidence(run)
         terminal_result = _terminal_result(
@@ -2392,7 +2392,7 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
             terminal_result=terminal_result,
         )
     finally:
-        if terminal_idempotency_key is not None and not release_attempted:
+        if terminal_idempotency_key is not None and not released:
             try:
                 _release_claim(
                     run,
@@ -2583,7 +2583,7 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
     run.root_ids.add(root_result.root.root_id)
     run.unreleased_root_ids.add(root_result.root.root_id)
     terminal_idempotency_key: str | None = None
-    release_attempted = False
+    released = False
     try:
         load, apply_dispatch, apply_receipt, health = _health_load(
             run, case, mode="healthy", root_result=root_result
@@ -2632,7 +2632,6 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
         terminal_idempotency_key = recovery_dispatch.idempotency_key
         recovered = _read_traffic(run, case, "revoked-recovered")
         _require_split(recovered, run.spec, stable=100, candidate=0)
-        release_attempted = True
         release = _release_claim(
             run,
             case,
@@ -2641,6 +2640,7 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
             terminal_idempotency_key=terminal_idempotency_key,
             label="revoked",
         )
+        released = True
         run.unreleased_root_ids.discard(root_result.root.root_id)
         run.revocation_root = root_result.root
         run.revocation_epoch = release.fenced_epoch
@@ -2680,7 +2680,7 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
             terminal_result=terminal_result,
         )
     finally:
-        if terminal_idempotency_key is not None and not release_attempted:
+        if terminal_idempotency_key is not None and not released:
             try:
                 _release_claim(
                     run,
