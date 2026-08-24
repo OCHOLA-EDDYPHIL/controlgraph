@@ -56,7 +56,7 @@ Run the same local gates as CI:
 (cd web && npm run test:ci)
 (cd web && npm run build)
 terraform -chdir=infra fmt -check -recursive
-python scripts/check_clean_room.py
+uv run --project backend --frozen python scripts/check_clean_room.py
 test "$(git rev-parse HEAD)" = "$CG_SOURCE_SHA"
 test -z "$(git status --porcelain=v1)"
 ```
@@ -140,15 +140,41 @@ Set coordinates from Terraform output rather than retyping them:
 ```bash
 CG_PROJECT_ID="$(jq -r '.project_id' "$CG_RUN_DIR/reference-target.json")"
 CG_PROJECT_NUMBER="$(terraform -chdir=infra/foundation output -raw project_number)"
+CG_ACCEPTANCE_IDENTITY="$(gcloud config get-value account)"
 CG_CLI=(uv run --project backend --frozen controlgraph-canary)
 ```
 
-Prepare and review `core-acceptance-spec.json` against the closed contract in
-`scripts/core_acceptance.py`. Its source commit, images, target, plan and policy artifact digests,
-seed, test clock, case order, duration bounds, and cost bounds must match this run. The hosted
-runner writes canonical command files under the external artifact directory and binds their
-evidence into one manifest. Both confirmations below are intentional because the command changes
-the disposable target:
+Place the exact reviewed canonical health-policy JSON under the external artifact directory, then
+generate the closed eight-case specification rather than hand-authoring it. The generator binds
+the source commit, five images, `nonprod` target and revisions, Terraform plan, policy, seed, test
+clock, case order, duration bounds, and cost bounds:
+
+```bash
+CG_POLICY_ARTIFACT="inputs/rollout-health-policy.json"
+CG_POLICY_SCHEMA_VERSION="$(jq -r '.schema_version' \
+  "$CG_RUN_DIR/artifacts/$CG_POLICY_ARTIFACT")"
+uv run --project backend --frozen python scripts/core_acceptance.py generate-spec \
+  --artifact-root "$CG_RUN_DIR/artifacts" \
+  --output "$CG_RUN_DIR/core-acceptance-spec.json" \
+  --project-id "$CG_PROJECT_ID" \
+  --source-commit "$CG_SOURCE_SHA" \
+  --stable-revision "$(jq -r '.stable_revision' "$CG_RUN_DIR/reference-target.json")" \
+  --candidate-revision "$(jq -r '.candidate_revision' "$CG_RUN_DIR/reference-target.json")" \
+  --controller-image "$(terraform -chdir=infra/runtime output -raw runtime_image)" \
+  --advisor-image "$(terraform -chdir=infra/runtime output -raw advisor_image)" \
+  --console-image "$(jq -r '.image' "$CG_RUN_DIR/operator-console.json")" \
+  --reference-stable-image "$(jq -r '.stable_image' "$CG_RUN_DIR/reference-target.json")" \
+  --reference-candidate-image "$(jq -r '.candidate_image' "$CG_RUN_DIR/reference-target.json")" \
+  --terraform-plan runtime-candidate-plan.json \
+  --policy-schema-version "$CG_POLICY_SCHEMA_VERSION" \
+  --policy-artifact "$CG_POLICY_ARTIFACT" \
+  --clock-start "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --random-seed 17
+```
+
+Review the generated specification before execution. The hosted runner writes canonical command
+files under the external artifact directory and binds their evidence into one manifest. Both
+confirmations below are intentional because the command changes the disposable target:
 
 ```bash
 CONTROLGRAPH_CORE_ACCEPTANCE_CONFIRM=RUN_CONTROLGRAPH_CORE_ACCEPTANCE \
@@ -162,6 +188,7 @@ uv run --project backend --frozen python scripts/core_acceptance.py execute \
   --subnetwork-resource "$(jq -r '.baseline_reset.subnetwork_resource' "$CG_RUN_DIR/reference-target.json")" \
   --verifier-service-account "$(terraform -chdir=infra/foundation output -json service_account_emails | jq -r '.verifier')" \
   --restricted-exporter-service-account "$(terraform -chdir=infra/foundation output -json service_account_emails | jq -r '.restricted_exporter')" \
+  --acceptance-identity "$CG_ACCEPTANCE_IDENTITY" \
   --confirm RUN_CONTROLGRAPH_CORE_ACCEPTANCE
 ```
 
@@ -218,6 +245,54 @@ jq -e '.schema_version == "controlgraph.target-traffic-read-result/v1"' \
 The verifier's `controlgraph.probe-attestation/v1`, its signed
 `controlgraph.independent-verification-evidence/v1`, the signed timeline source evidence, and the
 configuration readback must agree. The evidence-to-claim map is in [the demo](demo.md).
+
+## Prepare, rehearse, and finalize the bundle
+
+After the owner has published an annotated source tag for `$CG_SOURCE_SHA`, fetch it and verify its
+peeled commit before preparing the bundle. Build the external `PREPARED` specification only from
+the real artifacts and tracked source files produced above. Do not create a rehearsal file or a
+placeholder for one; a prepared specification omits both `PREPARED_BUNDLE` and
+`CLEAN_ROOM_REHEARSAL`.
+
+```bash
+CG_SOURCE_TAG="${CG_SOURCE_TAG:?set CG_SOURCE_TAG to the owner-published annotated tag}"
+git fetch --tags origin
+test "$(git cat-file -t "refs/tags/$CG_SOURCE_TAG")" = "tag"
+test "$(git rev-parse "refs/tags/$CG_SOURCE_TAG^{commit}")" = "$CG_SOURCE_SHA"
+set +e
+uv run --project backend --frozen python scripts/frozen_bundle.py \
+  --repo . \
+  --spec "$CG_RUN_DIR/frozen-bundle-prepared-spec.json" \
+  --artifact-root "$CG_RUN_DIR/artifacts" \
+  --output "$CG_RUN_DIR/artifacts/prepared-bundle.json"
+CG_PREPARED_STATUS=$?
+set -e
+test "$CG_PREPARED_STATUS" -eq 1
+jq -e '.stage == "PREPARED" and .status == "PENDING" and
+  .pending == ["CLEAN_ROOM_REHEARSAL"]' \
+  "$CG_RUN_DIR/artifacts/prepared-bundle.json"
+```
+
+Transfer the source tag, prepared bundle, specification, and checksum-bound artifact directory to
+a fresh environment. There, rerun the prepared verification, deploy only its frozen image and
+Terraform inputs, execute the same acceptance flow, validate every evidence link, and record the
+actual `controlgraph.clean-room-rehearsal/v1` sign-off. That record must cite the SHA-256 of
+`prepared-bundle.json`; it is created only after those steps pass.
+
+Create the external `FINAL` specification by preserving every prepared source, artifact, and claim
+binding and adding the real `PREPARED_BUNDLE` and `CLEAN_ROOM_REHEARSAL` artifacts with their
+digests. Finalization succeeds only when the prepared content is unchanged and the sign-off binds
+that prepared bundle:
+
+```bash
+uv run --project backend --frozen python scripts/frozen_bundle.py \
+  --repo . \
+  --spec "$CG_RUN_DIR/frozen-bundle-final-spec.json" \
+  --artifact-root "$CG_RUN_DIR/artifacts" \
+  --output "$CG_RUN_DIR/frozen-bundle.json"
+jq -e '.stage == "FINAL" and .status == "READY" and .pending == []' \
+  "$CG_RUN_DIR/frozen-bundle.json"
+```
 
 ## Cleanup
 
