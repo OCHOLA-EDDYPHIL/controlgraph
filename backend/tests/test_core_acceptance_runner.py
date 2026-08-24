@@ -1204,3 +1204,31 @@ def test_hosted_probe_records_stay_within_restricted_canonical_json() -> None:
     encoded = runner._canonical_object(runner._json_value(record))
 
     assert b'"status":"COMPLETE"' in encoded
+
+
+def test_hosted_policy_binding_compares_plain_artifact_digest() -> None:
+    """The spec artifact digest is plain SHA-256 of canonical policy bytes.
+
+    The hosted root check must compare it with the same plain digest of the
+    returned root policy, never with the domain-separated ``canonical_sha256``.
+    """
+
+    from controlgraph_canary.contracts.codec import (
+        canonical_json_bytes,
+        canonical_sha256,
+    )
+    from controlgraph_canary.contracts.health import create_rollout_health_policy_v2
+
+    policy = create_rollout_health_policy_v2()
+    artifact_sha256 = hashlib.sha256(canonical_json_bytes(policy)).hexdigest()
+
+    assert artifact_sha256 != canonical_sha256(policy)
+    vector = json.loads(
+        (SOURCE_ROOT / "contract-fixtures" / "health-v1" / "golden.json").read_text()
+    )
+    canonical = next(
+        item["canonical"]
+        for item in vector["vectors"]
+        if item["model"] == "RolloutHealthPolicyV2"
+    )
+    assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == artifact_sha256
