@@ -1,74 +1,64 @@
 # Native-cloud comparison
 
-## Purpose
+## Scope
 
-ControlGraph composes Google Cloud controls rather than replacing them. This comparison states
-which guarantee each native mechanism supplies, which question it does not answer, and the narrow
-additional decision ControlGraph is designed to make.
+ControlGraph composes Google Cloud controls rather than replacing them. [Cloud Run](https://docs.cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration)
+remains the traffic and serving control plane; IAM, Cloud Tasks, Cloud KMS, Cloud Monitoring, and
+Cloud Audit Logs retain their native responsibilities. [Cloud Deploy](https://docs.cloud.google.com/deploy/docs/overview)
+is included solely as the provider's native release-orchestration comparison.
 
-The comparison is architectural. The current scaffold does not yet deploy or exercise the hosted
-mechanisms listed here. Provider parameters, regional availability, IAM permissions, quotas, and
-failure behavior must be confirmed against official Google Cloud documentation before a live
-configuration is accepted.
+In this page, **inherited** means enforced by a Google Cloud service, **enforced** means a
+ControlGraph request is admitted or denied by its closed application boundary, and **observed**
+means a separate read-only ControlGraph path records or classifies provider state. The comparison
+does not claim production readiness, exactly-once provider mutation, or a transaction spanning
+Firestore and Cloud Run.
 
 ## Comparison
 
-| Mechanism | Native guarantee used by ControlGraph | What it does not establish | ControlGraph addition |
-|---|---|---|---|
-| Google Cloud IAM | A principal may call a permitted API on a permitted resource under the configured policy. | That a queued request remains authorized by its rollout root when it eventually executes; field-level canary intent; immutable lineage. | Root-scoped capabilities, exact target and action bindings, and a fresh epoch decision immediately before mutation. |
-| Cloud Run IAM | Only allowed principals can invoke a protected Cloud Run service. | That an authenticated caller is entitled to request a particular traffic mutation. | In-application caller policy plus a separate signed capability and current-epoch check. |
-| Cloud Tasks OIDC | A task is delivered with a Google-signed identity token for a configured service account and audience. | The business authority, scope, freshness, target, or idempotency of the task payload. | Canonical capability verification, lineage and target checks, receipts, and stale-epoch denial. |
-| Cloud Tasks delivery and retries | Addressed, delayed, and retried HTTP delivery under queue limits. | Exactly-once execution or a safe retry after an uncertain mutation response. | A deterministic request identity and durable receipt ensure duplicates cannot authorize a second mutation; ambiguity requires readback. |
-| Cloud KMS asymmetric signing | A configured key version signs a supplied digest without exporting private key material. | Whether the signed request was appropriately scoped, remains current, or matches the executing caller and target. | Canonical bounded claims, explicit key-version trust, attenuation, expiry, and execution-time epoch validation. |
-| Firestore transactions and write preconditions | Atomic document transactions and conditional writes within Firestore. | Atomicity with a later Cloud Run Admin API call or correctness of application-level document identities. | Immutable root records, canonical document keys, monotonic epoch transitions, exact receipt claims, and explicit unknown-write handling. |
-| Cloud Run service etag or equivalent precondition | A conditional update can reject a service that changed since the approved read. | The authorization epoch, capability lineage, or whether the requested fields form the approved canary plan. | The immutable root binds the captured version and exact plan; the sealed adapter permits only the approved fields and revisions. |
-| Immutable Cloud Run revisions | A named revision identifies a fixed deployed revision configuration. | Which revision was approved as stable or candidate for this rollout. | Stable capture and root creation bind exact immutable revision names and reject mutable aliases as authority. |
-| Cloud Logging and Monitoring | Provider telemetry and metric observations can be collected under configured access. | A deterministic authority decision, complete evidence sequence, or permission to promote or recover. | Versioned evidence references and deterministic policy inputs; observations remain non-authoritative until evaluated by the kernel. |
-| Artifact Registry digests | A digest identifies immutable container bytes. | That the image is authorized for an arbitrary deployment or that a rollout may change service configuration. | Terraform and service configuration accept reviewed digest references; the rollout adapter cannot deploy images. |
+| Concern | Native Google Cloud capability | ControlGraph boundary and demonstrated delta |
+|---|---|---|
+| Traffic management | Cloud Run can split traffic between revisions, migrate traffic gradually, and route traffic back to an earlier revision. Cloud Deploy can drive phased canary rollouts to Cloud Run. See [Cloud Run traffic management](https://docs.cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration) and [Cloud Deploy canary strategy](https://docs.cloud.google.com/deploy/docs/deployment-strategies/canary). | ControlGraph relies on Cloud Run for the actual traffic update. Its demonstrated addition is a root-, target-, plan-, and epoch-bound capability followed by independent configuration and data-path observation: [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion), [traffic-path verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993), and [independent-verification artifact](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730). |
+| Rollout controls | Cloud Deploy models releases and rollouts, supports canary phases, and provides promotion and approval workflows. See [canary strategy](https://docs.cloud.google.com/deploy/docs/deployment-strategies/canary) and [promotion and approvals](https://docs.cloud.google.com/deploy/docs/promote-release). | ControlGraph does not take credit for those controls. Its narrower enforcement is an immutable rollout root, KMS-signed attenuated capabilities, and an exact-match epoch fence: [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion), [negative-authority conformance](acceptance-cases.md#negative-authority-conformance), and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993). |
+| IAM and signatures | Cloud Run IAM controls who may invoke or administer services; Cloud Deploy IAM controls access to delivery resources; Cloud KMS signs supplied digests with a configured asymmetric key version. See [Cloud Run IAM](https://docs.cloud.google.com/run/docs/securing/managing-access), [Cloud Deploy IAM](https://docs.cloud.google.com/deploy/docs/iam-roles-permissions), and [Cloud KMS signatures](https://docs.cloud.google.com/kms/docs/create-validate-signatures). | These inherited controls remain necessary. ControlGraph additionally validates closed capability claims and prevents a child capability from widening its root, target, action, plan, caller, lifetime, or epoch scope: [negative-authority conformance](acceptance-cases.md#negative-authority-conformance) and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993). |
+| Retries and uncertain delivery | Cloud Tasks applies configured dispatch limits and retry policy, and its documentation states that duplicate executions can occur. See [queue retries](https://docs.cloud.google.com/tasks/docs/configuring-queues) and [duplicate execution](https://docs.cloud.google.com/tasks/docs/common-pitfalls#duplicate_execution). | ControlGraph does not restate native delivery as exactly-once mutation. Its demonstrated guarantees here are a fresh executor-time epoch decision and completion only after independent evidence agrees: [Case C](acceptance-cases.md#case-c-delayed-stale-task-after-manual-revocation), [stale-denial verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993), and [completion-classifier artifact](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730). |
+| Rollback and recovery | Cloud Run can shift traffic back to an earlier revision. Cloud Deploy rollback creates a new rollout based on an earlier release. See [Cloud Run rollback](https://docs.cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration#rollback) and [Cloud Deploy rollback](https://docs.cloud.google.com/deploy/docs/roll-back). | ControlGraph's demonstrated recovery is deliberately narrower: deterministic unhealthy evidence may authorize only 100% traffic to the stable revision captured by that rollout root, followed by independent readback. See [Case B](acceptance-cases.md#case-b-unhealthy-canary-and-stable-recovery) and [exact-main recovery verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32635228713). |
+| Health signals | Cloud Run exposes metrics and integrates with Cloud Monitoring. Cloud Deploy can run configured verification tasks after deployment and fail the rollout when verification fails. See [Cloud Run monitoring](https://docs.cloud.google.com/run/docs/monitoring) and [Cloud Deploy verification](https://docs.cloud.google.com/deploy/docs/verify-deployment). | ControlGraph fixes the admitted Monitoring queries, windows, thresholds, and transition rules in the rollout root, then evaluates them deterministically; the signals do not grant authority by themselves. See [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion), [Case B](acceptance-cases.md#case-b-unhealthy-canary-and-stable-recovery), and [exact-main health verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32635228713). |
+| Audit evidence | Cloud Audit Logs records provider administrative and data-access activity according to each service's audit-log support and configuration. See [Cloud Audit Logs](https://docs.cloud.google.com/logging/docs/audit) and [Cloud Run audit logging](https://docs.cloud.google.com/run/docs/audit-logging). | ControlGraph supplements provider logs with an ordered, target-scoped evidence timeline and separately authorized redacted projections; it does not present that timeline as a replacement for provider audit logs. See the [acceptance evidence rule](acceptance-cases.md#status-and-evidence-rule) and [exact-main timeline verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730). |
+| Operator workflow | Cloud Run exposes revision traffic operations. Cloud Deploy provides release promotion, approval, verification, and rollback workflows. See [Cloud Run traffic management](https://docs.cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration), [Cloud Deploy promotion and approvals](https://docs.cloud.google.com/deploy/docs/promote-release), and [Cloud Deploy rollback](https://docs.cloud.google.com/deploy/docs/roll-back). | ControlGraph's demonstrated operator-specific addition is a root-bound manual epoch advance that causes otherwise valid delayed work to fail closed; the evidence timeline makes that decision reviewable. See [Case C](acceptance-cases.md#case-c-delayed-stale-task-after-manual-revocation), [stale-denial verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993), and [timeline verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730). |
+| Independent observation | Cloud Run exposes [service state](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.services/get), while Cloud Monitoring exposes serving signals. These are provider facts, not an application-level conclusion that a rollout completed. | A separate read-only verifier canonicalizes configuration, performs a bounded harmless revision probe, and classifies completion only when intent, receipt, configuration, and data-path evidence agree: [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion), [Case B](acceptance-cases.md#case-b-unhealthy-canary-and-stable-recovery), and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730). |
 
-## Why signatures and IAM are not enough
+## Exact ControlGraph claim boundary
 
-A signature answers whether named bytes were signed by a trusted key. IAM and OIDC answer whether
-a caller may reach an API or handler. A provider precondition answers whether the target changed
-since a prior observation. None answers whether authority granted at epoch N remains current after
-an operator advances the rollout root to N+1.
+The accepted evidence supports only these ControlGraph additions:
 
-ControlGraph therefore treats the authoritative epoch read as a separate, last-mile decision.
-The request may be authentic, correctly signed, unexpired, and delivered by the expected task
-caller and still be denied because its root epoch is no longer current.
+- exact-match epoch fencing and executor-time denial of stale work — [Case C](acceptance-cases.md#case-c-delayed-stale-task-after-manual-revocation) and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993);
+- KMS-signed capability attenuation within a fixed rollout root — [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion), [negative-authority conformance](acceptance-cases.md#negative-authority-conformance), and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32441418993);
+- deterministic health evaluation and healthy promotion — [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion) and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32635228713);
+- deterministic captured-stable recovery — [Case B](acceptance-cases.md#case-b-unhealthy-canary-and-stable-recovery) and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32635228713);
+- independent configuration and data-path verification — [Case A](acceptance-cases.md#case-a-healthy-canary-and-promotion), [Case B](acceptance-cases.md#case-b-unhealthy-canary-and-stable-recovery), and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730); and
+- an ordered evidence timeline with bounded, redacted projections — the [acceptance evidence rule](acceptance-cases.md#status-and-evidence-rule) and [exact-main verification](https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/32670679730).
 
-## Why ControlGraph still relies on native controls
+Authentication, signing, task delivery, traffic mutation, provider metrics, deployment workflows,
+and cloud audit logging remain inherited native controls. ControlGraph neither replaces nor
+weakens them.
 
-The epoch check is not a substitute for IAM, OIDC, KMS, Firestore transactions, or provider
-preconditions. Removing any of those controls would create a different vulnerability:
+## Dated primary references
 
-- without IAM or OIDC, an unexpected caller could reach protected code;
-- without KMS, capability integrity and issuer provenance would be weaker;
-- without transactions, concurrent authority and receipt claims would be indecisive;
-- without a provider precondition, a valid plan could overwrite intervening service changes; and
-- without immutable revisions and image digests, the approved target would be ambiguous.
+The comparison was reviewed on 2026-08-24 against these first-party Google Cloud pages. The dates
+shown are the pages' own “Last updated” dates at review time.
 
-The intended system is defense in depth with distinct questions and independently testable
-failures, not a claim that epoch fencing replaces native cloud security.
-
-## Provider-native optimistic concurrency limitation
-
-Cloud Run concurrency control protects the service document, while the rollout epoch lives in
-Firestore. No native transaction spans those two resources. ControlGraph performs a strong epoch
-read immediately before a conditional Cloud Run update and keeps the interval explicit in the
-threat model. The delayed-task acceptance case proves stale work held before that read is denied;
-it does not claim a cross-provider atomic revocation primitive.
-
-## Acceptance relationship
-
-Native configuration is accepted only when both positive and negative behavior is observed:
-
-- intended identities can invoke only their expected services;
-- unintended identities and audiences are denied;
-- KMS signs only under configured key-version permissions;
-- Firestore races produce one deterministic winner;
-- Cloud Tasks duplicates do not produce duplicate mutation;
-- Cloud Run rejects stale provider preconditions; and
-- advancing an epoch makes an otherwise valid delayed task harmless before mutation.
-
-The reproducible cases are defined in `acceptance-cases.md`.
+- [Cloud Run: Rollbacks, gradual rollouts, and traffic migration](https://docs.cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration) — 2026-08-19 UTC.
+- [Cloud Run: Access control with IAM](https://docs.cloud.google.com/run/docs/securing/managing-access) — 2026-08-19 UTC.
+- [Cloud Run: Monitor health and performance](https://docs.cloud.google.com/run/docs/monitoring) — 2026-08-19 UTC.
+- [Cloud Run audit logging](https://docs.cloud.google.com/run/docs/audit-logging) — 2026-08-19 UTC.
+- [Cloud Run API: Get a service](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.services/get) — 2025-07-09 UTC.
+- [Cloud Deploy overview](https://docs.cloud.google.com/deploy/docs/overview) — 2026-08-11 UTC.
+- [Cloud Deploy: Use a canary deployment strategy](https://docs.cloud.google.com/deploy/docs/deployment-strategies/canary) — 2026-08-11 UTC.
+- [Cloud Deploy: Promote your release and manage approvals](https://docs.cloud.google.com/deploy/docs/promote-release) — 2026-08-11 UTC.
+- [Cloud Deploy: Roll back a target](https://docs.cloud.google.com/deploy/docs/roll-back) — 2026-08-11 UTC.
+- [Cloud Deploy: Verify your deployment](https://docs.cloud.google.com/deploy/docs/verify-deployment) — 2026-08-11 UTC.
+- [Cloud Deploy: IAM roles and permissions](https://docs.cloud.google.com/deploy/docs/iam-roles-permissions) — 2026-08-11 UTC.
+- [Cloud Tasks: Configure queue routing, limits, and retries](https://docs.cloud.google.com/tasks/docs/configuring-queues) — 2026-08-13 UTC.
+- [Cloud Tasks: Common issues, including duplicate execution](https://docs.cloud.google.com/tasks/docs/common-pitfalls#duplicate_execution) — 2026-08-11 UTC.
+- [Cloud KMS: Creating and validating digital signatures](https://docs.cloud.google.com/kms/docs/create-validate-signatures) — 2026-08-11 UTC.
+- [Cloud Audit Logs overview](https://docs.cloud.google.com/logging/docs/audit) — 2026-08-21 UTC.
