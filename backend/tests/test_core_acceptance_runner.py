@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -119,8 +120,9 @@ ENTRY_POINTS = {
         "cli:controlgraph-canary:capture-stable-snapshot",
         "cli:controlgraph-canary:create-rollout-root",
         "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:execution-queue:hold",
         "cli:controlgraph-canary:evaluate-health",
+        "cli:controlgraph-canary:execution-queue:hold",
+        "cli:controlgraph-canary:promote-candidate",
         "cli:controlgraph-canary:revoke-epoch",
         "cli:controlgraph-canary:execution-queue:release",
         "cli:controlgraph-canary:read-execution-receipt",
@@ -135,10 +137,6 @@ ENTRY_POINTS = {
     ),
     "AMBIGUITY_CLASSIFICATION": (
         *RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-ambiguous-receipt-readback",
         "cli:controlgraph-canary:classify-completion",
     ),
     "TIMELINE_CONSOLE_READ": (
@@ -151,6 +149,7 @@ ENTRY_POINTS = {
         "endpoint:api:advisor-command",
         "service:coordinator:advisor",
         "service:advisor",
+        "cli:controlgraph-canary:read-target-traffic",
     ),
 }
 
@@ -371,7 +370,14 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
             "steps": [
                 {
                     "duration_ms": 1,
-                    "evidence_ids": [evidence_ids[index % len(evidence_ids)]],
+                    "evidence_ids": (
+                        [
+                            evidence_ids[index % len(evidence_ids)],
+                            *evidence_ids[len(entry_points) :],
+                        ]
+                        if index == 0
+                        else [evidence_ids[index % len(evidence_ids)]]
+                    ),
                     "operation": operation,
                     "schema_version": "controlgraph.core-acceptance-step-result/v1",
                     "sequence": index + 1,
@@ -597,3 +603,123 @@ def test_rejects_package_loaded_from_another_checkout(tmp_path: Path) -> None:
 
     assert completed.returncode == 2
     assert completed.stderr.strip() == '{"code":"ACCEPTANCE_SOURCE_MISMATCH"}'
+
+
+def test_hosted_execute_requires_matching_double_confirmation(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPATH"] = str(SOURCE_ROOT / "backend" / "src")
+    environment.pop("CONTROLGRAPH_CORE_ACCEPTANCE_CONFIRM", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "execute",
+            "--spec",
+            str(tmp_path / "missing-spec.json"),
+            "--artifact-root",
+            str(tmp_path),
+            "--output-spec",
+            str(tmp_path / "bound-spec.json"),
+            "--output",
+            str(tmp_path / "manifest.json"),
+            "--project-number",
+            "123456789",
+            "--network-resource",
+            "projects/controlgraph-canary-abc123/global/networks/test",
+            "--subnetwork-resource",
+            "projects/controlgraph-canary-abc123/regions/us-central1/subnetworks/test",
+            "--verifier-service-account",
+            "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com",
+            "--restricted-exporter-service-account",
+            "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com",
+            "--confirm",
+            "RUN_CONTROLGRAPH_CORE_ACCEPTANCE",
+        ],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == ('{"code":"ACCEPTANCE_HOSTED_CONFIRMATION_REQUIRED"}')
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_hosted_execute_resets_before_all_eight_fixed_cases(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _repo, artifacts, _spec_path, spec_value = _fixture(tmp_path)
+    shutil.rmtree(artifacts / "evidence")
+    shutil.rmtree(artifacts / "results")
+    for case in spec_value["cases"]:
+        case["result"]["sha256"] = "0" * 64
+    template = tmp_path / "template.json"
+    _write(template, spec_value)
+    module_spec = importlib.util.spec_from_file_location("core_acceptance_execute_test", SCRIPT)
+    assert module_spec is not None and module_spec.loader is not None
+    runner = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = runner
+    module_spec.loader.exec_module(runner)
+    reset_cases: list[str] = []
+
+    monkeypatch.setenv(
+        "CONTROLGRAPH_CORE_ACCEPTANCE_CONFIRM",
+        "RUN_CONTROLGRAPH_CORE_ACCEPTANCE",
+    )
+    monkeypatch.setattr(runner, "_verify_source", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_verify_exact_remote_main", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_verify_hosted_bindings", lambda *_args, **_kwargs: None)
+
+    def reset(_run: Any, case: Any) -> dict[str, str]:
+        reset_cases.append(case.kind.value)
+        return {"schema_version": "test.reset/v1"}
+
+    def observations(_run: Any, case: Any, *_args: Any) -> dict[Any, object]:
+        return {
+            kind: {"schema_version": f"test.{kind.value.lower()}/v1"}
+            for kind in runner.REQUIRED_EVIDENCE[case.kind]
+        }
+
+    monkeypatch.setattr(runner, "_reset_target", reset)
+    monkeypatch.setattr(
+        runner,
+        "_probe_stable",
+        lambda *_args: {"schema_version": "test.probe/v1"},
+    )
+    monkeypatch.setattr(runner, "_run_healthy_case", observations)
+    monkeypatch.setattr(runner, "_run_unhealthy_case", observations)
+    monkeypatch.setattr(runner, "_run_revocation_case", observations)
+    monkeypatch.setattr(runner, "_run_verifier_case", observations)
+    monkeypatch.setattr(runner, "_run_ambiguity_case", observations)
+    monkeypatch.setattr(runner, "_run_timeline_console_case", observations)
+    monkeypatch.setattr(runner, "_run_advisor_case", observations)
+
+    output_spec = tmp_path / "bound-spec.json"
+    output_manifest = tmp_path / "manifest.json"
+    _payload, _run_id, status = runner.execute_hosted(
+        spec_path=template,
+        artifact_root=artifacts,
+        output_spec=output_spec,
+        output_manifest=output_manifest,
+        project_number="123456789",
+        network_resource="projects/controlgraph-canary-abc123/global/networks/test",
+        subnetwork_resource=(
+            "projects/controlgraph-canary-abc123/regions/us-central1/subnetworks/test"
+        ),
+        verifier_service_account=(
+            "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com"
+        ),
+        restricted_exporter_service_account=(
+            "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
+        ),
+        confirmation="RUN_CONTROLGRAPH_CORE_ACCEPTANCE",
+    )
+
+    assert reset_cases == [kind for kind, _evidence in CASES]
+    assert status.value == "PASSED"
+    assert output_spec.is_file()
+    assert output_manifest.is_file()
