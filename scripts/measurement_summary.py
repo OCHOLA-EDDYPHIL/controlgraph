@@ -19,6 +19,16 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, Self, cast
 
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
+
 from controlgraph_canary.contracts.base import (
     MAX_CONTRACT_BYTES,
     CloudRunName,
@@ -33,15 +43,6 @@ from controlgraph_canary.contracts.codec import (
     RestrictedJson,
     canonical_json_value_bytes,
     decode_contract,
-)
-from pydantic import (
-    AfterValidator,
-    BaseModel,
-    ConfigDict,
-    Field,
-    StringConstraints,
-    ValidationError,
-    model_validator,
 )
 
 SUMMARY_SCHEMA: Final = "controlgraph.measurement-summary/v1"
@@ -205,7 +206,7 @@ class _PolicyProjection(_ProjectionModel):
 class _TargetProjection(_ProjectionModel):
     project_id: ProjectId
     region: Region
-    environment: Literal["acceptance"]
+    environment: Literal["nonprod"]
     service_name: Literal["controlgraph-reference-target"]
     stable_revision: CloudRunName
     candidate_revision: CloudRunName

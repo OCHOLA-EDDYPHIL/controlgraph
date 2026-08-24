@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+
 SCRIPT = Path(__file__).parents[2] / "scripts" / "core_acceptance.py"
 SOURCE_ROOT = SCRIPT.parents[1]
 
@@ -81,6 +83,12 @@ CASES = (
         ("CLOUD_RUN_CONFIGURATION", "COORDINATOR", "MODEL_AUDIT", "TIMELINE"),
     ),
 )
+
+
+class _StrictTupleResponse(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    values: tuple[str, ...]
 
 EXPECTED_RESULTS = {
     "TARGET_RESET": "RESET_VERIFIED",
@@ -814,6 +822,34 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
     assert status.value == "PASSED"
     assert output_spec.is_file()
     assert output_manifest.is_file()
+
+
+def test_hosted_cli_decodes_json_arrays_for_strict_tuple_contracts(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module_spec = importlib.util.spec_from_file_location(
+        "core_acceptance_hosted_response_test", SCRIPT
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    runner = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = runner
+    module_spec.loader.exec_module(runner)
+    monkeypatch.setattr(
+        runner,
+        "_capture_process",
+        lambda *_args, **_kwargs: (0, b'{"values":["one","two"]}\n'),
+    )
+
+    _status, decoded, model = runner._run_cli(
+        repo=tmp_path,
+        entry_point="controlgraph-canary",
+        arguments=(),
+        model_type=_StrictTupleResponse,
+    )
+
+    assert decoded == {"values": ["one", "two"]}
+    assert model is not None and model.values == ("one", "two")
 
 
 def test_hosted_binding_uses_the_deployed_evidence_writer_identity(

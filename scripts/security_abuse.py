@@ -15,6 +15,14 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Final, Literal, Self, cast
 
+from pydantic import (
+    AfterValidator,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
+
 import controlgraph_canary
 from controlgraph_canary.contracts.base import (
     CloudRunName,
@@ -31,13 +39,6 @@ from controlgraph_canary.contracts.codec import (
     RestrictedJson,
     canonical_json_value_bytes,
     decode_contract,
-)
-from pydantic import (
-    AfterValidator,
-    Field,
-    StringConstraints,
-    ValidationError,
-    model_validator,
 )
 
 MANIFEST_SCHEMA: Final = "controlgraph.security-abuse-manifest/v1"

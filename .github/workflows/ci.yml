@@ -32,9 +32,23 @@ jobs:
       - name: Install
         run: uv sync --frozen --all-extras --dev
       - name: Lint
-        run: uv run ruff check . ../scripts/core_acceptance.py ../scripts/fault_acceptance.py
+        run: >-
+          uv run ruff check .
+          ../scripts/core_acceptance.py
+          ../scripts/fault_acceptance.py
+          ../scripts/frozen_bundle.py
+          ../scripts/measurement_summary.py
+          ../scripts/release_evidence.py
+          ../scripts/security_abuse.py
       - name: Type check
-        run: MYPYPATH=src uv run mypy src ../scripts/core_acceptance.py ../scripts/fault_acceptance.py
+        run: >-
+          MYPYPATH=src uv run mypy src
+          ../scripts/core_acceptance.py
+          ../scripts/fault_acceptance.py
+          ../scripts/frozen_bundle.py
+          ../scripts/measurement_summary.py
+          ../scripts/release_evidence.py
+          ../scripts/security_abuse.py
       - name: Test
         run: uv run pytest
 
