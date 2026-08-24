@@ -90,16 +90,11 @@ it has no mutation facade, and its result is always non-authoritative.
 
 ## Final manifest binding
 
-Fill these two values only after the exact hosted run completes and its canonical
-`controlgraph.core-acceptance-manifest/v1` validates:
-
-- run ID: `FINAL_ACCEPTANCE_RUN_ID`
-- manifest SHA-256: `FINAL_ACCEPTANCE_MANIFEST_SHA256`
-
-The manifest must report all eight fixed cases as passed, bind the exact clean source SHA and five
-distinct image digests, and remain within its declared cost and duration ceilings. Until those two
-identifiers are replaced with values from the accepted run, this document is a reproducible demo
-plan rather than hosted acceptance evidence.
+Read the run ID and manifest SHA-256 directly from the verified frozen bundle; do not copy a
+mutable example into this document. The manifest must report all eight fixed cases as passed, bind
+the exact clean source SHA and five distinct image digests, and remain within its declared cost and
+duration ceilings. This document is the reproducible narration; the immutable bundle is the run's
+acceptance evidence.
 
 ## Publication boundary
 
