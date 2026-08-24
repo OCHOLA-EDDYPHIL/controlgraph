@@ -1058,7 +1058,7 @@ def _run_cli(
     model = None
     if status == 0 and model_type is not None:
         try:
-            model = model_type.model_validate(decoded)
+            model = model_type.model_validate_json(payload)
         except (TypeError, ValueError, ValidationError) as error:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RESPONSE_INVALID") from error
         decoded = _model_dict(model)
