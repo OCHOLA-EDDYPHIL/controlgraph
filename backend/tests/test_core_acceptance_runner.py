@@ -1232,3 +1232,73 @@ def test_hosted_policy_binding_compares_plain_artifact_digest() -> None:
         if item["model"] == "RolloutHealthPolicyV2"
     )
     assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == artifact_sha256
+
+
+def test_hosted_receipt_poll_tolerates_transient_read_codes(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    case = SimpleNamespace(case_id="core-case-1")
+    root = SimpleNamespace(root_id="cgroot:" + "b" * 64, root_sha256="b" * 64)
+
+    class _Outcome:
+        value = "VERIFIED"
+
+    class _Receipt:
+        outcome = _Outcome()
+
+    class _Model:
+        receipt = _Receipt()
+
+    reads: list[tuple[int, bytes]] = [
+        (4, b'{"code":"RECEIPT_READ_OUTCOME_UNKNOWN"}'),
+        (4, b'{"code":"RECEIPT_READ_AUTH_UNAVAILABLE"}'),
+        (0, b"{}"),
+    ]
+
+    def fake_run_cli(*_args: Any, **_kwargs: Any) -> tuple[int, Any, Any]:
+        status, raw = reads.pop(0)
+        return status, json.loads(raw), _Model() if status == 0 else None
+
+    monkeypatch.setattr(runner, "_run_cli", fake_run_cli)
+    monkeypatch.setattr(runner.time, "sleep", lambda *_a: None)
+
+    model = runner._poll_receipt(
+        run=SimpleNamespace(repo=SOURCE_ROOT, project_number="123456789"),
+        case=case,
+        root=root,
+        epoch=1,
+        request_id="req",
+        idempotency_key="idem",
+        action="APPLY_CANARY_V1",
+        capability_sha256="c" * 64,
+        label="apply",
+    )
+
+    assert isinstance(model, _Model)
+
+    def fatal_run_cli(*_args: Any, **_kwargs: Any) -> tuple[int, Any, Any]:
+        return (
+            5,
+            json.loads(b'{"code":"RECEIPT_READ_COMMAND_INVALID"}'),
+            None,
+        )
+
+    monkeypatch.setattr(runner, "_run_cli", fatal_run_cli)
+    try:
+        runner._poll_receipt(
+            run=SimpleNamespace(repo=SOURCE_ROOT, project_number="123456789"),
+            case=case,
+            root=root,
+            epoch=1,
+            request_id="req",
+            idempotency_key="idem",
+            action="APPLY_CANARY_V1",
+            capability_sha256="c" * 64,
+            label="apply",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_RECEIPT_INVALID"
+    else:
+        raise AssertionError("fatal receipt-read code was unexpectedly tolerated")
