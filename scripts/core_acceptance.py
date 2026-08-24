@@ -1237,7 +1237,7 @@ def _reset_target(run: _HostedExecution, case: CaseBindingV1) -> Any:
 
 
 def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
-    from controlgraph_canary.contracts.codec import canonical_sha256
+    from controlgraph_canary.contracts.codec import canonical_json_bytes
     from controlgraph_canary.contracts.operator_observability import (
         StableSnapshotCaptureResultV1,
     )
@@ -1308,7 +1308,10 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
         or plan.concurrency != 8
         or root_result.initial_authority.current_epoch != 1
         or len(policy_bindings) != 1
-        or policy_bindings[0].artifact.sha256 != canonical_sha256(root.content.health_policy)
+        or policy_bindings[0].artifact.sha256
+        != hashlib.sha256(
+            canonical_json_bytes(root.content.health_policy)
+        ).hexdigest()
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
     return root_result
