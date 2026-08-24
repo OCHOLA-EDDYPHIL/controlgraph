@@ -44,17 +44,24 @@ CLAIM_CATEGORIES: Final = frozenset(
         "demo",
     }
 )
-FAULT_KINDS: Final = frozenset(
-    {
-        "DELAYED_TASK",
-        "DUPLICATE_DELIVERY",
-        "REVOCATION_RACE",
-        "MONITORING_GAP",
-        "API_TIMEOUT",
-        "CONFIGURATION_DRIFT",
-        "PROBE_FAILURE",
-    }
+FAULT_ORDER: Final = (
+    "DELAYED_TASK",
+    "DUPLICATE_DELIVERY",
+    "REVOCATION_RACE",
+    "MONITORING_GAP",
+    "API_TIMEOUT",
+    "CONFIGURATION_DRIFT",
+    "PROBE_FAILURE",
 )
+FAULT_INVARIANTS: Final = {
+    "DELAYED_TASK": frozenset({"STALE_DENIAL"}),
+    "DUPLICATE_DELIVERY": frozenset({"ONE_RECOVERY_INTENT"}),
+    "REVOCATION_RACE": frozenset({"STALE_DENIAL"}),
+    "MONITORING_GAP": frozenset({"DETERMINISTIC_HEALTH"}),
+    "API_TIMEOUT": frozenset({"NO_BLIND_RETRY", "AMBIGUITY_CLASSIFICATION"}),
+    "CONFIGURATION_DRIFT": frozenset({"SAFE_FALLBACK"}),
+    "PROBE_FAILURE": frozenset({"SAFE_FALLBACK"}),
+}
 BASE_REQUIRED_KINDS: Final = frozenset(
     {
         "CONTRACT_SCHEMA_INDEX",
@@ -62,8 +69,7 @@ BASE_REQUIRED_KINDS: Final = frozenset(
         "RELEASE_EVIDENCE_MANIFEST",
         "RELEASE_EVIDENCE_VERIFICATION",
         "CORE_ACCEPTANCE_MANIFEST",
-        "FAULT_SCENARIO_SET",
-        "FAULT_APPLICATION_EVIDENCE",
+        "FAULT_ACCEPTANCE_MANIFEST",
         "SECURITY_ABUSE_MANIFEST",
         "PERFORMANCE_SUMMARY",
         "REQUIRED_CHECK_RESULTS",
@@ -84,8 +90,7 @@ JSON_SCHEMAS: Final = {
     "RELEASE_EVIDENCE_MANIFEST": "controlgraph.release-evidence/v1",
     "RELEASE_EVIDENCE_VERIFICATION": "controlgraph.release-evidence-verification/v1",
     "CORE_ACCEPTANCE_MANIFEST": "controlgraph.core-acceptance-manifest/v1",
-    "FAULT_SCENARIO_SET": "controlgraph.fault-scenario-set/v1",
-    "FAULT_APPLICATION_EVIDENCE": "controlgraph.fault-application-evidence/v1",
+    "FAULT_ACCEPTANCE_MANIFEST": "controlgraph.fault-acceptance-manifest/v1",
     "SECURITY_ABUSE_MANIFEST": "controlgraph.security-abuse-manifest/v1",
     "PERFORMANCE_SUMMARY": "controlgraph.measurement-summary/v1",
     "REQUIRED_CHECK_RESULTS": "controlgraph.required-check-results/v1",
@@ -93,7 +98,7 @@ JSON_SCHEMAS: Final = {
     "PREPARED_BUNDLE": BUNDLE_SCHEMA,
     "CLEAN_ROOM_REHEARSAL": "controlgraph.clean-room-rehearsal/v1",
 }
-SINGLETON_KINDS: Final = ALLOWED_KINDS - {"FAULT_APPLICATION_EVIDENCE", "DEMO_ASSET"}
+SINGLETON_KINDS: Final = ALLOWED_KINDS - {"DEMO_ASSET"}
 REQUIRED_CHECKS: Final = frozenset({"PYTHON", "WEB", "TERRAFORM", "SECURITY"})
 RELEASE_CHECKS: Final = frozenset(
     {
@@ -147,11 +152,6 @@ def _read_json(path: Path, message: str) -> tuple[dict[str, Any], bytes]:
     except OSError as error:
         raise BundleError(message) from error
     return _object(_load_json_bytes(payload, message), message), payload
-
-
-def _canonical_sha(value: Any) -> str:
-    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _file_sha(path: Path) -> str:
@@ -359,7 +359,7 @@ def _bind_artifacts(
         raise BundleError("PREPARED_BUNDLE_HAS_FINAL_ARTIFACT")
     if any(kinds[kind] != 1 for kind in SINGLETON_KINDS if kind in required):
         raise BundleError("SINGLETON_ARTIFACT_KIND_INVALID")
-    if kinds["FAULT_APPLICATION_EVIDENCE"] != 7 or kinds["DEMO_ASSET"] < 1:
+    if kinds["DEMO_ASSET"] < 1:
         raise BundleError("ARTIFACT_KIND_COUNT_INVALID")
     return records, by_id, payloads, pending
 
@@ -537,81 +537,88 @@ def _validate_release_evidence(
     }
 
 
-def _validate_faults(
-    payloads: Mapping[str, dict[str, Any]], artifacts: Mapping[str, dict[str, Any]]
+def _validate_fault_acceptance(
+    payload: Mapping[str, Any], core: Mapping[str, Any], revision: str
 ) -> None:
-    scenario_ids = [
-        key for key, value in artifacts.items() if value["kind"] == "FAULT_SCENARIO_SET"
-    ]
-    evidence_ids = [
-        key
-        for key, value in artifacts.items()
-        if value["kind"] == "FAULT_APPLICATION_EVIDENCE"
-    ]
-    if not scenario_ids or any(
-        key not in payloads for key in [*scenario_ids, *evidence_ids]
+    core_inputs = _object(core.get("inputs"), "FAULT_ACCEPTANCE_RUN_MISMATCH")
+    target = _object(core_inputs.get("target"), "FAULT_ACCEPTANCE_RUN_MISMATCH")
+    if (
+        payload.get("source_commit") != revision
+        or payload.get("project_id") != target.get("project_id")
+        or payload.get("region") != target.get("region")
+        or payload.get("environment") != target.get("environment")
+        or payload.get("service_name") != target.get("service_name")
+        or payload.get("stable_revision") != target.get("stable_revision")
+        or payload.get("candidate_revision") != target.get("candidate_revision")
+        or payload.get("run_seed") != core_inputs.get("random_seed")
     ):
-        return
-    scenarios = payloads[scenario_ids[0]].get("scenarios")
-    if not isinstance(scenarios, list) or len(scenarios) != 7:
-        raise BundleError("FAULT_SCENARIO_SET_INVALID")
-    by_fault: dict[str, dict[str, Any]] = {}
-    for value in scenarios:
-        scenario = _object(value, "FAULT_SCENARIO_SET_INVALID")
-        fault = scenario.get("fault")
-        target = _object(scenario.get("target"), "FAULT_TARGET_INVALID")
+        raise BundleError("FAULT_ACCEPTANCE_RUN_MISMATCH")
+    cases = payload.get("cases")
+    principal_sha256 = payload.get("acceptance_principal_sha256")
+    if (
+        payload.get("schema_version") != "controlgraph.fault-acceptance-manifest/v1"
+        or payload.get("environment") != "nonprod"
+        or payload.get("purpose") != "PRODUCT_VALIDATION"
+        or payload.get("result") != "PASSED"
+        or not isinstance(principal_sha256, str)
+        or SHA_RE.fullmatch(principal_sha256) is None
+        or payload.get("allowlisted_faults") != list(FAULT_ORDER)
+        or type(payload.get("run_seed")) is not int
+        or not 0 <= payload["run_seed"] <= 9_007_199_254_740_991
+        or not isinstance(cases, list)
+        or len(cases) != len(FAULT_ORDER)
+        or tuple(case.get("fault") for case in cases if isinstance(case, dict))
+        != FAULT_ORDER
+    ):
+        raise BundleError("FAULT_ACCEPTANCE_MANIFEST_INVALID")
+    run_seed = payload["run_seed"]
+    root_ids: set[str] = set()
+    for raw, fault in zip(cases, FAULT_ORDER, strict=True):
+        case = _object(raw, "FAULT_ACCEPTANCE_MANIFEST_INVALID")
+        digest = hashlib.sha256(
+            b"controlgraph.fault-acceptance-seed/v1\0"
+            + str(run_seed).encode("ascii")
+            + b"\0"
+            + fault.encode("ascii")
+        ).digest()
+        expected_id = f"fault-{fault.lower().replace('_', '-')}-{digest.hex()[:16]}"
+        artifacts = case.get("artifacts")
+        invariants = case.get("observed_invariants")
+        root_id = case.get("root_id")
         if (
-            fault not in FAULT_KINDS
-            or fault in by_fault
-            or scenario.get("schema_version") != "controlgraph.fault-scenario/v1"
-            or scenario.get("purpose") != "PRODUCT_VALIDATION"
+            case.get("scenario_id") != expected_id
+            or case.get("random_seed") != int.from_bytes(digest[:6], "big")
+            or case.get("result") != "PASSED"
+            or not isinstance(case.get("boundary"), str)
+            or not case["boundary"]
+            or not isinstance(case.get("injection"), str)
+            or not case["injection"]
+            or not isinstance(root_id, str)
+            or not root_id
+            or root_id in root_ids
+            or not isinstance(artifacts, list)
+            or not artifacts
+            or not isinstance(invariants, list)
+            or len(invariants) != len(FAULT_INVARIANTS[fault])
+            or any(not isinstance(value, str) for value in invariants)
+            or set(invariants) != FAULT_INVARIANTS[fault]
         ):
-            raise BundleError("FAULT_SCENARIO_SET_INVALID")
-        if (
-            target.get("schema_version") != "controlgraph.acceptance-fault-target/v1"
-            or target.get("environment") != "acceptance"
-            or target.get("region") != "us-central1"
-            or target.get("service_name") != "controlgraph-reference-target"
-            or not isinstance(target.get("project_id"), str)
-            or PROJECT_RE.fullmatch(target["project_id"]) is None
-        ):
-            raise BundleError("FAULT_TARGET_INVALID")
-        by_fault[fault] = scenario
-    if set(by_fault) != FAULT_KINDS:
-        raise BundleError("FAULT_SCENARIO_SET_INVALID")
-    seen: set[str] = set()
-    for evidence_id in evidence_ids:
-        evidence = payloads[evidence_id]
-        fault = evidence.get("fault")
-        evidence_scenario = by_fault.get(str(fault))
-        if (
-            evidence_scenario is None
-            or str(fault) in seen
-            or evidence.get("result") != "PASSED"
-            or evidence.get("purpose") != "PRODUCT_VALIDATION"
-        ):
-            raise BundleError("FAULT_APPLICATION_EVIDENCE_INVALID")
-        if (
-            evidence.get("scenario_id") != evidence_scenario.get("scenario_id")
-            or evidence.get("scenario_sha256") != _canonical_sha(evidence_scenario)
-            or evidence.get("target") != evidence_scenario.get("target")
-            or evidence.get("boundary") != evidence_scenario.get("boundary")
-            or evidence.get("random_seed") != evidence_scenario.get("random_seed")
-            or evidence.get("activation_identity_sha256")
-            != evidence_scenario.get("activation", {}).get("identity_sha256")
-        ):
-            raise BundleError("FAULT_APPLICATION_EVIDENCE_INVALID")
-        required = evidence_scenario.get("required_invariants")
-        observed = evidence.get("observed_invariants")
-        if (
-            not isinstance(required, list)
-            or not isinstance(observed, list)
-            or not set(required).issubset(observed)
-        ):
-            raise BundleError("FAULT_APPLICATION_EVIDENCE_INVALID")
-        seen.add(str(fault))
-    if seen != FAULT_KINDS:
-        raise BundleError("FAULT_APPLICATION_EVIDENCE_INVALID")
+            raise BundleError("FAULT_ACCEPTANCE_MANIFEST_INVALID")
+        root_ids.add(root_id)
+        artifact_names: set[str] = set()
+        for raw_artifact in artifacts:
+            artifact = _object(raw_artifact, "FAULT_ACCEPTANCE_MANIFEST_INVALID")
+            name = artifact.get("name")
+            sha256 = artifact.get("sha256")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in artifact_names
+                or not isinstance(sha256, str)
+                or SHA_RE.fullmatch(sha256) is None
+            ):
+                raise BundleError("FAULT_ACCEPTANCE_MANIFEST_INVALID")
+            artifact_names.add(name)
 
 
 def _validate_known_payloads(
@@ -642,9 +649,13 @@ def _validate_known_payloads(
         )
     for _, payload in by_kind.get("CONTRACT_SCHEMA_INDEX", []):
         _validate_contract_index(payload, revision)
-    for _, payload in by_kind.get("CORE_ACCEPTANCE_MANIFEST", []):
+    core = by_kind.get("CORE_ACCEPTANCE_MANIFEST", [])
+    for _, payload in core:
         release_images = supply_chain["images"] if supply_chain is not None else None
         _validate_core_acceptance(payload, revision, release_images)
+    faults = by_kind.get("FAULT_ACCEPTANCE_MANIFEST", [])
+    if core and faults:
+        _validate_fault_acceptance(faults[0][1], core[0][1], revision)
     for _, payload in by_kind.get("SECURITY_ABUSE_MANIFEST", []):
         _require_source_commit(payload, revision)
         if (
@@ -752,7 +763,6 @@ def _validate_known_payloads(
             or not sign_off.get("recorded_at")
         ):
             raise BundleError("CLEAN_ROOM_REHEARSAL_INVALID")
-    _validate_faults(payloads, artifacts)
     return supply_chain
 
 

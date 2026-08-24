@@ -186,58 +186,47 @@ def _fixture(
                     }
                     for name in image_components
                 ],
+                "random_seed": 17,
             },
         },
     )
-    scenarios: list[dict[str, Any]] = []
-    fault_evidence: list[str] = []
-    for index, fault in enumerate(sorted(bundle.FAULT_KINDS)):
-        scenario = {
-            "activation": {
-                "identity_sha256": "a" * 64,
-                "schema_version": "controlgraph.fault-activation/v1",
-            },
-            "boundary": f"boundary.{index}",
-            "fault": fault,
-            "purpose": "PRODUCT_VALIDATION",
-            "random_seed": index + 1,
-            "required_invariants": ["SAFE_FALLBACK"],
-            "scenario_id": f"fault-{index}",
-            "schema_version": "controlgraph.fault-scenario/v1",
-            "target": {
-                "environment": "acceptance",
-                "project_id": "controlgraph-canary-abc123",
-                "region": "us-central1",
-                "schema_version": "controlgraph.acceptance-fault-target/v1",
-                "service_name": "controlgraph-reference-target",
-            },
-        }
-        scenarios.append(scenario)
-        evidence_id = f"fault-{index}"
-        fault_evidence.append(evidence_id)
-        add_json(
-            evidence_id,
-            "FAULT_APPLICATION_EVIDENCE",
+    fault_cases: list[dict[str, Any]] = []
+    for index, fault in enumerate(bundle.FAULT_ORDER):
+        digest = hashlib.sha256(
+            b"controlgraph.fault-acceptance-seed/v1\0" + b"17\0" + fault.encode("ascii")
+        ).digest()
+        fault_cases.append(
             {
-                "activation_identity_sha256": "a" * 64,
-                "boundary": scenario["boundary"],
+                "artifacts": [{"name": "evidence.json", "sha256": f"{index + 1:064x}"}],
+                "boundary": f"boundary.{index}",
                 "fault": fault,
-                "observed_invariants": ["SAFE_FALLBACK"],
-                "purpose": "PRODUCT_VALIDATION",
-                "random_seed": index + 1,
+                "injection": f"INJECT_{fault}",
+                "observed_invariants": sorted(bundle.FAULT_INVARIANTS[fault]),
+                "observation": {},
+                "random_seed": int.from_bytes(digest[:6], "big"),
                 "result": "PASSED",
-                "scenario_id": scenario["scenario_id"],
-                "scenario_sha256": bundle._canonical_sha(scenario),
-                "schema_version": "controlgraph.fault-application-evidence/v1",
-                "target": scenario["target"],
-            },
+                "root_id": f"cgroot:{index}",
+                "scenario_id": (f"fault-{fault.lower().replace('_', '-')}-{digest.hex()[:16]}"),
+            }
         )
     add_json(
-        "fault-scenarios",
-        "FAULT_SCENARIO_SET",
+        "fault-acceptance",
+        "FAULT_ACCEPTANCE_MANIFEST",
         {
-            "schema_version": "controlgraph.fault-scenario-set/v1",
-            "scenarios": scenarios,
+            "acceptance_principal_sha256": "a" * 64,
+            "allowlisted_faults": list(bundle.FAULT_ORDER),
+            "candidate_revision": "reference-candidate-00002-bbb",
+            "cases": fault_cases,
+            "environment": "nonprod",
+            "project_id": "controlgraph-canary-abc123",
+            "purpose": "PRODUCT_VALIDATION",
+            "region": "us-central1",
+            "result": "PASSED",
+            "run_seed": 17,
+            "schema_version": "controlgraph.fault-acceptance-manifest/v1",
+            "service_name": "controlgraph-reference-target",
+            "source_commit": revision,
+            "stable_revision": "reference-stable-00001-aaa",
         },
     )
     add_json(
@@ -380,7 +369,7 @@ def _fixture(
     claim_evidence = {
         "architecture": ["architecture", "architecture-diagram"],
         "security": ["security-abuse", "release-evidence"],
-        "determinism": ["fault-scenarios", *fault_evidence],
+        "determinism": ["fault-acceptance"],
         "latency": ["performance"],
         "reliability": ["core-acceptance", "performance"],
         "cost": ["performance"],
@@ -515,21 +504,60 @@ def test_prepared_bundle_has_only_clean_room_pending(
     assert result["pending"] == ["CLEAN_ROOM_REHEARSAL"]
 
 
-def test_fault_evidence_must_bind_the_canonical_scenario_digest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_commit", "f" * 40),
+        ("environment", "acceptance"),
+        ("stable_revision", "controlgraph-reference-target-other"),
+        ("run_seed", 18),
+    ],
+)
+def test_fault_manifest_must_bind_the_core_acceptance_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: Any
 ) -> None:
     repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
-    spec["stage"] = "PREPARED"
-    spec["artifacts"] = [
-        item for item in spec["artifacts"] if item["kind"] not in bundle.FINAL_ONLY_KINDS
-    ]
-    entry = next(item for item in spec["artifacts"] if item["id"] == "fault-0")
+    entry = next(item for item in spec["artifacts"] if item["id"] == "fault-acceptance")
     payload = json.loads((artifacts / entry["path"]).read_text())
-    payload["scenario_sha256"] = "f" * 64
+    payload[field] = value
     entry["sha256"] = _write_json(artifacts / entry["path"], payload)
     _write_json(spec_path, spec)
 
-    with pytest.raises(bundle.BundleError, match="FAULT_APPLICATION_EVIDENCE_INVALID"):
+    with pytest.raises(bundle.BundleError, match="FAULT_ACCEPTANCE_RUN_MISMATCH"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+def test_fault_manifest_rejects_the_superseded_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "fault-acceptance")
+    entry["schema_version"] = "controlgraph.fault-scenario-set/v1"
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match="ARTIFACT_SCHEMA_INVALID"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+@pytest.mark.parametrize("tamper", ["principal", "root", "artifact", "invariant"])
+def test_fault_manifest_rejects_unbound_passed_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "fault-acceptance")
+    payload = json.loads((artifacts / entry["path"]).read_text())
+    if tamper == "principal":
+        payload["acceptance_principal_sha256"] = "invalid"
+    elif tamper == "root":
+        payload["cases"][1]["root_id"] = payload["cases"][0]["root_id"]
+    elif tamper == "artifact":
+        payload["cases"][0]["artifacts"].append(payload["cases"][0]["artifacts"][0])
+    else:
+        payload["cases"][0]["observed_invariants"] = ["SAFE_FALLBACK"]
+    entry["sha256"] = _write_json(artifacts / entry["path"], payload)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match="FAULT_ACCEPTANCE_MANIFEST_INVALID"):
         bundle.verify_bundle(repo, spec_path, artifacts)
 
 
