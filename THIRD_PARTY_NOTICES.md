@@ -21,6 +21,8 @@ ControlGraph Canary is licensed under Apache-2.0. The project depends on or uses
 | Testing Library | Component tests | MIT |
 | jsdom | Test DOM implementation | MIT |
 | Hypothesis | Property-based Python tests | MPL-2.0 |
+| Cosign | Keyless release-attestation signing and verification | Apache-2.0 |
+| Trivy | Release SBOM generation and vulnerability, license, and secret scanning | Apache-2.0 |
 | Terraform | Infrastructure tooling | BUSL-1.1 for current upstream releases; verify the installed version |
 | Google and Google Beta Terraform providers | Google Cloud resource providers | MPL-2.0 |
 | GitHub checkout/setup actions | CI bootstrap | MIT |

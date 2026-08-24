@@ -67,16 +67,17 @@ locals {
       ])
     }
     key_problem = {
-      display_name = "ControlGraph signing key problem"
-      severity     = "CRITICAL"
-      owner        = "security-audit"
-      resource     = "cloudkms_cryptokeyversion"
-      runbook      = "key-rotation-or-disablement"
+      display_name    = "ControlGraph signing key problem"
+      severity        = "CRITICAL"
+      owner           = "security-audit"
+      resource        = "cloudkms_cryptokeyversion"
+      resource_filter = "(resource.type=\"cloudkms_cryptokey\" OR resource.type=\"cloudkms_cryptokeyversion\")"
+      runbook         = "key-rotation-or-disablement"
       filter = join(" AND ", [
-        "resource.type=\"cloudkms_cryptokeyversion\"",
+        "(resource.type=\"cloudkms_cryptokey\" OR resource.type=\"cloudkms_cryptokeyversion\")",
         "resource.labels.key_ring_id=\"controlgraph-signing\"",
         "protoPayload.serviceName=\"cloudkms.googleapis.com\"",
-        "(protoPayload.status.code>0 OR protoPayload.methodName=\"UpdateCryptoKeyVersion\" OR protoPayload.methodName=\"DestroyCryptoKeyVersion\")",
+        "(protoPayload.status.code>0 OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyPrimaryVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion\")",
       ])
     }
     verifier_disagreement = {
@@ -157,7 +158,7 @@ resource "google_monitoring_alert_policy" "operational" {
 
     condition_threshold {
       filter = join(" AND ", [
-        "resource.type=\"${each.value.resource}\"",
+        try(each.value.resource_filter, "resource.type=\"${each.value.resource}\""),
         "metric.type=\"logging.googleapis.com/user/${google_logging_metric.operational[each.key].name}\"",
       ])
       comparison      = "COMPARISON_GT"
