@@ -19,16 +19,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, Self, cast
 
-from pydantic import (
-    AfterValidator,
-    BaseModel,
-    ConfigDict,
-    Field,
-    StringConstraints,
-    ValidationError,
-    model_validator,
-)
-
 from controlgraph_canary.contracts.base import (
     MAX_CONTRACT_BYTES,
     CloudRunName,
@@ -43,6 +33,15 @@ from controlgraph_canary.contracts.codec import (
     RestrictedJson,
     canonical_json_value_bytes,
     decode_contract,
+)
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
 )
 
 SUMMARY_SCHEMA: Final = "controlgraph.measurement-summary/v1"
@@ -153,7 +152,7 @@ class MeasurementSampleSetV1(StrictContractModel):
             raise ValueError("sample sequence must be contiguous")
         if len({item.sample_id for item in self.samples}) != len(self.samples):
             raise ValueError("sample identities must be unique")
-        if set(item.phase for item in self.samples) != set(MeasurementPhase):
+        if {item.phase for item in self.samples} != set(MeasurementPhase):
             raise ValueError("sample set must cover every measurement phase")
         if len(self.samples) > self.bounds.maximum_samples:
             raise ValueError("sample count exceeds the declared bound")
