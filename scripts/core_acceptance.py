@@ -1788,40 +1788,51 @@ def _create_load_job(
         if not isinstance(described, dict):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
         specification = described.get("spec")
-        template = specification.get("template") if isinstance(specification, dict) else None
-        template_metadata = template.get("metadata") if isinstance(template, dict) else None
-        template_spec = template.get("spec") if isinstance(template, dict) else None
-        task_template = template_spec.get("template") if isinstance(template_spec, dict) else None
-        containers = task_template.get("containers") if isinstance(task_template, dict) else None
+        execution_template = (
+            specification.get("template") if isinstance(specification, dict) else None
+        )
+        template_metadata = (
+            execution_template.get("metadata")
+            if isinstance(execution_template, dict)
+            else None
+        )
+        template_spec = (
+            execution_template.get("spec") if isinstance(execution_template, dict) else None
+        )
+        task_envelope = template_spec.get("template") if isinstance(template_spec, dict) else None
+        containers: Any = None
+        service_account: Any = None
+        for task_source in (
+            task_envelope,
+            task_envelope.get("spec") if isinstance(task_envelope, dict) else None,
+        ):
+            if not isinstance(task_source, dict):
+                continue
+            if isinstance(task_source.get("containers"), list):
+                containers = task_source["containers"]
+            if "serviceAccountName" in task_source:
+                service_account = task_source.get("serviceAccountName")
         deployed_images = (
             tuple(
                 container.get("image")
                 for container in containers
                 if isinstance(container, dict) and isinstance(container.get("image"), str)
             )
-            if isinstance(containers, list)
+            if containers is not None
             else ()
         )
-        service_account = (
-            task_template.get("serviceAccountName")
-            if isinstance(task_template, dict)
-            else None
-        )
-        labels: dict[str, Any] = {}
+        labels_match = True
         for label_source in (template_metadata, described.get("metadata")):
             values = label_source.get("labels") if isinstance(label_source, dict) else None
-            if isinstance(values, dict):
-                labels.update(
-                    {
-                        key: value
-                        for key, value in values.items()
-                        if isinstance(key, str) and isinstance(value, str)
-                    }
-                )
+            if (
+                not isinstance(values, dict)
+                or values.get(_LOAD_JOB_LABEL_KEY) != _LOAD_JOB_LABEL
+            ):
+                labels_match = False
         if (
             deployed_images != (_image(run.spec, ImageComponent.CONTROLLER),)
             or service_account != run.verifier_service_account
-            or labels.get(_LOAD_JOB_LABEL_KEY) != _LOAD_JOB_LABEL
+            or not labels_match
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     except AcceptanceError:

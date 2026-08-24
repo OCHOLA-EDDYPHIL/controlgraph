@@ -1007,17 +1007,26 @@ def _provider_job_document(
     return {
         "apiVersion": "run.googleapis.com/v1",
         "kind": "Job",
-        "metadata": {"generation": 1, "name": "cg-m8-core-p-abc", "uid": "uid-1"},
+        "metadata": {
+            "generation": 1,
+            "labels": dict(labels),
+            "name": "cg-m8-core-p-abc",
+            "uid": "uid-1",
+        },
         "spec": {
             "template": {
-                "metadata": {"labels": labels, "name": "cg-m8-core-p-abc"},
+                "metadata": {"labels": dict(labels), "name": "cg-m8-core-p-abc"},
                 "spec": {
+                    "parallelism": 1,
+                    "taskCount": 1,
                     "template": {
-                        "containers": [{"image": image}],
-                        "maxRetries": 0,
-                        "serviceAccountName": service_account,
-                        "taskTimeout": "600s",
-                    }
+                        "spec": {
+                            "containers": [{"image": image}],
+                            "maxRetries": 0,
+                            "serviceAccountName": service_account,
+                            "timeoutSeconds": "600s",
+                        }
+                    },
                 },
             }
         },
@@ -1113,6 +1122,16 @@ def test_hosted_load_job_verification_rejects_provider_drift(
     monkeypatch.setattr(runner, "_capture_process", lambda *_args, **_kwargs: (0, b""))
     monkeypatch.setattr(runner, "_load_job_names", lambda *_args, **_kwargs: frozenset())
 
+    def without_template_labels(document: dict[str, Any]) -> dict[str, Any]:
+        drifted = json.loads(json.dumps(document))
+        drifted["spec"]["template"]["metadata"]["labels"] = {}
+        return drifted
+
+    def without_resource_labels(document: dict[str, Any]) -> dict[str, Any]:
+        drifted = json.loads(json.dumps(document))
+        drifted["metadata"]["labels"] = {}
+        return drifted
+
     drifted_documents = (
         _provider_job_document(
             controller_image[:-1] + ("0" if controller_image[-1] != "0" else "1"),
@@ -1125,6 +1144,20 @@ def test_hosted_load_job_verification_rejects_provider_drift(
             {runner._LOAD_JOB_LABEL_KEY: runner._LOAD_JOB_LABEL},
         ),
         _provider_job_document(controller_image, verifier, {}),
+        without_template_labels(
+            _provider_job_document(
+                controller_image,
+                verifier,
+                {runner._LOAD_JOB_LABEL_KEY: runner._LOAD_JOB_LABEL},
+            )
+        ),
+        without_resource_labels(
+            _provider_job_document(
+                controller_image,
+                verifier,
+                {runner._LOAD_JOB_LABEL_KEY: runner._LOAD_JOB_LABEL},
+            )
+        ),
     )
     for described in drifted_documents:
 
