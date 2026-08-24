@@ -45,6 +45,159 @@ def _write_text(path: Path, value: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _core_artifact(artifact_id: str, sha256: str, byte_count: int = 64) -> dict[str, Any]:
+    return {
+        "artifact_id": artifact_id,
+        "byte_count": byte_count,
+        "media_type": "application/json",
+        "sha256": sha256,
+    }
+
+
+def _core_manifest(
+    *,
+    revision: str,
+    image_references: dict[str, str],
+    plan_id: str,
+    plan_sha256: str,
+    plan_bytes: int,
+    digest_digit: str,
+) -> dict[str, Any]:
+    run_inputs_sha256 = digest_digit * 64
+    spec_sha256 = chr(ord(digest_digit) + 1) * 64
+    cases: list[dict[str, Any]] = []
+    artifact_index = 16
+    for sequence, kind in enumerate(bundle.CORE_CASE_ORDER, start=1):
+        evidence: list[dict[str, Any]] = []
+        for evidence_kind in sorted(bundle.CORE_REQUIRED_EVIDENCE[kind]):
+            slug = evidence_kind.lower().replace("_", "-")
+            evidence_id = f"case-{sequence}-{slug}"
+            evidence.append(
+                {
+                    "artifact": _core_artifact(f"artifact-{evidence_id}", f"{artifact_index:064x}"),
+                    "evidence_id": evidence_id,
+                    "kind": evidence_kind,
+                    "observed_at": f"2026-08-24T00:{sequence:02d}:00Z",
+                    "projection": "PUBLIC_REDACTED",
+                }
+            )
+            artifact_index += 1
+        evidence_ids = [item["evidence_id"] for item in evidence]
+        split = len(evidence_ids) // 2
+        entry_points = [f"runner:reset-case-{sequence}", f"runner:run-case-{sequence}"]
+        cases.append(
+            {
+                "case_id": f"case-{sequence}",
+                "completed_at": f"2026-08-24T00:{sequence:02d}:01Z",
+                "cost": {
+                    "basis": "UPPER_BOUND",
+                    "maximum_microusd": 100,
+                    "reported_microusd": 10,
+                },
+                "duration_ms": 10,
+                "entry_points": entry_points,
+                "evidence": evidence,
+                "execution_mode": "HOSTED_GOOGLE_CLOUD",
+                "expected_result": bundle.CORE_EXPECTED_RESULTS[kind],
+                "kind": kind,
+                "maximum_duration_ms": 1_000,
+                "observed_result": bundle.CORE_EXPECTED_RESULTS[kind],
+                "random_seed": sequence,
+                "result_artifact": _core_artifact(
+                    f"case-{sequence}-result", f"{artifact_index:064x}"
+                ),
+                "sequence": sequence,
+                "started_at": f"2026-08-24T00:{sequence:02d}:00Z",
+                "status": "PASSED",
+                "steps": [
+                    {
+                        "duration_ms": 5,
+                        "evidence_ids": evidence_ids[:split],
+                        "operation": entry_points[0],
+                        "schema_version": "controlgraph.core-acceptance-step-result/v1",
+                        "sequence": 1,
+                        "status": "PASSED",
+                    },
+                    {
+                        "duration_ms": 5,
+                        "evidence_ids": evidence_ids[split:],
+                        "operation": entry_points[1],
+                        "schema_version": "controlgraph.core-acceptance-step-result/v1",
+                        "sequence": 2,
+                        "status": "PASSED",
+                    },
+                ],
+                "test_clock_keys": [f"case-{sequence}-start"],
+            }
+        )
+        artifact_index += 1
+    return {
+        "cases": cases,
+        "completed_at": "2026-08-24T00:09:01Z",
+        "cost": {
+            "basis": "UPPER_BOUND",
+            "currency": "USD",
+            "maximum_microusd": 800,
+            "reported_microusd": 80,
+        },
+        "duration_ms": 80,
+        "evidence_binding_complete": True,
+        "inputs": {
+            "images": [
+                {
+                    "schema_version": "controlgraph.acceptance-image/v1",
+                    "component": name,
+                    "reference": image_references[name],
+                }
+                for name in (
+                    "controller",
+                    "advisor",
+                    "console",
+                    "reference-stable",
+                    "reference-candidate",
+                )
+            ],
+            "policies": [
+                {
+                    "artifact": _core_artifact("rollout-policy", "b" * 64),
+                    "policy_schema_version": "controlgraph.rollout-health-policy/v1",
+                }
+            ],
+            "random_seed": 17,
+            "run_inputs_sha256": run_inputs_sha256,
+            "source_commit": revision,
+            "target": {
+                "schema_version": "controlgraph.acceptance-target/v1",
+                "project_id": "controlgraph-canary-abc123",
+                "region": "us-central1",
+                "environment": "nonprod",
+                "service_name": "controlgraph-reference-target",
+                "stable_revision": "reference-stable-00001-aaa",
+                "candidate_revision": "reference-candidate-00002-bbb",
+            },
+            "terraform_plan": _core_artifact(plan_id, plan_sha256, plan_bytes),
+            "test_clock": {
+                "schema_version": "controlgraph.acceptance-test-clock/v1",
+                "ticks": [
+                    {
+                        "at": f"2026-08-24T00:{sequence:02d}:00Z",
+                        "name": f"case-{sequence}-start",
+                        "schema_version": "controlgraph.acceptance-test-clock-tick/v1",
+                    }
+                    for sequence in range(1, 9)
+                ],
+            },
+        },
+        "maximum_duration_ms": 8_000,
+        "run_id": f"cgacceptance:{spec_sha256}",
+        "runner_mode": "EXPLICIT_HOSTED_EVIDENCE_BINDING",
+        "schema_version": "controlgraph.core-acceptance-manifest/v1",
+        "spec_sha256": spec_sha256,
+        "started_at": "2026-08-24T00:01:00Z",
+        "status": "PASSED",
+    }
+
+
 def _fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
@@ -150,45 +303,28 @@ def _fixture(
         },
     )
     plan_path = artifacts / "terraform-plan.json"
+    plan_sha256 = _write_json(plan_path, {"format_version": "1.2"})
     entries.append(
         {
             "id": "terraform-plan",
             "kind": "TERRAFORM_PLAN",
             "location": "BUNDLE",
             "path": "terraform-plan.json",
-            "sha256": _write_json(plan_path, {"format_version": "1.2"}),
+            "sha256": plan_sha256,
             "status": "VERIFIED",
         }
     )
     add_json(
         "core-acceptance",
         "CORE_ACCEPTANCE_MANIFEST",
-        {
-            "schema_version": "controlgraph.core-acceptance-manifest/v1",
-            "status": "PASSED",
-            "evidence_binding_complete": True,
-            "inputs": {
-                "source_commit": revision,
-                "target": {
-                    "schema_version": "controlgraph.acceptance-target/v1",
-                    "project_id": "controlgraph-canary-abc123",
-                    "region": "us-central1",
-                    "environment": "nonprod",
-                    "service_name": "controlgraph-reference-target",
-                    "stable_revision": "reference-stable-00001-aaa",
-                    "candidate_revision": "reference-candidate-00002-bbb",
-                },
-                "images": [
-                    {
-                        "schema_version": "controlgraph.acceptance-image/v1",
-                        "component": name,
-                        "reference": image_references[name],
-                    }
-                    for name in image_components
-                ],
-                "random_seed": 17,
-            },
-        },
+        _core_manifest(
+            revision=revision,
+            image_references=image_references,
+            plan_id="terraform-plan",
+            plan_sha256=plan_sha256,
+            plan_bytes=plan_path.stat().st_size,
+            digest_digit="c",
+        ),
     )
     fault_cases: list[dict[str, Any]] = []
     for index, fault in enumerate(bundle.FAULT_ORDER):
@@ -278,6 +414,10 @@ def _fixture(
         {
             "schema_version": "controlgraph.required-check-results/v1",
             "source_commit": revision,
+            "head_sha": revision,
+            "workflow_run_id": 123456789,
+            "event": "push",
+            "run_url": ("https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/123456789"),
             "status": "PASSED",
             "checks": {key: "PASSED" for key in sorted(bundle.REQUIRED_CHECKS)},
         },
@@ -439,6 +579,35 @@ def _fixture(
         relative="prepared-bundle.json",
     )
     prepared_digest = next(item["sha256"] for item in entries if item["id"] == "prepared-bundle")
+    clean_plan_path = artifacts / "clean-room" / "terraform-plan.json"
+    clean_plan_sha256 = _write_json(
+        clean_plan_path, {"format_version": "1.2", "resource_changes": []}
+    )
+    clean_core_path = artifacts / "clean-room" / "core-acceptance-manifest.json"
+    clean_core_sha256 = _write_json(
+        clean_core_path,
+        _core_manifest(
+            revision=revision,
+            image_references=image_references,
+            plan_id="clean-room-terraform-plan",
+            plan_sha256=clean_plan_sha256,
+            plan_bytes=clean_plan_path.stat().st_size,
+            digest_digit="d",
+        ),
+    )
+    link_validation_path = artifacts / "clean-room" / "evidence-links.json"
+    link_validation_sha256 = _write_json(
+        link_validation_path,
+        {
+            "core_acceptance_manifest_sha256": clean_core_sha256,
+            "prepared_bundle_sha256": prepared_digest,
+            "schema_version": "controlgraph.evidence-link-validation/v1",
+            "source_commit": revision,
+            "status": "PASSED",
+            "terraform_plan_sha256": clean_plan_sha256,
+            "validated_claim_ids": sorted(claim_ids),
+        },
+    )
     add_json(
         "clean-room",
         "CLEAN_ROOM_REHEARSAL",
@@ -449,6 +618,23 @@ def _fixture(
             "prepared_bundle_sha256": prepared_digest,
             "status": "PASSED",
             "steps": {key: "PASSED" for key in sorted(bundle.CLEAN_ROOM_STEPS)},
+            "outputs": {
+                "terraform_plan": {
+                    "artifact_id": "clean-room-terraform-plan",
+                    "path": "clean-room/terraform-plan.json",
+                    "sha256": clean_plan_sha256,
+                },
+                "core_acceptance_manifest": {
+                    "artifact_id": "clean-room-core-acceptance",
+                    "path": "clean-room/core-acceptance-manifest.json",
+                    "sha256": clean_core_sha256,
+                },
+                "evidence_link_validation": {
+                    "artifact_id": "clean-room-evidence-links",
+                    "path": "clean-room/evidence-links.json",
+                    "sha256": link_validation_sha256,
+                },
+            },
             "sign_off": {
                 "reviewer_id": "fixture-reviewer",
                 "recorded_at": "2026-08-24T00:00:00Z",
@@ -573,6 +759,20 @@ def test_claim_source_must_be_a_verified_repository_artifact(
         bundle.verify_bundle(repo, spec_path, artifacts)
 
 
+def test_required_checks_bind_the_exact_main_workflow_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "checks")
+    payload = json.loads((artifacts / entry["path"]).read_text())
+    payload["run_url"] = "https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/987654321"
+    entry["sha256"] = _write_json(artifacts / entry["path"], payload)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match="REQUIRED_CHECK_RESULTS_INVALID"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
 def test_core_images_must_match_release_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -586,6 +786,130 @@ def test_core_images_must_match_release_evidence(
     _write_json(spec_path, spec)
 
     with pytest.raises(bundle.BundleError, match="CORE_RELEASE_IMAGE_MISMATCH"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+@pytest.mark.parametrize(
+    ("tamper", "error"),
+    [
+        ("spec", "CORE_ACCEPTANCE_MANIFEST_INVALID"),
+        ("run", "CORE_ACCEPTANCE_MANIFEST_INVALID"),
+        ("input", "CORE_ACCEPTANCE_MANIFEST_INVALID"),
+        ("cases", "CORE_ACCEPTANCE_CASES_INVALID"),
+        ("plan", "CORE_ACCEPTANCE_PLAN_MISMATCH"),
+        ("policy", "CORE_ACCEPTANCE_ARTIFACT_INVALID"),
+        ("evidence", "CORE_ACCEPTANCE_EVIDENCE_INVALID"),
+        ("bounds", "CORE_ACCEPTANCE_BOUNDS_INVALID"),
+    ],
+)
+def test_core_manifest_rejects_incomplete_or_unbound_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    error: str,
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "core-acceptance")
+    payload = json.loads((artifacts / entry["path"]).read_text())
+    if tamper == "spec":
+        payload["spec_sha256"] = "invalid"
+    elif tamper == "run":
+        payload["run_id"] = f"cgacceptance:{'f' * 64}"
+    elif tamper == "input":
+        payload["inputs"]["run_inputs_sha256"] = "invalid"
+    elif tamper == "cases":
+        payload["cases"].pop()
+    elif tamper == "plan":
+        payload["inputs"]["terraform_plan"]["sha256"] = "f" * 64
+    elif tamper == "policy":
+        payload["inputs"]["policies"][0]["artifact"]["sha256"] = "invalid"
+    elif tamper == "evidence":
+        payload["cases"][0]["evidence"].pop()
+    else:
+        payload["duration_ms"] += 1
+    entry["sha256"] = _write_json(artifacts / entry["path"], payload)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match=error):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+@pytest.mark.parametrize(
+    ("tamper", "error"),
+    [
+        ("terraform_plan", "CLEAN_ROOM_TERRAFORM_PLAN_INVALID"),
+        ("core_acceptance_manifest", "CORE_ACCEPTANCE_CASES_INVALID"),
+        ("evidence_link_validation", "CLEAN_ROOM_EVIDENCE_LINKS_INVALID"),
+    ],
+)
+def test_clean_room_validates_cited_output_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    error: str,
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "clean-room")
+    record = json.loads((artifacts / entry["path"]).read_text())
+    reference = record["outputs"][tamper]
+    output_path = artifacts / reference["path"]
+    output = json.loads(output_path.read_text())
+    if tamper == "terraform_plan":
+        output.pop("format_version")
+    elif tamper == "core_acceptance_manifest":
+        output["cases"].pop()
+    else:
+        output["validated_claim_ids"] = []
+    reference["sha256"] = _write_json(output_path, output)
+    if tamper == "core_acceptance_manifest":
+        links_reference = record["outputs"]["evidence_link_validation"]
+        links_path = artifacts / links_reference["path"]
+        links = json.loads(links_path.read_text())
+        links["core_acceptance_manifest_sha256"] = reference["sha256"]
+        links_reference["sha256"] = _write_json(links_path, links)
+    entry["sha256"] = _write_json(artifacts / entry["path"], record)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match=error):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+@pytest.mark.parametrize(
+    ("reuse", "error"),
+    [
+        ("path", "CLEAN_ROOM_OUTPUT_INVALID"),
+        ("plan", "CLEAN_ROOM_OUTPUT_INVALID"),
+        ("run", "CLEAN_ROOM_CORE_ACCEPTANCE_INVALID"),
+    ],
+)
+def test_clean_room_outputs_are_distinct_from_primary_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reuse: str,
+    error: str,
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "clean-room")
+    record = json.loads((artifacts / entry["path"]).read_text())
+    if reuse == "path":
+        record["outputs"]["evidence_link_validation"]["path"] = "evidence-links.json"
+    elif reuse == "plan":
+        plan = next(item for item in spec["artifacts"] if item["id"] == "terraform-plan")
+        clean_plan = record["outputs"]["terraform_plan"]
+        clean_plan["sha256"] = plan["sha256"]
+        (artifacts / clean_plan["path"]).write_bytes((artifacts / plan["path"]).read_bytes())
+    else:
+        clean_core_reference = record["outputs"]["core_acceptance_manifest"]
+        clean_core_path = artifacts / clean_core_reference["path"]
+        clean_core = json.loads(clean_core_path.read_text())
+        primary_entry = next(item for item in spec["artifacts"] if item["id"] == "core-acceptance")
+        primary_core = json.loads((artifacts / primary_entry["path"]).read_text())
+        clean_core["run_id"] = primary_core["run_id"]
+        clean_core_reference["sha256"] = _write_json(clean_core_path, clean_core)
+    entry["sha256"] = _write_json(artifacts / entry["path"], record)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match=error):
         bundle.verify_bundle(repo, spec_path, artifacts)
 
 

@@ -21,6 +21,8 @@ REPOSITORY: Final = "https://github.com/OCHOLA-EDDYPHIL/controlgraph"
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 ID_RE = re.compile(r"^[a-z][a-z0-9.-]{0,95}$")
+CORE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SCHEMA_RE = re.compile(r"^[a-z][a-z0-9.-]*/v[1-9][0-9]*$")
 PROJECT_RE = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 CLOUD_RUN_NAME_RE = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 IMAGE_RE = re.compile(
@@ -31,6 +33,89 @@ IMAGE_RE = re.compile(
 IMAGE_COMPONENTS: Final = frozenset(
     {"controller", "console", "advisor", "reference-stable", "reference-candidate"}
 )
+CORE_CASE_ORDER: Final = (
+    "TARGET_RESET",
+    "HEALTHY_PROMOTION",
+    "UNHEALTHY_STABLE_RECOVERY",
+    "REVOCATION_STALE_DENIAL",
+    "INDEPENDENT_VERIFIER_PROBE",
+    "AMBIGUITY_CLASSIFICATION",
+    "TIMELINE_CONSOLE_READ",
+    "BOUNDED_ADVISOR",
+)
+CORE_EXPECTED_RESULTS: Final = {
+    "TARGET_RESET": "RESET_VERIFIED",
+    "HEALTHY_PROMOTION": "PROMOTED",
+    "UNHEALTHY_STABLE_RECOVERY": "RECOVERED",
+    "REVOCATION_STALE_DENIAL": "DENIED",
+    "INDEPENDENT_VERIFIER_PROBE": "VERIFIED",
+    "AMBIGUITY_CLASSIFICATION": "AMBIGUOUS",
+    "TIMELINE_CONSOLE_READ": "READABLE",
+    "BOUNDED_ADVISOR": "ADVISORY_ONLY",
+}
+CORE_REQUIRED_EVIDENCE: Final = {
+    "TARGET_RESET": frozenset({"CLOUD_RUN_CONFIGURATION", "DATA_PATH_PROBE"}),
+    "HEALTHY_PROMOTION": frozenset(
+        {
+            "CLOUD_RUN_CONFIGURATION",
+            "DATA_PATH_PROBE",
+            "VERIFIED_CAPABILITY_METADATA",
+            "EXECUTOR_EPOCH_CHECK",
+            "EXECUTION_RECEIPT",
+            "HEALTH_DECISION",
+            "TIMELINE",
+        }
+    ),
+    "UNHEALTHY_STABLE_RECOVERY": frozenset(
+        {
+            "CLOUD_RUN_CONFIGURATION",
+            "DATA_PATH_PROBE",
+            "VERIFIED_CAPABILITY_METADATA",
+            "EXECUTOR_EPOCH_CHECK",
+            "EXECUTION_RECEIPT",
+            "HEALTH_DECISION",
+            "RECOVERY_SERVICE_IDENTITY_BINDING",
+            "TIMELINE",
+        }
+    ),
+    "REVOCATION_STALE_DENIAL": frozenset(
+        {
+            "AUTHORITY_TRANSITION",
+            "CLOUD_RUN_CONFIGURATION",
+            "DATA_PATH_PROBE",
+            "VERIFIED_CAPABILITY_METADATA",
+            "EXECUTOR_EPOCH_CHECK",
+            "STALE_DENIAL",
+            "EXECUTION_RECEIPT",
+            "TIMELINE",
+        }
+    ),
+    "INDEPENDENT_VERIFIER_PROBE": frozenset(
+        {
+            "CLOUD_RUN_CONFIGURATION",
+            "DATA_PATH_PROBE",
+            "INDEPENDENT_VERIFICATION",
+            "TIMELINE",
+        }
+    ),
+    "AMBIGUITY_CLASSIFICATION": frozenset(
+        {
+            "CLOUD_RUN_CONFIGURATION",
+            "EXECUTION_RECEIPT",
+            "AMBIGUITY_CLASSIFICATION",
+            "TIMELINE",
+        }
+    ),
+    "TIMELINE_CONSOLE_READ": frozenset(
+        {"CLOUD_RUN_CONFIGURATION", "TIMELINE", "CONSOLE_READ"}
+    ),
+    "BOUNDED_ADVISOR": frozenset(
+        {"CLOUD_RUN_CONFIGURATION", "COORDINATOR", "MODEL_AUDIT", "TIMELINE"}
+    ),
+}
+MAX_CORE_CASE_DURATION_MS: Final = 60 * 60 * 1_000
+MAX_CORE_DURATION_MS: Final = 4 * 60 * 60 * 1_000
+MAX_CORE_COST_MICROUSD: Final = 10_000_000
 
 CLAIM_CATEGORIES: Final = frozenset(
     {
@@ -389,15 +474,75 @@ def _validate_contract_index(payload: Mapping[str, Any], revision: str) -> None:
         identities.add(identifier)
 
 
+def _core_artifact(value: Any) -> dict[str, Any]:
+    artifact = _object(value, "CORE_ACCEPTANCE_ARTIFACT_INVALID")
+    if (
+        set(artifact) != {"artifact_id", "byte_count", "media_type", "sha256"}
+        or not isinstance(artifact.get("artifact_id"), str)
+        or CORE_ID_RE.fullmatch(artifact["artifact_id"]) is None
+        or type(artifact.get("byte_count")) is not int
+        or not 0 < artifact["byte_count"] <= 8 * 1024 * 1024
+        or artifact.get("media_type")
+        not in {"application/json", "text/plain", "application/octet-stream"}
+        or not isinstance(artifact.get("sha256"), str)
+        or SHA_RE.fullmatch(artifact["sha256"]) is None
+    ):
+        raise BundleError("CORE_ACCEPTANCE_ARTIFACT_INVALID")
+    return artifact
+
+
+def _clean_room_output(root: Path, value: Any) -> tuple[dict[str, Any], Path]:
+    reference = _object(value, "CLEAN_ROOM_OUTPUT_INVALID")
+    artifact_id = reference.get("artifact_id")
+    relative_path = reference.get("path")
+    sha256 = reference.get("sha256")
+    if (
+        set(reference) != {"artifact_id", "path", "sha256"}
+        or not isinstance(artifact_id, str)
+        or CORE_ID_RE.fullmatch(artifact_id) is None
+        or not isinstance(relative_path, str)
+        or PurePosixPath(relative_path).parts[:1] != ("clean-room",)
+        or not isinstance(sha256, str)
+        or SHA_RE.fullmatch(sha256) is None
+    ):
+        raise BundleError("CLEAN_ROOM_OUTPUT_INVALID")
+    path = _relative_path(root, reference.get("path"))
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise BundleError("CLEAN_ROOM_OUTPUT_INVALID") from error
+    if (
+        not path.is_file()
+        or not 0 < size <= 8 * 1024 * 1024
+        or _file_sha(path) != sha256
+    ):
+        raise BundleError("CLEAN_ROOM_OUTPUT_INVALID")
+    return {"bytes": size, "id": artifact_id, "sha256": sha256}, path
+
+
 def _validate_core_acceptance(
-    payload: Mapping[str, Any], revision: str, release_images: Mapping[str, str] | None
+    payload: Mapping[str, Any],
+    revision: str,
+    release_images: Mapping[str, str] | None,
+    terraform_plan: Mapping[str, Any],
 ) -> None:
     inputs = _object(payload.get("inputs"), "CORE_ACCEPTANCE_MANIFEST_INVALID")
     target = _object(inputs.get("target"), "CORE_ACCEPTANCE_TARGET_INVALID")
+    spec_sha256 = payload.get("spec_sha256")
+    run_inputs_sha256 = inputs.get("run_inputs_sha256")
     if (
-        payload.get("status") != "PASSED"
+        payload.get("schema_version") != "controlgraph.core-acceptance-manifest/v1"
+        or payload.get("status") != "PASSED"
         or payload.get("evidence_binding_complete") is not True
+        or payload.get("runner_mode") != "EXPLICIT_HOSTED_EVIDENCE_BINDING"
         or inputs.get("source_commit") != revision
+        or not isinstance(spec_sha256, str)
+        or SHA_RE.fullmatch(spec_sha256) is None
+        or payload.get("run_id") != f"cgacceptance:{spec_sha256}"
+        or not isinstance(run_inputs_sha256, str)
+        or SHA_RE.fullmatch(run_inputs_sha256) is None
+        or type(inputs.get("random_seed")) is not int
+        or not 0 <= inputs["random_seed"] <= 9_007_199_254_740_991
     ):
         raise BundleError("CORE_ACCEPTANCE_MANIFEST_INVALID")
     if (
@@ -443,6 +588,161 @@ def _validate_core_acceptance(
         release_images is not None and images != release_images
     ):
         raise BundleError("CORE_RELEASE_IMAGE_MISMATCH")
+
+    plan = _core_artifact(inputs.get("terraform_plan"))
+    if (
+        plan["artifact_id"] != terraform_plan.get("id")
+        or plan["sha256"] != terraform_plan.get("sha256")
+        or plan["byte_count"] != terraform_plan.get("bytes")
+        or plan["media_type"] != "application/json"
+    ):
+        raise BundleError("CORE_ACCEPTANCE_PLAN_MISMATCH")
+    policies = inputs.get("policies")
+    if not isinstance(policies, list) or not 1 <= len(policies) <= 8:
+        raise BundleError("CORE_ACCEPTANCE_POLICY_INVALID")
+    artifact_ids = {plan["artifact_id"]}
+    for raw in policies:
+        policy = _object(raw, "CORE_ACCEPTANCE_POLICY_INVALID")
+        schema_version = policy.get("policy_schema_version")
+        artifact = _core_artifact(policy.get("artifact"))
+        if (
+            set(policy) != {"artifact", "policy_schema_version"}
+            or not isinstance(schema_version, str)
+            or SCHEMA_RE.fullmatch(schema_version) is None
+            or artifact["media_type"] != "application/json"
+            or artifact["artifact_id"] in artifact_ids
+        ):
+            raise BundleError("CORE_ACCEPTANCE_POLICY_INVALID")
+        artifact_ids.add(artifact["artifact_id"])
+
+    raw_cases = payload.get("cases")
+    if not isinstance(raw_cases, list) or len(raw_cases) != len(CORE_CASE_ORDER):
+        raise BundleError("CORE_ACCEPTANCE_CASES_INVALID")
+    cases = [_object(value, "CORE_ACCEPTANCE_CASES_INVALID") for value in raw_cases]
+    if tuple(case.get("kind") for case in cases) != CORE_CASE_ORDER:
+        raise BundleError("CORE_ACCEPTANCE_CASES_INVALID")
+    case_ids: set[str] = set()
+    evidence_ids: set[str] = set()
+    total_duration = 0
+    maximum_duration = 0
+    reported_cost = 0
+    maximum_cost = 0
+    for sequence, case in enumerate(cases, start=1):
+        kind = CORE_CASE_ORDER[sequence - 1]
+        case_id = case.get("case_id")
+        duration = case.get("duration_ms")
+        duration_bound = case.get("maximum_duration_ms")
+        cost = _object(case.get("cost"), "CORE_ACCEPTANCE_CASES_INVALID")
+        cost_reported = cost.get("reported_microusd")
+        cost_bound = cost.get("maximum_microusd")
+        entry_points = case.get("entry_points")
+        evidence = case.get("evidence")
+        steps = case.get("steps")
+        if (
+            case.get("sequence") != sequence
+            or not isinstance(case_id, str)
+            or CORE_ID_RE.fullmatch(case_id) is None
+            or case_id in case_ids
+            or case.get("status") != "PASSED"
+            or case.get("execution_mode") != "HOSTED_GOOGLE_CLOUD"
+            or case.get("expected_result") != CORE_EXPECTED_RESULTS[kind]
+            or case.get("observed_result") != CORE_EXPECTED_RESULTS[kind]
+            or type(duration) is not int
+            or type(duration_bound) is not int
+            or not 0 <= duration <= duration_bound <= MAX_CORE_CASE_DURATION_MS
+            or cost.get("basis") not in {"MEASURED", "UPPER_BOUND"}
+            or type(cost_reported) is not int
+            or type(cost_bound) is not int
+            or not 0 <= cost_reported <= cost_bound <= MAX_CORE_COST_MICROUSD
+            or not isinstance(entry_points, list)
+            or not entry_points
+            or any(not isinstance(value, str) or not value for value in entry_points)
+            or not isinstance(evidence, list)
+            or not evidence
+            or not isinstance(steps, list)
+            or not steps
+            or len(steps) != len(entry_points)
+        ):
+            raise BundleError("CORE_ACCEPTANCE_CASES_INVALID")
+        result_artifact = _core_artifact(case.get("result_artifact"))
+        if (
+            result_artifact["media_type"] != "application/json"
+            or result_artifact["artifact_id"] in artifact_ids
+        ):
+            raise BundleError("CORE_ACCEPTANCE_CASES_INVALID")
+        artifact_ids.add(result_artifact["artifact_id"])
+        case_ids.add(case_id)
+        total_duration += duration
+        maximum_duration += duration_bound
+        reported_cost += cost_reported
+        maximum_cost += cost_bound
+
+        case_evidence_ids: set[str] = set()
+        evidence_kinds: set[str] = set()
+        for raw_evidence in evidence:
+            item = _object(raw_evidence, "CORE_ACCEPTANCE_EVIDENCE_INVALID")
+            evidence_id = item.get("evidence_id")
+            kind_value = item.get("kind")
+            artifact = _core_artifact(item.get("artifact"))
+            if (
+                not isinstance(evidence_id, str)
+                or CORE_ID_RE.fullmatch(evidence_id) is None
+                or evidence_id in evidence_ids
+                or not isinstance(kind_value, str)
+                or item.get("projection")
+                not in {"PUBLIC_REDACTED", "PRIVATE_DIGEST_ONLY"}
+                or artifact["artifact_id"] in artifact_ids
+            ):
+                raise BundleError("CORE_ACCEPTANCE_EVIDENCE_INVALID")
+            evidence_ids.add(evidence_id)
+            case_evidence_ids.add(evidence_id)
+            evidence_kinds.add(kind_value)
+            artifact_ids.add(artifact["artifact_id"])
+        if not CORE_REQUIRED_EVIDENCE[kind].issubset(evidence_kinds):
+            raise BundleError("CORE_ACCEPTANCE_EVIDENCE_INVALID")
+
+        referenced: set[str] = set()
+        step_duration = 0
+        for step_sequence, raw_step in enumerate(steps, start=1):
+            step = _object(raw_step, "CORE_ACCEPTANCE_EVIDENCE_INVALID")
+            references = step.get("evidence_ids")
+            step_ms = step.get("duration_ms")
+            if (
+                step.get("schema_version")
+                != "controlgraph.core-acceptance-step-result/v1"
+                or step.get("sequence") != step_sequence
+                or step.get("status") != "PASSED"
+                or step.get("operation") != entry_points[step_sequence - 1]
+                or type(step_ms) is not int
+                or not 0 <= step_ms <= MAX_CORE_CASE_DURATION_MS
+                or not isinstance(references, list)
+                or not references
+                or any(not isinstance(value, str) for value in references)
+                or len(set(references)) != len(references)
+            ):
+                raise BundleError("CORE_ACCEPTANCE_EVIDENCE_INVALID")
+            referenced.update(references)
+            step_duration += step_ms
+        if referenced != case_evidence_ids or step_duration > duration:
+            raise BundleError("CORE_ACCEPTANCE_EVIDENCE_INVALID")
+
+    manifest_duration = payload.get("duration_ms")
+    duration_bound = payload.get("maximum_duration_ms")
+    cost = _object(payload.get("cost"), "CORE_ACCEPTANCE_MANIFEST_INVALID")
+    manifest_cost_bound = cost.get("maximum_microusd")
+    if (
+        type(manifest_duration) is not int
+        or type(duration_bound) is not int
+        or manifest_duration != total_duration
+        or not 0 <= manifest_duration <= duration_bound <= MAX_CORE_DURATION_MS
+        or maximum_duration > duration_bound
+        or cost.get("basis") not in {"MEASURED", "UPPER_BOUND"}
+        or cost.get("currency") != "USD"
+        or cost.get("reported_microusd") != reported_cost
+        or type(manifest_cost_bound) is not int
+        or not maximum_cost <= manifest_cost_bound <= MAX_CORE_COST_MICROUSD
+    ):
+        raise BundleError("CORE_ACCEPTANCE_BOUNDS_INVALID")
 
 
 def _validate_release_evidence(
@@ -650,9 +950,12 @@ def _validate_known_payloads(
     for _, payload in by_kind.get("CONTRACT_SCHEMA_INDEX", []):
         _validate_contract_index(payload, revision)
     core = by_kind.get("CORE_ACCEPTANCE_MANIFEST", [])
+    terraform_plan = next(
+        item for item in artifact_records if item["kind"] == "TERRAFORM_PLAN"
+    )
+    release_images = supply_chain["images"] if supply_chain is not None else None
     for _, payload in core:
-        release_images = supply_chain["images"] if supply_chain is not None else None
-        _validate_core_acceptance(payload, revision, release_images)
+        _validate_core_acceptance(payload, revision, release_images, terraform_plan)
     faults = by_kind.get("FAULT_ACCEPTANCE_MANIFEST", [])
     if core and faults:
         _validate_fault_acceptance(faults[0][1], core[0][1], revision)
@@ -709,9 +1012,21 @@ def _validate_known_payloads(
             raise BundleError("PERFORMANCE_CLAIM_SCOPE_INVALID")
     for _, payload in by_kind.get("REQUIRED_CHECK_RESULTS", []):
         _require_source_commit(payload, revision)
-        if payload.get("status") != "PASSED" or payload.get("checks") != {
-            key: "PASSED" for key in sorted(REQUIRED_CHECKS)
-        }:
+        workflow_run_id = payload.get("workflow_run_id")
+        if (
+            payload.get("status") != "PASSED"
+            or payload.get("checks")
+            != {key: "PASSED" for key in sorted(REQUIRED_CHECKS)}
+            or payload.get("head_sha") != revision
+            or type(workflow_run_id) is not int
+            or workflow_run_id <= 0
+            or payload.get("event") != "push"
+            or payload.get("run_url")
+            != (
+                "https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/"
+                f"{workflow_run_id}"
+            )
+        ):
             raise BundleError("REQUIRED_CHECK_RESULTS_INVALID")
     for _, payload in by_kind.get("RELEASE_REVIEW", []):
         _require_source_commit(payload, revision)
@@ -752,6 +1067,7 @@ def _validate_known_payloads(
         _require_source_commit(payload, revision)
         sign_off = payload.get("sign_off")
         prepared_digest = artifacts[prepared[0][0]]["sha256"] if prepared else None
+        outputs = _object(payload.get("outputs"), "CLEAN_ROOM_REHEARSAL_INVALID")
         if (
             payload.get("source_tag") != source_tag
             or payload.get("prepared_bundle_sha256") != prepared_digest
@@ -761,8 +1077,78 @@ def _validate_known_payloads(
             or not isinstance(sign_off, dict)
             or not sign_off.get("reviewer_id")
             or not sign_off.get("recorded_at")
+            or set(outputs)
+            != {
+                "terraform_plan",
+                "core_acceptance_manifest",
+                "evidence_link_validation",
+            }
         ):
             raise BundleError("CLEAN_ROOM_REHEARSAL_INVALID")
+        bound_outputs: dict[str, dict[str, Any]] = {}
+        output_paths: dict[str, Path] = {}
+        for name, value in outputs.items():
+            bound_outputs[name], output_paths[name] = _clean_room_output(
+                artifact_root, value
+            )
+        if (
+            len({item["id"] for item in bound_outputs.values()}) != len(bound_outputs)
+            or len(set(output_paths.values())) != len(output_paths)
+            or output_paths["terraform_plan"]
+            == _relative_path(artifact_root, terraform_plan["path"])
+            or bound_outputs["terraform_plan"]["sha256"] == terraform_plan["sha256"]
+        ):
+            raise BundleError("CLEAN_ROOM_OUTPUT_INVALID")
+        plan_payload, _ = _read_json(
+            output_paths["terraform_plan"], "CLEAN_ROOM_TERRAFORM_PLAN_INVALID"
+        )
+        if not isinstance(plan_payload.get("format_version"), str):
+            raise BundleError("CLEAN_ROOM_TERRAFORM_PLAN_INVALID")
+        clean_core, _ = _read_json(
+            output_paths["core_acceptance_manifest"],
+            "CLEAN_ROOM_CORE_ACCEPTANCE_INVALID",
+        )
+        if not core:
+            raise BundleError("CLEAN_ROOM_CORE_ACCEPTANCE_INVALID")
+        primary_core_id, primary_core = core[0]
+        clean_inputs = _object(
+            clean_core.get("inputs"), "CLEAN_ROOM_CORE_ACCEPTANCE_INVALID"
+        )
+        primary_inputs = _object(
+            primary_core.get("inputs"), "CLEAN_ROOM_CORE_ACCEPTANCE_INVALID"
+        )
+        if (
+            bound_outputs["core_acceptance_manifest"]["sha256"]
+            == artifacts[primary_core_id]["sha256"]
+            or clean_core.get("run_id") == primary_core.get("run_id")
+            or clean_inputs.get("source_commit") != primary_inputs.get("source_commit")
+            or clean_inputs.get("target") != primary_inputs.get("target")
+            or clean_inputs.get("images") != primary_inputs.get("images")
+        ):
+            raise BundleError("CLEAN_ROOM_CORE_ACCEPTANCE_INVALID")
+        _validate_core_acceptance(
+            clean_core,
+            revision,
+            release_images,
+            bound_outputs["terraform_plan"],
+        )
+        links, _ = _read_json(
+            output_paths["evidence_link_validation"],
+            "CLEAN_ROOM_EVIDENCE_LINKS_INVALID",
+        )
+        if (
+            links.get("schema_version") != "controlgraph.evidence-link-validation/v1"
+            or links.get("status") != "PASSED"
+            or links.get("source_commit") != revision
+            or links.get("prepared_bundle_sha256") != prepared_digest
+            or links.get("terraform_plan_sha256")
+            != bound_outputs["terraform_plan"]["sha256"]
+            or links.get("core_acceptance_manifest_sha256")
+            != bound_outputs["core_acceptance_manifest"]["sha256"]
+            or links.get("validated_claim_ids")
+            != sorted(claim["id"] for claim in claims)
+        ):
+            raise BundleError("CLEAN_ROOM_EVIDENCE_LINKS_INVALID")
     return supply_chain
 
 
