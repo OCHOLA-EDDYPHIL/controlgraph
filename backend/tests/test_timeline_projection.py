@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import Any
@@ -22,6 +23,10 @@ from controlgraph_canary.application.timeline import (
     TimelineWriteService,
     project_timeline_entry,
 )
+from controlgraph_canary.application.timeline_recording import (
+    _emit_operational_signals,
+    _operational_signals,
+)
 from controlgraph_canary.contracts.codec import canonical_json_bytes
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_CORRELATION_V1,
@@ -35,9 +40,12 @@ from controlgraph_canary.contracts.timeline import (
     TimelineDisplayFieldName,
     TimelineDisplayFieldV1,
     TimelineEntryV1,
+    TimelineEventType,
     TimelineEventV1,
     TimelineHeadV1,
     TimelinePageCommandV1,
+    TimelineTerminalClassification,
+    TimelineVerificationStatus,
     standard_timeline_evidence_policy_set,
     timeline_entry,
 )
@@ -118,6 +126,63 @@ def _classified_entry() -> TimelineEntryV1:
         previous_entry_sha256=None,
         recorded_at="2026-08-21T00:04:00Z",
     )
+
+
+def test_operational_signal_log_is_closed_and_excludes_source_content(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sensitive_marker = "unmistakably-synthetic-sensitive-source"
+    event = timeline_event(
+        9,
+        event_type=TimelineEventType.TERMINAL_CLASSIFIED,
+        display_fields=(
+            TimelineDisplayFieldV1(
+                schema_version=TIMELINE_DISPLAY_FIELD_V1,
+                name=TimelineDisplayFieldName.ACTION,
+                value="RECOVERY",
+                data_class=TimelineAudience.PUBLIC_DEMO,
+            ),
+            TimelineDisplayFieldV1(
+                schema_version=TIMELINE_DISPLAY_FIELD_V1,
+                name=TimelineDisplayFieldName.OUTCOME,
+                value="AMBIGUOUS",
+                data_class=TimelineAudience.PUBLIC_DEMO,
+            ),
+            TimelineDisplayFieldV1(
+                schema_version=TIMELINE_DISPLAY_FIELD_V1,
+                name=TimelineDisplayFieldName.REASON_CODE,
+                value="EVIDENCE_STALE",
+                data_class=TimelineAudience.OPERATOR,
+            ),
+            TimelineDisplayFieldV1(
+                schema_version=TIMELINE_DISPLAY_FIELD_V1,
+                name=TimelineDisplayFieldName.SUMMARY,
+                value=sensitive_marker,
+                data_class=TimelineAudience.RESTRICTED,
+            ),
+        ),
+    ).model_copy(
+        update={
+            "terminal_classification": TimelineTerminalClassification.AMBIGUOUS,
+            "verification_status": TimelineVerificationStatus.AMBIGUOUS,
+        }
+    )
+
+    assert _operational_signals(event) == ("failed_recovery", "evidence_failure")
+    _emit_operational_signals(event)
+
+    records = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert [record["signal"] for record in records] == [
+        "failed_recovery",
+        "evidence_failure",
+    ]
+    assert all(
+        set(record)
+        == {"epoch", "event", "event_type", "root_sha256", "signal"}
+        for record in records
+    )
+    assert sensitive_marker not in json.dumps(records)
+    assert "request:9" not in json.dumps(records)
 
 
 def test_audience_projections_are_nested_and_secret_safe() -> None:

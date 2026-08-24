@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from typing import Protocol, runtime_checkable
 
 from controlgraph_canary.application.timeline import (
@@ -29,6 +31,9 @@ from controlgraph_canary.contracts.canary_execution import CanaryDispatchResultV
 from controlgraph_canary.contracts.health_execution import SignedHealthDecisionProofV1
 from controlgraph_canary.contracts.independent_verification import (
     CompletionClassificationV1,
+    CompletionKind,
+    CompletionReason,
+    IndependentVerificationVerdict,
     VerifiedIndependentVerificationEvidenceV1,
 )
 from controlgraph_canary.contracts.model_assistance import ModelAssistanceTimelineAuditV1
@@ -50,7 +55,87 @@ from controlgraph_canary.contracts.root_creation import (
     SignedEvidenceEventV1,
 )
 from controlgraph_canary.contracts.service_claim_release import ServiceClaimReleaseResultV1
-from controlgraph_canary.contracts.timeline import TimelineEvidencePolicySetV1
+from controlgraph_canary.contracts.timeline import (
+    TimelineDisplayFieldName,
+    TimelineEventType,
+    TimelineEventV1,
+    TimelineEvidencePolicySetV1,
+    TimelineTerminalClassification,
+)
+
+_VERIFIER_DISAGREEMENT_REASONS = frozenset(
+    {
+        CompletionReason.CONFIGURATION_DATA_DISAGREEMENT.value,
+        CompletionReason.CONFIGURATION_MISMATCH.value,
+        CompletionReason.EXECUTION_EVIDENCE_CONTRADICTORY.value,
+    }
+)
+_EVIDENCE_FAILURE_REASONS = frozenset(
+    {
+        CompletionReason.AUTHORITY_PROOF_ABSENT.value,
+        CompletionReason.CONFIGURATION_PROOF_ABSENT.value,
+        CompletionReason.CONFIGURATION_UNAVAILABLE.value,
+        CompletionReason.EVIDENCE_BINDING_MISMATCH.value,
+        CompletionReason.EVIDENCE_STALE.value,
+        CompletionReason.EXECUTION_PROOF_ABSENT.value,
+        CompletionReason.PROBE_INCONCLUSIVE.value,
+        CompletionReason.PROBE_PROOF_ABSENT.value,
+    }
+)
+
+
+def _operational_signals(event: TimelineEventV1) -> tuple[str, ...]:
+    fields = {item.name: item.value for item in event.display_fields}
+    action = fields.get(TimelineDisplayFieldName.ACTION)
+    outcome = fields.get(TimelineDisplayFieldName.OUTCOME)
+    reason = fields.get(TimelineDisplayFieldName.REASON_CODE)
+    signals: list[str] = []
+
+    if (
+        event.event_type is TimelineEventType.TERMINAL_CLASSIFIED
+        and event.terminal_classification is TimelineTerminalClassification.DENIED
+    ):
+        signals.append("stale_denial")
+    if event.event_type is TimelineEventType.MUTATION_AMBIGUOUS:
+        signals.append("ambiguous_mutation")
+    if event.event_type is TimelineEventType.HEALTH_DECIDED and outcome == "unhealthy":
+        signals.append("unhealthy_rollout")
+    if (
+        event.event_type is TimelineEventType.TERMINAL_CLASSIFIED
+        and event.terminal_classification is TimelineTerminalClassification.AMBIGUOUS
+        and action == CompletionKind.RECOVERY.value
+    ):
+        signals.append("failed_recovery")
+    if (
+        event.event_type is TimelineEventType.VERIFICATION_RECORDED
+        and outcome == IndependentVerificationVerdict.MISMATCH.value
+    ) or reason in _VERIFIER_DISAGREEMENT_REASONS:
+        signals.append("verifier_disagreement")
+    if (
+        event.event_type is TimelineEventType.VERIFICATION_RECORDED
+        and outcome
+        in {
+            IndependentVerificationVerdict.INCONCLUSIVE.value,
+            IndependentVerificationVerdict.UNAVAILABLE.value,
+        }
+    ) or reason in _EVIDENCE_FAILURE_REASONS:
+        signals.append("evidence_failure")
+    return tuple(signals)
+
+
+def _emit_operational_signals(event: TimelineEventV1) -> None:
+    signals = _operational_signals(event)
+    for signal in signals:
+        summary = {
+            "epoch": event.epoch,
+            "event": "controlgraph.operational.signal",
+            "event_type": event.event_type.value,
+            "root_sha256": event.root_sha256,
+            "signal": signal,
+        }
+        sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
+    if signals:
+        sys.stderr.flush()
 
 
 @runtime_checkable
@@ -143,6 +228,8 @@ class TimelineRecorder:
             tuple((item.event, item.raw_source) for item in projections),
             self._grant,
         )
+        for projection in projections:
+            _emit_operational_signals(projection.event)
 
     async def record_root_creation(
         self,

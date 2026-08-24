@@ -69,6 +69,20 @@ output "audit_log_bucket" {
   }
 }
 
+output "operational_alerts" {
+  description = "Fixed operational alert policies, count metrics, and notification channel."
+  value = {
+    notification_channel = google_monitoring_notification_channel.operator_email.name
+    policies = {
+      for signal, policy in google_monitoring_alert_policy.operational : signal => {
+        name     = policy.name
+        severity = local.operational_log_alerts[signal].severity
+        metric   = google_logging_metric.operational[signal].name
+      }
+    }
+  }
+}
+
 output "firestore_authority" {
   description = "Named regional Firestore authority database coordinates."
   value = {
