@@ -22,9 +22,14 @@ SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 ID_RE = re.compile(r"^[a-z][a-z0-9.-]{0,95}$")
 PROJECT_RE = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
+CLOUD_RUN_NAME_RE = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 IMAGE_RE = re.compile(
-    r"^us-central1-docker\.pkg\.dev/controlgraph-canary-[a-z0-9]{6,10}/"
-    r"controlgraph-canary/[a-z-]+@sha256:[0-9a-f]{64}$"
+    r"^(?P<region>us-central1)-docker\.pkg\.dev/"
+    r"(?P<project>controlgraph-canary-[a-z0-9]{6,10})/controlgraph-canary/"
+    r"(?P<image>[a-z-]+)@sha256:(?P<digest>[0-9a-f]{64})$"
+)
+IMAGE_COMPONENTS: Final = frozenset(
+    {"controller", "console", "advisor", "reference-stable", "reference-candidate"}
 )
 
 CLAIM_CATEGORIES: Final = frozenset(
@@ -50,7 +55,7 @@ FAULT_KINDS: Final = frozenset(
         "PROBE_FAILURE",
     }
 )
-REQUIRED_KINDS: Final = frozenset(
+BASE_REQUIRED_KINDS: Final = frozenset(
     {
         "CONTRACT_SCHEMA_INDEX",
         "TERRAFORM_PLAN",
@@ -70,10 +75,10 @@ REQUIRED_KINDS: Final = frozenset(
         "LIMITATIONS_DOCUMENT",
         "DISCLOSURE_DOCUMENT",
         "RELEASE_REVIEW",
-        "CLEAN_ROOM_REHEARSAL",
     }
 )
-ALLOWED_KINDS: Final = REQUIRED_KINDS | {"DEMO_MANIFEST"}
+FINAL_ONLY_KINDS: Final = frozenset({"PREPARED_BUNDLE", "CLEAN_ROOM_REHEARSAL"})
+ALLOWED_KINDS: Final = BASE_REQUIRED_KINDS | FINAL_ONLY_KINDS
 JSON_SCHEMAS: Final = {
     "CONTRACT_SCHEMA_INDEX": "controlgraph.contract-schema-index/v1",
     "RELEASE_EVIDENCE_MANIFEST": "controlgraph.release-evidence/v1",
@@ -85,9 +90,10 @@ JSON_SCHEMAS: Final = {
     "PERFORMANCE_SUMMARY": "controlgraph.measurement-summary/v1",
     "REQUIRED_CHECK_RESULTS": "controlgraph.required-check-results/v1",
     "RELEASE_REVIEW": "controlgraph.release-review/v1",
+    "PREPARED_BUNDLE": BUNDLE_SCHEMA,
     "CLEAN_ROOM_REHEARSAL": "controlgraph.clean-room-rehearsal/v1",
 }
-SINGLETON_KINDS: Final = REQUIRED_KINDS - {"FAULT_APPLICATION_EVIDENCE", "DEMO_ASSET"}
+SINGLETON_KINDS: Final = ALLOWED_KINDS - {"FAULT_APPLICATION_EVIDENCE", "DEMO_ASSET"}
 REQUIRED_CHECKS: Final = frozenset({"PYTHON", "WEB", "TERRAFORM", "SECURITY"})
 RELEASE_CHECKS: Final = frozenset(
     {
@@ -238,6 +244,23 @@ def _validate_source(repo: Path, source: Any) -> tuple[dict[str, Any], list[str]
             raise BundleError("SOURCE_TAG_OBJECT_MISMATCH")
         if _git(repo, "rev-parse", f"refs/tags/{tag}^{{commit}}") != revision:
             raise BundleError("SOURCE_TAG_COMMIT_MISMATCH")
+        remote_refs = {
+            ref: sha
+            for line in _git(
+                repo,
+                "ls-remote",
+                "--tags",
+                "origin",
+                f"refs/tags/{tag}",
+                f"refs/tags/{tag}^{{}}",
+            ).splitlines()
+            for sha, ref in (line.split("\t", maxsplit=1),)
+        }
+        if (
+            remote_refs.get(f"refs/tags/{tag}") != tag_object
+            or remote_refs.get(f"refs/tags/{tag}^{{}}") != revision
+        ):
+            raise BundleError("SOURCE_TAG_REMOTE_MISMATCH")
     return item, pending
 
 
@@ -269,10 +292,6 @@ def _validate_artifact_entry(value: Any) -> dict[str, Any]:
     declared_schema = item.get("schema_version")
     if expected_schema is not None and declared_schema != expected_schema:
         raise BundleError("ARTIFACT_SCHEMA_INVALID")
-    if kind == "DEMO_MANIFEST" and (
-        not isinstance(declared_schema, str) or not declared_schema
-    ):
-        raise BundleError("ARTIFACT_SCHEMA_INVALID")
     if item["status"] == "PENDING" and item.get("sha256") is not None:
         raise BundleError("PENDING_ARTIFACT_HAS_DIGEST")
     if item["status"] == "VERIFIED" and (
@@ -284,7 +303,7 @@ def _validate_artifact_entry(value: Any) -> dict[str, Any]:
 
 
 def _bind_artifacts(
-    repo: Path, artifact_root: Path, values: Any
+    repo: Path, artifact_root: Path, values: Any, stage: str
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, dict[str, Any]],
@@ -333,15 +352,14 @@ def _bind_artifacts(
                 payloads[artifact_id] = payload
         records.append(record)
         by_id[artifact_id] = item
-    if not REQUIRED_KINDS.issubset(kinds):
+    required = BASE_REQUIRED_KINDS | (FINAL_ONLY_KINDS if stage == "FINAL" else set())
+    if not required.issubset(kinds):
         raise BundleError("REQUIRED_ARTIFACT_KIND_MISSING")
-    if any(kinds[kind] != 1 for kind in SINGLETON_KINDS):
+    if stage == "PREPARED" and any(kinds[kind] for kind in FINAL_ONLY_KINDS):
+        raise BundleError("PREPARED_BUNDLE_HAS_FINAL_ARTIFACT")
+    if any(kinds[kind] != 1 for kind in SINGLETON_KINDS if kind in required):
         raise BundleError("SINGLETON_ARTIFACT_KIND_INVALID")
-    if (
-        kinds["FAULT_APPLICATION_EVIDENCE"] != 7
-        or kinds["DEMO_ASSET"] < 1
-        or kinds["DEMO_MANIFEST"] > 1
-    ):
+    if kinds["FAULT_APPLICATION_EVIDENCE"] != 7 or kinds["DEMO_ASSET"] < 1:
         raise BundleError("ARTIFACT_KIND_COUNT_INVALID")
     return records, by_id, payloads, pending
 
@@ -369,6 +387,62 @@ def _validate_contract_index(payload: Mapping[str, Any], revision: str) -> None:
         ):
             raise BundleError("CONTRACT_SCHEMA_INDEX_INVALID")
         identities.add(identifier)
+
+
+def _validate_core_acceptance(
+    payload: Mapping[str, Any], revision: str, release_images: Mapping[str, str] | None
+) -> None:
+    inputs = _object(payload.get("inputs"), "CORE_ACCEPTANCE_MANIFEST_INVALID")
+    target = _object(inputs.get("target"), "CORE_ACCEPTANCE_TARGET_INVALID")
+    if (
+        payload.get("status") != "PASSED"
+        or payload.get("evidence_binding_complete") is not True
+        or inputs.get("source_commit") != revision
+    ):
+        raise BundleError("CORE_ACCEPTANCE_MANIFEST_INVALID")
+    if (
+        target.get("schema_version") != "controlgraph.acceptance-target/v1"
+        or target.get("environment") != "nonprod"
+        or target.get("region") != "us-central1"
+        or target.get("service_name") != "controlgraph-reference-target"
+        or not isinstance(target.get("project_id"), str)
+        or PROJECT_RE.fullmatch(target["project_id"]) is None
+        or not isinstance(target.get("stable_revision"), str)
+        or CLOUD_RUN_NAME_RE.fullmatch(target["stable_revision"]) is None
+        or not isinstance(target.get("candidate_revision"), str)
+        or CLOUD_RUN_NAME_RE.fullmatch(target["candidate_revision"]) is None
+        or target["stable_revision"] == target["candidate_revision"]
+    ):
+        raise BundleError("CORE_ACCEPTANCE_TARGET_INVALID")
+    values = inputs.get("images")
+    if not isinstance(values, list) or len(values) != len(IMAGE_COMPONENTS):
+        raise BundleError("CORE_ACCEPTANCE_IMAGES_INVALID")
+    images: dict[str, str] = {}
+    digests: set[str] = set()
+    for value in values:
+        image = _object(value, "CORE_ACCEPTANCE_IMAGES_INVALID")
+        component = image.get("component")
+        reference = image.get("reference")
+        if not isinstance(component, str) or not isinstance(reference, str):
+            raise BundleError("CORE_ACCEPTANCE_IMAGES_INVALID")
+        match = IMAGE_RE.fullmatch(reference)
+        if (
+            image.get("schema_version") != "controlgraph.acceptance-image/v1"
+            or component not in IMAGE_COMPONENTS
+            or component in images
+            or match is None
+            or match.group("image") != component
+            or match.group("project") != target["project_id"]
+            or match.group("region") != target["region"]
+            or match.group("digest") in digests
+        ):
+            raise BundleError("CORE_ACCEPTANCE_IMAGES_INVALID")
+        images[component] = reference
+        digests.add(match.group("digest"))
+    if set(images) != IMAGE_COMPONENTS or (
+        release_images is not None and images != release_images
+    ):
+        raise BundleError("CORE_RELEASE_IMAGE_MISMATCH")
 
 
 def _validate_release_evidence(
@@ -414,14 +488,7 @@ def _validate_release_evidence(
             raise BundleError("RELEASE_EVIDENCE_MATERIALS_INVALID")
     subjects = _object(manifest.get("subjects"), "RELEASE_EVIDENCE_SUBJECTS_INVALID")
     expected_subjects = {"backend", "cli", "console", "terraform", "release"} | {
-        f"image-{name}"
-        for name in (
-            "controller",
-            "console",
-            "advisor",
-            "reference-stable",
-            "reference-candidate",
-        )
+        f"image-{name}" for name in IMAGE_COMPONENTS
     }
     if set(subjects) != expected_subjects:
         raise BundleError("RELEASE_EVIDENCE_SUBJECTS_INVALID")
@@ -435,9 +502,17 @@ def _validate_release_evidence(
             bind(evidence.get("path"), evidence.get("sha256"))
         if name.startswith("image-"):
             reference = subject.get("immutable_reference")
-            if not isinstance(reference, str) or IMAGE_RE.fullmatch(reference) is None:
+            if not isinstance(reference, str):
                 raise BundleError("RELEASE_IMAGE_REFERENCE_INVALID")
-            images[name.removeprefix("image-")] = reference
+            match = IMAGE_RE.fullmatch(reference)
+            component = name.removeprefix("image-")
+            if match is None or match.group("image") != component:
+                raise BundleError("RELEASE_IMAGE_REFERENCE_INVALID")
+            images[component] = reference
+    if len({reference.rsplit("@", 1)[1] for reference in images.values()}) != len(
+        IMAGE_COMPONENTS
+    ):
+        raise BundleError("RELEASE_IMAGE_REFERENCE_INVALID")
     tool = _object(
         _object(manifest.get("tooling"), "RELEASE_EVIDENCE_TOOL_INVALID").get("trivy"),
         "RELEASE_EVIDENCE_TOOL_INVALID",
@@ -546,7 +621,10 @@ def _validate_known_payloads(
     payloads: Mapping[str, dict[str, Any]],
     revision: str,
     source_tag: str,
-    claim_ids: set[str],
+    source_tag_object: str | None,
+    artifact_records: Sequence[dict[str, Any]],
+    claims: Sequence[dict[str, Any]],
+    stage: str,
 ) -> dict[str, Any] | None:
     by_kind: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for artifact_id, item in artifacts.items():
@@ -554,15 +632,19 @@ def _validate_known_payloads(
             by_kind.setdefault(item["kind"], []).append(
                 (artifact_id, payloads[artifact_id])
             )
+    supply_chain: dict[str, Any] | None = None
+    release = by_kind.get("RELEASE_EVIDENCE_MANIFEST", [])
+    marker = by_kind.get("RELEASE_EVIDENCE_VERIFICATION", [])
+    if release and marker:
+        release_id, manifest = release[0]
+        supply_chain = _validate_release_evidence(
+            repo, artifact_root, artifacts[release_id], manifest, marker[0][1], revision
+        )
     for _, payload in by_kind.get("CONTRACT_SCHEMA_INDEX", []):
         _validate_contract_index(payload, revision)
     for _, payload in by_kind.get("CORE_ACCEPTANCE_MANIFEST", []):
-        if (
-            payload.get("status") != "PASSED"
-            or payload.get("evidence_binding_complete") is not True
-            or payload.get("inputs", {}).get("source_commit") != revision
-        ):
-            raise BundleError("CORE_ACCEPTANCE_MANIFEST_INVALID")
+        release_images = supply_chain["images"] if supply_chain is not None else None
+        _validate_core_acceptance(payload, revision, release_images)
     for _, payload in by_kind.get("SECURITY_ABUSE_MANIFEST", []):
         _require_source_commit(payload, revision)
         if (
@@ -626,15 +708,42 @@ def _validate_known_payloads(
             payload.get("status") != "PASSED"
             or payload.get("checks")
             != {key: "PASSED" for key in sorted(RELEASE_CHECKS)}
-            or set(payload.get("claim_ids", [])) != claim_ids
+            or set(payload.get("claim_ids", [])) != {claim["id"] for claim in claims}
             or not payload.get("residual_risks")
         ):
             raise BundleError("RELEASE_REVIEW_INVALID")
-    for _, payload in by_kind.get("CLEAN_ROOM_REHEARSAL", []):
+    prepared = by_kind.get("PREPARED_BUNDLE", [])
+    clean_room = by_kind.get("CLEAN_ROOM_REHEARSAL", [])
+    if stage == "FINAL" and prepared and clean_room:
+        _, prepared_payload = prepared[0]
+        expected_artifacts = sorted(
+            (item for item in artifact_records if item["kind"] not in FINAL_ONLY_KINDS),
+            key=lambda item: item["id"],
+        )
+        if (
+            prepared_payload.get("stage") != "PREPARED"
+            or prepared_payload.get("status") != "PENDING"
+            or prepared_payload.get("pending") != ["CLEAN_ROOM_REHEARSAL"]
+            or prepared_payload.get("source")
+            != {
+                "repository": REPOSITORY,
+                "revision": revision,
+                "tag": source_tag,
+                "tag_status": "VERIFIED",
+                "tag_object_sha": source_tag_object,
+            }
+            or prepared_payload.get("artifacts") != expected_artifacts
+            or prepared_payload.get("claims")
+            != sorted(claims, key=lambda item: item["id"])
+        ):
+            raise BundleError("PREPARED_BUNDLE_INVALID")
+    for _, payload in clean_room:
         _require_source_commit(payload, revision)
         sign_off = payload.get("sign_off")
+        prepared_digest = artifacts[prepared[0][0]]["sha256"] if prepared else None
         if (
             payload.get("source_tag") != source_tag
+            or payload.get("prepared_bundle_sha256") != prepared_digest
             or payload.get("status") != "PASSED"
             or payload.get("steps")
             != {key: "PASSED" for key in sorted(CLEAN_ROOM_STEPS)}
@@ -644,14 +753,7 @@ def _validate_known_payloads(
         ):
             raise BundleError("CLEAN_ROOM_REHEARSAL_INVALID")
     _validate_faults(payloads, artifacts)
-    release = by_kind.get("RELEASE_EVIDENCE_MANIFEST", [])
-    marker = by_kind.get("RELEASE_EVIDENCE_VERIFICATION", [])
-    if release and marker:
-        release_id, manifest = release[0]
-        return _validate_release_evidence(
-            repo, artifact_root, artifacts[release_id], manifest, marker[0][1], revision
-        )
-    return None
+    return supply_chain
 
 
 def _validate_claims(
@@ -677,6 +779,7 @@ def _validate_claims(
             raise BundleError("CLAIM_INVALID")
         claim_id = item.get("id")
         statement = item.get("statement")
+        source_ids = item.get("source_ids")
         evidence_ids = item.get("evidence_ids")
         if (
             not isinstance(claim_id, str)
@@ -688,9 +791,19 @@ def _validate_claims(
             or len(statement) > 1000
             or item.get("statement_sha256")
             != hashlib.sha256(statement.encode()).hexdigest()
-            or item.get("source_ids") != ["source"]
+            or not isinstance(source_ids, list)
+            or not source_ids
+            or any(not isinstance(source_id, str) for source_id in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+            or any(source_id not in artifacts for source_id in source_ids)
+            or any(
+                artifacts[source_id]["location"] != "REPOSITORY"
+                or artifacts[source_id]["status"] != "VERIFIED"
+                for source_id in source_ids
+            )
             or not isinstance(evidence_ids, list)
             or not evidence_ids
+            or any(not isinstance(evidence_id, str) for evidence_id in evidence_ids)
             or len(set(evidence_ids)) != len(evidence_ids)
             or any(value not in artifacts for value in evidence_ids)
             or item.get("status") not in {"PENDING", "SUPPORTED"}
@@ -702,11 +815,6 @@ def _validate_claims(
                 for evidence_id in evidence_ids
             ):
                 raise BundleError("SUPPORTED_CLAIM_HAS_PENDING_EVIDENCE")
-            if item["category"] == "demo" and not any(
-                artifacts[evidence_id]["kind"] == "DEMO_MANIFEST"
-                for evidence_id in evidence_ids
-            ):
-                raise BundleError("DEMO_CLAIM_HAS_NO_FINAL_MANIFEST")
         else:
             pending.append(f"CLAIM:{claim_id}")
         identifiers.add(claim_id)
@@ -724,18 +832,18 @@ def verify_bundle(
 
     repo = repo.resolve(strict=True)
     spec, spec_bytes = _read_json(spec_path, "SPEC_INVALID")
-    if spec.get("schema_version") != SPEC_SCHEMA or set(spec) != {
-        "schema_version",
-        "source",
-        "artifacts",
-        "claims",
-    }:
+    stage = spec.get("stage")
+    if (
+        spec.get("schema_version") != SPEC_SCHEMA
+        or stage not in {"PREPARED", "FINAL"}
+        or set(spec) != {"schema_version", "stage", "source", "artifacts", "claims"}
+    ):
         raise BundleError("SPEC_INVALID")
     source, pending = _validate_source(repo, spec["source"])
     artifact_records, artifacts, payloads, artifact_pending = _bind_artifacts(
-        repo, artifact_root.resolve(), spec["artifacts"]
+        repo, artifact_root.resolve(), spec["artifacts"], stage
     )
-    claims, claim_pending, claim_ids = _validate_claims(spec["claims"], artifacts)
+    claims, claim_pending, _ = _validate_claims(spec["claims"], artifacts)
     supply_chain = _validate_known_payloads(
         repo,
         artifact_root.resolve(),
@@ -743,10 +851,17 @@ def verify_bundle(
         payloads,
         source["revision"],
         source["tag"],
-        claim_ids,
+        source["tag_object_sha"],
+        artifact_records,
+        claims,
+        stage,
     )
     pending.extend(artifact_pending)
     pending.extend(claim_pending)
+    if stage == "PREPARED":
+        pending.append("CLEAN_ROOM_REHEARSAL")
+    elif pending:
+        raise BundleError("FINAL_BUNDLE_INCOMPLETE")
     result: dict[str, Any] = {
         "artifacts": sorted(artifact_records, key=lambda value: value["id"]),
         "claims": sorted(claims, key=lambda value: value["id"]),
@@ -754,11 +869,12 @@ def verify_bundle(
         "schema_version": BUNDLE_SCHEMA,
         "source": source,
         "spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
-        "status": "READY" if not pending else "PENDING",
+        "stage": stage,
+        "status": "READY" if stage == "FINAL" else "PENDING",
     }
     if supply_chain is not None:
         result["supply_chain"] = supply_chain
-    return result, not pending
+    return result, stage == "FINAL"
 
 
 def _write_once(path: Path, value: Mapping[str, Any]) -> None:

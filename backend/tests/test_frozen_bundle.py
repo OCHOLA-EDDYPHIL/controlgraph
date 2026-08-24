@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -44,7 +45,9 @@ def _write_text(path: Path, value: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
+def _fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path, dict[str, Any]]:
     repo = tmp_path / "repo"
     artifacts = tmp_path / "artifacts"
     repo.mkdir()
@@ -76,6 +79,28 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     revision = _run(repo, "rev-parse", "HEAD")
     _run(repo, "tag", "-a", "v0.1.0", "-m", "fixture release")
     tag_object = _run(repo, "rev-parse", "refs/tags/v0.1.0")
+    original_git = bundle._git
+
+    def git_with_remote_tag(repository: Path, *args: str) -> str:
+        if args[:3] == ("ls-remote", "--tags", "origin"):
+            return f"{tag_object}\trefs/tags/v0.1.0\n{revision}\trefs/tags/v0.1.0^{{}}"
+        return str(original_git(repository, *args))
+
+    monkeypatch.setattr(bundle, "_git", git_with_remote_tag)
+    image_components = (
+        "controller",
+        "advisor",
+        "console",
+        "reference-stable",
+        "reference-candidate",
+    )
+    image_references = {
+        name: (
+            "us-central1-docker.pkg.dev/controlgraph-canary-abc123/"
+            f"controlgraph-canary/{name}@sha256:{index:064x}"
+        )
+        for index, name in enumerate(image_components, start=1)
+    }
 
     entries: list[dict[str, Any]] = []
 
@@ -142,7 +167,26 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
             "schema_version": "controlgraph.core-acceptance-manifest/v1",
             "status": "PASSED",
             "evidence_binding_complete": True,
-            "inputs": {"source_commit": revision},
+            "inputs": {
+                "source_commit": revision,
+                "target": {
+                    "schema_version": "controlgraph.acceptance-target/v1",
+                    "project_id": "controlgraph-canary-abc123",
+                    "region": "us-central1",
+                    "environment": "nonprod",
+                    "service_name": "controlgraph-reference-target",
+                    "stable_revision": "reference-stable-00001-aaa",
+                    "candidate_revision": "reference-candidate-00002-bbb",
+                },
+                "images": [
+                    {
+                        "schema_version": "controlgraph.acceptance-image/v1",
+                        "component": name,
+                        "reference": image_references[name],
+                    }
+                    for name in image_components
+                ],
+            },
         },
     )
     scenarios: list[dict[str, Any]] = []
@@ -279,13 +323,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
                 "sha256": nested_files[f"scans/{name}.json"],
             },
         }
-    for name in ["controller", "console", "advisor", "reference-stable", "reference-candidate"]:
+    for name in image_components:
         subject = f"image-{name}"
         subjects[subject] = {
-            "immutable_reference": (
-                "us-central1-docker.pkg.dev/controlgraph-canary-abc123/"
-                f"controlgraph-canary/{name}@sha256:{index + 1:064x}"
-            ),
+            "immutable_reference": image_references[name],
             "sbom": {
                 "path": f"sboms/{subject}.json",
                 "sha256": nested_files[f"sboms/{subject}.json"],
@@ -336,13 +377,6 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
         },
         relative="release/VERIFIED.json",
     )
-    add_json(
-        "demo-manifest",
-        "DEMO_MANIFEST",
-        {"schema_version": "controlgraph.demo-manifest/v1", "status": "PASSED"},
-        schema="controlgraph.demo-manifest/v1",
-    )
-
     claim_evidence = {
         "architecture": ["architecture", "architecture-diagram"],
         "security": ["security-abuse", "release-evidence"],
@@ -351,7 +385,17 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
         "reliability": ["core-acceptance", "performance"],
         "cost": ["performance"],
         "comparison": ["comparison"],
-        "demo": ["demo-asset", "demo-manifest"],
+        "demo": ["demo-asset", "core-acceptance"],
+    }
+    claim_sources = {
+        "architecture": ["architecture", "architecture-diagram"],
+        "security": ["architecture"],
+        "determinism": ["architecture"],
+        "latency": ["limitations"],
+        "reliability": ["architecture"],
+        "cost": ["limitations"],
+        "comparison": ["comparison"],
+        "demo": ["quickstart", "demo-asset"],
     }
     claims = []
     for category, evidence_ids in claim_evidence.items():
@@ -362,7 +406,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
                 "category": category,
                 "statement": statement,
                 "statement_sha256": hashlib.sha256(statement.encode()).hexdigest(),
-                "source_ids": ["source"],
+                "source_ids": claim_sources[category],
                 "evidence_ids": evidence_ids,
                 "status": "SUPPORTED",
             }
@@ -380,6 +424,32 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
             "residual_risks": ["ISOLATED_ACCEPTANCE_ONLY"],
         },
     )
+    source = {
+        "repository": bundle.REPOSITORY,
+        "revision": revision,
+        "tag": "v0.1.0",
+        "tag_status": "VERIFIED",
+        "tag_object_sha": tag_object,
+    }
+    prepared_spec = {
+        "schema_version": "controlgraph.frozen-bundle-spec/v1",
+        "stage": "PREPARED",
+        "source": source,
+        "artifacts": copy.deepcopy(entries),
+        "claims": copy.deepcopy(claims),
+    }
+    prepared_spec_path = tmp_path / "prepared-spec.json"
+    _write_json(prepared_spec_path, prepared_spec)
+    prepared_bundle, ready = bundle.verify_bundle(repo, prepared_spec_path, artifacts)
+    assert ready is False
+    assert prepared_bundle["pending"] == ["CLEAN_ROOM_REHEARSAL"]
+    add_json(
+        "prepared-bundle",
+        "PREPARED_BUNDLE",
+        prepared_bundle,
+        relative="prepared-bundle.json",
+    )
+    prepared_digest = next(item["sha256"] for item in entries if item["id"] == "prepared-bundle")
     add_json(
         "clean-room",
         "CLEAN_ROOM_REHEARSAL",
@@ -387,20 +457,19 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
             "schema_version": "controlgraph.clean-room-rehearsal/v1",
             "source_commit": revision,
             "source_tag": "v0.1.0",
+            "prepared_bundle_sha256": prepared_digest,
             "status": "PASSED",
             "steps": {key: "PASSED" for key in sorted(bundle.CLEAN_ROOM_STEPS)},
-            "sign_off": {"reviewer_id": "fixture-reviewer", "recorded_at": "2026-08-24T00:00:00Z"},
+            "sign_off": {
+                "reviewer_id": "fixture-reviewer",
+                "recorded_at": "2026-08-24T00:00:00Z",
+            },
         },
     )
     spec = {
         "schema_version": "controlgraph.frozen-bundle-spec/v1",
-        "source": {
-            "repository": bundle.REPOSITORY,
-            "revision": revision,
-            "tag": "v0.1.0",
-            "tag_status": "VERIFIED",
-            "tag_object_sha": tag_object,
-        },
+        "stage": "FINAL",
+        "source": source,
         "artifacts": entries,
         "claims": claims,
     }
@@ -409,8 +478,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     return repo, artifacts, spec_path, spec
 
 
-def test_ready_bundle_binds_claims_faults_and_supply_chain(tmp_path: Path) -> None:
-    repo, artifacts, spec_path, _ = _fixture(tmp_path)
+def test_ready_bundle_binds_claims_faults_and_supply_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, _ = _fixture(tmp_path, monkeypatch)
 
     result, ready = bundle.verify_bundle(repo, spec_path, artifacts)
 
@@ -426,27 +497,32 @@ def test_ready_bundle_binds_claims_faults_and_supply_chain(tmp_path: Path) -> No
     }
 
 
-def test_pending_entries_remain_fail_closed_without_artifacts(tmp_path: Path) -> None:
-    repo, artifacts, spec_path, spec = _fixture(tmp_path)
-    spec["source"]["tag_status"] = "PENDING"
-    spec["source"]["tag_object_sha"] = None
-    for artifact in spec["artifacts"]:
-        artifact["status"] = "PENDING"
-        artifact["sha256"] = None
-    for claim in spec["claims"]:
-        claim["status"] = "PENDING"
+def test_prepared_bundle_has_only_clean_room_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    spec["stage"] = "PREPARED"
+    spec["artifacts"] = [
+        item for item in spec["artifacts"] if item["kind"] not in bundle.FINAL_ONLY_KINDS
+    ]
     _write_json(spec_path, spec)
 
     result, ready = bundle.verify_bundle(repo, spec_path, artifacts)
 
     assert ready is False
     assert result["status"] == "PENDING"
-    assert "SOURCE_TAG" in result["pending"]
-    assert "CLAIM:claim-demo" in result["pending"]
+    assert result["stage"] == "PREPARED"
+    assert result["pending"] == ["CLEAN_ROOM_REHEARSAL"]
 
 
-def test_fault_evidence_must_bind_the_canonical_scenario_digest(tmp_path: Path) -> None:
-    repo, artifacts, spec_path, spec = _fixture(tmp_path)
+def test_fault_evidence_must_bind_the_canonical_scenario_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    spec["stage"] = "PREPARED"
+    spec["artifacts"] = [
+        item for item in spec["artifacts"] if item["kind"] not in bundle.FINAL_ONLY_KINDS
+    ]
     entry = next(item for item in spec["artifacts"] if item["id"] == "fault-0")
     payload = json.loads((artifacts / entry["path"]).read_text())
     payload["scenario_sha256"] = "f" * 64
@@ -457,12 +533,44 @@ def test_fault_evidence_must_bind_the_canonical_scenario_digest(tmp_path: Path) 
         bundle.verify_bundle(repo, spec_path, artifacts)
 
 
-def test_demo_claim_cannot_be_supported_before_final_manifest_exists(tmp_path: Path) -> None:
-    repo, artifacts, spec_path, spec = _fixture(tmp_path)
-    spec["artifacts"] = [item for item in spec["artifacts"] if item["kind"] != "DEMO_MANIFEST"]
+def test_claim_source_must_be_a_verified_repository_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
     demo_claim = next(item for item in spec["claims"] if item["category"] == "demo")
-    demo_claim["evidence_ids"] = ["demo-asset"]
+    demo_claim["source_ids"] = ["core-acceptance"]
     _write_json(spec_path, spec)
 
-    with pytest.raises(bundle.BundleError, match="DEMO_CLAIM_HAS_NO_FINAL_MANIFEST"):
+    with pytest.raises(bundle.BundleError, match="CLAIM_INVALID"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+def test_core_images_must_match_release_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "core-acceptance")
+    payload = json.loads((artifacts / entry["path"]).read_text())
+    payload["inputs"]["images"][0]["reference"] = payload["inputs"]["images"][0][
+        "reference"
+    ].replace("@sha256:0", "@sha256:f", 1)
+    entry["sha256"] = _write_json(artifacts / entry["path"], payload)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match="CORE_RELEASE_IMAGE_MISMATCH"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+def test_verified_tag_must_exist_on_origin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, artifacts, spec_path, _ = _fixture(tmp_path, monkeypatch)
+    current_git = bundle._git
+
+    def git_without_remote_tag(repository: Path, *args: str) -> str:
+        if args[:3] == ("ls-remote", "--tags", "origin"):
+            return ""
+        return str(current_git(repository, *args))
+
+    monkeypatch.setattr(bundle, "_git", git_without_remote_tag)
+
+    with pytest.raises(bundle.BundleError, match="SOURCE_TAG_REMOTE_MISMATCH"):
         bundle.verify_bundle(repo, spec_path, artifacts)
