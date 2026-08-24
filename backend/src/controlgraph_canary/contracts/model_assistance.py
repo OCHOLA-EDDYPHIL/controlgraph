@@ -680,13 +680,18 @@ class AdvisorRecommendationV1(StrictContractModel):
     confidence_basis_points: Annotated[int, Field(ge=0, le=10_000)]
     requested_operator_action: RequestedOperatorAction
     manual_review_reason: ShortText | None
-    operator_review_required: Literal[True]
+    operator_review_required: bool
     authority_effect: Literal["none"]
-    deterministic_health_override: Literal[False]
+    deterministic_health_override: bool
 
     @model_validator(mode="after")
     def validate_shape(self) -> Self:
         manual = self.requested_operator_action is RequestedOperatorAction.MANUAL_REVIEW
+        if (
+            self.operator_review_required is not True
+            or self.deterministic_health_override is not False
+        ):
+            raise ValueError("recommendation cannot alter the advisory authority boundary")
         if manual != (self.manual_review_reason is not None):
             raise ValueError("manual review reason does not match the requested action")
         if self.confidence_basis_points < MIN_ACTION_CONFIDENCE_BASIS_POINTS and not manual:
