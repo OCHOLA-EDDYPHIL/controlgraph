@@ -816,6 +816,80 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
     assert output_manifest.is_file()
 
 
+def test_hosted_binding_uses_the_deployed_evidence_writer_identity(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _repo, _artifacts, spec_path, _spec_value = _fixture(tmp_path)
+    module_spec = importlib.util.spec_from_file_location(
+        "core_acceptance_hosted_binding_test", SCRIPT
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    runner = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = runner
+    module_spec.loader.exec_module(runner)
+    _payload, spec = runner._load_contract(
+        spec_path,
+        runner.CoreAcceptanceRunSpecV1,
+        error_code="ACCEPTANCE_SPEC_INVALID",
+    )
+    project_id = spec.target.project_id
+    active_identity = "acceptance@example.invalid"
+
+    def gcloud_json(arguments: tuple[str, ...], **_kwargs: Any) -> object:
+        if arguments[:2] == ("auth", "list"):
+            return [{"account": active_identity}]
+        if arguments[:2] == ("projects", "describe"):
+            return {"projectNumber": "123456789"}
+        role = arguments[3].removeprefix("controlgraph-")
+        component = (
+            runner.ImageComponent.ADVISOR
+            if role == "advisor"
+            else runner.ImageComponent.CONSOLE
+            if role == "console"
+            else runner.ImageComponent.CONTROLLER
+        )
+        account_id = "cg-evidence-writer" if role == "evidence-writer" else f"controlgraph-{role}"
+        return {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"image": runner._image(spec, component)}],
+                        "serviceAccountName": (
+                            f"{account_id}@{project_id}.iam.gserviceaccount.com"
+                        ),
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(runner, "_gcloud_json", gcloud_json)
+    run = runner._HostedExecution(
+        repo=tmp_path,
+        artifact_root=tmp_path,
+        spec=spec,
+        run_inputs_sha256="1" * 64,
+        project_number="123456789",
+        network_resource=f"projects/{project_id}/global/networks/test",
+        subnetwork_resource=(
+            f"projects/{project_id}/regions/us-central1/subnetworks/test"
+        ),
+        verifier_service_account=(
+            f"controlgraph-verifier@{project_id}.iam.gserviceaccount.com"
+        ),
+        restricted_exporter_service_account=(
+            f"cg-restricted-exporter@{project_id}.iam.gserviceaccount.com"
+        ),
+        acceptance_identity=active_identity,
+    )
+
+    runner._verify_hosted_bindings(run)
+
+    assert run.service_bindings["evidence-writer"]["service_account"] == (
+        f"cg-evidence-writer@{project_id}.iam.gserviceaccount.com"
+    )
+
+
 def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
     monkeypatch: Any,
 ) -> None:

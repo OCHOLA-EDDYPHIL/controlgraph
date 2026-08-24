@@ -10,12 +10,11 @@ import hashlib
 import json
 import re
 import subprocess
+import tomllib
 import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-
-import tomllib
 
 POLICY_PATH = Path(".github/release-evidence-policy.json")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")

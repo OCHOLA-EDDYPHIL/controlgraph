@@ -3655,8 +3655,9 @@ def _verify_hosted_bindings(run: _HostedExecution) -> None:
             if isinstance(containers, list)
             else ()
         )
+        account_id = "cg-evidence-writer" if role == "evidence-writer" else f"controlgraph-{role}"
         expected_service_account = (
-            f"controlgraph-{role}@{run.spec.target.project_id}.iam.gserviceaccount.com"
+            f"{account_id}@{run.spec.target.project_id}.iam.gserviceaccount.com"
         )
         if deployed_images != (image,) or service_account != expected_service_account:
             raise AcceptanceError("ACCEPTANCE_HOSTED_IMAGE_MISMATCH")
