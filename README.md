@@ -6,7 +6,7 @@ reaches the mutation boundary. Every mutating executor must re-read the rollout 
 current epoch immediately before invoking its target-bound adapter. A capability from any
 other epoch fails closed even when its caller and signature are valid.
 
-The repository contains a Python 3.12 backend and CLI, a read-only React and TypeScript
+The repository contains a Python 3.12 backend and CLI, a static React and TypeScript operator
 console, Terraform, shared contract fixtures, and CI checks. The implemented rollout vertical
 captures a stable Cloud Run revision, applies a 90/10 canary, deterministically evaluates its
 Cloud Monitoring signals, then either promotes the approved candidate or restores the captured
@@ -22,6 +22,11 @@ docs/     Product contract, architecture, threat model, acceptance, and provenan
 ```
 
 ## Quick start
+
+The commands below are the local development path. For the isolated hosted setup, exact 90/10
+walkthrough, revocation and recovery sequence, evidence review, and cleanup, use the
+[reproducible canary quickstart](docs/quickstart.md) and
+[evidence-backed demo](docs/demo.md).
 
 ### Backend
 
@@ -79,7 +84,9 @@ and applies are intentional operator actions and are never run by the local cons
 - The recovery identity can only verify and forward stable-only work to the executor's separate
   recovery facade. It has no direct target-update, target service-account impersonation
   (`actAs`), or operation-read authority.
-- The console remains read-only and never invokes a cloud control plane directly.
+- The static console never invokes a cloud control plane directly. It reads the timeline and can
+  submit only an authenticated, explicitly confirmed epoch revocation through the API.
+- ADK/Gemini assistance is bounded and read-only; model output is never mutation authority.
 - Unknown or ambiguous mutation outcomes remain explicit and are never blindly retried.
 
 See [docs/architecture.md](docs/architecture.md) and

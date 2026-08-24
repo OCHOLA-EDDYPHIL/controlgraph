@@ -8,8 +8,9 @@ revision has passed hosted acceptance. The repository implements canonical contr
 root-scoped epoch authority, authenticated role composition, KMS signing, Firestore claims and
 receipts, addressed Cloud Tasks delivery, target-bound Cloud Run execution and readback,
 deterministic Monitoring health evaluation, healthy promotion, and captured-stable recovery.
-The current console remains read-only and static; a rendered operator evidence timeline is
-outside this implementation boundary.
+The current console is static, renders the bounded operator timeline, and submits only an
+authenticated, explicitly confirmed epoch-revocation command through the API. The optional
+ADK/Gemini advisor reads bounded recorded facts and has no mutation authority.
 
 Version 1 controls one canary rollout for one Cloud Run service in one Google Cloud project and
 region. It is not a general deployment system, workflow engine, graph engine, or authorization
@@ -43,7 +44,7 @@ separate implementation concerns.
 | `controlgraph.operator/v1` | Approve a root, request a rollout action, and explicitly revoke an epoch. | Cannot bypass capability validation or choose an arbitrary executor target. |
 | `controlgraph.api/v1` | Authenticate operator requests, validate public contracts, and expose narrow application operations. | Cannot mutate Cloud Run or sign capabilities. |
 | `controlgraph.cli/v1` | Submit explicit operator requests to the authenticated API and render machine-readable results. | Cannot write authority storage or call the Cloud Run Admin API directly. |
-| `controlgraph.console/v1` | Present read-only operator information obtained from the API. | Cannot hold cloud credentials, sign authority, or invoke cloud control-plane APIs. |
+| `controlgraph.console/v1` | Present the operator timeline and submit one explicitly confirmed epoch-revocation command through the API. | Cannot hold cloud credentials, sign authority, apply, promote, recover, or invoke cloud control-plane APIs. |
 | `controlgraph.coordinator/v1` | Reduce accepted events into deterministic next commands and request bounded issuance or delivery. | Cannot approve authority, mutate Cloud Run, or reinterpret model output as a decision. |
 | `controlgraph.issuer/v1` | Construct canonical, attenuated capability claims and request signatures from the configured KMS key version. | Cannot mutate Cloud Run or use a caller-selected key. |
 | `controlgraph.executor/v1` | Independently validate normal execution or recovery-facade work, recheck authority, claim the matching receipt, and invoke the purpose-bound adapter once. | Cannot deploy images, retarget another service, or retry an ambiguous mutation blindly. |

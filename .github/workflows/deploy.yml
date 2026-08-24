@@ -154,6 +154,7 @@ jobs:
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             [[ "$immutable_reference" == "${registry}/"*"@sha256:"* ]]
             printf '%s=%s\n' "$output_name" "$immutable_reference" >> "$GITHUB_OUTPUT"
+            printf '%s_digest=%s\n' "${output_name%_image}" "$digest" >> "$GITHUB_OUTPUT"
             digests+=("$digest")
             references+=("${output_name} = \"${immutable_reference}\"")
           done
@@ -167,6 +168,268 @@ jobs:
             printf '%s\n' "${references[@]}"
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove build registry credentials
+        shell: bash
+        run: docker logout "${CONTROLGRAPH_REGION}-docker.pkg.dev" >/dev/null
+
+      - name: Install pinned evidence tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="$(mktemp -d "${RUNNER_TEMP}/controlgraph-evidence-tools.XXXXXX")"
+          cache_dir="$(mktemp -d "${RUNNER_TEMP}/controlgraph-trivy-cache.XXXXXX")"
+          evidence_parent="$(mktemp -d "${RUNNER_TEMP}/controlgraph-release.XXXXXX")"
+          mapfile -t tool < <(
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          policy = json.loads(Path(".github/release-evidence-policy.json").read_text())
+          for name, asset_key in (("trivy", "archive"), ("cosign", "asset")):
+              tool = policy["tools"][name]
+              print(tool["version"])
+              print(tool[asset_key])
+              print(tool["sha256"])
+          PY
+          )
+          [[ "${#tool[@]}" -eq 6 ]]
+          archive="${tools_dir}/${tool[1]}"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --retry 2 \
+            --show-error \
+            --silent \
+            --output "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${tool[0]}/${tool[1]}"
+          printf '%s  %s\n' "${tool[2]}" "$archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$tools_dir" trivy
+          [[ "$("${tools_dir}/trivy" --version | head -1)" == "Version: ${tool[0]}" ]]
+          cosign="${tools_dir}/${tool[4]}"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --retry 2 \
+            --show-error \
+            --silent \
+            --output "$cosign" \
+            "https://github.com/sigstore/cosign/releases/download/v${tool[3]}/${tool[4]}"
+          printf '%s  %s\n' "${tool[5]}" "$cosign" | sha256sum --check --strict
+          chmod 0700 "$cosign"
+          "$cosign" version --json \
+            | python3 -c 'import json, sys; raise SystemExit(json.load(sys.stdin)["gitVersion"] != f"v{sys.argv[1]}")' "${tool[3]}"
+          {
+            printf 'CONTROLGRAPH_COSIGN=%s\n' "$cosign"
+            printf 'CONTROLGRAPH_TRIVY=%s\n' "${tools_dir}/trivy"
+            printf 'CONTROLGRAPH_TRIVY_CACHE=%s\n' "$cache_dir"
+            printf 'CONTROLGRAPH_RELEASE_EVIDENCE=%s\n' "${evidence_parent}/release-evidence"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare source inventories and immutable image bindings
+        shell: bash
+        env:
+          CONTROLLER_IMAGE: ${{ steps.publish.outputs.controller_image }}
+          CONSOLE_IMAGE: ${{ steps.publish.outputs.console_image }}
+          ADVISOR_IMAGE: ${{ steps.publish.outputs.advisor_image }}
+          REFERENCE_STABLE_IMAGE: ${{ steps.publish.outputs.reference_target_stable_image }}
+          REFERENCE_CANDIDATE_IMAGE: ${{ steps.publish.outputs.reference_target_candidate_image }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_evidence.py prepare \
+            --repo "$GITHUB_WORKSPACE" \
+            --output "$CONTROLGRAPH_RELEASE_EVIDENCE" \
+            --source-sha "$GITHUB_SHA" \
+            --builder-id "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --invocation-id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --image "controller=${CONTROLLER_IMAGE}" \
+            --image "console=${CONSOLE_IMAGE}" \
+            --image "advisor=${ADVISOR_IMAGE}" \
+            --image "reference-stable=${REFERENCE_STABLE_IMAGE}" \
+            --image "reference-candidate=${REFERENCE_CANDIDATE_IMAGE}"
+          mkdir -p \
+            "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations" \
+            "$CONTROLGRAPH_RELEASE_EVIDENCE/scans" \
+            "$CONTROLGRAPH_RELEASE_EVIDENCE/tooling"
+          while IFS='=' read -r name reference; do
+            digest="${reference##*@sha256:}"
+            image_name="${reference%@*}"
+            printf '%s  %s\n' "$digest" "$image_name"
+          done < <(
+            python3 - "$CONTROLGRAPH_RELEASE_EVIDENCE/inputs.json" <<'PY'
+          import json
+          import sys
+
+          inputs = json.load(open(sys.argv[1], encoding="utf-8"))
+          for name, reference in sorted(inputs["images"].items()):
+              print(f"{name}={reference}")
+          PY
+          ) > "$CONTROLGRAPH_RELEASE_EVIDENCE/image-subjects.sha256"
+
+      - name: Generate SBOM, vulnerability, license, and secret evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CONTROLGRAPH_TRIVY" image \
+            --cache-dir "$CONTROLGRAPH_TRIVY_CACHE" \
+            --download-db-only
+          cp \
+            "$CONTROLGRAPH_TRIVY_CACHE/db/metadata.json" \
+            "$CONTROLGRAPH_RELEASE_EVIDENCE/tooling/trivy-db.json"
+          "$CONTROLGRAPH_TRIVY" filesystem \
+            --cache-dir "$CONTROLGRAPH_TRIVY_CACHE" \
+            --skip-db-update \
+            --scanners vuln,misconfig,secret,license \
+            --license-full \
+            --format json \
+            --output "$CONTROLGRAPH_RELEASE_EVIDENCE/scans/source.trivy.json" \
+            "$GITHUB_WORKSPACE"
+          while IFS='=' read -r name reference; do
+            "$CONTROLGRAPH_TRIVY" image \
+              --cache-dir "$CONTROLGRAPH_TRIVY_CACHE" \
+              --skip-db-update \
+              --image-src docker \
+              --format spdx-json \
+              --output "$CONTROLGRAPH_RELEASE_EVIDENCE/sboms/image-${name}.spdx.json" \
+              "$reference"
+            "$CONTROLGRAPH_TRIVY" image \
+              --cache-dir "$CONTROLGRAPH_TRIVY_CACHE" \
+              --skip-db-update \
+              --image-src docker \
+              --scanners vuln,secret,license \
+              --license-full \
+              --format json \
+              --output "$CONTROLGRAPH_RELEASE_EVIDENCE/scans/image-${name}.trivy.json" \
+              "$reference"
+          done < <(
+            python3 - "$CONTROLGRAPH_RELEASE_EVIDENCE/inputs.json" <<'PY'
+          import json
+          import sys
+
+          inputs = json.load(open(sys.argv[1], encoding="utf-8"))
+          for name, reference in sorted(inputs["images"].items()):
+              print(f"{name}={reference}")
+          PY
+          )
+
+      - name: Authenticate for attestation publication
+        id: attestation_auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.CONTROLGRAPH_PROJECT_ID }}
+          workload_identity_provider: projects/${{ vars.CONTROLGRAPH_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/controlgraph-github/providers/github-main
+          service_account: cg-ci-image-builder@${{ vars.CONTROLGRAPH_PROJECT_ID }}.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_lifetime: 900s
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Authenticate Docker for attestation publication
+        shell: bash
+        env:
+          CONTROLGRAPH_ACCESS_TOKEN: ${{ steps.attestation_auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$CONTROLGRAPH_ACCESS_TOKEN" \
+            | docker login \
+                --username oauth2accesstoken \
+                --password-stdin \
+                "${CONTROLGRAPH_REGION}-docker.pkg.dev"
+
+      - name: Publish signed image evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS='=' read -r name reference; do
+            "$CONTROLGRAPH_COSIGN" attest \
+              --yes \
+              --oidc-provider github-actions \
+              --signing-config "$GITHUB_WORKSPACE/.github/sigstore-signing-config.json" \
+              --bundle "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/${name}.sbom.sigstore.json" \
+              --predicate "$CONTROLGRAPH_RELEASE_EVIDENCE/sboms/image-${name}.spdx.json" \
+              --type spdxjson \
+              "$reference"
+            "$CONTROLGRAPH_COSIGN" attest \
+              --yes \
+              --oidc-provider github-actions \
+              --signing-config "$GITHUB_WORKSPACE/.github/sigstore-signing-config.json" \
+              --bundle "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/${name}.provenance.sigstore.json" \
+              --predicate "$CONTROLGRAPH_RELEASE_EVIDENCE/provenance.predicate.json" \
+              --type slsaprovenance1 \
+              "$reference"
+          done < <(
+            python3 - "$CONTROLGRAPH_RELEASE_EVIDENCE/inputs.json" <<'PY'
+          import json
+          import sys
+
+          inputs = json.load(open(sys.argv[1], encoding="utf-8"))
+          for name, reference in sorted(inputs["images"].items()):
+              print(f"{name}={reference}")
+          PY
+          )
+
+      - name: Verify and package release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_evidence.py finalize \
+            --repo "$GITHUB_WORKSPACE" \
+            --output "$CONTROLGRAPH_RELEASE_EVIDENCE" \
+            --source-sha "$GITHUB_SHA" \
+            --builder-id "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --invocation-id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --cosign "$CONTROLGRAPH_COSIGN"
+          python3 scripts/release_evidence.py verify \
+            --repo "$GITHUB_WORKSPACE" \
+            --output "$CONTROLGRAPH_RELEASE_EVIDENCE" \
+            --source-sha "$GITHUB_SHA" \
+            --cosign "$CONTROLGRAPH_COSIGN"
+          tar \
+            --create \
+            --gzip \
+            --file "${CONTROLGRAPH_RELEASE_EVIDENCE}.tar.gz" \
+            --directory "$(dirname "$CONTROLGRAPH_RELEASE_EVIDENCE")" \
+            "$(basename "$CONTROLGRAPH_RELEASE_EVIDENCE")"
+
+      - name: Attest and verify the complete evidence bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${CONTROLGRAPH_RELEASE_EVIDENCE}.tar.gz"
+          bundle="${archive}.sigstore.json"
+          "$CONTROLGRAPH_COSIGN" attest-blob \
+            --yes \
+            --oidc-provider github-actions \
+            --signing-config "$GITHUB_WORKSPACE/.github/sigstore-signing-config.json" \
+            --bundle "$bundle" \
+            --predicate "$CONTROLGRAPH_RELEASE_EVIDENCE/provenance.predicate.json" \
+            --type slsaprovenance1 \
+            "$archive"
+          "$CONTROLGRAPH_COSIGN" verify-blob-attestation \
+            --bundle "$bundle" \
+            --trusted-root "$GITHUB_WORKSPACE/.github/sigstore-trusted-root.json" \
+            --use-signed-timestamps \
+            --insecure-ignore-tlog \
+            --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger "$GITHUB_EVENT_NAME" \
+            --type slsaprovenance1 \
+            "$archive"
+
+      - name: Retain private release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: controlgraph-release-evidence-${{ github.sha }}
+          path: |
+            ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}.tar.gz
+            ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}.tar.gz.sigstore.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Remove registry credentials
         if: always()
