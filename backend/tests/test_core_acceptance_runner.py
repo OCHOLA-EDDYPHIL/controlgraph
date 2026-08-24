@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "core_acceptance.py"
@@ -813,3 +814,57 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
     assert status.value == "PASSED"
     assert output_spec.is_file()
     assert output_manifest.is_file()
+
+
+def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
+    monkeypatch: Any,
+) -> None:
+    module_spec = importlib.util.spec_from_file_location(
+        "core_acceptance_queue_safety_test", SCRIPT
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    runner = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = runner
+    module_spec.loader.exec_module(runner)
+    root = SimpleNamespace(root_id="cgroot:test")
+    run = SimpleNamespace(
+        execution_queue_cleanup_required=False,
+        root_ids=set(),
+        unreleased_root_ids=set(),
+    )
+    queue_actions: list[str] = []
+
+    monkeypatch.setattr(runner, "_create_root", lambda *_args: SimpleNamespace(root=root))
+    monkeypatch.setattr(
+        runner,
+        "_health_load",
+        lambda *_args, **_kwargs: (object(), object(), object(), object()),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_queue_control",
+        lambda _run, action: queue_actions.append(action),
+    )
+    monkeypatch.setattr(runner, "_promote", lambda *_args, **_kwargs: (object(), object()))
+
+    def uncertain_revoke(*_args: Any, **_kwargs: Any) -> None:
+        raise runner.AcceptanceError("ACCEPTANCE_HOSTED_REVOCATION_INVALID")
+
+    monkeypatch.setattr(runner, "_revoke", uncertain_revoke)
+
+    try:
+        runner._run_revocation_case(run, object())
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_REVOCATION_INVALID"
+    else:
+        raise AssertionError("uncertain revocation unexpectedly succeeded")
+
+    assert queue_actions == ["hold"]
+    assert run.execution_queue_cleanup_required is True
+    failure = runner._runner_failure_observation(
+        run,
+        code="ACCEPTANCE_HOSTED_REVOCATION_INVALID",
+        disposition="FAILED",
+        reset_completed=True,
+    )
+    assert failure["execution_queue_cleanup_required"] is True

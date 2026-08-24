@@ -1151,6 +1151,7 @@ class _HostedExecution:
     service_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
     revocation_root: Any | None = None
     revocation_epoch: int | None = None
+    execution_queue_cleanup_required: bool = False
 
     @property
     def api_origin(self) -> str:
@@ -2588,21 +2589,18 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
         load, apply_dispatch, apply_receipt, health = _health_load(
             run, case, mode="healthy", root_result=root_result
         )
-        queue_held = False
-        try:
-            _queue_control(run, "hold")
-            queue_held = True
-            promotion_dispatch, promotion_command = _promote(
-                run,
-                case,
-                root_result=root_result,
-                apply_receipt=apply_receipt,
-                terminal=health,
-            )
-            revocation, proof = _revoke(run, case, root_result.root)
-        finally:
-            if queue_held:
-                _queue_control(run, "release")
+        _queue_control(run, "hold")
+        run.execution_queue_cleanup_required = True
+        promotion_dispatch, promotion_command = _promote(
+            run,
+            case,
+            root_result=root_result,
+            apply_receipt=apply_receipt,
+            terminal=health,
+        )
+        revocation, proof = _revoke(run, case, root_result.root)
+        _queue_control(run, "release")
+        run.execution_queue_cleanup_required = False
         stale_receipt = _poll_receipt(
             run,
             case,
@@ -2693,6 +2691,23 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
                 run.unreleased_root_ids.discard(root_result.root.root_id)
             except AcceptanceError as error:
                 raise AcceptanceError("ACCEPTANCE_HOSTED_CLAIM_CLEANUP_FAILED") from error
+
+
+def _runner_failure_observation(
+    run: _HostedExecution,
+    *,
+    code: str,
+    disposition: Literal["FAILED", "NOT_RUN"],
+    reset_completed: bool,
+) -> dict[str, object]:
+    return {
+        "code": code,
+        "disposition": disposition,
+        "execution_queue_cleanup_required": run.execution_queue_cleanup_required,
+        "reset_completed": reset_completed,
+        "schema_version": "controlgraph.acceptance-runner-failure/v1",
+        "unreleased_root_ids": sorted(run.unreleased_root_ids),
+    }
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -3804,13 +3819,12 @@ def execute_hosted(
                     run,
                     case,
                     {
-                        EvidenceKind.RUNNER_FAILURE: {
-                            "code": error.code,
-                            "disposition": "FAILED",
-                            "reset_completed": reset_succeeded,
-                            "schema_version": "controlgraph.acceptance-runner-failure/v1",
-                            "unreleased_root_ids": sorted(run.unreleased_root_ids),
-                        }
+                        EvidenceKind.RUNNER_FAILURE: _runner_failure_observation(
+                            run,
+                            code=error.code,
+                            disposition="FAILED",
+                            reset_completed=reset_succeeded,
+                        )
                     },
                     started=started,
                     completed=completed,
@@ -3828,13 +3842,12 @@ def execute_hosted(
                         run,
                         skipped,
                         {
-                            EvidenceKind.RUNNER_FAILURE: {
-                                "code": "ACCEPTANCE_NOT_RUN_AFTER_FAILURE",
-                                "disposition": "NOT_RUN",
-                                "reset_completed": False,
-                                "schema_version": "controlgraph.acceptance-runner-failure/v1",
-                                "unreleased_root_ids": sorted(run.unreleased_root_ids),
-                            }
+                            EvidenceKind.RUNNER_FAILURE: _runner_failure_observation(
+                                run,
+                                code="ACCEPTANCE_NOT_RUN_AFTER_FAILURE",
+                                disposition="NOT_RUN",
+                                reset_completed=False,
+                            )
                         },
                         started=skipped_at,
                         completed=skipped_at,
