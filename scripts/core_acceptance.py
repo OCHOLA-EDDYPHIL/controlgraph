@@ -65,6 +65,7 @@ _ZERO_SHA256: Final = "0" * 64
 _API_ORIGIN = "https://controlgraph-api-{project_number}.us-central1.run.app"
 _CONSOLE_ORIGIN = "https://controlgraph-console-{project_number}.us-central1.run.app"
 _LOAD_JOB_PREFIX = "cg-m8-core-"
+_LOAD_JOB_LABEL_KEY = "controlgraph-purpose"
 _LOAD_JOB_LABEL = "m8-core-acceptance"
 _LOAD_RESULT_SCHEMA = "controlgraph.core-acceptance-load-result/v1"
 _LOAD_READY_SCHEMA = "controlgraph.core-acceptance-load-ready/v1"
@@ -1462,7 +1463,7 @@ def main():
             "accepted": accepted,
             "mode": mode,
             "request_count": 1,
-            "response_codes": {str(code): 1},
+            "response_codes": [{"code": int(code), "count": 1}],
             "schema_version": RESULT,
             "started_at": utc(datetime.datetime.fromtimestamp(
                 started, datetime.timezone.utc
@@ -1522,14 +1523,16 @@ def main():
         codes = {}
         accepted = 0
         for code, good in results:
-            codes[str(code)] = codes.get(str(code), 0) + 1
+            codes[int(code)] = codes.get(int(code), 0) + 1
             accepted += int(good)
         windows.append({
             "accepted": accepted,
             "ended_at": utc(datetime.datetime.fromtimestamp(
                 window_start + 60, datetime.timezone.utc
             )),
-            "response_codes": codes,
+            "response_codes": [
+                {"code": code, "count": count} for code, count in sorted(codes.items())
+            ],
             "started_at": utc(datetime.datetime.fromtimestamp(
                 window_start, datetime.timezone.utc
             )),
@@ -1653,7 +1656,7 @@ def _load_job_names(run: _HostedExecution) -> frozenset[str]:
             "list",
             f"--project={run.spec.target.project_id}",
             f"--region={run.spec.target.region}",
-            f"--filter=metadata.labels.controlgraph-purpose={_LOAD_JOB_LABEL}",
+            f"--filter=metadata.labels.{_LOAD_JOB_LABEL_KEY}={_LOAD_JOB_LABEL}",
         ),
         repo=run.repo,
     )
@@ -1764,7 +1767,7 @@ def _create_load_job(
                 f"--network={run.network_resource}",
                 f"--subnet={run.subnetwork_resource}",
                 "--vpc-egress=all-traffic",
-                f"--labels=controlgraph-purpose={_LOAD_JOB_LABEL}",
+                f"--labels={_LOAD_JOB_LABEL_KEY}={_LOAD_JOB_LABEL}",
                 "--quiet",
                 "--format=none",
             ),
@@ -1782,14 +1785,44 @@ def _create_load_job(
             ),
             repo=run.repo,
         )
-        encoded = _canonical_object(described)
-        required = (
-            job_name.encode(),
-            _image(run.spec, ImageComponent.CONTROLLER).encode(),
-            run.verifier_service_account.encode(),
-            _LOAD_JOB_LABEL.encode(),
+        if not isinstance(described, dict):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+        specification = described.get("spec")
+        template = specification.get("template") if isinstance(specification, dict) else None
+        template_metadata = template.get("metadata") if isinstance(template, dict) else None
+        template_spec = template.get("spec") if isinstance(template, dict) else None
+        task_template = template_spec.get("template") if isinstance(template_spec, dict) else None
+        containers = task_template.get("containers") if isinstance(task_template, dict) else None
+        deployed_images = (
+            tuple(
+                container.get("image")
+                for container in containers
+                if isinstance(container, dict) and isinstance(container.get("image"), str)
+            )
+            if isinstance(containers, list)
+            else ()
         )
-        if any(item not in encoded for item in required):
+        service_account = (
+            task_template.get("serviceAccountName")
+            if isinstance(task_template, dict)
+            else None
+        )
+        labels: dict[str, Any] = {}
+        for label_source in (template_metadata, described.get("metadata")):
+            values = label_source.get("labels") if isinstance(label_source, dict) else None
+            if isinstance(values, dict):
+                labels.update(
+                    {
+                        key: value
+                        for key, value in values.items()
+                        if isinstance(key, str) and isinstance(value, str)
+                    }
+                )
+        if (
+            deployed_images != (_image(run.spec, ImageComponent.CONTROLLER),)
+            or service_account != run.verifier_service_account
+            or labels.get(_LOAD_JOB_LABEL_KEY) != _LOAD_JOB_LABEL
+        ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     except AcceptanceError:
         if job_name in _load_job_names(run):

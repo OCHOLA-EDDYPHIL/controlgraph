@@ -978,3 +978,196 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
         reset_completed=True,
     )
     assert failure["execution_queue_cleanup_required"] is True
+
+
+def _hosted_module(tmp_path: Path) -> Any:
+    module_spec = importlib.util.spec_from_file_location(
+        f"core_acceptance_hosted_{_next_module_index()}", SCRIPT
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    runner = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = runner
+    module_spec.loader.exec_module(runner)
+    return runner
+
+
+_MODULE_INDEX = {"value": 0}
+
+
+def _next_module_index() -> int:
+    _MODULE_INDEX["value"] += 1
+    return _MODULE_INDEX["value"]
+
+
+def _provider_job_document(
+    image: str,
+    service_account: str,
+    labels: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "run.googleapis.com/v1",
+        "kind": "Job",
+        "metadata": {"generation": 1, "name": "cg-m8-core-p-abc", "uid": "uid-1"},
+        "spec": {
+            "template": {
+                "metadata": {"labels": labels, "name": "cg-m8-core-p-abc"},
+                "spec": {
+                    "template": {
+                        "containers": [{"image": image}],
+                        "maxRetries": 0,
+                        "serviceAccountName": service_account,
+                        "taskTimeout": "600s",
+                    }
+                },
+            }
+        },
+        "status": {"conditions": []},
+    }
+
+
+def test_hosted_load_job_verification_accepts_provider_json_envelope(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    _repo, _artifacts, spec_path, _spec_value = _fixture(tmp_path)
+    _payload, spec = runner._load_contract(
+        spec_path,
+        runner.CoreAcceptanceRunSpecV1,
+        error_code="ACCEPTANCE_SPEC_INVALID",
+    )
+    controller_image = next(
+        item.reference
+        for item in spec.images
+        if item.component is runner.ImageComponent.CONTROLLER
+    )
+    verifier = "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com"
+    run = SimpleNamespace(
+        repo=SOURCE_ROOT,
+        artifact_root=tmp_path,
+        spec=spec,
+        run_inputs_sha256="a" * 64,
+        project_number="123456789",
+        network_resource="projects/controlgraph-canary-abc123/global/networks/test",
+        subnetwork_resource=(
+            "projects/controlgraph-canary-abc123/regions/us-central1/subnetworks/test"
+        ),
+        verifier_service_account=verifier,
+    )
+    case = spec.cases[0]
+    described = _provider_job_document(
+        controller_image,
+        verifier,
+        {runner._LOAD_JOB_LABEL_KEY: runner._LOAD_JOB_LABEL},
+    )
+    monkeypatch.setattr(runner, "_capture_process", lambda *_args, **_kwargs: (0, b""))
+    monkeypatch.setattr(runner, "_load_job_names", lambda *_args, **_kwargs: frozenset())
+    monkeypatch.setattr(
+        runner,
+        "_gcloud_json",
+        lambda *_args, **_kwargs: described,
+    )
+
+    job_name = runner._create_load_job(
+        run,
+        case,
+        mode="probe-stable",
+        destination="https://controlgraph-reference-target.example/v1/probe",
+        audience="https://controlgraph-reference-target.example",
+        expected_revision=spec.target.stable_revision,
+    )
+
+    assert job_name.startswith(runner._LOAD_JOB_PREFIX)
+
+
+def test_hosted_load_job_verification_rejects_provider_drift(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    _repo, _artifacts, spec_path, _spec_value = _fixture(tmp_path)
+    _payload, spec = runner._load_contract(
+        spec_path,
+        runner.CoreAcceptanceRunSpecV1,
+        error_code="ACCEPTANCE_SPEC_INVALID",
+    )
+    controller_image = next(
+        item.reference
+        for item in spec.images
+        if item.component is runner.ImageComponent.CONTROLLER
+    )
+    verifier = "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com"
+    run = SimpleNamespace(
+        repo=SOURCE_ROOT,
+        artifact_root=tmp_path,
+        spec=spec,
+        run_inputs_sha256="a" * 64,
+        project_number="123456789",
+        network_resource="projects/controlgraph-canary-abc123/global/networks/test",
+        subnetwork_resource=(
+            "projects/controlgraph-canary-abc123/regions/us-central1/subnetworks/test"
+        ),
+        verifier_service_account=verifier,
+    )
+    case = spec.cases[0]
+    monkeypatch.setattr(runner, "_capture_process", lambda *_args, **_kwargs: (0, b""))
+    monkeypatch.setattr(runner, "_load_job_names", lambda *_args, **_kwargs: frozenset())
+
+    drifted_documents = (
+        _provider_job_document(
+            controller_image[:-1] + ("0" if controller_image[-1] != "0" else "1"),
+            verifier,
+            {runner._LOAD_JOB_LABEL_KEY: runner._LOAD_JOB_LABEL},
+        ),
+        _provider_job_document(
+            controller_image,
+            "other@controlgraph-canary-abc123.iam.gserviceaccount.com",
+            {runner._LOAD_JOB_LABEL_KEY: runner._LOAD_JOB_LABEL},
+        ),
+        _provider_job_document(controller_image, verifier, {}),
+    )
+    for described in drifted_documents:
+
+        def make_gcloud_json(document: dict[str, Any]) -> Any:
+            return lambda _arguments, **_kwargs: document
+
+        monkeypatch.setattr(runner, "_gcloud_json", make_gcloud_json(described))
+        try:
+            runner._create_load_job(
+                run,
+                case,
+                mode="probe-stable",
+                destination="https://controlgraph-reference-target.example/v1/probe",
+                audience="https://controlgraph-reference-target.example",
+                expected_revision=spec.target.stable_revision,
+            )
+        except runner.AcceptanceError as error:
+            assert error.code == "ACCEPTANCE_HOSTED_LOAD_INVALID"
+        else:
+            raise AssertionError("drifted load job document unexpectedly accepted")
+
+
+def test_hosted_probe_records_stay_within_restricted_canonical_json() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    record = {
+        "accepted": True,
+        "mode": "probe-stable",
+        "request_count": 1,
+        "response_codes": [{"code": 200, "count": 1}],
+        "schema_version": runner._LOAD_RESULT_SCHEMA,
+        "started_at": "2026-08-24T00:00:00Z",
+        "status": "COMPLETE",
+        "token_persisted": False,
+        "windows": [
+            {
+                "accepted": 120,
+                "response_codes": [{"code": 200, "count": 118}, {"code": 404, "count": 2}],
+                "submitted": 120,
+                "window_index": 1,
+            }
+        ],
+    }
+
+    encoded = runner._canonical_object(runner._json_value(record))
+
+    assert b'"status":"COMPLETE"' in encoded
