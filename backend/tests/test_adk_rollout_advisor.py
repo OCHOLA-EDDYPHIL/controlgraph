@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 
 import pytest
 from google.adk.telemetry.context import ContentCapturingMode
-from google.genai import types
+from google.genai import _transformers, types
 from model_assistance_test_data import (
     invocation,
     recommendation,
@@ -20,6 +20,7 @@ from controlgraph_canary.application.model_assistance import (
 from controlgraph_canary.contracts.model_assistance import (
     MAX_LLM_CALLS,
     MAX_MODEL_OUTPUT_TOKENS,
+    AdvisorRecommendationV1,
     DiagnosticToolId,
 )
 from controlgraph_canary.integrations.adk import rollout_advisor
@@ -64,6 +65,16 @@ class _FakeRunner:
         for tool in self.agent.tools:
             await tool(snapshot_sha256=snapshot_sha256)
         yield _Event(self.output)
+
+
+def test_recommendation_schema_is_accepted_by_the_pinned_genai_transformer() -> None:
+    schema = AdvisorRecommendationV1.model_json_schema()
+
+    _transformers.process_schema(schema, client=None)
+
+    properties = schema["properties"]
+    assert properties["operator_review_required"]["type"] == "boolean"
+    assert properties["deterministic_health_override"]["type"] == "boolean"
 
 
 def test_adk_runner_exposes_only_six_bounded_snapshot_tools(

@@ -115,6 +115,24 @@ def test_recommendation_schema_has_no_revision_or_mutation_authority_fields() ->
         AdvisorRecommendationV1.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operator_review_required", False),
+        ("deterministic_health_override", True),
+    ],
+)
+def test_recommendation_rejects_changes_to_advisory_authority_flags(
+    field: str,
+    value: bool,
+) -> None:
+    payload = recommendation(invocation()).model_dump(mode="python")
+    payload[field] = value
+
+    with pytest.raises(ValidationError, match="advisory authority boundary"):
+        AdvisorRecommendationV1.model_validate(payload)
+
+
 def test_low_confidence_requires_explicit_manual_review() -> None:
     request = invocation()
     value = recommendation(request)
