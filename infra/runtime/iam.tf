@@ -270,7 +270,7 @@ check "operator_console_has_no_control_plane_identity" {
   assert {
     condition = (
       local.service_accounts.console == "controlgraph-console@${var.project_id}.iam.gserviceaccount.com" &&
-      google_cloud_run_v2_service_iam_member.operator_console_public.name == module.console.service.name &&
+      trimprefix(google_cloud_run_v2_service_iam_member.operator_console_public.name, "projects/${var.project_id}/locations/${var.region}/services/") == module.console.service.name &&
       google_cloud_run_v2_service_iam_member.operator_console_public.member == "allUsers" &&
       local.run_invokers.api.member == var.operator_principal
     )
