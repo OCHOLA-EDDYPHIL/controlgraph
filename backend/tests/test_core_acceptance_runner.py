@@ -20,7 +20,7 @@ CASES = (
         (
             "CLOUD_RUN_CONFIGURATION",
             "DATA_PATH_PROBE",
-            "SIGNED_CAPABILITY",
+            "VERIFIED_CAPABILITY_METADATA",
             "EXECUTOR_EPOCH_CHECK",
             "EXECUTION_RECEIPT",
             "HEALTH_DECISION",
@@ -32,11 +32,11 @@ CASES = (
         (
             "CLOUD_RUN_CONFIGURATION",
             "DATA_PATH_PROBE",
-            "SIGNED_CAPABILITY",
+            "VERIFIED_CAPABILITY_METADATA",
             "EXECUTOR_EPOCH_CHECK",
             "EXECUTION_RECEIPT",
             "HEALTH_DECISION",
-            "RECOVERY_IDENTITY",
+            "RECOVERY_SERVICE_IDENTITY_BINDING",
             "TIMELINE",
         ),
     ),
@@ -46,7 +46,7 @@ CASES = (
             "AUTHORITY_TRANSITION",
             "CLOUD_RUN_CONFIGURATION",
             "DATA_PATH_PROBE",
-            "SIGNED_CAPABILITY",
+            "VERIFIED_CAPABILITY_METADATA",
             "EXECUTOR_EPOCH_CHECK",
             "STALE_DENIAL",
             "EXECUTION_RECEIPT",
@@ -71,8 +71,14 @@ CASES = (
             "TIMELINE",
         ),
     ),
-    ("TIMELINE_CONSOLE_READ", ("TIMELINE", "CONSOLE_READ")),
-    ("BOUNDED_ADVISOR", ("COORDINATOR", "MODEL_AUDIT", "TIMELINE")),
+    (
+        "TIMELINE_CONSOLE_READ",
+        ("CLOUD_RUN_CONFIGURATION", "TIMELINE", "CONSOLE_READ"),
+    ),
+    (
+        "BOUNDED_ADVISOR",
+        ("CLOUD_RUN_CONFIGURATION", "COORDINATOR", "MODEL_AUDIT", "TIMELINE"),
+    ),
 )
 
 EXPECTED_RESULTS = {
@@ -86,70 +92,38 @@ EXPECTED_RESULTS = {
     "BOUNDED_ADVISOR": "ADVISORY_ONLY",
 }
 
-RESET_AND_READ = (
-    "cli:controlgraph-reference-target-reset",
-    "cli:controlgraph-canary:read-target-traffic",
-)
-
 ENTRY_POINTS = {
-    "TARGET_RESET": RESET_AND_READ,
+    "TARGET_RESET": (
+        "runner:reset-reference-target",
+        "runner:verify-stable-data-path",
+    ),
     "HEALTHY_PROMOTION": (
-        *RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:evaluate-health",
-        "cli:controlgraph-canary:promote-candidate",
-        "cli:controlgraph-canary:read-execution-receipt",
-        "cli:controlgraph-canary:read-target-traffic",
-        "cli:controlgraph-canary:release-service-claim",
+        "runner:reset-reference-target",
+        "runner:observe-healthy-promotion",
     ),
     "UNHEALTHY_STABLE_RECOVERY": (
-        *RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:evaluate-health",
-        "service:recovery",
-        "cli:controlgraph-canary:read-execution-receipt",
-        "cli:controlgraph-canary:read-target-traffic",
-        "cli:controlgraph-canary:release-service-claim",
+        "runner:reset-reference-target",
+        "runner:observe-unhealthy-stable-recovery",
     ),
     "REVOCATION_STALE_DENIAL": (
-        *RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:evaluate-health",
-        "cli:controlgraph-canary:execution-queue:hold",
-        "cli:controlgraph-canary:promote-candidate",
-        "cli:controlgraph-canary:revoke-epoch",
-        "cli:controlgraph-canary:execution-queue:release",
-        "cli:controlgraph-canary:read-execution-receipt",
-        "cli:controlgraph-canary:read-target-traffic",
-        "cli:controlgraph-canary:recover-captured-stable",
-        "cli:controlgraph-canary:release-service-claim",
+        "runner:reset-reference-target",
+        "runner:observe-revocation-stale-denial",
     ),
     "INDEPENDENT_VERIFIER_PROBE": (
-        *RESET_AND_READ,
-        "service:verifier:independent-verification",
-        "endpoint:reference-target:probe",
+        "runner:reset-reference-target",
+        "runner:observe-independent-verification",
     ),
     "AMBIGUITY_CLASSIFICATION": (
-        *RESET_AND_READ,
-        "cli:controlgraph-canary:classify-completion",
+        "runner:reset-reference-target",
+        "runner:observe-ambiguity-classification",
     ),
     "TIMELINE_CONSOLE_READ": (
-        *RESET_AND_READ,
-        "endpoint:api:timeline-read",
-        "web:operator-console",
+        "runner:reset-reference-target",
+        "runner:observe-timeline-console",
     ),
     "BOUNDED_ADVISOR": (
-        *RESET_AND_READ,
-        "endpoint:api:advisor-command",
-        "service:coordinator:advisor",
-        "service:advisor",
-        "cli:controlgraph-canary:read-target-traffic",
+        "runner:reset-reference-target",
+        "runner:observe-bounded-advisor",
     ),
 }
 
@@ -245,7 +219,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts.mkdir()
     target = {
         "candidate_revision": "controlgraph-reference-target-candidate-v4",
-        "environment": "acceptance",
+        "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
@@ -333,9 +307,23 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
             digest = _write(
                 artifacts / relative_path,
                 {
+                    "case_id": binding["case_id"],
                     "evidence_id": evidence_id,
-                    "private_marker": "not-copied-to-manifest",
-                    "synthetic": True,
+                    "kind": evidence_kind,
+                    "observed_at": f"2026-08-24T00:00:{completed_second:02d}Z",
+                    "ordinal": evidence_sequence,
+                    "run_inputs_sha256": run_inputs_sha256,
+                    "schema_version": "controlgraph.hosted-acceptance-observation/v1",
+                    "source": {
+                        "observation": {
+                            "private_marker": "not-copied-to-manifest",
+                            "synthetic": True,
+                        },
+                        "schema_version": (
+                            "controlgraph.hosted-evidence-"
+                            f"{evidence_kind.lower().replace('_', '-')}/v1"
+                        ),
+                    },
                 },
             )
             evidence.append(
@@ -500,6 +488,27 @@ def test_rejects_changed_evidence_artifact(tmp_path: Path) -> None:
     assert completed.stderr.strip() == '{"code":"ACCEPTANCE_ARTIFACT_DIGEST_MISMATCH"}'
 
 
+def test_rejects_digest_bound_evidence_without_the_typed_observation_envelope(
+    tmp_path: Path,
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path)
+    binding = spec["cases"][0]
+    result_path = artifacts / binding["result"]["relative_path"]
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    evidence = result["evidence"][0]
+    evidence_path = artifacts / evidence["artifact"]["relative_path"]
+    observation = json.loads(evidence_path.read_text(encoding="utf-8"))
+    observation["source"]["schema_version"] = "controlgraph.hosted-evidence-wrong/v1"
+    evidence["artifact"]["sha256"] = _write(evidence_path, observation)
+    binding["result"]["sha256"] = _write(result_path, result)
+    _write(spec_path, spec)
+
+    completed = _run(repo, artifacts, spec_path, tmp_path / "manifest.json")
+
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == '{"code":"ACCEPTANCE_EVIDENCE_INVALID"}'
+
+
 def test_rejects_case_not_bound_to_fixed_product_entry_points(tmp_path: Path) -> None:
     repo, artifacts, spec_path, spec = _fixture(tmp_path)
     binding = spec["cases"][0]
@@ -550,6 +559,10 @@ def test_rejects_overlapping_case_intervals(tmp_path: Path) -> None:
     result["completed_at"] = "2026-08-24T00:00:01Z"
     for evidence in result["evidence"]:
         evidence["observed_at"] = "2026-08-24T00:00:01Z"
+        evidence_path = artifacts / evidence["artifact"]["relative_path"]
+        observation = json.loads(evidence_path.read_text(encoding="utf-8"))
+        observation["observed_at"] = "2026-08-24T00:00:01Z"
+        evidence["artifact"]["sha256"] = _write(evidence_path, observation)
     binding["result"]["sha256"] = _write(result_path, result)
     _write(spec_path, spec)
 
@@ -634,6 +647,8 @@ def test_hosted_execute_requires_matching_double_confirmation(tmp_path: Path) ->
             "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com",
             "--restricted-exporter-service-account",
             "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com",
+            "--acceptance-identity",
+            "acceptance@example.invalid",
             "--confirm",
             "RUN_CONTROLGRAPH_CORE_ACCEPTANCE",
         ],
@@ -646,6 +661,77 @@ def test_hosted_execute_requires_matching_double_confirmation(tmp_path: Path) ->
     assert completed.returncode == 2
     assert completed.stderr.strip() == ('{"code":"ACCEPTANCE_HOSTED_CONFIRMATION_REQUIRED"}')
     assert not (tmp_path / "manifest.json").exists()
+
+
+def test_generate_spec_emits_a_deterministic_operable_template(tmp_path: Path) -> None:
+    repo, artifacts, _spec_path, spec = _fixture(tmp_path)
+    first = tmp_path / "generated-first.json"
+    second = tmp_path / "generated-second.json"
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPATH"] = str(SOURCE_ROOT / "backend" / "src")
+    base = [
+        sys.executable,
+        str(SCRIPT),
+        "generate-spec",
+        "--artifact-root",
+        str(artifacts),
+        "--project-id",
+        spec["target"]["project_id"],
+        "--source-commit",
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip(),
+        "--stable-revision",
+        spec["target"]["stable_revision"],
+        "--candidate-revision",
+        spec["target"]["candidate_revision"],
+    ]
+    for option, image in zip(
+        (
+            "--controller-image",
+            "--advisor-image",
+            "--console-image",
+            "--reference-stable-image",
+            "--reference-candidate-image",
+        ),
+        spec["images"],
+        strict=True,
+    ):
+        base.extend((option, image["reference"]))
+    base.extend(
+        (
+            "--terraform-plan",
+            "inputs/plan.json",
+            "--policy-schema-version",
+            "controlgraph.rollout-health-policy/v1",
+            "--policy-artifact",
+            "inputs/policy.json",
+            "--clock-start",
+            "2026-08-24T00:00:00Z",
+            "--random-seed",
+            "17",
+        )
+    )
+
+    for output in (first, second):
+        completed = subprocess.run(
+            [*base, "--output", str(output)],
+            check=False,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        assert completed.returncode == 0
+
+    generated = json.loads(first.read_text(encoding="utf-8"))
+    assert first.read_bytes() == second.read_bytes()
+    assert generated["target"]["environment"] == "nonprod"
+    assert [case["kind"] for case in generated["cases"]] == [kind for kind, _ in CASES]
+    assert {case["result"]["sha256"] for case in generated["cases"]} == {"0" * 64}
 
 
 def test_hosted_execute_resets_before_all_eight_fixed_cases(
@@ -678,17 +764,20 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
         reset_cases.append(case.kind.value)
         return {"schema_version": "test.reset/v1"}
 
-    def observations(_run: Any, case: Any, *_args: Any) -> dict[Any, object]:
-        return {
-            kind: {"schema_version": f"test.{kind.value.lower()}/v1"}
-            for kind in runner.REQUIRED_EVIDENCE[case.kind]
-        }
+    def observations(_run: Any, case: Any, *_args: Any) -> Any:
+        return runner._CaseOutcome(
+            observations={
+                kind: {"schema_version": f"test.{kind.value.lower()}/v1"}
+                for kind in runner.REQUIRED_EVIDENCE[case.kind]
+            },
+            terminal_result=runner.EXPECTED_RESULTS[case.kind],
+        )
 
     monkeypatch.setattr(runner, "_reset_target", reset)
     monkeypatch.setattr(
         runner,
         "_probe_stable",
-        lambda *_args: {"schema_version": "test.probe/v1"},
+        lambda *_args: {"schema_version": "test.probe/v1", "status": "COMPLETE"},
     )
     monkeypatch.setattr(runner, "_run_healthy_case", observations)
     monkeypatch.setattr(runner, "_run_unhealthy_case", observations)
@@ -716,6 +805,7 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
         restricted_exporter_service_account=(
             "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
         ),
+        acceptance_identity="acceptance@example.invalid",
         confirmation="RUN_CONTROLGRAPH_CORE_ACCEPTANCE",
     )
 

@@ -68,6 +68,16 @@ _LOAD_JOB_PREFIX = "cg-m8-core-"
 _LOAD_JOB_LABEL = "m8-core-acceptance"
 _LOAD_RESULT_SCHEMA = "controlgraph.core-acceptance-load-result/v1"
 _LOAD_READY_SCHEMA = "controlgraph.core-acceptance-load-ready/v1"
+_LOAD_JOB_PERMISSIONS = (
+    "iam.serviceAccounts.actAs",
+    "logging.logEntries.list",
+    "run.executions.list",
+    "run.jobs.create",
+    "run.jobs.delete",
+    "run.jobs.get",
+    "run.jobs.list",
+    "run.jobs.run",
+)
 
 _PROJECT = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _IMAGE = re.compile(
@@ -156,11 +166,11 @@ class ImageComponent(StrEnum):
 class EvidenceKind(StrEnum):
     CLOUD_RUN_CONFIGURATION = "CLOUD_RUN_CONFIGURATION"
     DATA_PATH_PROBE = "DATA_PATH_PROBE"
-    SIGNED_CAPABILITY = "SIGNED_CAPABILITY"
+    VERIFIED_CAPABILITY_METADATA = "VERIFIED_CAPABILITY_METADATA"
     EXECUTOR_EPOCH_CHECK = "EXECUTOR_EPOCH_CHECK"
     EXECUTION_RECEIPT = "EXECUTION_RECEIPT"
     HEALTH_DECISION = "HEALTH_DECISION"
-    RECOVERY_IDENTITY = "RECOVERY_IDENTITY"
+    RECOVERY_SERVICE_IDENTITY_BINDING = "RECOVERY_SERVICE_IDENTITY_BINDING"
     AUTHORITY_TRANSITION = "AUTHORITY_TRANSITION"
     STALE_DENIAL = "STALE_DENIAL"
     INDEPENDENT_VERIFICATION = "INDEPENDENT_VERIFICATION"
@@ -169,6 +179,7 @@ class EvidenceKind(StrEnum):
     CONSOLE_READ = "CONSOLE_READ"
     COORDINATOR = "COORDINATOR"
     MODEL_AUDIT = "MODEL_AUDIT"
+    RUNNER_FAILURE = "RUNNER_FAILURE"
 
 
 class ResultStatus(StrEnum):
@@ -194,7 +205,7 @@ REQUIRED_EVIDENCE: Final[dict[CaseKind, frozenset[EvidenceKind]]] = {
         {
             EvidenceKind.CLOUD_RUN_CONFIGURATION,
             EvidenceKind.DATA_PATH_PROBE,
-            EvidenceKind.SIGNED_CAPABILITY,
+            EvidenceKind.VERIFIED_CAPABILITY_METADATA,
             EvidenceKind.EXECUTOR_EPOCH_CHECK,
             EvidenceKind.EXECUTION_RECEIPT,
             EvidenceKind.HEALTH_DECISION,
@@ -205,11 +216,11 @@ REQUIRED_EVIDENCE: Final[dict[CaseKind, frozenset[EvidenceKind]]] = {
         {
             EvidenceKind.CLOUD_RUN_CONFIGURATION,
             EvidenceKind.DATA_PATH_PROBE,
-            EvidenceKind.SIGNED_CAPABILITY,
+            EvidenceKind.VERIFIED_CAPABILITY_METADATA,
             EvidenceKind.EXECUTOR_EPOCH_CHECK,
             EvidenceKind.EXECUTION_RECEIPT,
             EvidenceKind.HEALTH_DECISION,
-            EvidenceKind.RECOVERY_IDENTITY,
+            EvidenceKind.RECOVERY_SERVICE_IDENTITY_BINDING,
             EvidenceKind.TIMELINE,
         }
     ),
@@ -218,7 +229,7 @@ REQUIRED_EVIDENCE: Final[dict[CaseKind, frozenset[EvidenceKind]]] = {
             EvidenceKind.AUTHORITY_TRANSITION,
             EvidenceKind.CLOUD_RUN_CONFIGURATION,
             EvidenceKind.DATA_PATH_PROBE,
-            EvidenceKind.SIGNED_CAPABILITY,
+            EvidenceKind.VERIFIED_CAPABILITY_METADATA,
             EvidenceKind.EXECUTOR_EPOCH_CHECK,
             EvidenceKind.STALE_DENIAL,
             EvidenceKind.EXECUTION_RECEIPT,
@@ -241,76 +252,55 @@ REQUIRED_EVIDENCE: Final[dict[CaseKind, frozenset[EvidenceKind]]] = {
             EvidenceKind.TIMELINE,
         }
     ),
-    CaseKind.TIMELINE_CONSOLE_READ: frozenset({EvidenceKind.TIMELINE, EvidenceKind.CONSOLE_READ}),
+    CaseKind.TIMELINE_CONSOLE_READ: frozenset(
+        {
+            EvidenceKind.CLOUD_RUN_CONFIGURATION,
+            EvidenceKind.TIMELINE,
+            EvidenceKind.CONSOLE_READ,
+        }
+    ),
     CaseKind.BOUNDED_ADVISOR: frozenset(
-        {EvidenceKind.COORDINATOR, EvidenceKind.MODEL_AUDIT, EvidenceKind.TIMELINE}
+        {
+            EvidenceKind.CLOUD_RUN_CONFIGURATION,
+            EvidenceKind.COORDINATOR,
+            EvidenceKind.MODEL_AUDIT,
+            EvidenceKind.TIMELINE,
+        }
     ),
 }
 
-_RESET_AND_READ: Final = (
-    "cli:controlgraph-reference-target-reset",
-    "cli:controlgraph-canary:read-target-traffic",
-)
-
 ENTRY_POINTS: Final[dict[CaseKind, tuple[str, ...]]] = {
-    CaseKind.TARGET_RESET: _RESET_AND_READ,
+    CaseKind.TARGET_RESET: (
+        "runner:reset-reference-target",
+        "runner:verify-stable-data-path",
+    ),
     CaseKind.HEALTHY_PROMOTION: (
-        *_RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:evaluate-health",
-        "cli:controlgraph-canary:promote-candidate",
-        "cli:controlgraph-canary:read-execution-receipt",
-        "cli:controlgraph-canary:read-target-traffic",
-        "cli:controlgraph-canary:release-service-claim",
+        "runner:reset-reference-target",
+        "runner:observe-healthy-promotion",
     ),
     CaseKind.UNHEALTHY_STABLE_RECOVERY: (
-        *_RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:evaluate-health",
-        "service:recovery",
-        "cli:controlgraph-canary:read-execution-receipt",
-        "cli:controlgraph-canary:read-target-traffic",
-        "cli:controlgraph-canary:release-service-claim",
+        "runner:reset-reference-target",
+        "runner:observe-unhealthy-stable-recovery",
     ),
     CaseKind.REVOCATION_STALE_DENIAL: (
-        *_RESET_AND_READ,
-        "cli:controlgraph-canary:capture-stable-snapshot",
-        "cli:controlgraph-canary:create-rollout-root",
-        "cli:controlgraph-canary:apply-canary",
-        "cli:controlgraph-canary:evaluate-health",
-        "cli:controlgraph-canary:execution-queue:hold",
-        "cli:controlgraph-canary:promote-candidate",
-        "cli:controlgraph-canary:revoke-epoch",
-        "cli:controlgraph-canary:execution-queue:release",
-        "cli:controlgraph-canary:read-execution-receipt",
-        "cli:controlgraph-canary:read-target-traffic",
-        "cli:controlgraph-canary:recover-captured-stable",
-        "cli:controlgraph-canary:release-service-claim",
+        "runner:reset-reference-target",
+        "runner:observe-revocation-stale-denial",
     ),
     CaseKind.INDEPENDENT_VERIFIER_PROBE: (
-        *_RESET_AND_READ,
-        "service:verifier:independent-verification",
-        "endpoint:reference-target:probe",
+        "runner:reset-reference-target",
+        "runner:observe-independent-verification",
     ),
     CaseKind.AMBIGUITY_CLASSIFICATION: (
-        *_RESET_AND_READ,
-        "cli:controlgraph-canary:classify-completion",
+        "runner:reset-reference-target",
+        "runner:observe-ambiguity-classification",
     ),
     CaseKind.TIMELINE_CONSOLE_READ: (
-        *_RESET_AND_READ,
-        "endpoint:api:timeline-read",
-        "web:operator-console",
+        "runner:reset-reference-target",
+        "runner:observe-timeline-console",
     ),
     CaseKind.BOUNDED_ADVISOR: (
-        *_RESET_AND_READ,
-        "endpoint:api:advisor-command",
-        "service:coordinator:advisor",
-        "service:advisor",
-        "cli:controlgraph-canary:read-target-traffic",
+        "runner:reset-reference-target",
+        "runner:observe-bounded-advisor",
     ),
 }
 
@@ -327,7 +317,7 @@ class AcceptanceTargetV1(StrictContractModel):
     schema_version: Literal["controlgraph.acceptance-target/v1"]
     project_id: ProjectId
     region: Region
-    environment: Literal["acceptance"]
+    environment: Literal["nonprod"]
     service_name: CloudRunName
     stable_revision: CloudRunName
     candidate_revision: CloudRunName
@@ -749,7 +739,13 @@ def _manifest_case(
     for item in result.evidence:
         if item.run_inputs_sha256 != run_inputs_sha256:
             raise AcceptanceError("ACCEPTANCE_CASE_BINDING_MISMATCH")
-        _, artifact = _bind_artifact(item.artifact, artifact_root=artifact_root)
+        evidence_payload, artifact = _bind_artifact(item.artifact, artifact_root=artifact_root)
+        _validate_observation_artifact(
+            evidence_payload,
+            binding=binding,
+            evidence=item,
+            run_inputs_sha256=run_inputs_sha256,
+        )
         evidence.append(
             {
                 "artifact": artifact,
@@ -783,6 +779,39 @@ def _manifest_case(
         "steps": cast(RestrictedJson, [item.model_dump(mode="json") for item in result.steps]),
         "test_clock_keys": list(binding.test_clock_keys),
     }
+
+
+def _evidence_source_schema(kind: EvidenceKind) -> str:
+    return f"controlgraph.hosted-evidence-{kind.value.lower().replace('_', '-')}/v1"
+
+
+def _validate_observation_artifact(
+    payload: bytes,
+    *,
+    binding: CaseBindingV1,
+    evidence: EvidenceBindingV1,
+    run_inputs_sha256: str,
+) -> None:
+    try:
+        observation = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AcceptanceError("ACCEPTANCE_EVIDENCE_INVALID") from error
+    if not isinstance(observation, dict):
+        raise AcceptanceError("ACCEPTANCE_EVIDENCE_INVALID")
+    source = observation.get("source")
+    if (
+        observation.get("schema_version")
+        != "controlgraph.hosted-acceptance-observation/v1"
+        or observation.get("case_id") != binding.case_id
+        or observation.get("evidence_id") != evidence.evidence_id
+        or observation.get("kind") != evidence.kind.value
+        or observation.get("observed_at") != evidence.observed_at
+        or observation.get("run_inputs_sha256") != run_inputs_sha256
+        or not isinstance(source, dict)
+        or source.get("schema_version") != _evidence_source_schema(evidence.kind)
+        or "observation" not in source
+    ):
+        raise AcceptanceError("ACCEPTANCE_EVIDENCE_INVALID")
 
 
 def build_manifest(
@@ -1073,6 +1102,7 @@ def _require_target(result: Any, spec: CoreAcceptanceRunSpecV1) -> None:
     if (
         request.target.project_id != spec.target.project_id
         or request.target.region != spec.target.region
+        or request.target.environment != spec.target.environment
         or request.target.service_name != spec.target.service_name
         or request.stable_revision != spec.target.stable_revision
         or request.candidate_revision != spec.target.candidate_revision
@@ -1115,8 +1145,10 @@ class _HostedExecution:
     subnetwork_resource: str
     verifier_service_account: str
     restricted_exporter_service_account: str
-    observations: dict[CaseKind, dict[EvidenceKind, object]] = field(default_factory=dict)
+    acceptance_identity: str
     root_ids: set[str] = field(default_factory=set)
+    unreleased_root_ids: set[str] = field(default_factory=set)
+    service_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
     revocation_root: Any | None = None
     revocation_epoch: int | None = None
 
@@ -1130,6 +1162,12 @@ class _HostedExecution:
 
     def command_path(self, case: CaseBindingV1, label: str) -> Path:
         return self.artifact_root / "commands" / f"{case.sequence:02d}-{label}.json"
+
+
+@dataclass(frozen=True, slots=True)
+class _CaseOutcome:
+    observations: Mapping[EvidenceKind, object]
+    terminal_result: str
 
 
 def _read_traffic(run: _HostedExecution, case: CaseBindingV1, label: str) -> Any:
@@ -1197,6 +1235,7 @@ def _reset_target(run: _HostedExecution, case: CaseBindingV1) -> Any:
 
 
 def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
+    from controlgraph_canary.contracts.codec import canonical_sha256
     from controlgraph_canary.contracts.operator_observability import (
         StableSnapshotCaptureResultV1,
     )
@@ -1249,10 +1288,16 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     assert root_result is not None
     root = root_result.root
     plan = root.content.rollout_plan
+    policy_bindings = tuple(
+        item
+        for item in run.spec.policies
+        if item.policy_schema_version == root.content.health_policy.schema_version
+    )
     if (
         root_result.outcome != "CREATED"
         or root.content.target.project_id != run.spec.target.project_id
         or root.content.target.region != run.spec.target.region
+        or root.content.target.environment != run.spec.target.environment
         or root.content.target.service_name != run.spec.target.service_name
         or plan.stable_revision != run.spec.target.stable_revision
         or plan.candidate_revision != run.spec.target.candidate_revision
@@ -1260,6 +1305,8 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
         or plan.candidate_percent != 10
         or plan.concurrency != 8
         or root_result.initial_authority.current_epoch != 1
+        or len(policy_bindings) != 1
+        or policy_bindings[0].artifact.sha256 != canonical_sha256(root.content.health_policy)
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
     return root_result
@@ -1597,6 +1644,32 @@ def _job_executions(run: _HostedExecution, job_name: str) -> dict[str, str]:
     return result
 
 
+def _load_job_names(run: _HostedExecution) -> frozenset[str]:
+    values = _gcloud_json(
+        (
+            "run",
+            "jobs",
+            "list",
+            f"--project={run.spec.target.project_id}",
+            f"--region={run.spec.target.region}",
+            f"--filter=metadata.labels.controlgraph-purpose={_LOAD_JOB_LABEL}",
+        ),
+        repo=run.repo,
+    )
+    if not isinstance(values, list):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+    names: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+        metadata = value.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else value
+        name = metadata.get("name")
+        if isinstance(name, str):
+            names.add(name.rsplit("/", 1)[-1])
+    return frozenset(names)
+
+
 def _load_log_record(
     run: _HostedExecution,
     execution_name: str,
@@ -1655,6 +1728,8 @@ def _create_load_job(
     expected_revision: str,
 ) -> str:
     job_name = _job_name(run, case, mode)
+    if job_name in _load_job_names(run):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALREADY_EXISTS")
     bootstrap = (
         "import base64;exec(base64.b64decode('"
         + base64.b64encode(_REMOTE_LOAD_SCRIPT.encode("utf-8")).decode("ascii")
@@ -1664,37 +1739,37 @@ def _create_load_job(
         f"CG_AUDIENCE={audience},CG_DESTINATION={destination},CG_MODE={mode},"
         f"CG_EXPECTED_REVISION={expected_revision}"
     )
-    _capture_process(
-        (
-            "gcloud",
-            "run",
-            "jobs",
-            "create",
-            job_name,
-            f"--project={run.spec.target.project_id}",
-            f"--region={run.spec.target.region}",
-            f"--image={_image(run.spec, ImageComponent.CONTROLLER)}",
-            f"--service-account={run.verifier_service_account}",
-            "--command=/app/.venv/bin/python",
-            f"--args=-c,{bootstrap}",
-            f"--set-env-vars={environment}",
-            "--tasks=1",
-            "--parallelism=1",
-            "--max-retries=0",
-            "--task-timeout=600s",
-            "--cpu=1",
-            "--memory=512Mi",
-            f"--network={run.network_resource}",
-            f"--subnet={run.subnetwork_resource}",
-            "--vpc-egress=all-traffic",
-            f"--labels=controlgraph-purpose={_LOAD_JOB_LABEL}",
-            "--quiet",
-            "--format=none",
-        ),
-        repo=run.repo,
-        timeout=300,
-    )
     try:
+        _capture_process(
+            (
+                "gcloud",
+                "run",
+                "jobs",
+                "create",
+                job_name,
+                f"--project={run.spec.target.project_id}",
+                f"--region={run.spec.target.region}",
+                f"--image={_image(run.spec, ImageComponent.CONTROLLER)}",
+                f"--service-account={run.verifier_service_account}",
+                "--command=/app/.venv/bin/python",
+                f"--args=-c,{bootstrap}",
+                f"--set-env-vars={environment}",
+                "--tasks=1",
+                "--parallelism=1",
+                "--max-retries=0",
+                "--task-timeout=600s",
+                "--cpu=1",
+                "--memory=512Mi",
+                f"--network={run.network_resource}",
+                f"--subnet={run.subnetwork_resource}",
+                "--vpc-egress=all-traffic",
+                f"--labels=controlgraph-purpose={_LOAD_JOB_LABEL}",
+                "--quiet",
+                "--format=none",
+            ),
+            repo=run.repo,
+            timeout=300,
+        )
         described = _gcloud_json(
             (
                 "run",
@@ -1716,8 +1791,11 @@ def _create_load_job(
         if any(item not in encoded for item in required):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     except AcceptanceError:
-        with suppress(AcceptanceError):
-            _delete_load_job(run, job_name)
+        if job_name in _load_job_names(run):
+            try:
+                _delete_load_job(run, job_name)
+            except AcceptanceError as cleanup_error:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_CLEANUP_FAILED") from cleanup_error
         raise
     return job_name
 
@@ -1742,8 +1820,12 @@ def _delete_load_job(run: _HostedExecution, job_name: str) -> None:
         ),
         repo=run.repo,
         timeout=300,
-        allowed_statuses=frozenset({0, 1}),
     )
+    for _attempt in range(30):
+        if job_name not in _load_job_names(run):
+            return
+        time.sleep(1)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_CLEANUP_FAILED")
 
 
 def _execute_job(
@@ -2135,132 +2217,194 @@ def _release_claim(
     return result
 
 
-def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> dict[EvidenceKind, object]:
+def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcome:
     root_result = _create_root(run, case)
     run.root_ids.add(root_result.root.root_id)
-    load, apply_dispatch, apply_receipt, health = _health_load(
-        run, case, mode="healthy", root_result=root_result
-    )
-    promotion_dispatch, promotion_command = _promote(
-        run,
-        case,
-        root_result=root_result,
-        apply_receipt=apply_receipt,
-        terminal=health,
-    )
+    run.unreleased_root_ids.add(root_result.root.root_id)
     root = root_result.root
-    promotion_receipt = _poll_receipt(
-        run,
-        case,
-        root=root,
-        epoch=1,
-        request_id=promotion_command.request_id,
-        idempotency_key=promotion_command.idempotency_key,
-        action="PROMOTE_CANDIDATE_V1",
-        capability_sha256=promotion_dispatch.capability_sha256,
-        label="promotion",
-    )
-    if promotion_receipt.receipt.outcome.value != "VERIFIED":
-        raise AcceptanceError("ACCEPTANCE_HOSTED_PROMOTION_INVALID")
-    traffic = _read_traffic(run, case, "promoted")
-    _require_split(traffic, run.spec, stable=0, candidate=100)
-    if (
-        promotion_receipt.receipt.expected_poststate_sha256 != traffic.target_configuration_sha256
-        or promotion_receipt.receipt.observed_etag != traffic.provider_etag
-    ):
-        raise AcceptanceError("ACCEPTANCE_HOSTED_PROMOTION_INVALID")
-    release = _release_claim(
-        run,
-        case,
-        root=root,
-        epoch=1,
-        terminal_idempotency_key=promotion_command.idempotency_key,
-        label="healthy",
-    )
-    token = _identity_token(run)
+    terminal_idempotency_key: str | None = None
+    release_attempted = False
     try:
-        pages = _timeline_pages(run, token)
-    finally:
-        token = ""
-    return {
-        EvidenceKind.CLOUD_RUN_CONFIGURATION: traffic,
-        EvidenceKind.DATA_PATH_PROBE: load,
-        EvidenceKind.SIGNED_CAPABILITY: {
-            "apply_dispatch": _model_dict(apply_dispatch),
-            "dispatch": _model_dict(promotion_dispatch),
-            "root_signed_evidence": _model_dict(root_result.signed_evidence),
-        },
-        EvidenceKind.EXECUTOR_EPOCH_CHECK: promotion_receipt,
-        EvidenceKind.EXECUTION_RECEIPT: promotion_receipt,
-        EvidenceKind.HEALTH_DECISION: health,
-        EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
-    }
-
-
-def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> dict[EvidenceKind, object]:
-    root_result = _create_root(run, case)
-    run.root_ids.add(root_result.root.root_id)
-    load, apply_dispatch, apply_receipt, health = _health_load(
-        run, case, mode="unhealthy", root_result=root_result
-    )
-    recovery = health.recovery_dispatch
-    if (
-        recovery is None
-        or recovery.trigger_basis.value != "TERMINAL_UNHEALTHY_V3"
-        or recovery.enqueue_disposition not in {"CREATED", "DUPLICATE"}
-    ):
-        raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
-    root = root_result.root
-    receipt = _poll_receipt(
-        run,
-        case,
-        root=root,
-        epoch=1,
-        request_id=recovery.request_id,
-        idempotency_key=recovery.idempotency_key,
-        action="RECOVER_STABLE_V1",
-        capability_sha256=recovery.capability_sha256,
-        label="recovery",
-    )
-    if receipt.receipt.outcome.value != "VERIFIED":
-        raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
-    traffic = _read_traffic(run, case, "recovered")
-    _require_split(traffic, run.spec, stable=100, candidate=0)
-    release = _release_claim(
-        run,
-        case,
-        root=root,
-        epoch=1,
-        terminal_idempotency_key=recovery.idempotency_key,
-        label="unhealthy",
-    )
-    token = _identity_token(run)
-    try:
-        pages = _timeline_pages(run, token)
-    finally:
-        token = ""
-    return {
-        EvidenceKind.CLOUD_RUN_CONFIGURATION: traffic,
-        EvidenceKind.DATA_PATH_PROBE: load,
-        EvidenceKind.SIGNED_CAPABILITY: {
-            "apply_dispatch": _model_dict(apply_dispatch),
-            "dispatch": _model_dict(recovery),
-            "root_signed_evidence": _model_dict(root_result.signed_evidence),
-        },
-        EvidenceKind.EXECUTOR_EPOCH_CHECK: receipt,
-        EvidenceKind.EXECUTION_RECEIPT: {
-            "apply": _model_dict(apply_receipt),
-            "recovery": _model_dict(receipt),
-        },
-        EvidenceKind.HEALTH_DECISION: health,
-        EvidenceKind.RECOVERY_IDENTITY: {
-            "expected_identity": (
-                f"controlgraph-recovery@{run.spec.target.project_id}.iam.gserviceaccount.com"
+        load, apply_dispatch, apply_receipt, health = _health_load(
+            run, case, mode="healthy", root_result=root_result
+        )
+        promotion_dispatch, promotion_command = _promote(
+            run,
+            case,
+            root_result=root_result,
+            apply_receipt=apply_receipt,
+            terminal=health,
+        )
+        promotion_receipt = _poll_receipt(
+            run,
+            case,
+            root=root,
+            epoch=1,
+            request_id=promotion_command.request_id,
+            idempotency_key=promotion_command.idempotency_key,
+            action="PROMOTE_CANDIDATE_V1",
+            capability_sha256=promotion_dispatch.capability_sha256,
+            label="promotion",
+        )
+        if promotion_receipt.receipt.outcome.value != "VERIFIED":
+            raise AcceptanceError("ACCEPTANCE_HOSTED_PROMOTION_INVALID")
+        terminal_idempotency_key = promotion_command.idempotency_key
+        traffic = _read_traffic(run, case, "promoted")
+        _require_split(traffic, run.spec, stable=0, candidate=100)
+        if (
+            promotion_receipt.receipt.expected_poststate_sha256
+            != traffic.target_configuration_sha256
+            or promotion_receipt.receipt.observed_etag != traffic.provider_etag
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_PROMOTION_INVALID")
+        release_attempted = True
+        release = _release_claim(
+            run,
+            case,
+            root=root,
+            epoch=1,
+            terminal_idempotency_key=terminal_idempotency_key,
+            label="healthy",
+        )
+        run.unreleased_root_ids.discard(root.root_id)
+        pages, raw = _read_timeline_evidence(run)
+        terminal_result = _terminal_result(
+            pages, root_id=root.root_id, expected="PROMOTED"
+        )
+        capability_metadata = _verified_capability_metadata(
+            pages=pages,
+            raw=raw,
+            root_id=root.root_id,
+            capability_sha256s=frozenset(
+                {apply_dispatch.capability_sha256, promotion_dispatch.capability_sha256}
             ),
-            "receipt": _model_dict(receipt),
-        },
-        EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
-    }
+        )
+        return _CaseOutcome(
+            observations={
+                EvidenceKind.CLOUD_RUN_CONFIGURATION: traffic,
+                EvidenceKind.DATA_PATH_PROBE: load,
+                EvidenceKind.VERIFIED_CAPABILITY_METADATA: capability_metadata,
+                EvidenceKind.EXECUTOR_EPOCH_CHECK: promotion_receipt,
+                EvidenceKind.EXECUTION_RECEIPT: promotion_receipt,
+                EvidenceKind.HEALTH_DECISION: health,
+                EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
+            },
+            terminal_result=terminal_result,
+        )
+    finally:
+        if terminal_idempotency_key is not None and not release_attempted:
+            try:
+                _release_claim(
+                    run,
+                    case,
+                    root=root,
+                    epoch=1,
+                    terminal_idempotency_key=terminal_idempotency_key,
+                    label="healthy-cleanup",
+                )
+                run.unreleased_root_ids.discard(root.root_id)
+            except AcceptanceError as error:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_CLAIM_CLEANUP_FAILED") from error
+
+
+def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcome:
+    root_result = _create_root(run, case)
+    run.root_ids.add(root_result.root.root_id)
+    run.unreleased_root_ids.add(root_result.root.root_id)
+    root = root_result.root
+    terminal_idempotency_key: str | None = None
+    release_attempted = False
+    try:
+        load, apply_dispatch, apply_receipt, health = _health_load(
+            run, case, mode="unhealthy", root_result=root_result
+        )
+        recovery = health.recovery_dispatch
+        if (
+            recovery is None
+            or recovery.trigger_basis.value != "TERMINAL_UNHEALTHY_V3"
+            or recovery.enqueue_disposition not in {"CREATED", "DUPLICATE"}
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
+        receipt = _poll_receipt(
+            run,
+            case,
+            root=root,
+            epoch=1,
+            request_id=recovery.request_id,
+            idempotency_key=recovery.idempotency_key,
+            action="RECOVER_STABLE_V1",
+            capability_sha256=recovery.capability_sha256,
+            label="recovery",
+        )
+        if receipt.receipt.outcome.value != "VERIFIED":
+            raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
+        terminal_idempotency_key = recovery.idempotency_key
+        traffic = _read_traffic(run, case, "recovered")
+        _require_split(traffic, run.spec, stable=100, candidate=0)
+        release_attempted = True
+        release = _release_claim(
+            run,
+            case,
+            root=root,
+            epoch=1,
+            terminal_idempotency_key=terminal_idempotency_key,
+            label="unhealthy",
+        )
+        run.unreleased_root_ids.discard(root.root_id)
+        pages, raw = _read_timeline_evidence(run)
+        terminal_result = _terminal_result(
+            pages, root_id=root.root_id, expected="RECOVERED"
+        )
+        capability_metadata = _verified_capability_metadata(
+            pages=pages,
+            raw=raw,
+            root_id=root.root_id,
+            capability_sha256s=frozenset(
+                {apply_dispatch.capability_sha256, recovery.capability_sha256}
+            ),
+        )
+        recovery_service = run.service_bindings.get("recovery")
+        recovery_identity = root.content.authority_bounds.recovery_identity
+        if (
+            recovery_service is None
+            or recovery_service.get("service_account") != recovery_identity
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_IDENTITY_INVALID")
+        return _CaseOutcome(
+            observations={
+                EvidenceKind.CLOUD_RUN_CONFIGURATION: traffic,
+                EvidenceKind.DATA_PATH_PROBE: load,
+                EvidenceKind.VERIFIED_CAPABILITY_METADATA: capability_metadata,
+                EvidenceKind.EXECUTOR_EPOCH_CHECK: receipt,
+                EvidenceKind.EXECUTION_RECEIPT: {
+                    "apply": _model_dict(apply_receipt),
+                    "recovery": _model_dict(receipt),
+                },
+                EvidenceKind.HEALTH_DECISION: health,
+                EvidenceKind.RECOVERY_SERVICE_IDENTITY_BINDING: {
+                    "dispatch": _model_dict(recovery),
+                    "root_authority_identity": recovery_identity,
+                    "schema_version": "controlgraph.recovery-service-identity-binding/v1",
+                    "service": recovery_service,
+                },
+                EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
+            },
+            terminal_result=terminal_result,
+        )
+    finally:
+        if terminal_idempotency_key is not None and not release_attempted:
+            try:
+                _release_claim(
+                    run,
+                    case,
+                    root=root,
+                    epoch=1,
+                    terminal_idempotency_key=terminal_idempotency_key,
+                    label="unhealthy-cleanup",
+                )
+                run.unreleased_root_ids.discard(root.root_id)
+            except AcceptanceError as error:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_CLAIM_CLEANUP_FAILED") from error
 
 
 def _queue_control(run: _HostedExecution, action: Literal["hold", "release"]) -> dict[str, Any]:
@@ -2375,7 +2519,7 @@ def _recover_revoked(
     root_result: Any,
     apply_receipt: Any,
     revocation_proof: Any,
-) -> tuple[Any, Any, Any]:
+) -> tuple[Any, Any]:
     from controlgraph_canary.contracts.recovery_execution import (
         RecoveryDispatchResultV2,
         create_recovery_apply_receipt_locator,
@@ -2431,87 +2575,124 @@ def _recover_revoked(
     )
     if receipt.receipt.outcome.value != "VERIFIED":
         raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
-    traffic = _read_traffic(run, case, "revoked-recovered")
-    _require_split(traffic, run.spec, stable=100, candidate=0)
-    return dispatch, receipt, traffic
+    return dispatch, receipt
 
 
-def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> dict[EvidenceKind, object]:
+def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcome:
     root_result = _create_root(run, case)
     run.root_ids.add(root_result.root.root_id)
-    load, apply_dispatch, apply_receipt, health = _health_load(
-        run, case, mode="healthy", root_result=root_result
-    )
+    run.unreleased_root_ids.add(root_result.root.root_id)
+    terminal_idempotency_key: str | None = None
+    release_attempted = False
     try:
-        _queue_control(run, "hold")
-        promotion_dispatch, promotion_command = _promote(
+        load, apply_dispatch, apply_receipt, health = _health_load(
+            run, case, mode="healthy", root_result=root_result
+        )
+        queue_held = False
+        try:
+            _queue_control(run, "hold")
+            queue_held = True
+            promotion_dispatch, promotion_command = _promote(
+                run,
+                case,
+                root_result=root_result,
+                apply_receipt=apply_receipt,
+                terminal=health,
+            )
+            revocation, proof = _revoke(run, case, root_result.root)
+        finally:
+            if queue_held:
+                _queue_control(run, "release")
+        stale_receipt = _poll_receipt(
+            run,
+            case,
+            root=root_result.root,
+            epoch=1,
+            request_id=promotion_command.request_id,
+            idempotency_key=promotion_command.idempotency_key,
+            action="PROMOTE_CANDIDATE_V1",
+            capability_sha256=promotion_dispatch.capability_sha256,
+            label="stale-promotion",
+        )
+        if (
+            stale_receipt.receipt.outcome.value != "DENIED"
+            or stale_receipt.receipt.reason_code.value != "EPOCH_MISMATCH"
+            or stale_receipt.receipt.observed_authority_epoch != 2
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_STALE_DENIAL_INVALID")
+        unchanged = _read_traffic(run, case, "after-stale-denial")
+        _require_split(unchanged, run.spec, stable=90, candidate=10)
+        recovery_dispatch, recovery_receipt = _recover_revoked(
             run,
             case,
             root_result=root_result,
             apply_receipt=apply_receipt,
-            terminal=health,
+            revocation_proof=proof,
         )
-        revocation, proof = _revoke(run, case, root_result.root)
+        terminal_idempotency_key = recovery_dispatch.idempotency_key
+        recovered = _read_traffic(run, case, "revoked-recovered")
+        _require_split(recovered, run.spec, stable=100, candidate=0)
+        release_attempted = True
+        release = _release_claim(
+            run,
+            case,
+            root=root_result.root,
+            epoch=2,
+            terminal_idempotency_key=terminal_idempotency_key,
+            label="revoked",
+        )
+        run.unreleased_root_ids.discard(root_result.root.root_id)
+        run.revocation_root = root_result.root
+        run.revocation_epoch = release.fenced_epoch
+        pages, raw = _read_timeline_evidence(run)
+        terminal_result = _terminal_result(
+            pages, root_id=root_result.root.root_id, expected="DENIED"
+        )
+        capability_metadata = _verified_capability_metadata(
+            pages=pages,
+            raw=raw,
+            root_id=root_result.root.root_id,
+            capability_sha256s=frozenset(
+                {
+                    apply_dispatch.capability_sha256,
+                    promotion_dispatch.capability_sha256,
+                    recovery_dispatch.capability_sha256,
+                }
+            ),
+        )
+        return _CaseOutcome(
+            observations={
+                EvidenceKind.AUTHORITY_TRANSITION: {
+                    "outcome": _model_dict(revocation),
+                    "proof": _model_dict(proof),
+                },
+                EvidenceKind.CLOUD_RUN_CONFIGURATION: recovered,
+                EvidenceKind.DATA_PATH_PROBE: load,
+                EvidenceKind.VERIFIED_CAPABILITY_METADATA: capability_metadata,
+                EvidenceKind.EXECUTOR_EPOCH_CHECK: stale_receipt,
+                EvidenceKind.STALE_DENIAL: stale_receipt,
+                EvidenceKind.EXECUTION_RECEIPT: recovery_receipt,
+                EvidenceKind.TIMELINE: {
+                    "pages": pages,
+                    "release": _model_dict(release),
+                },
+            },
+            terminal_result=terminal_result,
+        )
     finally:
-        _queue_control(run, "release")
-    stale_receipt = _poll_receipt(
-        run,
-        case,
-        root=root_result.root,
-        epoch=1,
-        request_id=promotion_command.request_id,
-        idempotency_key=promotion_command.idempotency_key,
-        action="PROMOTE_CANDIDATE_V1",
-        capability_sha256=promotion_dispatch.capability_sha256,
-        label="stale-promotion",
-    )
-    if (
-        stale_receipt.receipt.outcome.value != "DENIED"
-        or stale_receipt.receipt.reason_code.value != "EPOCH_MISMATCH"
-        or stale_receipt.receipt.observed_authority_epoch != 2
-    ):
-        raise AcceptanceError("ACCEPTANCE_HOSTED_STALE_DENIAL_INVALID")
-    unchanged = _read_traffic(run, case, "after-stale-denial")
-    _require_split(unchanged, run.spec, stable=90, candidate=10)
-    recovery_dispatch, recovery_receipt, recovered = _recover_revoked(
-        run,
-        case,
-        root_result=root_result,
-        apply_receipt=apply_receipt,
-        revocation_proof=proof,
-    )
-    release = _release_claim(
-        run,
-        case,
-        root=root_result.root,
-        epoch=2,
-        terminal_idempotency_key=recovery_dispatch.idempotency_key,
-        label="revoked",
-    )
-    run.revocation_root = root_result.root
-    run.revocation_epoch = release.fenced_epoch
-    token = _identity_token(run)
-    try:
-        pages = _timeline_pages(run, token)
-    finally:
-        token = ""
-    return {
-        EvidenceKind.AUTHORITY_TRANSITION: {
-            "outcome": _model_dict(revocation),
-            "proof": _model_dict(proof),
-        },
-        EvidenceKind.CLOUD_RUN_CONFIGURATION: recovered,
-        EvidenceKind.DATA_PATH_PROBE: load,
-        EvidenceKind.SIGNED_CAPABILITY: {
-            "apply": _model_dict(apply_dispatch),
-            "promotion": _model_dict(promotion_dispatch),
-            "recovery": _model_dict(recovery_dispatch),
-        },
-        EvidenceKind.EXECUTOR_EPOCH_CHECK: stale_receipt,
-        EvidenceKind.STALE_DENIAL: stale_receipt,
-        EvidenceKind.EXECUTION_RECEIPT: recovery_receipt,
-        EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
-    }
+        if terminal_idempotency_key is not None and not release_attempted:
+            try:
+                _release_claim(
+                    run,
+                    case,
+                    root=root_result.root,
+                    epoch=2,
+                    terminal_idempotency_key=terminal_idempotency_key,
+                    label="revoked-cleanup",
+                )
+                run.unreleased_root_ids.discard(root_result.root.root_id)
+            except AcceptanceError as error:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_CLAIM_CLEANUP_FAILED") from error
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2727,17 +2908,95 @@ def _read_timeline_evidence(
     return pages, raw
 
 
+def _read_operator_timeline(run: _HostedExecution) -> tuple[Any, ...]:
+    token = _identity_token(run)
+    try:
+        pages = _timeline_pages(run, token)
+    finally:
+        token = ""
+    if not pages:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    return pages
+
+
+def _verified_capability_metadata(
+    *,
+    pages: Sequence[Any],
+    raw: Sequence[Any],
+    root_id: str,
+    capability_sha256s: frozenset[str],
+) -> dict[str, object]:
+    from controlgraph_canary.contracts.timeline import (
+        TimelineEventType,
+        TimelineRedactedSourceV1,
+        TimelineVerificationStatus,
+    )
+
+    projections = {
+        entry.entry_id: entry
+        for page in pages
+        for entry in page.entries
+        if entry.root_id == root_id
+        and entry.event_type is TimelineEventType.CAPABILITY_ISSUED
+        and entry.verification_status is TimelineVerificationStatus.VERIFIED
+        and entry.signature is not None
+        and entry.signature.purpose == "CAPABILITY"
+    }
+    matched: dict[str, dict[str, object]] = {}
+    for item in raw:
+        if item.entry_id not in projections or item.canonical_record is None:
+            continue
+        try:
+            redacted = TimelineRedactedSourceV1.model_validate_json(item.canonical_record)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_CAPABILITY_EVIDENCE_INVALID") from error
+        if redacted.source_sha256 in capability_sha256s:
+            matched[redacted.source_sha256] = {
+                "projection": projections[item.entry_id],
+                "redacted_source": redacted,
+            }
+    if frozenset(matched) != capability_sha256s:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_CAPABILITY_EVIDENCE_INVALID")
+    return {
+        "capabilities": tuple(matched[digest] for digest in sorted(matched)),
+        "schema_version": "controlgraph.verified-capability-metadata-set/v1",
+    }
+
+
+def _terminal_result(pages: Sequence[Any], *, root_id: str, expected: str) -> str:
+    from controlgraph_canary.contracts.timeline import (
+        TimelineEventType,
+        TimelineVerificationStatus,
+    )
+
+    matches = [
+        entry
+        for page in pages
+        for entry in page.entries
+        if entry.root_id == root_id
+        and entry.event_type is TimelineEventType.TERMINAL_CLASSIFIED
+        and entry.verification_status is TimelineVerificationStatus.VERIFIED
+        and entry.terminal_classification.value == expected
+    ]
+    if not matches:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TERMINAL_RESULT_MISSING")
+    return cast(
+        str,
+        max(matches, key=lambda entry: entry.sequence).terminal_classification.value,
+    )
+
+
 def _run_verifier_case(
     run: _HostedExecution,
     case: CaseBindingV1,
     reset: Any,
-) -> dict[EvidenceKind, object]:
+) -> _CaseOutcome:
     from controlgraph_canary.contracts.independent_verification import (
         VerifiedIndependentVerificationEvidenceV1,
     )
 
     pages, raw = _read_timeline_evidence(run)
-    verified: list[Any] = []
+    verified_by_request: dict[str, list[Any]] = {}
     for record in _available_raw_records(raw):
         if record.get("schema_version") != (
             "controlgraph.verified-independent-verification-evidence/v1"
@@ -2749,30 +3008,51 @@ def _run_verifier_case(
             raise AcceptanceError("ACCEPTANCE_HOSTED_VERIFICATION_INVALID") from error
         evidence = item.signing_request.evidence
         if evidence.root_id in run.root_ids and evidence.verdict.value == "MATCH":
-            verified.append(item)
-    kinds = {item.signing_request.evidence.kind.value for item in verified}
-    probes = [
-        item
-        for item in verified
-        if item.signing_request.evidence.kind.value == "PROBE"
-        and item.signing_request.probe is not None
-        and len(item.signing_request.probe.observation.samples) == 20
-    ]
-    if kinds != {"CONFIGURATION", "PROBE"} or not probes:
+            verified_by_request.setdefault(evidence.verification_request_sha256, []).append(item)
+    coherent: list[tuple[Any, Any]] = []
+    for items in verified_by_request.values():
+        configuration = next(
+            (
+                item
+                for item in items
+                if item.signing_request.evidence.kind.value == "CONFIGURATION"
+            ),
+            None,
+        )
+        probe = next(
+            (
+                item
+                for item in items
+                if item.signing_request.evidence.kind.value == "PROBE"
+                and item.signing_request.probe is not None
+                and len(item.signing_request.probe.observation.samples) == 20
+            ),
+            None,
+        )
+        if configuration is not None and probe is not None:
+            coherent.append((configuration, probe))
+    if not coherent:
         raise AcceptanceError("ACCEPTANCE_HOSTED_VERIFICATION_INVALID")
-    return {
-        EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
-        EvidenceKind.DATA_PATH_PROBE: probes[-1],
-        EvidenceKind.INDEPENDENT_VERIFICATION: verified,
-        EvidenceKind.TIMELINE: pages,
-    }
+    configuration, probe = max(
+        coherent,
+        key=lambda pair: pair[1].signing_request.evidence.occurred_at,
+    )
+    return _CaseOutcome(
+        observations={
+            EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
+            EvidenceKind.DATA_PATH_PROBE: probe,
+            EvidenceKind.INDEPENDENT_VERIFICATION: (configuration, probe),
+            EvidenceKind.TIMELINE: pages,
+        },
+        terminal_result="VERIFIED",
+    )
 
 
 def _run_ambiguity_case(
     run: _HostedExecution,
     case: CaseBindingV1,
     reset: Any,
-) -> dict[EvidenceKind, object]:
+) -> _CaseOutcome:
     from controlgraph_canary.contracts.independent_verification import (
         COMPLETION_EVIDENCE_BUNDLE_V1,
         CompletionClassificationV1,
@@ -2830,20 +3110,23 @@ def _run_ambiguity_case(
     assert classification is not None
     if classification.status.value != "AMBIGUOUS" or not classification.follow_up_required:
         raise AcceptanceError("ACCEPTANCE_HOSTED_CLASSIFICATION_INVALID")
-    return {
-        EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
-        EvidenceKind.EXECUTION_RECEIPT: receipt,
-        EvidenceKind.AMBIGUITY_CLASSIFICATION: classification,
-        EvidenceKind.TIMELINE: pages,
-    }
+    return _CaseOutcome(
+        observations={
+            EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
+            EvidenceKind.EXECUTION_RECEIPT: receipt,
+            EvidenceKind.AMBIGUITY_CLASSIFICATION: classification,
+            EvidenceKind.TIMELINE: pages,
+        },
+        terminal_result=classification.status.value,
+    )
 
 
 def _run_timeline_console_case(
     run: _HostedExecution,
     case: CaseBindingV1,
-) -> dict[EvidenceKind, object]:
+) -> _CaseOutcome:
     del case
-    pages, _raw = _read_timeline_evidence(run)
+    pages = _read_operator_timeline(run)
     status, body, headers = _http_request(url=f"{run.console_origin}/", token=None)
     content_type = headers.get("content-type", "").split(";", 1)[0].lower()
     if (
@@ -2862,14 +3145,17 @@ def _run_timeline_console_case(
         "schema_version": "controlgraph.hosted-console-observation/v1",
         "status_code": status,
     }
-    return {EvidenceKind.TIMELINE: pages, EvidenceKind.CONSOLE_READ: console}
+    return _CaseOutcome(
+        observations={EvidenceKind.TIMELINE: pages, EvidenceKind.CONSOLE_READ: console},
+        terminal_result="READABLE",
+    )
 
 
 def _run_advisor_case(
     run: _HostedExecution,
     case: CaseBindingV1,
     baseline: Any,
-) -> dict[EvidenceKind, object]:
+) -> _CaseOutcome:
     from controlgraph_canary.contracts.codec import canonical_sha256
     from controlgraph_canary.contracts.model_assistance import (
         ADVISOR_OPERATOR_COMMAND_V1,
@@ -2932,12 +3218,15 @@ def _run_advisor_case(
         or after.target_configuration_sha256 != baseline.target_configuration_sha256
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_MUTATED_TARGET")
-    pages, _raw = _read_timeline_evidence(run)
-    return {
-        EvidenceKind.COORDINATOR: result,
-        EvidenceKind.MODEL_AUDIT: audit,
-        EvidenceKind.TIMELINE: pages,
-    }
+    pages = _read_operator_timeline(run)
+    return _CaseOutcome(
+        observations={
+            EvidenceKind.COORDINATOR: result,
+            EvidenceKind.MODEL_AUDIT: audit,
+            EvidenceKind.TIMELINE: pages,
+        },
+        terminal_result="ADVISORY_ONLY",
+    )
 
 
 def _json_value(value: object) -> RestrictedJson:
@@ -2984,9 +3273,16 @@ def _write_case_result(
     *,
     started: datetime,
     completed: datetime,
+    status: ResultStatus,
+    observed_result: str,
+    reset_duration_ms: int,
+    flow_duration_ms: int,
+    reset_succeeded: bool,
 ) -> CaseBindingV1:
     required = REQUIRED_EVIDENCE[case.kind]
-    if set(observations) != set(required):
+    if status is ResultStatus.PASSED and set(observations) != set(required):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_EVIDENCE_INCOMPLETE")
+    if status is ResultStatus.FAILED and set(observations) != {EvidenceKind.RUNNER_FAILURE}:
         raise AcceptanceError("ACCEPTANCE_HOSTED_EVIDENCE_INCOMPLETE")
     observed_at = _utc(completed)
     evidence: list[EvidenceBindingV1] = []
@@ -3003,7 +3299,10 @@ def _write_case_result(
                 "ordinal": ordinal,
                 "run_inputs_sha256": run.run_inputs_sha256,
                 "schema_version": "controlgraph.hosted-acceptance-observation/v1",
-                "source": _json_value(observations[kind]),
+                "source": {
+                    "observation": _json_value(observations[kind]),
+                    "schema_version": _evidence_source_schema(kind),
+                },
             }
         )
         path = _new_artifact_path(run.artifact_root, relative_path)
@@ -3028,22 +3327,37 @@ def _write_case_result(
         )
     evidence_ids = tuple(item.evidence_id for item in evidence)
     operations = ENTRY_POINTS[case.kind]
+    step_evidence: tuple[tuple[str, ...], tuple[str, ...]]
+    if status is ResultStatus.PASSED:
+        configuration_id = next(
+            item.evidence_id
+            for item in evidence
+            if item.kind is EvidenceKind.CLOUD_RUN_CONFIGURATION
+        )
+        step_evidence = ((configuration_id,), evidence_ids)
+        step_statuses = (ResultStatus.PASSED, ResultStatus.PASSED)
+    else:
+        step_evidence = (evidence_ids, evidence_ids)
+        step_statuses = (
+            ResultStatus.PASSED if reset_succeeded else ResultStatus.FAILED,
+            ResultStatus.FAILED,
+        )
+    step_durations = (reset_duration_ms, flow_duration_ms)
     steps = tuple(
         StepResultV1(
             schema_version="controlgraph.core-acceptance-step-result/v1",
             sequence=sequence,
             operation=operation,
-            status=ResultStatus.PASSED,
-            duration_ms=0,
-            evidence_ids=(
-                (evidence_ids[(sequence - 1) % len(evidence_ids)], *evidence_ids[len(operations) :])
-                if sequence == 1
-                else (evidence_ids[(sequence - 1) % len(evidence_ids)],)
-            ),
+            status=step_statuses[sequence - 1],
+            duration_ms=step_durations[sequence - 1],
+            evidence_ids=step_evidence[sequence - 1],
         )
         for sequence, operation in enumerate(operations, start=1)
     )
-    duration_ms = int((completed - started).total_seconds() * 1_000)
+    duration_ms = max(
+        reset_duration_ms + flow_duration_ms,
+        int((completed - started).total_seconds() * 1_000),
+    )
     result = CoreAcceptanceCaseResultV1(
         schema_version="controlgraph.core-acceptance-case-result/v1",
         case_id=case.case_id,
@@ -3054,8 +3368,8 @@ def _write_case_result(
         target=run.spec.target,
         random_seed=case.random_seed,
         test_clock_keys=case.test_clock_keys,
-        status=ResultStatus.PASSED,
-        observed_result=EXPECTED_RESULTS[case.kind],
+        status=status,
+        observed_result=observed_result,
         started_at=_utc(started),
         completed_at=_utc(completed),
         duration_ms=duration_ms,
@@ -3072,6 +3386,147 @@ def _write_case_result(
             "result": case.result.model_copy(update={"sha256": hashlib.sha256(payload).hexdigest()})
         }
     )
+
+
+def _input_artifact_binding(
+    *,
+    artifact_root: Path,
+    artifact_id: str,
+    relative_path: str,
+) -> ArtifactBindingV1:
+    try:
+        normalized = _relative_artifact_path(relative_path)
+    except ValueError as error:
+        raise AcceptanceError("ACCEPTANCE_ARTIFACT_INVALID") from error
+    payload = _read_regular_file(
+        _artifact_path(artifact_root, normalized),
+        maximum_bytes=MAX_ARTIFACT_BYTES,
+        error_code="ACCEPTANCE_ARTIFACT_INVALID",
+    )
+    return ArtifactBindingV1(
+        schema_version="controlgraph.acceptance-artifact-binding/v1",
+        artifact_id=artifact_id,
+        relative_path=normalized,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        media_type="application/json",
+    )
+
+
+def generate_spec_template(
+    *,
+    artifact_root: Path,
+    output: Path,
+    project_id: str,
+    source_commit: str,
+    stable_revision: str,
+    candidate_revision: str,
+    image_references: Mapping[ImageComponent, str],
+    terraform_plan_path: str,
+    policy_schema_version: str,
+    policy_path: str,
+    clock_start: str,
+    random_seed: int,
+) -> bytes:
+    """Generate the complete deterministic eight-case input template."""
+
+    try:
+        root = artifact_root.resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceError("ACCEPTANCE_ARTIFACT_ROOT_INVALID") from error
+    if artifact_root.is_symlink() or not root.is_dir():
+        raise AcceptanceError("ACCEPTANCE_ARTIFACT_ROOT_INVALID")
+    if output.exists() or output.is_symlink():
+        raise AcceptanceError("ACCEPTANCE_OUTPUT_INVALID")
+    try:
+        start = _parse_utc(clock_start)
+    except AcceptanceError as error:
+        raise AcceptanceError("ACCEPTANCE_TEMPLATE_CLOCK_INVALID") from error
+    ticks: list[TestClockTickV1] = []
+    cases: list[CaseBindingV1] = []
+    for sequence, kind in enumerate(CORE_CASE_ORDER, start=1):
+        slug = kind.value.lower().replace("_", "-")
+        clock_key = f"case-{sequence:02d}-start"
+        ticks.append(
+            TestClockTickV1(
+                schema_version="controlgraph.acceptance-test-clock-tick/v1",
+                name=clock_key,
+                at=_utc(start + timedelta(seconds=sequence - 1)),
+            )
+        )
+        seed = int.from_bytes(
+            hashlib.sha256(f"{random_seed}\0{kind.value}".encode("ascii")).digest()[:6],
+            "big",
+        )
+        cases.append(
+            CaseBindingV1(
+                schema_version="controlgraph.core-acceptance-case-binding/v1",
+                sequence=sequence,
+                case_id=f"core-{sequence:02d}-{slug}",
+                kind=kind,
+                random_seed=seed,
+                test_clock_keys=(clock_key,),
+                maximum_duration_ms=30 * 60 * 1_000,
+                maximum_cost_microusd=1_000_000,
+                result=ArtifactBindingV1(
+                    schema_version="controlgraph.acceptance-artifact-binding/v1",
+                    artifact_id=f"result-{sequence:02d}-{slug}",
+                    relative_path=f"results/{sequence:02d}-{slug}.json",
+                    sha256=_ZERO_SHA256,
+                    media_type="application/json",
+                ),
+            )
+        )
+    try:
+        spec = CoreAcceptanceRunSpecV1(
+            schema_version="controlgraph.core-acceptance-run-spec/v1",
+            source_commit=source_commit,
+            target=AcceptanceTargetV1(
+                schema_version="controlgraph.acceptance-target/v1",
+                project_id=project_id,
+                region="us-central1",
+                environment="nonprod",
+                service_name="controlgraph-reference-target",
+                stable_revision=stable_revision,
+                candidate_revision=candidate_revision,
+            ),
+            images=tuple(
+                ImageBindingV1(
+                    schema_version="controlgraph.acceptance-image/v1",
+                    component=component,
+                    reference=image_references[component],
+                )
+                for component in ImageComponent
+            ),
+            terraform_plan=_input_artifact_binding(
+                artifact_root=root,
+                artifact_id="terraform-plan",
+                relative_path=terraform_plan_path,
+            ),
+            policies=(
+                PolicyBindingV1(
+                    schema_version="controlgraph.acceptance-policy-binding/v1",
+                    policy_schema_version=policy_schema_version,
+                    artifact=_input_artifact_binding(
+                        artifact_root=root,
+                        artifact_id="health-policy",
+                        relative_path=policy_path,
+                    ),
+                ),
+            ),
+            random_seed=random_seed,
+            test_clock=TestClockV1(
+                schema_version="controlgraph.acceptance-test-clock/v1",
+                ticks=tuple(ticks),
+            ),
+            maximum_total_duration_ms=MAX_RUN_DURATION_MS,
+            maximum_total_cost_microusd=8_000_000,
+            cases=tuple(cases),
+        )
+    except (KeyError, TypeError, ValueError, ValidationError) as error:
+        raise AcceptanceError("ACCEPTANCE_TEMPLATE_INVALID") from error
+    payload = _canonical_object(_model_dict(spec))
+    _write_once(output, payload)
+    return payload
 
 
 def _verify_exact_remote_main(repo: Path, source_commit: str) -> None:
@@ -3103,6 +3558,17 @@ def _verify_exact_remote_main(repo: Path, source_commit: str) -> None:
 
 
 def _verify_hosted_bindings(run: _HostedExecution) -> None:
+    accounts = _gcloud_json(
+        ("auth", "list", "--filter=status:ACTIVE"),
+        repo=run.repo,
+    )
+    if (
+        not isinstance(accounts, list)
+        or len(accounts) != 1
+        or not isinstance(accounts[0], dict)
+        or accounts[0].get("account") != run.acceptance_identity
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID")
     project = _gcloud_json(
         ("projects", "describe", run.spec.target.project_id),
         repo=run.repo,
@@ -3152,8 +3618,37 @@ def _verify_hosted_bindings(run: _HostedExecution) -> None:
             ),
             repo=run.repo,
         )
-        if image.encode("utf-8") not in _canonical_object(document):
+        if not isinstance(document, dict):
             raise AcceptanceError("ACCEPTANCE_HOSTED_IMAGE_MISMATCH")
+        specification = document.get("spec")
+        template = specification.get("template") if isinstance(specification, dict) else None
+        template_spec = template.get("spec") if isinstance(template, dict) else None
+        if not isinstance(template_spec, dict):
+            template_spec = document.get("template")
+        containers = template_spec.get("containers") if isinstance(template_spec, dict) else None
+        service_account = None
+        if isinstance(template_spec, dict):
+            service_account = template_spec.get(
+                "serviceAccountName", template_spec.get("serviceAccount")
+            )
+        deployed_images = (
+            tuple(
+                container.get("image")
+                for container in containers
+                if isinstance(container, dict) and isinstance(container.get("image"), str)
+            )
+            if isinstance(containers, list)
+            else ()
+        )
+        expected_service_account = (
+            f"controlgraph-{role}@{run.spec.target.project_id}.iam.gserviceaccount.com"
+        )
+        if deployed_images != (image,) or service_account != expected_service_account:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_IMAGE_MISMATCH")
+        run.service_bindings[role] = {
+            "image": image,
+            "service_account": expected_service_account,
+        }
 
 
 def _validate_execute_destination(path: Path, repo: Path) -> None:
@@ -3178,6 +3673,7 @@ def execute_hosted(
     subnetwork_resource: str,
     verifier_service_account: str,
     restricted_exporter_service_account: str,
+    acceptance_identity: str,
     confirmation: str,
 ) -> tuple[bytes, str, ResultStatus]:
     """Run the fixed hosted suite and feed its typed observations to the binder."""
@@ -3224,44 +3720,132 @@ def execute_hosted(
         subnetwork_resource=subnetwork_resource,
         verifier_service_account=verifier_service_account,
         restricted_exporter_service_account=restricted_exporter_service_account,
+        acceptance_identity=acceptance_identity,
     )
     _verify_hosted_bindings(run)
     updated_cases: list[CaseBindingV1] = []
-    for case in spec.cases:
-        started = datetime.now(UTC).replace(microsecond=0)
-        reset = _reset_target(run, case)
-        if case.kind is CaseKind.TARGET_RESET:
-            observations = {
-                EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
-                EvidenceKind.DATA_PATH_PROBE: _probe_stable(run, case),
-            }
-        elif case.kind is CaseKind.HEALTHY_PROMOTION:
-            observations = _run_healthy_case(run, case)
-        elif case.kind is CaseKind.UNHEALTHY_STABLE_RECOVERY:
-            observations = _run_unhealthy_case(run, case)
-        elif case.kind is CaseKind.REVOCATION_STALE_DENIAL:
-            observations = _run_revocation_case(run, case)
-        elif case.kind is CaseKind.INDEPENDENT_VERIFIER_PROBE:
-            observations = _run_verifier_case(run, case, reset)
-        elif case.kind is CaseKind.AMBIGUITY_CLASSIFICATION:
-            observations = _run_ambiguity_case(run, case, reset)
-        elif case.kind is CaseKind.TIMELINE_CONSOLE_READ:
-            observations = _run_timeline_console_case(run, case)
-        else:
-            observations = _run_advisor_case(run, case, reset)
-        completed = datetime.now(UTC).replace(microsecond=0)
-        if int((completed - started).total_seconds() * 1_000) > case.maximum_duration_ms:
-            raise AcceptanceError("ACCEPTANCE_HOSTED_CASE_DURATION_EXCEEDED")
-        run.observations[case.kind] = observations
-        updated_cases.append(
-            _write_case_result(
-                run,
-                case,
-                observations,
-                started=started,
-                completed=completed,
+    for case_index, case in enumerate(spec.cases):
+        started = datetime.now(UTC)
+        reset_started = time.monotonic_ns()
+        flow_started = reset_started
+        reset_duration_ms = 0
+        flow_duration_ms = 0
+        reset_succeeded = False
+        try:
+            reset = _reset_target(run, case)
+            reset_duration_ms = max(0, (time.monotonic_ns() - reset_started) // 1_000_000)
+            reset_succeeded = True
+            flow_started = time.monotonic_ns()
+            if case.kind is CaseKind.TARGET_RESET:
+                probe = _probe_stable(run, case)
+                outcome = _CaseOutcome(
+                    observations={
+                        EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
+                        EvidenceKind.DATA_PATH_PROBE: probe,
+                    },
+                    terminal_result=(
+                        "RESET_VERIFIED" if probe.get("status") == "COMPLETE" else "FAILED_SAFE"
+                    ),
+                )
+            elif case.kind is CaseKind.HEALTHY_PROMOTION:
+                outcome = _run_healthy_case(run, case)
+            elif case.kind is CaseKind.UNHEALTHY_STABLE_RECOVERY:
+                outcome = _run_unhealthy_case(run, case)
+            elif case.kind is CaseKind.REVOCATION_STALE_DENIAL:
+                outcome = _run_revocation_case(run, case)
+            elif case.kind is CaseKind.INDEPENDENT_VERIFIER_PROBE:
+                outcome = _run_verifier_case(run, case, reset)
+            elif case.kind is CaseKind.AMBIGUITY_CLASSIFICATION:
+                outcome = _run_ambiguity_case(run, case, reset)
+            elif case.kind is CaseKind.TIMELINE_CONSOLE_READ:
+                outcome = _run_timeline_console_case(run, case)
+            else:
+                outcome = _run_advisor_case(run, case, reset)
+            flow_duration_ms = max(0, (time.monotonic_ns() - flow_started) // 1_000_000)
+            completed = datetime.now(UTC)
+            elapsed_ms = max(
+                reset_duration_ms + flow_duration_ms,
+                int((completed - started).total_seconds() * 1_000),
             )
-        )
+            if elapsed_ms > case.maximum_duration_ms:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_CASE_DURATION_EXCEEDED")
+            observations = dict(outcome.observations)
+            terminal_configuration = observations.get(
+                EvidenceKind.CLOUD_RUN_CONFIGURATION, reset
+            )
+            observations[EvidenceKind.CLOUD_RUN_CONFIGURATION] = {
+                "reset": reset,
+                "terminal": terminal_configuration,
+            }
+            updated_cases.append(
+                _write_case_result(
+                    run,
+                    case,
+                    observations,
+                    started=started,
+                    completed=completed,
+                    status=ResultStatus.PASSED,
+                    observed_result=outcome.terminal_result,
+                    reset_duration_ms=reset_duration_ms,
+                    flow_duration_ms=flow_duration_ms,
+                    reset_succeeded=True,
+                )
+            )
+        except AcceptanceError as error:
+            completed = datetime.now(UTC)
+            if reset_succeeded:
+                flow_duration_ms = max(0, (time.monotonic_ns() - flow_started) // 1_000_000)
+            else:
+                reset_duration_ms = max(
+                    0, (time.monotonic_ns() - reset_started) // 1_000_000
+                )
+            updated_cases.append(
+                _write_case_result(
+                    run,
+                    case,
+                    {
+                        EvidenceKind.RUNNER_FAILURE: {
+                            "code": error.code,
+                            "disposition": "FAILED",
+                            "reset_completed": reset_succeeded,
+                            "schema_version": "controlgraph.acceptance-runner-failure/v1",
+                            "unreleased_root_ids": sorted(run.unreleased_root_ids),
+                        }
+                    },
+                    started=started,
+                    completed=completed,
+                    status=ResultStatus.FAILED,
+                    observed_result=error.code,
+                    reset_duration_ms=reset_duration_ms,
+                    flow_duration_ms=flow_duration_ms,
+                    reset_succeeded=reset_succeeded,
+                )
+            )
+            for skipped in spec.cases[case_index + 1 :]:
+                skipped_at = datetime.now(UTC)
+                updated_cases.append(
+                    _write_case_result(
+                        run,
+                        skipped,
+                        {
+                            EvidenceKind.RUNNER_FAILURE: {
+                                "code": "ACCEPTANCE_NOT_RUN_AFTER_FAILURE",
+                                "disposition": "NOT_RUN",
+                                "reset_completed": False,
+                                "schema_version": "controlgraph.acceptance-runner-failure/v1",
+                                "unreleased_root_ids": sorted(run.unreleased_root_ids),
+                            }
+                        },
+                        started=skipped_at,
+                        completed=skipped_at,
+                        status=ResultStatus.FAILED,
+                        observed_result="ACCEPTANCE_NOT_RUN_AFTER_FAILURE",
+                        reset_duration_ms=0,
+                        flow_duration_ms=0,
+                        reset_succeeded=False,
+                    )
+                )
+            break
     final_spec = spec.model_copy(update={"cases": tuple(updated_cases)})
     _write_once(output_spec, _canonical_object(_model_dict(final_spec)))
     payload, run_id, status = build_manifest(spec_path=output_spec, artifact_root=root)
@@ -3287,6 +3871,11 @@ def _build_execute_parser() -> argparse.ArgumentParser:
         description=(
             "Execute the eight fixed cases against the isolated retained Google Cloud target."
         ),
+        epilog=(
+            "The pinned active principal needs the configured ControlGraph operator access plus "
+            "these permissions for the bounded ephemeral probe job: "
+            + ", ".join(_LOAD_JOB_PERMISSIONS)
+        ),
     )
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--artifact-root", required=True, type=Path)
@@ -3297,20 +3886,78 @@ def _build_execute_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subnetwork-resource", required=True)
     parser.add_argument("--verifier-service-account", required=True)
     parser.add_argument("--restricted-exporter-service-account", required=True)
+    parser.add_argument("--acceptance-identity", required=True)
     parser.add_argument("--confirm", required=True, choices=(EXECUTE_CONFIRMATION,))
+    return parser
+
+
+def _build_generate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="controlgraph-core-acceptance generate-spec",
+        description="Generate the deterministic eight-case hosted acceptance input spec.",
+    )
+    parser.add_argument("--artifact-root", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--stable-revision", required=True)
+    parser.add_argument("--candidate-revision", required=True)
+    parser.add_argument("--controller-image", required=True)
+    parser.add_argument("--advisor-image", required=True)
+    parser.add_argument("--console-image", required=True)
+    parser.add_argument("--reference-stable-image", required=True)
+    parser.add_argument("--reference-candidate-image", required=True)
+    parser.add_argument("--terraform-plan", required=True)
+    parser.add_argument("--policy-schema-version", required=True)
+    parser.add_argument("--policy-artifact", required=True)
+    parser.add_argument("--clock-start", required=True)
+    parser.add_argument("--random-seed", required=True, type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     execute = bool(arguments and arguments[0] == "execute")
+    generate = bool(arguments and arguments[0] == "generate-spec")
     if execute:
         args = _build_execute_parser().parse_args(arguments[1:])
+    elif generate:
+        args = _build_generate_parser().parse_args(arguments[1:])
     else:
         if arguments and arguments[0] == "bind":
             arguments = arguments[1:]
         args = _build_parser().parse_args(arguments)
     try:
+        if generate:
+            payload = generate_spec_template(
+                artifact_root=args.artifact_root,
+                output=args.output,
+                project_id=args.project_id,
+                source_commit=args.source_commit,
+                stable_revision=args.stable_revision,
+                candidate_revision=args.candidate_revision,
+                image_references={
+                    ImageComponent.CONTROLLER: args.controller_image,
+                    ImageComponent.ADVISOR: args.advisor_image,
+                    ImageComponent.CONSOLE: args.console_image,
+                    ImageComponent.REFERENCE_STABLE: args.reference_stable_image,
+                    ImageComponent.REFERENCE_CANDIDATE: args.reference_candidate_image,
+                },
+                terraform_plan_path=args.terraform_plan,
+                policy_schema_version=args.policy_schema_version,
+                policy_path=args.policy_artifact,
+                clock_start=args.clock_start,
+                random_seed=args.random_seed,
+            )
+            print(
+                canonical_json_value_bytes(
+                    {
+                        "spec_sha256": hashlib.sha256(payload).hexdigest(),
+                        "status": "TEMPLATE",
+                    }
+                ).decode("utf-8")
+            )
+            return 0
         if execute:
             payload, run_id, status_value = execute_hosted(
                 spec_path=args.spec,
@@ -3322,6 +3969,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 subnetwork_resource=args.subnetwork_resource,
                 verifier_service_account=args.verifier_service_account,
                 restricted_exporter_service_account=args.restricted_exporter_service_account,
+                acceptance_identity=args.acceptance_identity,
                 confirmation=args.confirm,
             )
         else:
