@@ -11,42 +11,74 @@ rollout reducer, root-scoped exact-match epochs, transactional Firestore authori
 adapters, purpose-separated KMS signing and verification, sealed Cloud Tasks delivery,
 target-bound Cloud Run mutation and readback, deterministic Monitoring health evaluation,
 healthy promotion, and captured-stable recovery. Terraform defines the isolated cloud substrate,
-and the React console remains static and read-only. These implementation facts do not establish
-that a particular revision has passed hosted acceptance; operator timeline and advisory surfaces
-are not part of this implementation boundary.
+and the static React console renders the operator timeline and submits only the explicitly
+confirmed epoch-revocation command through the API. A bounded ADK/Gemini advisor reads recorded
+facts but has no mutation authority. These implementation facts do not establish that a particular
+revision has passed hosted acceptance.
 
-## Control path
+## Trust boundaries and control path
 
-```text
-API or CLI
-    |
-    v
-authenticated application facade
-    |
-    v
-deterministic reducer and closed canary policy
-    |
-    v
-KMS capability issuer
-    |
-    v
-addressed Cloud Tasks delivery with dedicated OIDC caller
-    |
-    v
-caller, signature, time, lineage, scope, binding, and request validation
-    |
-    v
-transactional receipt claim
-    |
-    v
-fresh authoritative epoch read immediately before mutation
-    |
-    v
-target-bound Cloud Run adapter with provider precondition
-    |
-    v
-idempotent receipt, independent readback, and evidence
+```mermaid
+flowchart LR
+    subgraph Operator[Human operator boundary]
+        Human[Human operator]
+        CLI[Python CLI]
+        Browser[Browser]
+    end
+
+    subgraph Presentation[Public static presentation]
+        Console[Operator console]
+    end
+
+    subgraph Services[Authenticated ControlGraph services]
+        API[Operator API]
+        Coordinator[Coordinator and deterministic policy]
+        Issuer[Capability issuer]
+        Executor[Executor]
+        Recovery[Separate recovery service]
+        Verifier[Independent verifier]
+        Evidence[Evidence writer]
+        Advisor[Read-only ADK advisor]
+    end
+
+    subgraph Managed[Google Cloud managed boundaries]
+        Firestore[(Firestore root and epoch authority)]
+        CapabilityKMS[KMS capability key]
+        EvidenceKMS[KMS evidence key]
+        ExecutionQueue[[Execution Cloud Tasks queue]]
+        RecoveryQueue[[Recovery Cloud Tasks queue]]
+        ExecutionCaller[Execution task-caller identity]
+        RecoveryCaller[Recovery task-caller identity]
+        Monitoring[Cloud Monitoring]
+        Gemini[Vertex AI / Gemini]
+    end
+
+    Target[Private disposable Cloud Run target]
+
+    Human --> CLI --> API
+    Human --> Browser --> Console
+    Console -->|authenticated timeline read or confirmed revocation| API
+    API --> Coordinator
+    Coordinator <--> Firestore
+    Coordinator -->|canonical attenuated claims| Issuer --> CapabilityKMS
+    Coordinator --> ExecutionQueue --> ExecutionCaller -->|OIDC| Executor
+    Coordinator --> RecoveryQueue --> RecoveryCaller -->|OIDC| Recovery
+    Recovery -->|unchanged task to recovery-only facade| Executor
+    Executor -->|fresh epoch read immediately before mutation| Firestore
+    Executor -->|fixed conditional traffic update| Target
+    Verifier -->|read only| Monitoring
+    Verifier -->|configuration readback and authenticated probe| Target
+    Verifier --> Evidence --> EvidenceKMS
+    Coordinator -->|bounded recorded facts| Advisor --> Gemini
+    Advisor -->|advisory result only| Coordinator
 ```
+
+Arrows show authenticated requests or bounded data flow, not transferable authority. Firestore is
+the root-scoped epoch authority. KMS keys are purpose-separated. The two queues have different
+handlers and caller identities. Only the executor's target-bound adapter can update traffic, and it
+must repeat the authority check at execution time. Recovery validates stable-only work in its own
+service and forwards the unchanged task to the executor's recovery-only facade. Verification reads
+Cloud Run configuration, Monitoring, and the target data path independently of mutation.
 
 After a verified 90/10 apply, the verifier derives the two fixed candidate-revision Monitoring
 queries from the immutable root, canonicalizes bounded results, applies the frozen policy, and
@@ -54,9 +86,9 @@ obtains a signed health proof. Consecutive healthy windows authorize the normal 
 A terminal unhealthy proof is stored atomically with one root-owned recovery intent and then
 drives the separately addressed recovery path.
 
-No model appears in this path. An optional Gemini or ADK advisory integration may consume a
-narrow, read-only application view, but its output cannot approve authority, classify health,
-select a rollout or recovery action, enqueue protected work, or call a mutation adapter.
+No model appears in the authority or mutation path. The optional Gemini/ADK integration consumes
+six narrow, read-only diagnostic tools. Its bounded output cannot approve authority, classify
+health, select a rollout or recovery action, enqueue protected work, or call a mutation adapter.
 
 ## Layering and dependency direction
 
@@ -277,9 +309,16 @@ The API is the authority-preserving operator boundary. A CLI mutation command ca
 an authenticated identity, versioned request, expected epoch, request identity, reason, and
 explicit confirmation; it does not write Firestore or invoke Cloud Run directly.
 
-The current console is static and read-only. Evidence presentation must obtain bounded data
-through the API and must not hold provider credentials or become a mutation surface. This
-architecture makes no claim that such hosted console behavior is implemented.
+The console is a static client with no provider credential or cloud-control-plane access. It reads
+the bounded server-produced timeline through the API. Its only authority-changing interaction is
+an authenticated, CSRF-bound, explicitly confirmed epoch-revocation command; the API revalidates
+the operator identity, root, target, epoch, and request bindings. The console cannot apply,
+promote, recover, issue a capability, or reinterpret advisor output as authority.
+
+The optional advisor is a separate service and identity. It can query only bounded application
+facts, is capped by request, token, and timeout limits, records model assistance as
+`ADVISORY_ONLY`, and has no mutation-capable facade. Hosted behavior still requires evidence from
+the exact deployed revision; source and Terraform definitions alone do not prove it.
 
 ## Selective reuse and provenance
 
