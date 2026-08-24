@@ -1,0 +1,57 @@
+{
+  "schema_version": "controlgraph.release-evidence-policy/v1",
+  "repository": "OCHOLA-EDDYPHIL/controlgraph",
+  "workflow_ref": "OCHOLA-EDDYPHIL/controlgraph/.github/workflows/deploy.yml@refs/heads/main",
+  "critical_severities": [
+    "CRITICAL"
+  ],
+  "source_subjects": [
+    "backend",
+    "cli",
+    "console",
+    "terraform",
+    "release"
+  ],
+  "image_subjects": [
+    "controller",
+    "console",
+    "advisor",
+    "reference-stable",
+    "reference-candidate"
+  ],
+  "material_globs": [
+    ".github/release-evidence-policy.json",
+    ".github/workflows/*.yml",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "backend/Dockerfile",
+    "backend/pyproject.toml",
+    "backend/uv.lock",
+    "infra/**/*.tf",
+    "infra/**/.terraform.lock.hcl",
+    "scripts/release_evidence.py",
+    "web/Dockerfile",
+    "web/package-lock.json",
+    "web/package.json"
+  ],
+  "tools": {
+    "trivy": {
+      "version": "0.74.0",
+      "archive": "trivy_0.74.0_Linux-64bit.tar.gz",
+      "sha256": "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a",
+      "license": "Apache-2.0"
+    }
+  },
+  "licenses": {
+    "actions/attest-build-provenance": "MIT",
+    "actions/attest-sbom": "MIT",
+    "actions/checkout": "MIT",
+    "actions/setup-node": "MIT",
+    "actions/upload-artifact": "MIT",
+    "astral-sh/setup-uv": "MIT",
+    "google-github-actions/auth": "Apache-2.0",
+    "hashicorp/setup-terraform": "MPL-2.0",
+    "registry.terraform.io/hashicorp/google": "MPL-2.0",
+    "registry.terraform.io/hashicorp/google-beta": "MPL-2.0"
+  }
+}
