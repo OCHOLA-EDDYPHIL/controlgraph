@@ -20,7 +20,6 @@ from controlgraph_canary.application.model_assistance import (
 from controlgraph_canary.contracts.model_assistance import (
     MAX_LLM_CALLS,
     MAX_MODEL_OUTPUT_TOKENS,
-    AdvisorRecommendationV1,
     DiagnosticToolId,
 )
 from controlgraph_canary.integrations.adk import rollout_advisor
@@ -68,13 +67,23 @@ class _FakeRunner:
 
 
 def test_recommendation_schema_is_accepted_by_the_pinned_genai_transformer() -> None:
-    schema = AdvisorRecommendationV1.model_json_schema()
+    schema = rollout_advisor._vertex_response_schema()
 
     _transformers.process_schema(schema, client=None)
 
     properties = schema["properties"]
     assert properties["operator_review_required"]["type"] == "boolean"
     assert properties["deterministic_health_override"]["type"] == "boolean"
+    assert properties["confidence_basis_points"]["maximum"] == 10_000
+    pending: list[object] = [schema]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            assert "minItems" not in value
+            assert "maxItems" not in value
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
 
 
 def test_adk_runner_exposes_only_six_bounded_snapshot_tools(
@@ -104,16 +113,21 @@ def test_adk_runner_exposes_only_six_bounded_snapshot_tools(
     assert all(tool._get_declaration() is not None for tool in canonical_tools)
     assert agent.sub_agents == []
     assert agent.code_executor is None
-    assert agent.output_schema is result.__class__
+    assert agent.output_schema == rollout_advisor._vertex_response_schema()
     assert agent.model.client_kwargs["enterprise"] is True
     assert agent.model.client_kwargs["project"] == request.snapshot.target.project_id
     assert agent.model.client_kwargs["location"] == "global"
     assert "api_key" not in agent.model.client_kwargs
+    assert agent.model.client_kwargs["http_options"].timeout == 19_000
     run_config = _FakeRunner.run_arguments["run_config"]
     assert run_config.max_llm_calls == MAX_LLM_CALLS
     assert run_config.telemetry.capture_message_content is ContentCapturingMode.NO_CONTENT
     assert agent.generate_content_config.max_output_tokens == MAX_MODEL_OUTPUT_TOKENS
     assert agent.generate_content_config.temperature == 0
+    assert (
+        agent.generate_content_config.thinking_config.thinking_level
+        is types.ThinkingLevel.MINIMAL
+    )
 
 
 def test_adk_runner_rejects_malformed_or_oversized_public_output(
