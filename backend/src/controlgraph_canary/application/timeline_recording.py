@@ -15,6 +15,7 @@ from controlgraph_canary.application.timeline_projectors import (
     project_epoch_revocation,
     project_execution_receipt,
     project_independent_verification,
+    project_model_assistance,
     project_promotion_dispatch,
     project_recovery_abandonment,
     project_recovery_dispatch,
@@ -30,6 +31,7 @@ from controlgraph_canary.contracts.independent_verification import (
     CompletionClassificationV1,
     VerifiedIndependentVerificationEvidenceV1,
 )
+from controlgraph_canary.contracts.model_assistance import ModelAssistanceTimelineAuditV1
 from controlgraph_canary.contracts.models import (
     ExecutionReceipt,
     SignedCapability,
@@ -184,6 +186,12 @@ class TimelineRecorder:
         await self.record(
             project_independent_verification(verified, policy_set=self._policy_set)
         )
+
+    async def record_model_assistance(
+        self,
+        audit: ModelAssistanceTimelineAuditV1,
+    ) -> None:
+        await self.record(project_model_assistance(audit, policy_set=self._policy_set))
 
     async def record_completion_classification(
         self,

@@ -33,3 +33,16 @@ def test_controller_image_can_dispatch_the_packaged_evidence_writer() -> None:
     assert (backend / "Dockerfile").read_text(encoding="utf-8").rstrip().endswith(
         'CMD ["controlgraph-canary", "serve"]'
     )
+
+
+def test_advisor_image_alone_installs_the_optional_model_runtime() -> None:
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "FROM advisor-runtime AS advisor" in dockerfile
+    assert dockerfile.count("--extra advisor") == 2
+    runtime_section, advisor_section = dockerfile.split(
+        "FROM python:3.12.13-slim-bookworm@sha256:",
+        maxsplit=2,
+    )[1:]
+    assert "--extra advisor" not in runtime_section
+    assert "--extra advisor" in advisor_section

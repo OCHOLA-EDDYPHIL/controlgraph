@@ -36,6 +36,7 @@ from controlgraph_canary.application.identity import (
     ServiceRole,
     runtime_route_policy,
 )
+from controlgraph_canary.application.model_assistance import CoordinatorAdvisorClient
 from controlgraph_canary.application.root_relay import CoordinatorRootCreationRelay
 from controlgraph_canary.application.root_trust import (
     CoordinatorEvidenceClient,
@@ -937,6 +938,9 @@ def _coordinator_environment() -> dict[str, str]:
             f"cg-retention-sweeper@{PROJECT}.iam.gserviceaccount.com"
         ),
         "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT": SUBJECT,
+        "CONTROLGRAPH_ADVISOR_URL": (
+            f"https://controlgraph-advisor-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
     }
 
 
@@ -974,6 +978,7 @@ def test_coordinator_runtime_composes_exact_release_gate_with_mutations_disabled
     assert completion_workflow._signed_intent_verifier is not None
     assert kms.version_requests == [{"name": CAPABILITY_KEY_VERSION}]
     assert kms.public_key_requests == [{"name": CAPABILITY_KEY_VERSION}]
+    assert isinstance(app.state.controlgraph_advisor_client, CoordinatorAdvisorClient)
     assert isinstance(
         app.state.controlgraph_root_creation_relay,
         CoordinatorRootCreationRelay,

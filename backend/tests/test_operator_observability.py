@@ -259,6 +259,10 @@ def _runtime_environment(role: ServiceRole) -> dict[str, str]:
                 "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT": (
                     "556789012345678901234"
                 ),
+                "CONTROLGRAPH_ADVISOR_URL": (
+                    f"https://controlgraph-advisor-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
             }
         )
     return environment

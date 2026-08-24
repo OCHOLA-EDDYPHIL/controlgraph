@@ -21,6 +21,7 @@ jobs:
     outputs:
       controller_image: ${{ steps.publish.outputs.controller_image }}
       console_image: ${{ steps.publish.outputs.console_image }}
+      advisor_image: ${{ steps.publish.outputs.advisor_image }}
       reference_target_stable_image: ${{ steps.publish.outputs.reference_target_stable_image }}
       reference_target_candidate_image: ${{ steps.publish.outputs.reference_target_candidate_image }}
     env:
@@ -71,6 +72,7 @@ jobs:
           images=(
             "controller|controller|backend/Dockerfile|backend"
             "console|runtime|web/Dockerfile|web"
+            "advisor|advisor|backend/Dockerfile|backend"
             "reference-stable|reference-stable|backend/Dockerfile|backend"
             "reference-candidate|reference-candidate|backend/Dockerfile|backend"
           )
@@ -124,6 +126,7 @@ jobs:
           images=(
             "controller:controller_image"
             "console:console_image"
+            "advisor:advisor_image"
             "reference-stable:reference_target_stable_image"
             "reference-candidate:reference_target_candidate_image"
           )

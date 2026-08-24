@@ -12,6 +12,12 @@ resource "google_artifact_registry_repository_iam_member" "ci_image_writer" {
   member     = google_service_account.workloads["ci_image_builder"].member
 }
 
+resource "google_project_iam_member" "advisor_vertex_predict" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.controlgraph["vertex_advisor"].name
+  member  = google_service_account.workloads["advisor"].member
+}
+
 resource "google_service_account_iam_member" "github_ci_impersonation" {
   for_each = toset([
     "ci_image_builder",

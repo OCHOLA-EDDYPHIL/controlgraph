@@ -57,6 +57,7 @@ ROLE_MODULES = (
     (ServiceRole.RECOVERY, "controlgraph_canary.services.recovery.app"),
     (ServiceRole.VERIFIER, "controlgraph_canary.services.verifier.app"),
     (ServiceRole.EVIDENCE_WRITER, "controlgraph_canary.services.evidence_writer.app"),
+    (ServiceRole.ADVISOR, "controlgraph_canary.services.advisor.app"),
 )
 
 PROJECT_ID = "controlgraph-canary-abc123"
@@ -70,10 +71,12 @@ CALLER_ROLES = {
     ServiceRole.RECOVERY: CallerRole.RECOVERY_TASK_CALLER,
     ServiceRole.VERIFIER: CallerRole.COORDINATOR,
     ServiceRole.EVIDENCE_WRITER: CallerRole.COORDINATOR,
+    ServiceRole.ADVISOR: CallerRole.COORDINATOR,
 }
 CALLER_ACCOUNT_IDS = {
     CallerRole.API: "controlgraph-api",
     CallerRole.COORDINATOR: "controlgraph-coordinator",
+    CallerRole.ADVISOR: "controlgraph-advisor",
     CallerRole.EXECUTION_TASK_CALLER: "cg-execution-task-caller",
     CallerRole.RECOVERY_TASK_CALLER: "cg-recovery-task-caller",
 }
@@ -239,6 +242,26 @@ def _environment(role: ServiceRole) -> dict[str, str]:
                     f"cg-retention-sweeper@{PROJECT_ID}.iam.gserviceaccount.com"
                 ),
                 "CONTROLGRAPH_TIMELINE_RETENTION_CALLER_SUBJECT": SUBJECT,
+                "CONTROLGRAPH_ADVISOR_URL": (
+                    f"https://controlgraph-advisor-{PROJECT_NUMBER}."
+                    "us-central1.run.app"
+                ),
+            }
+        )
+    if role is ServiceRole.ADVISOR:
+        environment.update(
+            {
+                "CONTROLGRAPH_ADVISOR_MODEL": "gemini-3.5-flash",
+                "CONTROLGRAPH_ADVISOR_MODEL_LOCATION": "global",
+                "CONTROLGRAPH_ADVISOR_API_VERSION": "v1",
+                "CONTROLGRAPH_ADVISOR_PROMPT_VERSION": (
+                    "controlgraph.rollout-advisor-prompt/v1"
+                ),
+                "CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS": "20",
+                "CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS": "4",
+                "CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS": "2048",
+                "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS": "false",
+                "GOOGLE_GENAI_USE_ENTERPRISE": "true",
             }
         )
     if role is ServiceRole.VERIFIER:

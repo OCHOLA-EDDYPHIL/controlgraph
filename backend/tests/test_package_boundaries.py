@@ -11,6 +11,7 @@ import pytest
         "controlgraph_canary.contracts",
         "controlgraph_canary.http",
         "controlgraph_canary.integrations.google",
+        "controlgraph_canary.integrations.adk",
         "controlgraph_canary.reference_target",
         "controlgraph_canary.services.coordinator",
         "controlgraph_canary.services.executor",
@@ -18,6 +19,7 @@ import pytest
         "controlgraph_canary.services.issuer",
         "controlgraph_canary.services.recovery",
         "controlgraph_canary.services.verifier",
+        "controlgraph_canary.services.advisor",
     ],
 )
 def test_required_package_boundary_exists(module_name: str) -> None:

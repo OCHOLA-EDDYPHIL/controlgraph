@@ -64,6 +64,10 @@ locals {
       api      = "run.googleapis.com"
       boundary = "the authenticated operator API service"
     }
+    run_advisor_invoke = {
+      api      = "run.googleapis.com"
+      boundary = "the internal read-only advisor service"
+    }
     run_coordinator_invoke = {
       api      = "run.googleapis.com"
       boundary = "the internal coordinator service"
@@ -140,6 +144,10 @@ locals {
       api      = "iamcredentials.googleapis.com"
       boundary = "OIDC tokens for only the security-audit and restricted-export service accounts"
     }
+    vertex_model_predict = {
+      api      = "aiplatform.googleapis.com"
+      boundary = "prediction with the exact configured Vertex model"
+    }
   }
 
   identity_expected_allows = {
@@ -157,11 +165,15 @@ locals {
       "kms_evidence_public_key_read",
       "kms_evidence_version_read",
       "run_issuer_invoke",
+      "run_advisor_invoke",
       "run_evidence_writer_invoke",
       "run_verifier_invoke",
       "task_caller_act_as",
       "tasks_execution_enqueue",
       "tasks_recovery_enqueue",
+    ])
+    advisor = toset([
+      "vertex_model_predict",
     ])
     issuer = toset([
       "firestore_authority_read",
@@ -264,11 +276,15 @@ locals {
         "kms_evidence_public_key_read",
         "kms_evidence_version_read",
         "run_issuer_invoke",
+        "run_advisor_invoke",
         "run_evidence_writer_invoke",
         "run_verifier_invoke",
         "task_caller_act_as",
         "tasks_execution_enqueue",
         "tasks_recovery_enqueue",
+      ])
+      advisor = toset([
+        "vertex_model_predict",
       ])
       issuer = toset([
         "firestore_authority_read",
@@ -596,6 +612,32 @@ check "recovery_evidence_key_access_is_verification_only" {
       !contains(local.iam_permission_matrix.recovery.pending_allows, "kms_evidence_version_read")
     )
     error_message = "Recovery may verify the exact evidence key but only the evidence writer may sign with it."
+  }
+}
+
+check "advisor_permissions_are_prediction_only" {
+  assert {
+    condition = (
+      local.identity_expected_allows.advisor == toset([
+        "vertex_model_predict",
+      ]) &&
+      local.identity_implemented_allows.advisor == local.identity_expected_allows.advisor &&
+      toset([
+        for identity, allows in local.identity_expected_allows : identity
+        if contains(allows, "vertex_model_predict")
+      ]) == toset(["advisor"]) &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "firestore_authority_read") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "firestore_authority_write") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "kms_capability_sign") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "kms_evidence_sign") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "run_coordinator_invoke") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "run_executor_invoke") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "run_target_canary_or_promote") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "tasks_execution_enqueue") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "tasks_recovery_enqueue") &&
+      contains(local.iam_permission_matrix.advisor.expected_denials, "task_caller_act_as")
+    )
+    error_message = "The advisor may only invoke the configured Vertex model and must retain no authority, mutation, task, signing, storage, or service-invocation grant."
   }
 }
 

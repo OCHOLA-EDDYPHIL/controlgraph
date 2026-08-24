@@ -81,6 +81,17 @@ from controlgraph_canary.application.independent_verification_signing import (
     IndependentVerificationSigningService,
     VerifierIndependentVerificationEvidenceClient,
 )
+from controlgraph_canary.application.model_assistance import (
+    ApiAdvisorClient,
+    CoordinatorAdvisorClient,
+    CoordinatorAdvisorWorkflow,
+    DiagnosticSnapshotAssembler,
+    ModelAssistanceAuditStore,
+    ModelAssistanceTimelineRecorder,
+)
+from controlgraph_canary.application.model_assistance_m6 import (
+    M6DiagnosticSnapshotAssembler,
+)
 from controlgraph_canary.application.operator_observability import (
     ApiOperatorObservationClient,
     CoordinatorOperatorObservationRelay,
@@ -292,6 +303,9 @@ def create_runtime_service_app(
     revocation_attempt_id_factory: Callable[[], str] | None = None,
     health_evaluation_clock: Callable[[], datetime] | None = None,
     recovery_clock: Callable[[], datetime] | None = None,
+    diagnostic_snapshot_assembler: DiagnosticSnapshotAssembler | None = None,
+    model_assistance_audit_store: ModelAssistanceAuditStore | None = None,
+    model_assistance_timeline: ModelAssistanceTimelineRecorder | None = None,
 ) -> FastAPI:
     """Compose a fail-closed service from validated startup coordinates."""
 
@@ -334,6 +348,9 @@ def create_runtime_service_app(
     coordinator_independent_verification_client = None
     coordinator_completion_classification_service = None
     coordinator_completion_workflow = None
+    coordinator_advisor_client = None
+    coordinator_advisor_workflow = None
+    api_advisor_client = None
     api_root_creation_client = None
     coordinator_root_creation_relay = None
     api_operator_observation_client = None
@@ -836,6 +853,17 @@ def create_runtime_service_app(
             authentication_policy=policy,
             transport=selected_transport,
         )
+        api_advisor_client = ApiAdvisorClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.API,
+                service_role=ServiceRole.COORDINATOR,
+                audience=settings.coordinator_url,
+            ),
+            authentication_policy=policy,
+            transport=selected_transport,
+        )
     elif role is ServiceRole.ISSUER:
         from controlgraph_canary.integrations.google.firestore import (
             FirestoreAuthorityStore,
@@ -1148,6 +1176,9 @@ def create_runtime_service_app(
         from controlgraph_canary.integrations.google.firestore_health import (
             FirestoreHealthChainStore,
         )
+        from controlgraph_canary.integrations.google.firestore_model_assistance import (
+            FirestoreModelAssistanceAuditStore,
+        )
         from controlgraph_canary.integrations.google.firestore_recovery_abandonment import (
             FirestoreRecoveryAbandonmentStore,
         )
@@ -1172,6 +1203,7 @@ def create_runtime_service_app(
             or settings.recovery_task_caller is None
             or settings.receipt_authority_caller_identity is None
             or settings.receipt_authority_caller_subject is None
+            or settings.advisor_url is None
         ):
             raise ValueError("coordinator root-creation configuration is incomplete")
         selected_transport = (
@@ -1197,6 +1229,25 @@ def create_runtime_service_app(
             service_role=ServiceRole.EVIDENCE_WRITER,
             audience=settings.evidence_writer_url,
         )
+        coordinator_advisor_client = CoordinatorAdvisorClient(
+            route=CoordinatorInternalRoute(
+                project_id=settings.project_id,
+                project_number=settings.project_number,
+                caller_role=CallerRole.COORDINATOR,
+                service_role=ServiceRole.ADVISOR,
+                audience=settings.advisor_url,
+            ),
+            transport=selected_transport,
+        )
+        advisor_dependencies = (
+            diagnostic_snapshot_assembler,
+            model_assistance_audit_store,
+            model_assistance_timeline,
+        )
+        if any(item is not None for item in advisor_dependencies) and not all(
+            item is not None for item in advisor_dependencies
+        ):
+            raise ValueError("coordinator advisor workflow configuration is incomplete")
         evidence_signature_verifier = GoogleKmsEvidenceSignatureVerifier(
             project_id=settings.project_id,
             service_role=ServiceRole.COORDINATOR,
@@ -1299,6 +1350,28 @@ def create_runtime_service_app(
                 target=target,
                 configured_project_id=settings.project_id,
             )
+        )
+        selected_advisor_assembler = diagnostic_snapshot_assembler or (
+            M6DiagnosticSnapshotAssembler(
+                target=target,
+                authority=selected_store,
+                timeline=timeline_store,
+            )
+        )
+        selected_advisor_audit_store = model_assistance_audit_store or (
+            FirestoreModelAssistanceAuditStore(
+                target=target,
+                configured_project_id=settings.project_id,
+            )
+        )
+        selected_advisor_timeline = model_assistance_timeline or timeline_recorder
+        coordinator_advisor_workflow = CoordinatorAdvisorWorkflow(
+            authentication_policy=policy,
+            operator_policy=_operator_api_policy(settings),
+            assembler=selected_advisor_assembler,
+            advisor=coordinator_advisor_client,
+            audit_store=selected_advisor_audit_store,
+            timeline=cast(ModelAssistanceTimelineRecorder, selected_advisor_timeline),
         )
         stale_authority_reader = (
             cast(CompletionAuthorityReader, selected_store)
@@ -1635,6 +1708,15 @@ def create_runtime_service_app(
         raise ValueError("service-claim release clocks are coordinator-limited")
     if recovery_abandonment_clock is not None and role is not ServiceRole.COORDINATOR:
         raise ValueError("recovery-abandonment clocks are coordinator-limited")
+    if any(
+        item is not None
+        for item in (
+            diagnostic_snapshot_assembler,
+            model_assistance_audit_store,
+            model_assistance_timeline,
+        )
+    ) and role is not ServiceRole.COORDINATOR:
+        raise ValueError("model-assistance persistence is coordinator-limited")
     if capability_issuance_clock is not None and role is not ServiceRole.ISSUER:
         raise ValueError("capability-issuance clocks are issuer-limited")
     if (
@@ -1697,6 +1779,8 @@ def create_runtime_service_app(
         coordinator_service_claim_release_relay=(coordinator_service_claim_release_relay),
         api_recovery_abandonment_client=api_recovery_abandonment_client,
         coordinator_recovery_abandonment_relay=(coordinator_recovery_abandonment_relay),
+        api_advisor_client=api_advisor_client,
+        coordinator_advisor_workflow=coordinator_advisor_workflow,
         capability_issuance_service=capability_issuance_service,
         receipt_authority_service=receipt_authority_service,
         receipt_authority_authentication_policy=(receipt_authority_authentication_policy),
@@ -1747,6 +1831,12 @@ def create_runtime_service_app(
         )
     if coordinator_completion_workflow is not None:
         app.state.controlgraph_completion_workflow = coordinator_completion_workflow
+    if coordinator_advisor_client is not None:
+        app.state.controlgraph_advisor_client = coordinator_advisor_client
+    if coordinator_advisor_workflow is not None:
+        app.state.controlgraph_advisor_workflow = coordinator_advisor_workflow
+    if api_advisor_client is not None:
+        app.state.controlgraph_api_advisor_client = api_advisor_client
     if api_root_creation_client is not None:
         app.state.controlgraph_root_creation_client = api_root_creation_client
     if coordinator_root_creation_relay is not None:

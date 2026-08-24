@@ -25,6 +25,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+advisor = [
+  "google-adk==2.7.1",
+  "google-genai==2.19.0",
+]
 dev = [
   "hypothesis>=6.122,<7",
   "httpx>=0.28,<1",

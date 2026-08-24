@@ -6,6 +6,7 @@ locals {
   ])
 
   foundation_services = toset([
+    "aiplatform.googleapis.com",
     "artifactregistry.googleapis.com",
     "billingbudgets.googleapis.com",
     "cloudbilling.googleapis.com",

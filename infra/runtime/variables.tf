@@ -65,6 +65,16 @@ variable "console_image" {
   }
 }
 
+variable "advisor_image" {
+  description = "Reviewed advisor image in the dedicated registry, pinned by digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^.+@sha256:[0-9a-f]{64}$", var.advisor_image))
+    error_message = "advisor_image must be pinned to a lowercase sha256 digest."
+  }
+}
+
 variable "reference_target_stable_image" {
   description = "Stable reference-target image in the dedicated registry, pinned by digest."
   type        = string

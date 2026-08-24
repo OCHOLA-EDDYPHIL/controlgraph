@@ -61,6 +61,16 @@ check "console_image_is_isolated" {
   }
 }
 
+check "advisor_image_is_isolated" {
+  assert {
+    condition = startswith(
+      var.advisor_image,
+      "${var.region}-docker.pkg.dev/${var.project_id}/${data.terraform_remote_state.foundation.outputs.artifact_repository.repository_id}/advisor@sha256:",
+    )
+    error_message = "advisor_image must be an immutable advisor image from the dedicated regional ControlGraph repository."
+  }
+}
+
 check "reference_target_images_are_isolated" {
   assert {
     condition = (

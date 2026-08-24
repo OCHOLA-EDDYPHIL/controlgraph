@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "case_id": "valid_wait",
+      "scenario": "valid_wait",
+      "expected_accepted": true,
+      "expected_code": "accepted"
+    },
+    {
+      "case_id": "unknown_citation",
+      "scenario": "unknown_citation",
+      "expected_accepted": false,
+      "expected_code": "citation_invalid"
+    },
+    {
+      "case_id": "cross_target",
+      "scenario": "cross_target",
+      "expected_accepted": false,
+      "expected_code": "target_mismatch"
+    },
+    {
+      "case_id": "stale_snapshot",
+      "scenario": "stale_snapshot",
+      "expected_accepted": false,
+      "expected_code": "evidence_stale"
+    },
+    {
+      "case_id": "conflicting_evidence",
+      "scenario": "conflicting_evidence",
+      "expected_accepted": false,
+      "expected_code": "evidence_conflict"
+    },
+    {
+      "case_id": "unsupported_mutation",
+      "scenario": "unsupported_mutation",
+      "expected_accepted": false,
+      "expected_code": "schema_rejected"
+    },
+    {
+      "case_id": "injected_tool_instruction",
+      "scenario": "injected_tool_instruction",
+      "expected_accepted": false,
+      "expected_code": "unsafe_recommendation"
+    }
+  ],
+  "schema_version": "controlgraph.advisor-validation-replays/v1"
+}

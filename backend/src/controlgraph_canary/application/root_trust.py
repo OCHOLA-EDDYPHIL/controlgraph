@@ -260,6 +260,7 @@ class CoordinatorInternalRoute:
             (CallerRole.COORDINATOR, ServiceRole.ISSUER),
             (CallerRole.COORDINATOR, ServiceRole.VERIFIER),
             (CallerRole.COORDINATOR, ServiceRole.EVIDENCE_WRITER),
+            (CallerRole.COORDINATOR, ServiceRole.ADVISOR),
             (CallerRole.EXECUTOR, ServiceRole.COORDINATOR),
             (CallerRole.RECOVERY, ServiceRole.EXECUTOR),
             (CallerRole.VERIFIER, ServiceRole.EVIDENCE_WRITER),

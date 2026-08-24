@@ -3,6 +3,7 @@ output "controller_services" {
   value = {
     api             = module.api.service
     coordinator     = module.coordinator.service
+    advisor         = module.advisor.service
     issuer          = module.issuer.service
     executor        = module.executor.service
     recovery        = module.recovery.service
@@ -50,6 +51,11 @@ output "task_queues" {
 output "runtime_image" {
   description = "Immutable controller image used by every private service shell."
   value       = var.controller_image
+}
+
+output "advisor_image" {
+  description = "Immutable image used only by the read-only advisor service."
+  value       = var.advisor_image
 }
 
 output "reference_target" {

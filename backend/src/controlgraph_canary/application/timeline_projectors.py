@@ -21,6 +21,10 @@ from controlgraph_canary.contracts.independent_verification import (
     SignedIndependentVerificationEvidenceV1,
     VerifiedIndependentVerificationEvidenceV1,
 )
+from controlgraph_canary.contracts.model_assistance import (
+    ModelAssistanceActorRole,
+    ModelAssistanceTimelineAuditV1,
+)
 from controlgraph_canary.contracts.models import (
     CapabilityAction,
     EpochAuthorityRecord,
@@ -224,6 +228,7 @@ def _projection(
     display_fields: tuple[TimelineDisplayFieldV1, ...],
     policy_set: TimelineEvidencePolicySetV1,
     retained_source: StrictContractModel | None = None,
+    actor_id: str | None = None,
 ) -> TimelineProjection:
     evidence_class = _EVENT_CLASS[event_type]
     if target != policy_set.target:
@@ -250,7 +255,7 @@ def _projection(
         evidence_class=evidence_class,
         target=target,
         actor_role=actor_role,
-        actor_id=_actor_id(actor),
+        actor_id=actor_id or _actor_id(actor),
         actor_data_class=TimelineAudience.SECURITY_AUDIT,
         root_id=root_id,
         root_sha256=root_sha256,
@@ -1385,6 +1390,72 @@ def project_recovery_dispatch(
     )
 
 
+def project_model_assistance(
+    audit: ModelAssistanceTimelineAuditV1,
+    *,
+    policy_set: TimelineEvidencePolicySetV1,
+) -> TimelineProjection:
+    """Project one already-redacted advisor lifecycle record."""
+
+    if type(audit) is not ModelAssistanceTimelineAuditV1:
+        raise TypeError("model assistance projection input must be exact")
+    return _projection(
+        source=audit,
+        source_id=audit.event_id,
+        event_type=TimelineEventType.MODEL_ASSISTANCE_RECORDED,
+        target=audit.target,
+        actor_role=(
+            TimelineActorRole.OPERATOR
+            if audit.actor_role is ModelAssistanceActorRole.OPERATOR
+            else TimelineActorRole.ADVISOR
+        ),
+        actor=audit.actor_id,
+        root_id=audit.root_id,
+        root_sha256=audit.root_sha256,
+        epoch=audit.epoch,
+        occurred_at=audit.occurred_at,
+        correlations=_correlations(
+            (
+                (
+                    TimelineCorrelationKind.MODEL,
+                    audit.interaction_id,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineCorrelationKind.REQUEST,
+                    audit.request_id,
+                    TimelineAudience.OPERATOR,
+                ),
+            )
+        ),
+        payload_sha256=canonical_sha256(audit),
+        signature=None,
+        verification_status=TimelineVerificationStatus.NOT_APPLICABLE,
+        terminal_classification=TimelineTerminalClassification.NONE,
+        display_fields=_display(
+            (
+                (
+                    TimelineDisplayFieldName.OUTCOME,
+                    audit.disposition.value,
+                    TimelineAudience.OPERATOR,
+                ),
+                (
+                    TimelineDisplayFieldName.STATE,
+                    audit.lifecycle.value,
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+                (
+                    TimelineDisplayFieldName.SUMMARY,
+                    "Read-only rollout advice recorded",
+                    TimelineAudience.PUBLIC_DEMO,
+                ),
+            )
+        ),
+        policy_set=policy_set,
+        actor_id=audit.actor_id,
+    )
+
+
 __all__ = [
     "TimelineProjection",
     "project_canary_dispatch",
@@ -1393,6 +1464,7 @@ __all__ = [
     "project_epoch_revocation",
     "project_execution_receipt",
     "project_independent_verification",
+    "project_model_assistance",
     "project_promotion_dispatch",
     "project_recovery_abandonment",
     "project_recovery_dispatch",
