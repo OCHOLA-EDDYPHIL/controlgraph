@@ -34,12 +34,14 @@ from controlgraph_canary.contracts.timeline import (
     TimelineAudience,
     TimelineEntryV1,
     TimelineEventType,
+    TimelineHeadV1,
     TimelinePageCommandV1,
     TimelineTerminalClassification,
     TimelineVerificationStatus,
 )
 
-_MAX_TIMELINE_ENTRIES = 100
+_TIMELINE_PAGE_SIZE = 100
+_MAX_TIMELINE_ENTRIES = 1_000
 _SNAPSHOT_LIFETIME_SECONDS = 240
 
 
@@ -107,26 +109,13 @@ class M6DiagnosticSnapshotAssembler:
         ):
             raise ValueError("advisor authority evidence is stale")
 
-        page = await self._timeline.read_page(
-            TimelinePageCommandV1(
-                schema_version=TIMELINE_PAGE_COMMAND_V1,
-                target=self._target,
-                after_sequence=0,
-                after_entry_sha256=None,
-                limit=_MAX_TIMELINE_ENTRIES,
-                audience=TimelineAudience.OPERATOR,
-            )
+        timeline_head, timeline_entries = await _read_timeline(
+            target=self._target,
+            timeline=self._timeline,
         )
-        if (
-            page.head is None
-            or page.head.sequence != len(page.entries)
-            or page.head.sequence > _MAX_TIMELINE_ENTRIES
-            or page.head.entry_sha256 != page.entries[-1].entry_sha256
-        ):
-            raise ValueError("advisor timeline evidence is unavailable")
         entries = tuple(
             entry
-            for entry in page.entries
+            for entry in timeline_entries
             if entry.content.event.root_id == root.root_id
             and entry.content.event.root_sha256 == root.root_sha256
         )
@@ -210,7 +199,7 @@ class M6DiagnosticSnapshotAssembler:
             snapshot_id=_snapshot_id(
                 root.root_sha256,
                 authority.current_epoch,
-                page.head.entry_sha256,
+                timeline_head.entry_sha256,
                 command.request_id,
             ),
             target=self._target,
@@ -293,13 +282,13 @@ class M6DiagnosticSnapshotAssembler:
             timeline_summary=_summary(
                 DiagnosticEvidenceKind.TIMELINE,
                 timeline_entries,
-                source_sha256=page.head.entry_sha256,
+                source_sha256=timeline_head.entry_sha256,
                 fresh_until=fresh_until,
                 facts=(
                     (
                         entries[-1],
                         DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
-                        str(page.head.sequence),
+                        str(timeline_head.sequence),
                     ),
                     (
                         entries[-1],
@@ -328,6 +317,55 @@ class M6DiagnosticSnapshotAssembler:
             snapshot=snapshot,
             snapshot_sha256=canonical_sha256(snapshot),
         )
+
+
+async def _read_timeline(
+    *,
+    target: TargetBinding,
+    timeline: M6TimelineReader,
+) -> tuple[TimelineHeadV1, tuple[TimelineEntryV1, ...]]:
+    entries: list[TimelineEntryV1] = []
+    after_sequence = 0
+    after_entry_sha256: str | None = None
+    captured_head: TimelineHeadV1 | None = None
+    expected_head: tuple[int, str] | None = None
+
+    while True:
+        page = await timeline.read_page(
+            TimelinePageCommandV1(
+                schema_version=TIMELINE_PAGE_COMMAND_V1,
+                target=target,
+                after_sequence=after_sequence,
+                after_entry_sha256=after_entry_sha256,
+                limit=_TIMELINE_PAGE_SIZE,
+                audience=TimelineAudience.OPERATOR,
+            )
+        )
+        if page.head is None:
+            raise ValueError("advisor timeline evidence is unavailable")
+        observed_head = (page.head.sequence, page.head.entry_sha256)
+        if expected_head is None:
+            captured_head = page.head
+            expected_head = observed_head
+            if page.head.sequence > _MAX_TIMELINE_ENTRIES:
+                raise ValueError("advisor timeline evidence is unavailable")
+        elif observed_head != expected_head:
+            raise ValueError("advisor timeline evidence is unavailable")
+        if not page.entries:
+            raise ValueError("advisor timeline evidence is unavailable")
+
+        entries.extend(page.entries)
+        final_entry = page.entries[-1]
+        if final_entry.content.sequence <= after_sequence:
+            raise ValueError("advisor timeline evidence is unavailable")
+        after_sequence = final_entry.content.sequence
+        after_entry_sha256 = final_entry.entry_sha256
+        if after_sequence == expected_head[0]:
+            if after_entry_sha256 != expected_head[1] or captured_head is None:
+                raise ValueError("advisor timeline evidence is unavailable")
+            return captured_head, tuple(entries)
+        if after_sequence > expected_head[0]:
+            raise ValueError("advisor timeline evidence is unavailable")
 
 
 def _verified_entries(

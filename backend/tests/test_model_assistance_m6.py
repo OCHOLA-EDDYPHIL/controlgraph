@@ -10,6 +10,7 @@ from timeline_test_data import timeline_event
 from controlgraph_canary.application.authority_store import RootCreationBundle, StoredRecord
 from controlgraph_canary.application.model_assistance_m6 import (
     M6DiagnosticSnapshotAssembler,
+    _read_timeline,
 )
 from controlgraph_canary.application.timeline import TimelineReadSlice
 from controlgraph_canary.contracts.model_assistance import (
@@ -18,6 +19,7 @@ from controlgraph_canary.contracts.model_assistance import (
     AdvisoryHealth,
     RolloutPhase,
 )
+from controlgraph_canary.contracts.models import TargetBinding
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_DISPLAY_FIELD_V1,
     TIMELINE_HEAD_V1,
@@ -48,13 +50,106 @@ class _Timeline:
         self,
         head: TimelineHeadV1,
         entries: tuple[TimelineEntryV1, ...],
+        *,
+        later_heads: tuple[TimelineHeadV1, ...] = (),
     ) -> None:
         self.target = head.target
-        self._head = head
+        self._heads = (head, *later_heads)
         self._entries = entries
+        self.commands: list[TimelinePageCommandV1] = []
 
     async def read_page(self, command: TimelinePageCommandV1) -> TimelineReadSlice:
-        return TimelineReadSlice(command=command, head=self._head, entries=self._entries)
+        head = self._heads[min(len(self.commands), len(self._heads) - 1)]
+        self.commands.append(command)
+        end = min(head.sequence, command.after_sequence + command.limit)
+        return TimelineReadSlice(
+            command=command,
+            head=head,
+            entries=self._entries[command.after_sequence : end],
+        )
+
+
+def _synthetic_entries(
+    target: TargetBinding,
+    count: int,
+) -> tuple[TimelineEntryV1, ...]:
+    entries: list[TimelineEntryV1] = []
+    predecessor = None
+    for sequence in range(1, count + 1):
+        event = timeline_event(sequence, target=target)
+        entry = timeline_entry(
+            event,
+            sequence=sequence,
+            previous_entry_sha256=predecessor,
+            recorded_at=event.occurred_at,
+        )
+        entries.append(entry)
+        predecessor = entry.entry_sha256
+    return tuple(entries)
+
+
+def _head(
+    entries: tuple[TimelineEntryV1, ...],
+    *,
+    sequence: int | None = None,
+    entry_sha256: str | None = None,
+) -> TimelineHeadV1:
+    last = entries[-1]
+    digest = entry_sha256 or last.entry_sha256
+    return TimelineHeadV1(
+        schema_version=TIMELINE_HEAD_V1,
+        target=last.content.target,
+        sequence=last.content.sequence if sequence is None else sequence,
+        entry_id=f"cgtimeline:{digest}",
+        entry_sha256=digest,
+        updated_at=last.content.recorded_at,
+    )
+
+
+def test_timeline_read_paginates_with_exact_cursor_beyond_one_page() -> None:
+    target = make_root_v3_records().root.content.target
+    entries = _synthetic_entries(target, 106)
+    expected_head = _head(entries)
+    timeline = _Timeline(expected_head, entries)
+
+    head, observed = asyncio.run(_read_timeline(target=target, timeline=timeline))
+
+    assert head == expected_head
+    assert observed == entries
+    assert len(timeline.commands) == 2
+    assert timeline.commands[0].after_sequence == 0
+    assert timeline.commands[0].after_entry_sha256 is None
+    assert timeline.commands[1].after_sequence == 100
+    assert timeline.commands[1].after_entry_sha256 == entries[99].entry_sha256
+
+
+def test_timeline_read_rejects_head_drift_between_pages() -> None:
+    target = make_root_v3_records().root.content.target
+    entries = _synthetic_entries(target, 107)
+    timeline = _Timeline(
+        _head(entries[:106]),
+        entries,
+        later_heads=(_head(entries),),
+    )
+
+    with pytest.raises(ValueError, match="timeline evidence is unavailable"):
+        asyncio.run(_read_timeline(target=target, timeline=timeline))
+
+    assert len(timeline.commands) == 2
+
+
+def test_timeline_read_rejects_a_head_beyond_the_total_entry_cap() -> None:
+    target = make_root_v3_records().root.content.target
+    entries = _synthetic_entries(target, 100)
+    timeline = _Timeline(
+        _head(entries, sequence=1_001, entry_sha256="f" * 64),
+        entries,
+    )
+
+    with pytest.raises(ValueError, match="timeline evidence is unavailable"):
+        asyncio.run(_read_timeline(target=target, timeline=timeline))
+
+    assert len(timeline.commands) == 1
 
 
 def _field(name: TimelineDisplayFieldName, value: str) -> TimelineDisplayFieldV1:
