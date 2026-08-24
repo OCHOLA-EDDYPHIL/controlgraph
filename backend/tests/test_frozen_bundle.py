@@ -326,23 +326,48 @@ def _fixture(
             digest_digit="c",
         ),
     )
+    core_entry = next(item for item in entries if item["id"] == "core-acceptance")
+    core_payload = json.loads((artifacts / core_entry["path"]).read_text())
+    core_inputs_sha256 = core_payload["inputs"]["run_inputs_sha256"]
+    fault_inputs_sha256 = hashlib.sha256(
+        bundle.FAULT_INPUT_DOMAIN
+        + bytes.fromhex(core_inputs_sha256)
+        + bytes.fromhex(core_entry["sha256"])
+    ).hexdigest()
     fault_cases: list[dict[str, Any]] = []
     for index, fault in enumerate(bundle.FAULT_ORDER):
+        slug = fault.lower().replace("_", "-")
         digest = hashlib.sha256(
             b"controlgraph.fault-acceptance-seed/v1\0" + b"17\0" + fault.encode("ascii")
         ).digest()
+        scenario_id = f"fault-{slug}-{digest.hex()[:16]}"
+        random_seed = int.from_bytes(digest[:6], "big")
+        if fault == "REVOCATION_RACE":
+            scenario_id = f"{scenario_id}-a1"
+            digest = hashlib.sha256(f"{random_seed}\0{1}".encode("ascii")).digest()
+            random_seed = int.from_bytes(digest[:6], "big")
+        relative_path = f"{slug}/evidence.json"
+        artifact_sha256 = _write_json(
+            artifacts / relative_path, {"fault": fault, "result": "PASSED"}
+        )
         fault_cases.append(
             {
-                "artifacts": [{"name": "evidence.json", "sha256": f"{index + 1:064x}"}],
+                "artifacts": [
+                    {
+                        "name": "evidence.json",
+                        "relative_path": relative_path,
+                        "sha256": artifact_sha256,
+                    }
+                ],
                 "boundary": f"boundary.{index}",
                 "fault": fault,
                 "injection": f"INJECT_{fault}",
                 "observed_invariants": sorted(bundle.FAULT_INVARIANTS[fault]),
                 "observation": {},
-                "random_seed": int.from_bytes(digest[:6], "big"),
+                "random_seed": random_seed,
                 "result": "PASSED",
                 "root_id": f"cgroot:{index}",
-                "scenario_id": (f"fault-{fault.lower().replace('_', '-')}-{digest.hex()[:16]}"),
+                "scenario_id": scenario_id,
             }
         )
     add_json(
@@ -353,7 +378,11 @@ def _fixture(
             "allowlisted_faults": list(bundle.FAULT_ORDER),
             "candidate_revision": "reference-candidate-00002-bbb",
             "cases": fault_cases,
+            "core_manifest_sha256": core_entry["sha256"],
+            "core_run_id": core_payload["run_id"],
+            "core_run_inputs_sha256": core_inputs_sha256,
             "environment": "nonprod",
+            "fault_run_inputs_sha256": fault_inputs_sha256,
             "project_id": "controlgraph-canary-abc123",
             "purpose": "PRODUCT_VALIDATION",
             "region": "us-central1",
@@ -697,6 +726,9 @@ def test_prepared_bundle_has_only_clean_room_pending(
         ("environment", "acceptance"),
         ("stable_revision", "controlgraph-reference-target-other"),
         ("run_seed", 18),
+        ("core_run_id", f"cgacceptance:{'f' * 64}"),
+        ("core_run_inputs_sha256", "f" * 64),
+        ("core_manifest_sha256", "f" * 64),
     ],
 )
 def test_fault_manifest_must_bind_the_core_acceptance_run(
@@ -744,6 +776,27 @@ def test_fault_manifest_rejects_unbound_passed_content(
     _write_json(spec_path, spec)
 
     with pytest.raises(bundle.BundleError, match="FAULT_ACCEPTANCE_MANIFEST_INVALID"):
+        bundle.verify_bundle(repo, spec_path, artifacts)
+
+
+@pytest.mark.parametrize("tamper", ["path", "content"])
+def test_fault_manifest_rehashes_normalized_evidence_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path, monkeypatch)
+    entry = next(item for item in spec["artifacts"] if item["id"] == "fault-acceptance")
+    payload = json.loads((artifacts / entry["path"]).read_text())
+    evidence = payload["cases"][0]["artifacts"][0]
+    if tamper == "path":
+        evidence["relative_path"] = "../evidence.json"
+        error = "FAULT_ACCEPTANCE_MANIFEST_INVALID"
+    else:
+        (artifacts / evidence["relative_path"]).write_text("tampered\n", encoding="utf-8")
+        error = "FAULT_ACCEPTANCE_ARTIFACT_INVALID"
+    entry["sha256"] = _write_json(artifacts / entry["path"], payload)
+    _write_json(spec_path, spec)
+
+    with pytest.raises(bundle.BundleError, match=error):
         bundle.verify_bundle(repo, spec_path, artifacts)
 
 

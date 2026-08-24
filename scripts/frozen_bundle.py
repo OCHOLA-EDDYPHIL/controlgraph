@@ -116,6 +116,7 @@ CORE_REQUIRED_EVIDENCE: Final = {
 MAX_CORE_CASE_DURATION_MS: Final = 60 * 60 * 1_000
 MAX_CORE_DURATION_MS: Final = 4 * 60 * 60 * 1_000
 MAX_CORE_COST_MICROUSD: Final = 10_000_000
+FAULT_INPUT_DOMAIN: Final = b"controlgraph.fault-acceptance-run-inputs/v1\0"
 
 CLAIM_CATEGORIES: Final = frozenset(
     {
@@ -838,10 +839,16 @@ def _validate_release_evidence(
 
 
 def _validate_fault_acceptance(
-    payload: Mapping[str, Any], core: Mapping[str, Any], revision: str
+    payload: Mapping[str, Any],
+    core: Mapping[str, Any],
+    core_manifest_sha256: str,
+    revision: str,
+    artifact_root: Path,
 ) -> None:
     core_inputs = _object(core.get("inputs"), "FAULT_ACCEPTANCE_RUN_MISMATCH")
     target = _object(core_inputs.get("target"), "FAULT_ACCEPTANCE_RUN_MISMATCH")
+    core_inputs_sha256 = core_inputs.get("run_inputs_sha256")
+    fault_inputs_sha256 = payload.get("fault_run_inputs_sha256")
     if (
         payload.get("source_commit") != revision
         or payload.get("project_id") != target.get("project_id")
@@ -851,6 +858,19 @@ def _validate_fault_acceptance(
         or payload.get("stable_revision") != target.get("stable_revision")
         or payload.get("candidate_revision") != target.get("candidate_revision")
         or payload.get("run_seed") != core_inputs.get("random_seed")
+        or payload.get("core_run_id") != core.get("run_id")
+        or payload.get("core_run_inputs_sha256") != core_inputs_sha256
+        or payload.get("core_manifest_sha256") != core_manifest_sha256
+        or not isinstance(core_inputs_sha256, str)
+        or SHA_RE.fullmatch(core_inputs_sha256) is None
+        or not isinstance(fault_inputs_sha256, str)
+        or SHA_RE.fullmatch(fault_inputs_sha256) is None
+        or fault_inputs_sha256
+        != hashlib.sha256(
+            FAULT_INPUT_DOMAIN
+            + bytes.fromhex(core_inputs_sha256)
+            + bytes.fromhex(core_manifest_sha256)
+        ).hexdigest()
     ):
         raise BundleError("FAULT_ACCEPTANCE_RUN_MISMATCH")
     cases = payload.get("cases")
@@ -873,6 +893,7 @@ def _validate_fault_acceptance(
         raise BundleError("FAULT_ACCEPTANCE_MANIFEST_INVALID")
     run_seed = payload["run_seed"]
     root_ids: set[str] = set()
+    artifact_paths: set[Path] = set()
     for raw, fault in zip(cases, FAULT_ORDER, strict=True):
         case = _object(raw, "FAULT_ACCEPTANCE_MANIFEST_INVALID")
         digest = hashlib.sha256(
@@ -881,13 +902,26 @@ def _validate_fault_acceptance(
             + b"\0"
             + fault.encode("ascii")
         ).digest()
-        expected_id = f"fault-{fault.lower().replace('_', '-')}-{digest.hex()[:16]}"
+        slug = fault.lower().replace("_", "-")
+        expected_id = f"fault-{slug}-{digest.hex()[:16]}"
+        expected_seed = int.from_bytes(digest[:6], "big")
+        if fault == "REVOCATION_RACE":
+            match = re.fullmatch(
+                rf"{re.escape(expected_id)}-a([1-3])", str(case.get("scenario_id"))
+            )
+            if match is None:
+                raise BundleError("FAULT_ACCEPTANCE_MANIFEST_INVALID")
+            race_digest = hashlib.sha256(
+                f"{expected_seed}\0{match.group(1)}".encode("ascii")
+            ).digest()
+            expected_id = f"{expected_id}-a{match.group(1)}"
+            expected_seed = int.from_bytes(race_digest[:6], "big")
         artifacts = case.get("artifacts")
         invariants = case.get("observed_invariants")
         root_id = case.get("root_id")
         if (
             case.get("scenario_id") != expected_id
-            or case.get("random_seed") != int.from_bytes(digest[:6], "big")
+            or case.get("random_seed") != expected_seed
             or case.get("result") != "PASSED"
             or not isinstance(case.get("boundary"), str)
             or not case["boundary"]
@@ -909,16 +943,34 @@ def _validate_fault_acceptance(
         for raw_artifact in artifacts:
             artifact = _object(raw_artifact, "FAULT_ACCEPTANCE_MANIFEST_INVALID")
             name = artifact.get("name")
+            relative_path = artifact.get("relative_path")
             sha256 = artifact.get("sha256")
             if (
-                not isinstance(name, str)
+                set(artifact) != {"name", "relative_path", "sha256"}
+                or not isinstance(name, str)
                 or not name
+                or "/" in name
+                or name in {".", ".."}
                 or name in artifact_names
+                or relative_path != f"{slug}/{name}"
                 or not isinstance(sha256, str)
                 or SHA_RE.fullmatch(sha256) is None
             ):
                 raise BundleError("FAULT_ACCEPTANCE_MANIFEST_INVALID")
+            path = _relative_path(artifact_root, relative_path)
+            try:
+                size = path.stat().st_size
+            except OSError as error:
+                raise BundleError("FAULT_ACCEPTANCE_ARTIFACT_INVALID") from error
+            if (
+                path in artifact_paths
+                or not path.is_file()
+                or not 0 < size <= 8 * 1024 * 1024
+                or _file_sha(path) != sha256
+            ):
+                raise BundleError("FAULT_ACCEPTANCE_ARTIFACT_INVALID")
             artifact_names.add(name)
+            artifact_paths.add(path)
 
 
 def _validate_known_payloads(
@@ -958,7 +1010,13 @@ def _validate_known_payloads(
         _validate_core_acceptance(payload, revision, release_images, terraform_plan)
     faults = by_kind.get("FAULT_ACCEPTANCE_MANIFEST", [])
     if core and faults:
-        _validate_fault_acceptance(faults[0][1], core[0][1], revision)
+        _validate_fault_acceptance(
+            faults[0][1],
+            core[0][1],
+            artifacts[core[0][0]]["sha256"],
+            revision,
+            artifact_root,
+        )
     for _, payload in by_kind.get("SECURITY_ABUSE_MANIFEST", []):
         _require_source_commit(payload, revision)
         if (
