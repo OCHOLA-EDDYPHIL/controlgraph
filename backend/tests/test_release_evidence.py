@@ -30,15 +30,19 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-def _bundle(predicate_type: str, subjects: list[tuple[str, str]]) -> dict[str, Any]:
+def _bundle(
+    predicate_type: str,
+    subjects: list[tuple[str, str]],
+    predicate: dict[str, Any],
+) -> dict[str, Any]:
     statement = {
-        "_type": "https://in-toto.io/Statement/v1",
+        "_type": "https://in-toto.io/Statement/v0.1",
         "predicateType": predicate_type,
         "subject": [
             {"name": name, "digest": {"sha256": digest.removeprefix("sha256:")}}
             for name, digest in subjects
         ],
-        "predicate": {},
+        "predicate": predicate,
     }
     payload = base64.b64encode(json.dumps(statement).encode()).decode()
     return {
@@ -59,7 +63,7 @@ def test_source_inventories_cover_every_required_surface() -> None:
         "registry.terraform.io/hashicorp/google",
         "registry.terraform.io/hashicorp/google-beta",
     }
-    assert any(item["name"] == "actions/attest-sbom" for item in inventories["release"])
+    assert any(item["name"] == "cosign" for item in inventories["release"])
     assert all(
         item.get("licenseDeclared") and item.get("externalRefs")
         for packages in inventories.values()
@@ -131,7 +135,14 @@ def test_prepare_accepts_an_exact_clean_git_revision(
 
     monkeypatch.setattr(release_evidence, "_git", fake_git)
 
-    release_evidence.prepare(REPO, tmp_path / "evidence", source_sha, images)
+    release_evidence.prepare(
+        REPO,
+        tmp_path / "evidence",
+        source_sha,
+        images,
+        "https://github.com/OCHOLA-EDDYPHIL/controlgraph/.github/workflows/deploy.yml@refs/heads/main",
+        "https://github.com/OCHOLA-EDDYPHIL/controlgraph/actions/runs/1/attempts/1",
+    )
 
     inputs = json.loads((tmp_path / "evidence/inputs.json").read_text())
     assert inputs["source_sha"] == source_sha
@@ -171,29 +182,108 @@ def test_trivy_policy_accepts_noncritical_findings(tmp_path: Path) -> None:
     release_evidence._validate_trivy(report, {"CRITICAL"})
 
 
-def test_attestations_bind_all_five_immutable_images(tmp_path: Path) -> None:
+def test_attestations_bind_all_five_immutable_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     names = ["controller", "console", "advisor", "reference-stable", "reference-candidate"]
     registry = "us-central1-docker.pkg.dev/controlgraph-canary-abcdef/controlgraph-canary"
     images = {name: f"{registry}/{name}@sha256:{index:064x}" for index, name in enumerate(names, 1)}
-    subjects = [
-        (reference.rsplit("@", 1)[0], reference.rsplit("@", 1)[1]) for reference in images.values()
-    ]
-    _write_json(
-        tmp_path / "attestations/image-provenance.sigstore.json",
-        _bundle("https://slsa.dev/provenance/v1", subjects),
+    policy = release_evidence._policy(REPO)
+    provenance_predicate = {
+        "buildDefinition": {"buildType": "https://github.com/actions/workflow"},
+        "runDetails": {"builder": {"id": "synthetic"}},
+    }
+    _write_json(tmp_path / "provenance.predicate.json", provenance_predicate)
+    monkeypatch.setattr(
+        release_evidence,
+        "_verify_sigstore_bundle",
+        lambda **_kwargs: None,
     )
     for name, reference in images.items():
+        subject = [(reference.rsplit("@", 1)[0], reference.rsplit("@", 1)[1])]
+        sbom = {
+            "spdxVersion": "SPDX-2.3",
+            "packages": [{"name": name, "licenseDeclared": "NOASSERTION"}],
+        }
+        _write_json(tmp_path / f"sboms/image-{name}.spdx.json", sbom)
         _write_json(
             tmp_path / f"attestations/{name}.sbom.sigstore.json",
             _bundle(
-                "https://spdx.dev/Document/v2.3",
-                [(reference.rsplit("@", 1)[0], reference.rsplit("@", 1)[1])],
+                "https://spdx.dev/Document",
+                subject,
+                sbom,
+            ),
+        )
+        _write_json(
+            tmp_path / f"attestations/{name}.provenance.sigstore.json",
+            _bundle(
+                "https://slsa.dev/provenance/v1",
+                subject,
+                provenance_predicate,
             ),
         )
 
-    paths = release_evidence._validate_attestations(tmp_path, images)
+    paths = release_evidence._validate_attestations(
+        output=tmp_path,
+        images=images,
+        policy=policy,
+        source_sha="a" * 40,
+        cosign=Path("/pinned/cosign"),
+        trusted_root=REPO / ".github/sigstore-trusted-root.json",
+    )
 
-    assert set(paths) == {"image-provenance", *(f"{name}-sbom" for name in names)}
+    assert set(paths) == {
+        *(f"{name}-provenance" for name in names),
+        *(f"{name}-sbom" for name in names),
+    }
+
+    _write_json(
+        tmp_path / "sboms/image-controller.spdx.json",
+        {"spdxVersion": "SPDX-2.3", "packages": [{"name": "tampered"}]},
+    )
+    with pytest.raises(release_evidence.EvidenceError, match="retained SPDX"):
+        release_evidence._validate_attestations(
+            output=tmp_path,
+            images=images,
+            policy=policy,
+            source_sha="a" * 40,
+            cosign=Path("/pinned/cosign"),
+            trusted_root=REPO / ".github/sigstore-trusted-root.json",
+        )
+
+
+def test_fake_attestation_signature_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "fake.sigstore.json"
+    _write_json(bundle, _bundle("https://spdx.dev/Document", [], {}))
+    policy = release_evidence._policy(REPO)
+    captured: list[str] = []
+
+    def reject(command: list[str], **_kwargs: Any) -> None:
+        captured.extend(command)
+        raise release_evidence.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(release_evidence.subprocess, "run", reject)
+
+    with pytest.raises(release_evidence.EvidenceError, match="cryptographic"):
+        release_evidence._verify_sigstore_bundle(
+            cosign=Path("/pinned/cosign"),
+            bundle=bundle,
+            digest="sha256:" + "1" * 64,
+            predicate_type="spdxjson",
+            policy=policy,
+            source_sha="a" * 40,
+            trusted_root=REPO / ".github/sigstore-trusted-root.json",
+        )
+
+    assert "--certificate-identity" in captured
+    assert "--certificate-oidc-issuer" in captured
+    assert "--certificate-github-workflow-repository" in captured
+    assert "--certificate-github-workflow-ref" in captured
+    assert "--certificate-github-workflow-sha" in captured
+    assert "--use-signed-timestamps" in captured
+    assert "--insecure-ignore-tlog" in captured
 
 
 def test_material_inventory_is_complete_and_unique() -> None:

@@ -4,11 +4,13 @@ import asyncio
 import json
 from collections.abc import Callable, Coroutine
 from functools import wraps
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from timeline_test_data import OTHER_TARGET, TARGET, timeline_event
 
+from controlgraph_canary.application import timeline_recording
 from controlgraph_canary.application.timeline import (
     REDACTED_DISPLAY_VALUE,
     TimelineAppendCreated,
@@ -183,6 +185,29 @@ def test_operational_signal_log_is_closed_and_excludes_source_content(
     )
     assert sensitive_marker not in json.dumps(records)
     assert "request:9" not in json.dumps(records)
+
+
+def test_operational_signal_output_failure_does_not_change_the_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingStream:
+        def write(self, _value: str) -> None:
+            raise OSError("synthetic closed stream")
+
+        def flush(self) -> None:
+            raise AssertionError("flush must not follow a failed write")
+
+    event = timeline_event(
+        9,
+        event_type=TimelineEventType.MUTATION_AMBIGUOUS,
+    )
+    monkeypatch.setattr(
+        timeline_recording,
+        "sys",
+        SimpleNamespace(stderr=FailingStream()),
+    )
+
+    _emit_operational_signals(event)
 
 
 def test_audience_projections_are_nested_and_secret_safe() -> None:

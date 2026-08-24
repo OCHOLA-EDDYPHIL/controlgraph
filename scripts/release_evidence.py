@@ -32,6 +32,9 @@ PROVIDER_RE = re.compile(r'provider\s+"([^"]+)"\s*\{(.*?)\n\}', re.DOTALL)
 VERSION_RE = re.compile(r'^\s*version\s*=\s*"([^"]+)"', re.MULTILINE)
 HASH_RE = re.compile(r'"(h1:[A-Za-z0-9+/=]+|zh:[0-9a-f]{64})"')
 SPDX_LICENSE_RE = re.compile(r"^[A-Za-z0-9.+-]+$")
+GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+GITHUB_MAIN_REF = "refs/heads/main"
+GITHUB_WORKFLOW_TRIGGER = "workflow_dispatch"
 
 
 class EvidenceError(ValueError):
@@ -292,12 +295,13 @@ def _release_packages(repo: Path, policy: Mapping[str, Any]) -> list[dict[str, A
         if not isinstance(item, dict):
             raise EvidenceError(f"invalid tool policy: {name}")
         version = str(item["version"])
+        repository = str(item["repository"])
         packages[(name, version)] = _package(
             name=name,
             version=version,
-            download=f"https://github.com/aquasecurity/{name}",
+            download=f"https://github.com/{repository}",
             license_name=str(item["license"]),
-            purl=_purl("github", f"aquasecurity/{name}", version),
+            purl=_purl("github", repository, version),
             checksum={"algorithm": "SHA256", "checksumValue": str(item["sha256"])},
         )
     if not packages:
@@ -357,6 +361,50 @@ def _material_paths(repo: Path, policy: Mapping[str, Any]) -> list[Path]:
     return sorted(paths)
 
 
+def _validate_builder_identity(
+    policy: Mapping[str, Any], builder_id: str, invocation_id: str
+) -> None:
+    if builder_id != f"https://github.com/{policy['workflow_ref']}":
+        raise EvidenceError(
+            "builder identity is outside the pinned publication workflow"
+        )
+    invocation_pattern = re.compile(
+        rf"https://github\.com/{re.escape(str(policy['repository']))}/actions/runs/"
+        r"[1-9][0-9]*/attempts/[1-9][0-9]*"
+    )
+    if invocation_pattern.fullmatch(invocation_id) is None:
+        raise EvidenceError("invocation identity is outside the repository")
+
+
+def _provenance_predicate(
+    *,
+    repo: Path,
+    policy: Mapping[str, Any],
+    source_sha: str,
+    builder_id: str,
+    invocation_id: str,
+) -> dict[str, Any]:
+    _validate_builder_identity(policy, builder_id, invocation_id)
+    return {
+        "buildDefinition": {
+            "buildType": "https://github.com/actions/workflow",
+            "externalParameters": {"sourceRevision": source_sha},
+            "internalParameters": {},
+            "resolvedDependencies": [
+                {
+                    "uri": str(path.relative_to(repo)),
+                    "digest": {"sha256": _sha256(path)},
+                }
+                for path in _material_paths(repo, policy)
+            ],
+        },
+        "runDetails": {
+            "builder": {"id": builder_id},
+            "metadata": {"invocationId": invocation_id},
+        },
+    }
+
+
 def _parse_images(values: Iterable[str], policy: Mapping[str, Any]) -> dict[str, str]:
     images: dict[str, str] = {}
     for value in values:
@@ -380,9 +428,15 @@ def _parse_images(values: Iterable[str], policy: Mapping[str, Any]) -> dict[str,
 
 
 def prepare(
-    repo: Path, output: Path, source_sha: str, image_values: Sequence[str]
+    repo: Path,
+    output: Path,
+    source_sha: str,
+    image_values: Sequence[str],
+    builder_id: str,
+    invocation_id: str,
 ) -> None:
     policy = _policy(repo)
+    _sigstore_paths(repo, policy)
     if (
         not GIT_SHA_RE.fullmatch(source_sha)
         or _git(repo, "rev-parse", "HEAD") != source_sha
@@ -406,6 +460,16 @@ def prepare(
             "source_sha": source_sha,
             "images": images,
         },
+    )
+    _write_json(
+        output / "provenance.predicate.json",
+        _provenance_predicate(
+            repo=repo,
+            policy=policy,
+            source_sha=source_sha,
+            builder_id=builder_id,
+            invocation_id=invocation_id,
+        ),
     )
 
 
@@ -465,6 +529,91 @@ def _validate_trivy(path: Path, critical: set[str]) -> None:
         )
 
 
+def _validate_cosign_binary(cosign: Path, policy: Mapping[str, Any]) -> None:
+    tool = policy.get("tools", {}).get("cosign", {})
+    if (
+        not cosign.is_file()
+        or not isinstance(tool, dict)
+        or _sha256(cosign) != tool.get("sha256")
+    ):
+        raise EvidenceError("cosign verifier does not match the pinned tool digest")
+
+
+def _sigstore_paths(repo: Path, policy: Mapping[str, Any]) -> tuple[Path, Path]:
+    config = policy.get("sigstore", {})
+    if not isinstance(config, dict):
+        raise EvidenceError("Sigstore policy is malformed")
+    signing_config = repo / str(config.get("signing_config", ""))
+    trusted_root = repo / str(config.get("trusted_root", ""))
+    if (
+        not signing_config.is_file()
+        or _sha256(signing_config) != config.get("signing_config_sha256")
+        or not trusted_root.is_file()
+        or _sha256(trusted_root) != config.get("trusted_root_sha256")
+    ):
+        raise EvidenceError("Sigstore trust configuration digest drift detected")
+    signing = _load_json(signing_config)
+    trust = _load_json(trusted_root)
+    if (
+        not isinstance(signing, dict)
+        or signing.get("rekorTlogConfig") != {}
+        or not signing.get("tsaUrls")
+        or not isinstance(trust, dict)
+        or trust.get("tlogs")
+        or not trust.get("certificateAuthorities")
+        or not trust.get("ctlogs")
+        or not trust.get("timestampAuthorities")
+    ):
+        raise EvidenceError("Sigstore policy must use Fulcio, CT, and TSA without Rekor")
+    return signing_config, trusted_root
+
+
+def _verify_sigstore_bundle(
+    *,
+    cosign: Path,
+    bundle: Path,
+    digest: str,
+    predicate_type: str,
+    policy: Mapping[str, Any],
+    source_sha: str,
+    trusted_root: Path,
+) -> None:
+    command = [
+        str(cosign),
+        "verify-blob-attestation",
+        "--bundle",
+        str(bundle),
+        "--digest",
+        digest.removeprefix("sha256:"),
+        "--digestAlg",
+        "sha256",
+        "--type",
+        predicate_type,
+        "--trusted-root",
+        str(trusted_root),
+        "--use-signed-timestamps",
+        "--insecure-ignore-tlog",
+        "--certificate-identity",
+        f"https://github.com/{policy['workflow_ref']}",
+        "--certificate-oidc-issuer",
+        GITHUB_OIDC_ISSUER,
+        "--certificate-github-workflow-repository",
+        str(policy["repository"]),
+        "--certificate-github-workflow-ref",
+        GITHUB_MAIN_REF,
+        "--certificate-github-workflow-sha",
+        source_sha,
+        "--certificate-github-workflow-trigger",
+        GITHUB_WORKFLOW_TRIGGER,
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise EvidenceError(
+            f"cryptographic Sigstore verification failed: {bundle.name}"
+        ) from error
+
+
 def _attestation_payload(path: Path) -> dict[str, Any]:
     bundle = _load_json(path)
     if not isinstance(bundle, dict):
@@ -496,38 +645,70 @@ def _attestation_subjects(payload: Mapping[str, Any]) -> set[tuple[str, str]]:
     return subjects
 
 
-def _validate_attestations(output: Path, images: Mapping[str, str]) -> dict[str, str]:
-    expected = {
-        (reference.rsplit("@", maxsplit=1)[0], reference.rsplit("@", maxsplit=1)[1])
-        for reference in images.values()
-    }
+def _validate_attestations(
+    *,
+    output: Path,
+    images: Mapping[str, str],
+    policy: Mapping[str, Any],
+    source_sha: str,
+    cosign: Path,
+    trusted_root: Path,
+) -> dict[str, str]:
     attestation_paths: dict[str, str] = {}
-    provenance_path = output / "attestations/image-provenance.sigstore.json"
-    provenance = _attestation_payload(provenance_path)
-    if provenance.get("predicateType") != "https://slsa.dev/provenance/v1":
-        raise EvidenceError("image provenance has the wrong predicate type")
-    if _attestation_subjects(provenance) != expected:
-        raise EvidenceError(
-            "image provenance subjects do not match the five published images"
-        )
-    attestation_paths["image-provenance"] = str(provenance_path.relative_to(output))
+    provenance_predicate = _load_json(output / "provenance.predicate.json")
+    if not isinstance(provenance_predicate, dict):
+        raise EvidenceError("release provenance predicate is malformed")
     for name, reference in images.items():
-        path = output / f"attestations/{name}.sbom.sigstore.json"
-        payload = _attestation_payload(path)
-        if payload.get("predicateType") not in {
-            "https://spdx.dev/Document",
-            "https://spdx.dev/Document/v2.3",
-        }:
+        image_name, digest = reference.rsplit("@", maxsplit=1)
+        subject = {(image_name, digest)}
+        sbom_path = output / f"attestations/{name}.sbom.sigstore.json"
+        _verify_sigstore_bundle(
+            cosign=cosign,
+            bundle=sbom_path,
+            digest=digest,
+            predicate_type="spdxjson",
+            policy=policy,
+            source_sha=source_sha,
+            trusted_root=trusted_root,
+        )
+        sbom_payload = _attestation_payload(sbom_path)
+        if sbom_payload.get("predicateType") != "https://spdx.dev/Document":
             raise EvidenceError(
                 f"SBOM attestation has the wrong predicate type: {name}"
             )
-        subject = (
-            reference.rsplit("@", maxsplit=1)[0],
-            reference.rsplit("@", maxsplit=1)[1],
-        )
-        if subject not in _attestation_subjects(payload):
+        if _attestation_subjects(sbom_payload) != subject:
             raise EvidenceError(f"SBOM attestation does not bind image: {name}")
-        attestation_paths[f"{name}-sbom"] = str(path.relative_to(output))
+        local_sbom = _load_json(output / f"sboms/image-{name}.spdx.json")
+        if sbom_payload.get("predicate") != local_sbom:
+            raise EvidenceError(
+                f"SBOM attestation does not bind the retained SPDX document: {name}"
+            )
+        attestation_paths[f"{name}-sbom"] = str(sbom_path.relative_to(output))
+
+        provenance_path = output / f"attestations/{name}.provenance.sigstore.json"
+        _verify_sigstore_bundle(
+            cosign=cosign,
+            bundle=provenance_path,
+            digest=digest,
+            predicate_type="slsaprovenance1",
+            policy=policy,
+            source_sha=source_sha,
+            trusted_root=trusted_root,
+        )
+        provenance_payload = _attestation_payload(provenance_path)
+        if provenance_payload.get("predicateType") != "https://slsa.dev/provenance/v1":
+            raise EvidenceError(
+                f"image provenance has the wrong predicate type: {name}"
+            )
+        if _attestation_subjects(provenance_payload) != subject:
+            raise EvidenceError(f"provenance attestation does not bind image: {name}")
+        if provenance_payload.get("predicate") != provenance_predicate:
+            raise EvidenceError(
+                f"provenance attestation does not bind release inputs: {name}"
+            )
+        attestation_paths[f"{name}-provenance"] = str(
+            provenance_path.relative_to(output)
+        )
     return dict(sorted(attestation_paths.items()))
 
 
@@ -541,8 +722,11 @@ def finalize(
     source_sha: str,
     builder_id: str,
     invocation_id: str,
+    cosign: Path,
 ) -> None:
     policy = _policy(repo)
+    _validate_cosign_binary(cosign, policy)
+    _, trusted_root = _sigstore_paths(repo, policy)
     inputs = _load_json(output / "inputs.json")
     if not isinstance(inputs, dict) or inputs.get("source_sha") != source_sha:
         raise EvidenceError("release input revision is missing or stale")
@@ -552,14 +736,17 @@ def finalize(
     images = _parse_images(
         [f"{name}={value}" for name, value in images.items()], policy
     )
-    expected_builder = f"https://github.com/{policy['workflow_ref']}"
-    if builder_id != expected_builder:
-        raise EvidenceError(
-            "builder identity is outside the pinned publication workflow"
-        )
-    expected_invocation = f"https://github.com/{policy['repository']}/actions/runs/"
-    if not invocation_id.startswith(expected_invocation):
-        raise EvidenceError("invocation identity is outside the repository")
+    expected_provenance_predicate = _provenance_predicate(
+        repo=repo,
+        policy=policy,
+        source_sha=source_sha,
+        builder_id=builder_id,
+        invocation_id=invocation_id,
+    )
+    if _load_json(output / "provenance.predicate.json") != (
+        expected_provenance_predicate
+    ):
+        raise EvidenceError("release provenance predicate drift detected")
 
     expected_sboms = _source_packages(repo, policy)
     subjects: dict[str, dict[str, Any]] = {}
@@ -588,7 +775,14 @@ def finalize(
             "sbom": _file_record(output, sbom),
             "vulnerability_and_secret_scan": _file_record(output, scan),
         }
-    attestations = _validate_attestations(output, images)
+    attestations = _validate_attestations(
+        output=output,
+        images=images,
+        policy=policy,
+        source_sha=source_sha,
+        cosign=cosign,
+        trusted_root=trusted_root,
+    )
     materials = [
         {
             "path": str(path.relative_to(repo)),
@@ -613,6 +807,7 @@ def finalize(
         },
         "materials": materials,
         "tooling": {
+            "cosign": policy["tools"]["cosign"],
             "trivy": {
                 **policy["tools"]["trivy"],
                 "database": _file_record(output, db_metadata),
@@ -632,28 +827,16 @@ def finalize(
                 for name, record in sorted(subjects.items())
             ],
             "predicateType": "https://slsa.dev/provenance/v1",
-            "predicate": {
-                "buildDefinition": {
-                    "buildType": "https://github.com/actions/workflow",
-                    "externalParameters": {"sourceRevision": source_sha},
-                    "internalParameters": {},
-                    "resolvedDependencies": [
-                        {"uri": item["path"], "digest": {"sha256": item["sha256"]}}
-                        for item in materials
-                    ],
-                },
-                "runDetails": {
-                    "builder": {"id": builder_id},
-                    "metadata": {"invocationId": invocation_id},
-                },
-            },
+            "predicate": expected_provenance_predicate,
         },
     )
-    verify(repo, output, source_sha)
+    verify(repo, output, source_sha, cosign)
 
 
-def verify(repo: Path, output: Path, source_sha: str) -> None:
+def verify(repo: Path, output: Path, source_sha: str, cosign: Path) -> None:
     policy = _policy(repo)
+    _validate_cosign_binary(cosign, policy)
+    _, trusted_root = _sigstore_paths(repo, policy)
     if _git(repo, "rev-parse", "HEAD") != source_sha:
         raise EvidenceError("verification source revision does not match HEAD")
     manifest = _load_json(output / "manifest.json")
@@ -670,14 +853,22 @@ def verify(repo: Path, output: Path, source_sha: str) -> None:
     }:
         raise EvidenceError("release manifest source revision is stale")
     builder = manifest.get("builder", {})
-    if builder.get("id") != f"https://github.com/{policy['workflow_ref']}":
-        raise EvidenceError("release manifest builder identity is invalid")
-    invocation_pattern = re.compile(
-        rf"https://github\.com/{re.escape(policy['repository'])}/actions/runs/"
-        r"[1-9][0-9]*/attempts/[1-9][0-9]*"
+    _validate_builder_identity(
+        policy,
+        str(builder.get("id", "")),
+        str(builder.get("invocation_id", "")),
     )
-    if invocation_pattern.fullmatch(str(builder.get("invocation_id", ""))) is None:
-        raise EvidenceError("release manifest invocation identity is invalid")
+    expected_provenance_predicate = _provenance_predicate(
+        repo=repo,
+        policy=policy,
+        source_sha=source_sha,
+        builder_id=str(builder["id"]),
+        invocation_id=str(builder["invocation_id"]),
+    )
+    if _load_json(output / "provenance.predicate.json") != (
+        expected_provenance_predicate
+    ):
+        raise EvidenceError("release provenance predicate drift detected")
     if manifest.get("policy", {}).get("sha256") != _sha256(repo / POLICY_PATH):
         raise EvidenceError("release evidence policy digest drifted")
     expected_materials = {
@@ -730,7 +921,14 @@ def verify(repo: Path, output: Path, source_sha: str) -> None:
             output / f"scans/image-{name}.trivy.json",
             set(policy["critical_severities"]),
         )
-    if manifest.get("attestations") != _validate_attestations(output, images):
+    if manifest.get("attestations") != _validate_attestations(
+        output=output,
+        images=images,
+        policy=policy,
+        source_sha=source_sha,
+        cosign=cosign,
+        trusted_root=trusted_root,
+    ):
         raise EvidenceError("release attestation inventory drift detected")
     for record in subjects.values():
         for evidence_name in ("sbom", "vulnerability_and_secret_scan"):
@@ -748,20 +946,15 @@ def verify(repo: Path, output: Path, source_sha: str) -> None:
         raise EvidenceError("release scanner database evidence drift detected")
     if not isinstance(_load_json(database_path), dict):
         raise EvidenceError("release scanner database metadata is malformed")
+    if manifest.get("tooling", {}).get("cosign") != policy["tools"]["cosign"]:
+        raise EvidenceError("release attestation verifier identity drift detected")
     provenance = _load_json(output / "provenance.intoto.jsonl")
     if not isinstance(provenance, dict) or provenance.get("predicateType") != (
         "https://slsa.dev/provenance/v1"
     ):
         raise EvidenceError("local provenance statement is missing")
-    provenance_materials = {
-        item.get("uri"): item.get("digest", {}).get("sha256")
-        for item in provenance.get("predicate", {})
-        .get("buildDefinition", {})
-        .get("resolvedDependencies", [])
-        if isinstance(item, dict)
-    }
-    if provenance_materials != expected_materials:
-        raise EvidenceError("local provenance material drift detected")
+    if provenance.get("predicate") != expected_provenance_predicate:
+        raise EvidenceError("local provenance statement drift detected")
     _write_json(
         output / "VERIFIED.json",
         {
@@ -782,16 +975,20 @@ def _parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--output", type=Path, required=True)
     prepare_parser.add_argument("--source-sha", required=True)
     prepare_parser.add_argument("--image", action="append", default=[])
+    prepare_parser.add_argument("--builder-id", required=True)
+    prepare_parser.add_argument("--invocation-id", required=True)
     finalize_parser = subparsers.add_parser("finalize")
     finalize_parser.add_argument("--repo", type=Path, required=True)
     finalize_parser.add_argument("--output", type=Path, required=True)
     finalize_parser.add_argument("--source-sha", required=True)
     finalize_parser.add_argument("--builder-id", required=True)
     finalize_parser.add_argument("--invocation-id", required=True)
+    finalize_parser.add_argument("--cosign", type=Path, required=True)
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--repo", type=Path, required=True)
     verify_parser.add_argument("--output", type=Path, required=True)
     verify_parser.add_argument("--source-sha", required=True)
+    verify_parser.add_argument("--cosign", type=Path, required=True)
     return parser
 
 
@@ -801,11 +998,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = args.output.resolve()
     try:
         if args.command == "prepare":
-            prepare(repo, output, args.source_sha, args.image)
+            prepare(
+                repo,
+                output,
+                args.source_sha,
+                args.image,
+                args.builder_id,
+                args.invocation_id,
+            )
         elif args.command == "finalize":
-            finalize(repo, output, args.source_sha, args.builder_id, args.invocation_id)
+            finalize(
+                repo,
+                output,
+                args.source_sha,
+                args.builder_id,
+                args.invocation_id,
+                args.cosign.resolve(),
+            )
         else:
-            verify(repo, output, args.source_sha)
+            verify(repo, output, args.source_sha, args.cosign.resolve())
     except (EvidenceError, KeyError, OSError, subprocess.CalledProcessError) as error:
         print(f"release evidence verification failed: {error}")
         return 1

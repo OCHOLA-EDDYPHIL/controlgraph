@@ -16,7 +16,6 @@ jobs:
     timeout-minutes: 30
     environment: controlgraph-image-builder
     permissions:
-      attestations: write
       contents: read
       id-token: write
     outputs:
@@ -174,7 +173,7 @@ jobs:
         shell: bash
         run: docker logout "${CONTROLGRAPH_REGION}-docker.pkg.dev" >/dev/null
 
-      - name: Install the pinned evidence scanner
+      - name: Install pinned evidence tools
         shell: bash
         run: |
           set -euo pipefail
@@ -187,13 +186,14 @@ jobs:
           from pathlib import Path
 
           policy = json.loads(Path(".github/release-evidence-policy.json").read_text())
-          trivy = policy["tools"]["trivy"]
-          print(trivy["version"])
-          print(trivy["archive"])
-          print(trivy["sha256"])
+          for name, asset_key in (("trivy", "archive"), ("cosign", "asset")):
+              tool = policy["tools"][name]
+              print(tool["version"])
+              print(tool[asset_key])
+              print(tool["sha256"])
           PY
           )
-          [[ "${#tool[@]}" -eq 3 ]]
+          [[ "${#tool[@]}" -eq 6 ]]
           archive="${tools_dir}/${tool[1]}"
           curl \
             --fail \
@@ -207,7 +207,22 @@ jobs:
           printf '%s  %s\n' "${tool[2]}" "$archive" | sha256sum --check --strict
           tar --extract --gzip --file "$archive" --directory "$tools_dir" trivy
           [[ "$("${tools_dir}/trivy" --version | head -1)" == "Version: ${tool[0]}" ]]
+          cosign="${tools_dir}/${tool[4]}"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --retry 2 \
+            --show-error \
+            --silent \
+            --output "$cosign" \
+            "https://github.com/sigstore/cosign/releases/download/v${tool[3]}/${tool[4]}"
+          printf '%s  %s\n' "${tool[5]}" "$cosign" | sha256sum --check --strict
+          chmod 0700 "$cosign"
+          "$cosign" version --json \
+            | python3 -c 'import json, sys; raise SystemExit(json.load(sys.stdin)["gitVersion"] != f"v{sys.argv[1]}")' "${tool[3]}"
           {
+            printf 'CONTROLGRAPH_COSIGN=%s\n' "$cosign"
             printf 'CONTROLGRAPH_TRIVY=%s\n' "${tools_dir}/trivy"
             printf 'CONTROLGRAPH_TRIVY_CACHE=%s\n' "$cache_dir"
             printf 'CONTROLGRAPH_RELEASE_EVIDENCE=%s\n' "${evidence_parent}/release-evidence"
@@ -227,6 +242,8 @@ jobs:
             --repo "$GITHUB_WORKSPACE" \
             --output "$CONTROLGRAPH_RELEASE_EVIDENCE" \
             --source-sha "$GITHUB_SHA" \
+            --builder-id "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --invocation-id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
             --image "controller=${CONTROLLER_IMAGE}" \
             --image "console=${CONSOLE_IMAGE}" \
             --image "advisor=${ADVISOR_IMAGE}" \
@@ -321,84 +338,54 @@ jobs:
                 --password-stdin \
                 "${CONTROLGRAPH_REGION}-docker.pkg.dev"
 
-      - name: Attest controller SBOM
-        id: attest_controller
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
-        with:
-          subject-name: us-central1-docker.pkg.dev/${{ vars.CONTROLGRAPH_PROJECT_ID }}/controlgraph-canary/controller
-          subject-digest: ${{ steps.publish.outputs.controller_digest }}
-          sbom-path: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}/sboms/image-controller.spdx.json
-          push-to-registry: true
+      - name: Publish signed image evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS='=' read -r name reference; do
+            "$CONTROLGRAPH_COSIGN" attest \
+              --yes \
+              --oidc-provider github-actions \
+              --signing-config "$GITHUB_WORKSPACE/.github/sigstore-signing-config.json" \
+              --bundle "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/${name}.sbom.sigstore.json" \
+              --predicate "$CONTROLGRAPH_RELEASE_EVIDENCE/sboms/image-${name}.spdx.json" \
+              --type spdxjson \
+              "$reference"
+            "$CONTROLGRAPH_COSIGN" attest \
+              --yes \
+              --oidc-provider github-actions \
+              --signing-config "$GITHUB_WORKSPACE/.github/sigstore-signing-config.json" \
+              --bundle "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/${name}.provenance.sigstore.json" \
+              --predicate "$CONTROLGRAPH_RELEASE_EVIDENCE/provenance.predicate.json" \
+              --type slsaprovenance1 \
+              "$reference"
+          done < <(
+            python3 - "$CONTROLGRAPH_RELEASE_EVIDENCE/inputs.json" <<'PY'
+          import json
+          import sys
 
-      - name: Attest console SBOM
-        id: attest_console
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
-        with:
-          subject-name: us-central1-docker.pkg.dev/${{ vars.CONTROLGRAPH_PROJECT_ID }}/controlgraph-canary/console
-          subject-digest: ${{ steps.publish.outputs.console_digest }}
-          sbom-path: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}/sboms/image-console.spdx.json
-          push-to-registry: true
-
-      - name: Attest advisor SBOM
-        id: attest_advisor
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
-        with:
-          subject-name: us-central1-docker.pkg.dev/${{ vars.CONTROLGRAPH_PROJECT_ID }}/controlgraph-canary/advisor
-          subject-digest: ${{ steps.publish.outputs.advisor_digest }}
-          sbom-path: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}/sboms/image-advisor.spdx.json
-          push-to-registry: true
-
-      - name: Attest stable reference-target SBOM
-        id: attest_reference_stable
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
-        with:
-          subject-name: us-central1-docker.pkg.dev/${{ vars.CONTROLGRAPH_PROJECT_ID }}/controlgraph-canary/reference-stable
-          subject-digest: ${{ steps.publish.outputs.reference_target_stable_digest }}
-          sbom-path: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}/sboms/image-reference-stable.spdx.json
-          push-to-registry: true
-
-      - name: Attest candidate reference-target SBOM
-        id: attest_reference_candidate
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
-        with:
-          subject-name: us-central1-docker.pkg.dev/${{ vars.CONTROLGRAPH_PROJECT_ID }}/controlgraph-canary/reference-candidate
-          subject-digest: ${{ steps.publish.outputs.reference_target_candidate_digest }}
-          sbom-path: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}/sboms/image-reference-candidate.spdx.json
-          push-to-registry: true
-
-      - name: Attest provenance for all published images
-        id: attest_images
-        uses: actions/attest-build-provenance@46a583fd92dfbf46b772907a9740f888f4324bb9 # v3.1.0
-        with:
-          subject-checksums: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}/image-subjects.sha256
+          inputs = json.load(open(sys.argv[1], encoding="utf-8"))
+          for name, reference in sorted(inputs["images"].items()):
+              print(f"{name}={reference}")
+          PY
+          )
 
       - name: Verify and package release evidence
         shell: bash
-        env:
-          CONTROLLER_ATTESTATION: ${{ steps.attest_controller.outputs.bundle-path }}
-          CONSOLE_ATTESTATION: ${{ steps.attest_console.outputs.bundle-path }}
-          ADVISOR_ATTESTATION: ${{ steps.attest_advisor.outputs.bundle-path }}
-          REFERENCE_STABLE_ATTESTATION: ${{ steps.attest_reference_stable.outputs.bundle-path }}
-          REFERENCE_CANDIDATE_ATTESTATION: ${{ steps.attest_reference_candidate.outputs.bundle-path }}
-          IMAGE_PROVENANCE_ATTESTATION: ${{ steps.attest_images.outputs.bundle-path }}
         run: |
           set -euo pipefail
-          install -m 0600 "$CONTROLLER_ATTESTATION" "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/controller.sbom.sigstore.json"
-          install -m 0600 "$CONSOLE_ATTESTATION" "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/console.sbom.sigstore.json"
-          install -m 0600 "$ADVISOR_ATTESTATION" "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/advisor.sbom.sigstore.json"
-          install -m 0600 "$REFERENCE_STABLE_ATTESTATION" "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/reference-stable.sbom.sigstore.json"
-          install -m 0600 "$REFERENCE_CANDIDATE_ATTESTATION" "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/reference-candidate.sbom.sigstore.json"
-          install -m 0600 "$IMAGE_PROVENANCE_ATTESTATION" "$CONTROLGRAPH_RELEASE_EVIDENCE/attestations/image-provenance.sigstore.json"
           python3 scripts/release_evidence.py finalize \
             --repo "$GITHUB_WORKSPACE" \
             --output "$CONTROLGRAPH_RELEASE_EVIDENCE" \
             --source-sha "$GITHUB_SHA" \
             --builder-id "https://github.com/${GITHUB_WORKFLOW_REF}" \
-            --invocation-id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+            --invocation-id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --cosign "$CONTROLGRAPH_COSIGN"
           python3 scripts/release_evidence.py verify \
             --repo "$GITHUB_WORKSPACE" \
             --output "$CONTROLGRAPH_RELEASE_EVIDENCE" \
-            --source-sha "$GITHUB_SHA"
+            --source-sha "$GITHUB_SHA" \
+            --cosign "$CONTROLGRAPH_COSIGN"
           tar \
             --create \
             --gzip \
@@ -406,11 +393,33 @@ jobs:
             --directory "$(dirname "$CONTROLGRAPH_RELEASE_EVIDENCE")" \
             "$(basename "$CONTROLGRAPH_RELEASE_EVIDENCE")"
 
-      - name: Attest the complete evidence bundle
-        id: attest_evidence
-        uses: actions/attest-build-provenance@46a583fd92dfbf46b772907a9740f888f4324bb9 # v3.1.0
-        with:
-          subject-path: ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}.tar.gz
+      - name: Attest and verify the complete evidence bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${CONTROLGRAPH_RELEASE_EVIDENCE}.tar.gz"
+          bundle="${archive}.sigstore.json"
+          "$CONTROLGRAPH_COSIGN" attest-blob \
+            --yes \
+            --oidc-provider github-actions \
+            --signing-config "$GITHUB_WORKSPACE/.github/sigstore-signing-config.json" \
+            --bundle "$bundle" \
+            --predicate "$CONTROLGRAPH_RELEASE_EVIDENCE/provenance.predicate.json" \
+            --type slsaprovenance1 \
+            "$archive"
+          "$CONTROLGRAPH_COSIGN" verify-blob-attestation \
+            --bundle "$bundle" \
+            --trusted-root "$GITHUB_WORKSPACE/.github/sigstore-trusted-root.json" \
+            --use-signed-timestamps \
+            --insecure-ignore-tlog \
+            --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger "$GITHUB_EVENT_NAME" \
+            --type slsaprovenance1 \
+            "$archive"
 
       - name: Retain private release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -418,7 +427,7 @@ jobs:
           name: controlgraph-release-evidence-${{ github.sha }}
           path: |
             ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}.tar.gz
-            ${{ steps.attest_evidence.outputs.bundle-path }}
+            ${{ env.CONTROLGRAPH_RELEASE_EVIDENCE }}.tar.gz.sigstore.json
           if-no-files-found: error
           retention-days: 30
 

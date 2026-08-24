@@ -167,6 +167,17 @@ record the independently verified recovery evidence before resolving the inciden
    deployed image digests, alert and recovery times, and the verifier result. Public summaries use
    only the redacted timeline projection.
 
+## Release evidence verification
+
+Release attestations use the pinned Sigstore Fulcio and RFC3161 timestamp-authority trust material.
+The signing configuration intentionally excludes Rekor because its public log can disclose private
+SBOM and provenance predicates. Cosign's `--insecure-ignore-tlog` switch is permitted only together
+with the pinned trusted root and `--use-signed-timestamps`; verification still requires the
+signature, certificate and SCT chain, signed timestamp, exact GitHub workflow identity, subject
+digest, and retained predicate content. The resulting limitation is no public transparency-log
+inclusion, so retain the private bundles with the release archive and verify OCI-referrer support in
+the hosted Artifact Registry acceptance run.
+
 ## Rehearsal protocol
 
 Rehearse each critical procedure against the isolated reference target before relying on it. Use a

@@ -125,17 +125,23 @@ def _operational_signals(event: TimelineEventV1) -> tuple[str, ...]:
 
 def _emit_operational_signals(event: TimelineEventV1) -> None:
     signals = _operational_signals(event)
-    for signal in signals:
-        summary = {
-            "epoch": event.epoch,
-            "event": "controlgraph.operational.signal",
-            "event_type": event.event_type.value,
-            "root_sha256": event.root_sha256,
-            "signal": signal,
-        }
-        sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
-    if signals:
-        sys.stderr.flush()
+    try:
+        for signal in signals:
+            summary = {
+                "epoch": event.epoch,
+                "event": "controlgraph.operational.signal",
+                "event_type": event.event_type.value,
+                "root_sha256": event.root_sha256,
+                "signal": signal,
+            }
+            sys.stderr.write(
+                json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+        if signals:
+            sys.stderr.flush()
+    except OSError:
+        # Operational telemetry must never change an already-persisted outcome.
+        return
 
 
 @runtime_checkable
