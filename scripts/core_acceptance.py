@@ -1423,22 +1423,29 @@ def token(audience):
     return value
 
 def one(url, credential, mode, expected_revision, timeout_seconds=5):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": "Bearer " + credential,
-            "User-Agent": "controlgraph-m8-core/1",
-        },
-    )
     code = 0
     body = b""
-    try:
-        with OPENER.open(request, timeout=timeout_seconds) as response:
-            code = response.status
-            body = response.read(4096)
-    except urllib.error.HTTPError as error:
-        code = error.code
-        body = error.read(4096)
+    for attempt in range(3):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": "Bearer " + credential,
+                "User-Agent": "controlgraph-m8-core/1",
+            },
+        )
+        try:
+            with OPENER.open(request, timeout=timeout_seconds) as response:
+                code = response.status
+                body = response.read(4096)
+            break
+        except urllib.error.HTTPError as error:
+            code = error.code
+            body = error.read(4096)
+            break
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            if attempt == 2:
+                raise
+            time.sleep(0.75)
     if mode in {"probe-stable", "healthy"}:
         marker = "controlgraph-stable-v1" if mode == "probe-stable" else "controlgraph-candidate-v1"
         try:

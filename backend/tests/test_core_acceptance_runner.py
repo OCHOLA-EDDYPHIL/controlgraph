@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -7,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1348,3 +1350,54 @@ def test_hosted_candidate_prewarm_fails_closed_when_never_ready(
         assert error.code == "ACCEPTANCE_HOSTED_CANDIDATE_UNREADY"
     else:
         raise AssertionError("unready candidate was unexpectedly accepted")
+
+
+def test_hosted_load_script_retries_transport_failures() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    source = runner._REMOTE_LOAD_SCRIPT
+    namespace: dict[str, Any] = {"__name__": "load-script"}
+    with contextlib.suppress(SystemExit):
+        exec(compile(source, "<load-script>", "exec"), namespace)
+
+    class _FlakyOpener:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def open(self, *_args: Any, **_kwargs: Any):
+            self.calls += 1
+            if self.calls < 3:
+                raise urllib.error.URLError(TimeoutError("cold start"))
+
+            class _Response:
+                status = 200
+
+                def read(self, *_a: Any) -> bytes:
+                    return json.dumps(
+                        {
+                            "marker": "controlgraph-candidate-v1",
+                            "revision": "controlgraph-reference-target-candidate-v4",
+                            "schema_version": "controlgraph.reference-probe/v1",
+                        }
+                    ).encode()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_a: Any) -> None:
+                    return None
+
+            return _Response()
+
+    namespace["time.sleep"] = lambda *_a: None
+    flaky = _FlakyOpener()
+    namespace["OPENER"] = flaky
+
+    code, accepted = namespace["one"](
+        "https://candidate.example/v1/probe",
+        "token",
+        "healthy",
+        "controlgraph-reference-target-candidate-v4",
+    )
+
+    assert flaky.calls == 3
+    assert code == 200 and accepted is True
