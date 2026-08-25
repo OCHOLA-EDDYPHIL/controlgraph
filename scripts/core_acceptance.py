@@ -2049,6 +2049,24 @@ def _evaluate_health(
     raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_AMBIGUOUS")
 
 
+def _prewarm_candidate(*, candidate_url: str, deadline: datetime) -> None:
+    """Ramp the scaled-to-zero candidate until it answers one request."""
+
+    probe_url = f"{candidate_url}/v1/probe"
+    request = urllib.request.Request(probe_url, method="GET")
+    last_error: Exception | None = None
+    while datetime.now(UTC) < deadline - timedelta(seconds=5):
+        try:
+            with urllib.request.urlopen(request, timeout=8):
+                return
+        except urllib.error.HTTPError:
+            return
+        except (OSError, TimeoutError, urllib.error.URLError) as error:
+            last_error = error
+            time.sleep(0.5)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_CANDIDATE_UNREADY") from last_error
+
+
 def _health_load(
     run: _HostedExecution,
     case: CaseBindingV1,
@@ -2094,6 +2112,7 @@ def _health_load(
         derived_anchor = receipt_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
         if derived_anchor != anchor:
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
+        _prewarm_candidate(candidate_url=candidate_url, deadline=anchor)
         loaded = _read_traffic(run, case, "canary-loaded")
         _require_split(loaded, run.spec, stable=90, candidate=10)
         while datetime.now(UTC) < anchor + timedelta(seconds=125):
