@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1302,3 +1303,48 @@ def test_hosted_receipt_poll_tolerates_transient_read_codes(
         assert error.code == "ACCEPTANCE_HOSTED_RECEIPT_INVALID"
     else:
         raise AssertionError("fatal receipt-read code was unexpectedly tolerated")
+
+
+def test_hosted_candidate_prewarm_returns_on_first_answer(
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    calls = {"count": 0}
+
+    class _Response:
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    def answering(*_args: Any, **_kwargs: Any):
+        calls["count"] += 1
+        return _Response()
+
+    monkeypatch.setattr(runner.urllib.request, "urlopen", answering)
+    runner._prewarm_candidate(
+        candidate_url="https://candidate.example",
+        deadline=datetime.now(UTC) + timedelta(seconds=30),
+    )
+    assert calls["count"] == 1
+
+
+def test_hosted_candidate_prewarm_fails_closed_when_never_ready(
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(Path(__file__).parent)
+
+    def timing_out(*_args: Any, **_kwargs: Any):
+        raise TimeoutError("cold start")
+
+    monkeypatch.setattr(runner.urllib.request, "urlopen", timing_out)
+    try:
+        runner._prewarm_candidate(
+            candidate_url="https://candidate.example",
+            deadline=datetime.now(UTC),
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_CANDIDATE_UNREADY"
+    else:
+        raise AssertionError("unready candidate was unexpectedly accepted")
