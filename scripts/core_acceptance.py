@@ -1372,6 +1372,8 @@ def _poll_receipt(
         if status != 0 and payload.get("code") not in {
             "EXECUTION_RECEIPT_NOT_FOUND",
             "EXECUTION_RECEIPT_OUTCOME_UNKNOWN",
+            "RECEIPT_READ_OUTCOME_UNKNOWN",
+            "RECEIPT_READ_AUTH_UNAVAILABLE",
         }:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RECEIPT_INVALID")
         time.sleep(2)
