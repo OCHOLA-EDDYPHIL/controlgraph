@@ -70,7 +70,7 @@ locals {
       display_name = "ControlGraph signing key problem"
       severity     = "CRITICAL"
       owner        = "security-audit"
-      resource     = "cloudkms_cryptokeyversion"
+      resource     = "global"
       runbook      = "key-rotation-or-disablement"
       filter = join(" AND ", [
         "resource.type=\"cloudkms_cryptokeyversion\"",

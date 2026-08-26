@@ -929,6 +929,11 @@ class CloudRunV2ReferenceTargetResetter:
         service = state.service
         stable = state.stable_revision
         candidate = state.candidate_revision
+        previous_baseline = (
+            allow_reset_precursor
+            and self._is_previous_baseline(service.traffic)
+            and self._is_previous_baseline(service.traffic_statuses)
+        )
         if (
             service.target != self.configuration.target
             or stable.revision != REFERENCE_TARGET_STABLE_REVISION
@@ -942,11 +947,18 @@ class CloudRunV2ReferenceTargetResetter:
             or service.generation != service.observed_generation
             or service.template_revision != REFERENCE_TARGET_CANDIDATE_REVISION
             or service.latest_created_revision != REFERENCE_TARGET_CANDIDATE_REVISION
-            or service.latest_ready_revision
-            not in {
-                REFERENCE_TARGET_STABLE_REVISION,
-                REFERENCE_TARGET_CANDIDATE_REVISION,
-            }
+            or (
+                service.latest_ready_revision
+                not in {
+                    REFERENCE_TARGET_STABLE_REVISION,
+                    REFERENCE_TARGET_CANDIDATE_REVISION,
+                }
+                and not (
+                    previous_baseline
+                    and service.latest_ready_revision
+                    == _PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION
+                )
+            )
             or stable.reconciling
             or stable.ready_state is not CloudRunReadyState.READY
             or stable.generation != stable.observed_generation
@@ -966,9 +978,7 @@ class CloudRunV2ReferenceTargetResetter:
                 revision=REFERENCE_TARGET_STABLE_REVISION,
             ):
                 return None
-            if self._is_previous_baseline(
-                service.traffic
-            ) and self._is_previous_baseline(service.traffic_statuses):
+            if previous_baseline:
                 return None
         traffic = self._traffic_pair(service.traffic)
         statuses = self._traffic_pair(service.traffic_statuses)
