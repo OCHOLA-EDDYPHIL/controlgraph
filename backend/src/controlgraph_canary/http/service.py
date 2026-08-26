@@ -248,6 +248,7 @@ from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseFailureCode,
     ServiceClaimReleaseInvocationV1,
     ServiceClaimReleaseRelayResponseV1,
+    StrandedStableClaimReleaseCommandV1,
 )
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_PAGE_COMMAND_V1,
@@ -1192,13 +1193,20 @@ def create_service_app(
                         context,
                     )
                     response_body = canonical_json_bytes(recovery_result)
-                elif type(command) is ServiceClaimReleaseCommandV1:
+                elif type(command) in (
+                    ServiceClaimReleaseCommandV1,
+                    StrandedStableClaimReleaseCommandV1,
+                ):
                     if api_service_claim_release_client is None:
                         raise ServiceClaimReleaseError(
                             ServiceClaimReleaseFailureCode.STORE_UNAVAILABLE
                         )
                     release_result = await api_service_claim_release_client.release(
-                        command,
+                        cast(
+                            ServiceClaimReleaseCommandV1
+                            | StrandedStableClaimReleaseCommandV1,
+                            command,
+                        ),
                         context,
                     )
                     response_body = canonical_json_bytes(release_result)
@@ -1408,7 +1416,10 @@ def create_service_app(
                             failure_code=error.code,
                         )
                     else:
-                        if timeline_recorder is not None:
+                        if (
+                            timeline_recorder is not None
+                            and _should_record_service_claim_release(invocation)
+                        ):
                             await timeline_recorder.record_service_claim_release(
                                 release_result
                             )
@@ -2304,6 +2315,14 @@ def protected_paths(role: ServiceRole) -> tuple[str, ...]:
     return (protected_path(role),)
 
 
+def _should_record_service_claim_release(
+    invocation: ServiceClaimReleaseInvocationV1,
+) -> bool:
+    """Admit only terminal receipt-backed releases to the legacy projector."""
+
+    return type(invocation.command) is ServiceClaimReleaseCommandV1
+
+
 def _decode_api_command(
     body: bytes,
 ) -> (
@@ -2311,6 +2330,7 @@ def _decode_api_command(
     | ApplyCanaryCommandV1
     | PromotionCommandV2
     | ServiceClaimReleaseCommandV1
+    | StrandedStableClaimReleaseCommandV1
     | RecoveryAbandonmentCommandV1
     | StableSnapshotCaptureCommandV1
     | ExecutionReceiptReadCommandV1
@@ -2349,6 +2369,11 @@ def _decode_api_command(
             raise
     try:
         return decode_contract(body, ServiceClaimReleaseCommandV1)
+    except ContractError as error:
+        if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
+            raise
+    try:
+        return decode_contract(body, StrandedStableClaimReleaseCommandV1)
     except ContractError as error:
         if error.code is not ContractErrorCode.VERSION_UNSUPPORTED:
             raise

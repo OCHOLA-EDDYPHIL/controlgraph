@@ -35,6 +35,9 @@ from controlgraph_canary.contracts.models import (
     ReceiptOutcome,
     TargetBinding,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    RecoveryApplyReceiptLocatorV1,
+)
 from controlgraph_canary.contracts.root_creation import SignedEvidenceEventV1
 from controlgraph_canary.contracts.storage import (
     ServiceClaimRecord,
@@ -45,6 +48,9 @@ from controlgraph_canary.contracts.storage import (
 
 SERVICE_CLAIM_RELEASE_COMMAND_V1: Final = (
     "controlgraph.service-claim-release-command/v1"
+)
+STRANDED_STABLE_CLAIM_RELEASE_COMMAND_V1: Final = (
+    "controlgraph.stranded-stable-claim-release-command/v1"
 )
 SERVICE_CLAIM_RELEASE_INVOCATION_V1: Final = (
     "controlgraph.service-claim-release-invocation/v1"
@@ -63,6 +69,9 @@ SERVICE_CLAIM_CLASSIFICATION_ATTESTATION_V1: Final = (
 )
 SERVICE_CLAIM_TERMINAL_EVIDENCE_SUBJECT_V1: Final = (
     "controlgraph.service-claim-terminal-evidence-subject/v1"
+)
+STRANDED_STABLE_CLAIM_EVIDENCE_SUBJECT_V1: Final = (
+    "controlgraph.stranded-stable-claim-evidence-subject/v1"
 )
 SERVICE_CLAIM_FENCE_EVIDENCE_SUBJECT_V1: Final = (
     "controlgraph.service-claim-fence-evidence-subject/v1"
@@ -87,6 +96,9 @@ SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1: Final = (
 )
 
 _REQUEST_DIGEST_DOMAIN: Final = b"controlgraph.service-claim-release-request/v1\0"
+_STRANDED_REQUEST_DIGEST_DOMAIN: Final = (
+    b"controlgraph.stranded-stable-claim-release-request/v1\0"
+)
 _CLASSIFICATION_DIGEST_DOMAIN: Final = (
     b"controlgraph.service-claim-classification-request/v1\0"
 )
@@ -149,11 +161,41 @@ class ServiceClaimReleaseCommandV1(StrictContractModel):
         return self
 
 
+class StrandedStableClaimReleaseCommandV1(StrictContractModel):
+    """Explicit break-glass request for one stranded synthetic APPLY claim."""
+
+    schema_version: Literal[
+        "controlgraph.stranded-stable-claim-release-command/v1"
+    ]
+    root_id: Identifier
+    expected_root_sha256: Sha256Digest
+    expected_epoch: PositiveSafeInteger
+    expected_service_claim_sha256: Sha256Digest
+    expected_service_claim_revision: NonNegativeSafeInteger
+    verified_apply_receipt: RecoveryApplyReceiptLocatorV1
+    reason: BoundedText
+    request_id: Identifier
+    idempotency_key: Identifier
+    confirmation: Literal["RELEASE_STRANDED_STABLE_CLAIM"]
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> Self:
+        receipt = self.verified_apply_receipt
+        if (
+            self.root_id != f"cgroot:{self.expected_root_sha256}"
+            or receipt.root_id != self.root_id
+            or receipt.root_sha256 != self.expected_root_sha256
+            or receipt.epoch != self.expected_epoch
+        ):
+            raise ValueError("stranded claim release bindings are invalid")
+        return self
+
+
 class ServiceClaimReleaseInvocationV1(StrictContractModel):
     """A release command plus operator facts authenticated by the API."""
 
     schema_version: Literal["controlgraph.service-claim-release-invocation/v1"]
-    command: ServiceClaimReleaseCommandV1
+    command: ServiceClaimReleaseCommandV1 | StrandedStableClaimReleaseCommandV1
     attempt_id: Identifier
     operator_identity: BoundedText
     operator_subject: GoogleSubject
@@ -265,6 +307,40 @@ class ServiceClaimTerminalEvidenceSubjectV1(StrictContractModel):
     evidence_id: Identifier
     confirmed_by: Literal["controlgraph.coordinator/v1"]
     confirmed_at: UtcSecond
+
+
+class StrandedStableClaimEvidenceSubjectV1(StrictContractModel):
+    """Auditable pre-classification basis for fencing one exact stranded claim."""
+
+    schema_version: Literal[
+        "controlgraph.stranded-stable-claim-evidence-subject/v1"
+    ]
+    target: TargetBinding
+    root_id: Identifier
+    root_sha256: Sha256Digest
+    state: Literal[ServiceClaimTerminalRootState.STRANDED_STABLE]
+    expected_stable_target_configuration_sha256: Sha256Digest
+    expected_service_claim_sha256: Sha256Digest
+    expected_service_claim_revision: NonNegativeSafeInteger
+    verified_apply_receipt: RecoveryApplyReceiptLocatorV1
+    reason: BoundedText
+    confirmation: Literal["RELEASE_STRANDED_STABLE_CLAIM"]
+    classification_pending: Literal[True]
+    evidence_id: Identifier
+    confirmed_by: Literal["controlgraph.coordinator/v1"]
+    confirmed_at: UtcSecond
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> Self:
+        locator = self.verified_apply_receipt
+        if (
+            self.root_id != f"cgroot:{self.root_sha256}"
+            or locator.target != self.target
+            or locator.root_id != self.root_id
+            or locator.root_sha256 != self.root_sha256
+        ):
+            raise ValueError("stranded claim evidence bindings are invalid")
+        return self
 
 
 class ServiceClaimFenceEvidenceSubjectV1(StrictContractModel):
@@ -443,7 +519,10 @@ class ServiceClaimReleaseProgressV1(StrictContractModel):
     terminal_receipt_sha256: Sha256Digest
     terminal_evidence_id: Identifier
     terminal_evidence_sha256: Sha256Digest
-    terminal_subject: ServiceClaimTerminalEvidenceSubjectV1
+    terminal_subject: (
+        ServiceClaimTerminalEvidenceSubjectV1
+        | StrandedStableClaimEvidenceSubjectV1
+    )
     fence_evidence_id: Identifier
     fence_evidence_sha256: Sha256Digest
     fence_subject: ServiceClaimFenceEvidenceSubjectV1
@@ -453,6 +532,21 @@ class ServiceClaimReleaseProgressV1(StrictContractModel):
 
     @model_validator(mode="after")
     def validate_progress(self) -> Self:
+        if type(self.terminal_subject) is ServiceClaimTerminalEvidenceSubjectV1:
+            receipt_binding_is_exact = (
+                self.terminal_subject.receipt_id == self.terminal_receipt_id
+                and self.terminal_subject.receipt_sha256
+                == self.terminal_receipt_sha256
+            )
+        elif type(self.terminal_subject) is StrandedStableClaimEvidenceSubjectV1:
+            receipt_binding_is_exact = (
+                self.terminal_subject.verified_apply_receipt.receipt_id
+                == self.terminal_receipt_id
+                and self.terminal_subject.verified_apply_receipt.receipt_sha256
+                == self.terminal_receipt_sha256
+            )
+        else:
+            receipt_binding_is_exact = False
         if (
             self.root_id != f"cgroot:{self.root_sha256}"
             or self.result_id != f"cgrelease:{self.request_sha256}"
@@ -461,8 +555,7 @@ class ServiceClaimReleaseProgressV1(StrictContractModel):
             or self.terminal_subject.root_id != self.root_id
             or self.terminal_subject.root_sha256 != self.root_sha256
             or self.terminal_subject.target != self.target
-            or self.terminal_subject.receipt_id != self.terminal_receipt_id
-            or self.terminal_subject.receipt_sha256 != self.terminal_receipt_sha256
+            or not receipt_binding_is_exact
             or self.terminal_subject.evidence_id != self.terminal_evidence_id
             or self.fence_subject.root_id != self.root_id
             or self.fence_subject.root_sha256 != self.root_sha256
@@ -589,7 +682,10 @@ class ServiceClaimReleaseFenceCommitV1(StrictContractModel):
 
     replacement_claim: ServiceClaimRecord
     replacement_authority: EpochAuthorityRecord
-    terminal_subject: ServiceClaimTerminalEvidenceSubjectV1
+    terminal_subject: (
+        ServiceClaimTerminalEvidenceSubjectV1
+        | StrandedStableClaimEvidenceSubjectV1
+    )
     terminal_evidence: SignedEvidenceEventV1
     fence_subject: ServiceClaimFenceEvidenceSubjectV1
     fence_evidence: SignedEvidenceEventV1
@@ -619,21 +715,48 @@ def service_claim_release_request_sha256(
     if type(invocation) is not ServiceClaimReleaseInvocationV1:
         raise TypeError("release request hashing requires an exact invocation")
     command = invocation.command
-    value: RestrictedJson = {
-        "confirmation": command.confirmation,
-        "expected_epoch": command.expected_epoch,
-        "expected_root_sha256": command.expected_root_sha256,
-        "idempotency_key": command.idempotency_key,
-        "operator_identity": invocation.operator_identity,
-        "operator_subject": invocation.operator_subject,
-        "request_id": command.request_id,
-        "root_id": command.root_id,
-        "schema_version": "controlgraph.service-claim-release-request/v1",
-        "terminal_receipt_idempotency_key": command.terminal_receipt_idempotency_key,
-    }
-    return hashlib.sha256(
-        _REQUEST_DIGEST_DOMAIN + canonical_json_value_bytes(value)
-    ).hexdigest()
+    if type(command) is ServiceClaimReleaseCommandV1:
+        value: RestrictedJson = {
+            "confirmation": command.confirmation,
+            "expected_epoch": command.expected_epoch,
+            "expected_root_sha256": command.expected_root_sha256,
+            "idempotency_key": command.idempotency_key,
+            "operator_identity": invocation.operator_identity,
+            "operator_subject": invocation.operator_subject,
+            "request_id": command.request_id,
+            "root_id": command.root_id,
+            "schema_version": "controlgraph.service-claim-release-request/v1",
+            "terminal_receipt_idempotency_key": (
+                command.terminal_receipt_idempotency_key
+            ),
+        }
+        domain = _REQUEST_DIGEST_DOMAIN
+    elif type(command) is StrandedStableClaimReleaseCommandV1:
+        value = {
+            "confirmation": command.confirmation,
+            "expected_epoch": command.expected_epoch,
+            "expected_root_sha256": command.expected_root_sha256,
+            "expected_service_claim_revision": (
+                command.expected_service_claim_revision
+            ),
+            "expected_service_claim_sha256": command.expected_service_claim_sha256,
+            "idempotency_key": command.idempotency_key,
+            "operator_identity": invocation.operator_identity,
+            "operator_subject": invocation.operator_subject,
+            "reason": command.reason,
+            "request_id": command.request_id,
+            "root_id": command.root_id,
+            "schema_version": (
+                "controlgraph.stranded-stable-claim-release-request/v1"
+            ),
+            "verified_apply_receipt": command.verified_apply_receipt.model_dump(
+                mode="json"
+            ),
+        }
+        domain = _STRANDED_REQUEST_DIGEST_DOMAIN
+    else:
+        raise TypeError("release request contains an unsupported command")
+    return hashlib.sha256(domain + canonical_json_value_bytes(value)).hexdigest()
 
 
 def service_claim_classification_request_sha256(
@@ -685,6 +808,8 @@ __all__ = [
     "SERVICE_CLAIM_RELEASE_RESULT_V1",
     "SERVICE_CLAIM_TARGET_CLASSIFICATION_EVIDENCE_SUBJECT_V1",
     "SERVICE_CLAIM_TERMINAL_EVIDENCE_SUBJECT_V1",
+    "STRANDED_STABLE_CLAIM_EVIDENCE_SUBJECT_V1",
+    "STRANDED_STABLE_CLAIM_RELEASE_COMMAND_V1",
     "ServiceClaimClassificationAttestationV1",
     "ServiceClaimClassificationRequestV1",
     "ServiceClaimClassificationResultV1",
@@ -703,6 +828,8 @@ __all__ = [
     "ServiceClaimReleaseResultV1",
     "ServiceClaimTargetClassificationEvidenceSubjectV1",
     "ServiceClaimTerminalEvidenceSubjectV1",
+    "StrandedStableClaimEvidenceSubjectV1",
+    "StrandedStableClaimReleaseCommandV1",
     "service_claim_classification_request_sha256",
     "service_claim_release_evidence_id",
     "service_claim_release_request_sha256",

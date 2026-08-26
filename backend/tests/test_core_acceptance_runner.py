@@ -1352,6 +1352,95 @@ def test_hosted_candidate_prewarm_fails_closed_when_never_ready(
         raise AssertionError("unready candidate was unexpectedly accepted")
 
 
+def test_hosted_promotion_uses_five_second_schedule_lead(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    from controlgraph_canary.contracts.promotion_execution import (
+        PROMOTION_HEALTH_CHAIN_LOCATOR_V1,
+        VERIFIED_APPLY_RECEIPT_LOCATOR_V1,
+        PromotionHealthChainLocatorV1,
+        VerifiedApplyReceiptLocatorV1,
+    )
+
+    runner = _hosted_module(tmp_path)
+    fixed_now = datetime(2026, 8, 25, 13, 6, 19, tzinfo=UTC)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            assert tz is UTC
+            return fixed_now
+
+    root_sha256 = "a" * 64
+    root = SimpleNamespace(
+        root_id=f"cgroot:{root_sha256}",
+        root_sha256=root_sha256,
+    )
+    receipt = VerifiedApplyReceiptLocatorV1(
+        schema_version=VERIFIED_APPLY_RECEIPT_LOCATOR_V1,
+        receipt_id="receipt-apply-001",
+        request_id="request-apply-001",
+        idempotency_key="idempotency-apply-001",
+        capability_sha256="b" * 64,
+        mutation_sha256="c" * 64,
+        expected_poststate_sha256="d" * 64,
+        provider_operation="operations/apply-001",
+        receipt_sha256="e" * 64,
+    )
+    health_chain = PromotionHealthChainLocatorV1(
+        schema_version=PROMOTION_HEALTH_CHAIN_LOCATOR_V1,
+        anchor_id="cghealthanchor:healthy-001",
+        anchor_sha256="f" * 64,
+        chain_id=f"cghealthchain:{'1' * 64}",
+        health_chain_sha256="1" * 64,
+        chain_head_sha256="2" * 64,
+        ordered_proof_chain_sha256="3" * 64,
+        terminal_sequence=2,
+    )
+    terminal = SimpleNamespace(
+        terminal_status=SimpleNamespace(value="healthy"),
+        promotion_health_chain=health_chain,
+    )
+    run = SimpleNamespace(
+        repo=SOURCE_ROOT,
+        project_number="123456789",
+        run_inputs_sha256="4" * 64,
+        command_path=lambda _case, _label: tmp_path / "promotion.json",
+    )
+    case = SimpleNamespace(case_id="core-case-02")
+    commands: list[Any] = []
+
+    monkeypatch.setattr(runner, "datetime", _FixedDateTime)
+    monkeypatch.setattr(
+        runner,
+        "_write_command",
+        lambda _path, command: commands.append(command),
+    )
+
+    def run_cli(*_args: Any, **_kwargs: Any) -> tuple[int, dict[str, Any], Any]:
+        dispatch = SimpleNamespace(
+            root_id=root.root_id,
+            epoch=1,
+            health_chain_locator=health_chain,
+            enqueue_disposition="CREATED",
+        )
+        return 0, {}, dispatch
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+
+    runner._promote(
+        run,
+        case,
+        root_result=SimpleNamespace(root=root),
+        apply_receipt=SimpleNamespace(verified_apply_receipt=receipt),
+        terminal=terminal,
+    )
+
+    assert len(commands) == 1
+    assert commands[0].scheduled_at == "2026-08-25T13:06:24Z"
+
+
 def test_hosted_load_script_retries_transport_failures() -> None:
     runner = _hosted_module(Path(__file__).parent)
     source = runner._REMOTE_LOAD_SCRIPT

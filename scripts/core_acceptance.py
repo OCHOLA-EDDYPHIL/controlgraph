@@ -2215,7 +2215,7 @@ def _promote(
         expected_epoch=1,
         request_id=request_id,
         idempotency_key=idempotency_key,
-        scheduled_at=_utc(datetime.now(UTC) + timedelta(seconds=10)),
+        scheduled_at=_utc(datetime.now(UTC) + timedelta(seconds=5)),
         verified_apply_receipt=apply_receipt.verified_apply_receipt,
         health_chain_locator=terminal.promotion_health_chain,
     )
