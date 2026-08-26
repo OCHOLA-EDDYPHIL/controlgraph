@@ -227,7 +227,7 @@ check "operational_alert_set_is_closed" {
       ]) &&
       alltrue([
         for alert in google_monitoring_alert_policy.operational :
-        alert.notification_channels == [google_monitoring_notification_channel.operator_email.name]
+        toset(alert.notification_channels) == toset([google_monitoring_notification_channel.operator_email.name])
       ])
     )
     error_message = "Operational alerts must cover the fixed signal set and notify only the explicit operator channel."

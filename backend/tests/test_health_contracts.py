@@ -37,7 +37,7 @@ from controlgraph_canary.contracts import (
 
 PROJECT = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
-CANDIDATE = f"{SERVICE}-candidate-v7"
+CANDIDATE = f"{SERVICE}-candidate-v8"
 ROOT_ID = "cgroot:" + "1" * 64
 ROOT_SHA256 = "1" * 64
 
