@@ -83,6 +83,7 @@ jobs:
             docker build \
               --pull \
               --platform linux/amd64 \
+              --provenance=false \
               --file "$dockerfile" \
               --target "$target" \
               --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
