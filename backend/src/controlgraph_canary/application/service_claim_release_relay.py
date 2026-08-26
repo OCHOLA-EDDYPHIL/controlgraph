@@ -31,6 +31,7 @@ from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseInvocationV1,
     ServiceClaimReleaseRelayResponseV1,
     ServiceClaimReleaseResultV1,
+    StrandedStableClaimReleaseCommandV1,
     service_claim_release_request_sha256,
 )
 
@@ -75,12 +76,15 @@ class ApiServiceClaimReleaseClient:
 
     async def release(
         self,
-        command: ServiceClaimReleaseCommandV1,
+        command: ServiceClaimReleaseCommandV1 | StrandedStableClaimReleaseCommandV1,
         principal: AuthenticationContext,
     ) -> ServiceClaimReleaseResultV1:
         """Return only an exact coordinator result for this operator request."""
 
-        if type(command) is not ServiceClaimReleaseCommandV1:
+        if type(command) not in (
+            ServiceClaimReleaseCommandV1,
+            StrandedStableClaimReleaseCommandV1,
+        ):
             raise ServiceClaimReleaseError(
                 ServiceClaimReleaseFailureCode.COMMAND_DENIED
             )
