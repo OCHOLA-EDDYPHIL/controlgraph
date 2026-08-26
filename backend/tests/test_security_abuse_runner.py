@@ -40,7 +40,7 @@ CASES = (
     (
         "CAPABILITY_TAMPER",
         "controlgraph:tampered-capability",
-        "PROTECTED_APPLICATION_ROUTE",
+        "SOURCE_RUNTIME_ATTESTATION",
         "APPLICATION",
         "SIGNATURE_DENIED",
         1,
@@ -48,7 +48,7 @@ CASES = (
     (
         "CAPABILITY_REPLAY",
         "controlgraph:cross-request-capability-replay",
-        "PROTECTED_APPLICATION_ROUTE",
+        "SOURCE_RUNTIME_ATTESTATION",
         "APPLICATION",
         "REPLAY_DENIED",
         1,
@@ -64,7 +64,7 @@ CASES = (
     (
         "SCOPE_AMPLIFICATION",
         "controlgraph:widened-capability-scope",
-        "PROTECTED_APPLICATION_ROUTE",
+        "SOURCE_RUNTIME_ATTESTATION",
         "APPLICATION",
         "SCOPE_DENIED",
         1,
@@ -120,7 +120,7 @@ CASES = (
     (
         "MODEL_TOOL_MUTATION",
         "adk:unregistered-mutation-tool",
-        "ADK_TOOL_REGISTRY",
+        "SOURCE_RUNTIME_ATTESTATION",
         "APPLICATION",
         "TOOL_DENIED",
         1,
@@ -140,7 +140,7 @@ REASONS = {
     "CROSS_PROJECT_TARGET": "TARGET_BINDING_MISMATCH",
     "CROSS_SERVICE_TARGET": "TARGET_BINDING_MISMATCH",
     "CAPABILITY_TAMPER": "SIGNATURE_INVALID",
-    "CAPABILITY_REPLAY": "CLAIM_BINDING_MISMATCH",
+    "CAPABILITY_REPLAY": "CONTRACT_INVALID",
     "STALE_EPOCH": "EPOCH_MISMATCH",
     "SCOPE_AMPLIFICATION": "SCOPE_AMPLIFICATION",
     "RECEIPT_COLLISION": "IDEMPOTENCY_CONFLICT",
@@ -336,6 +336,16 @@ def test_binds_complete_denial_run_without_copying_private_evidence(tmp_path: Pa
     assert manifest["status"] == "PASSED"
     assert manifest["target_unchanged_for_every_case"] is True
     assert [item["kind"] for item in manifest["cases"]] == [item[0] for item in CASES]
+    assert [
+        item["kind"]
+        for item in manifest["cases"]
+        if item["probe_method"] == "SOURCE_RUNTIME_ATTESTATION"
+    ] == [
+        "CAPABILITY_TAMPER",
+        "CAPABILITY_REPLAY",
+        "SCOPE_AMPLIFICATION",
+        "MODEL_TOOL_MUTATION",
+    ]
     encoded = output.read_text(encoding="utf-8")
     assert "relative_path" not in encoded
 
@@ -383,6 +393,38 @@ def test_rejects_caller_selected_operation(tmp_path: Path) -> None:
     assert completed.stderr.strip() == '{"code":"SECURITY_ABUSE_CASE_BINDING_MISMATCH"}'
 
 
+def test_rejects_live_probe_label_for_source_runtime_attestation(tmp_path: Path) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path)
+    _rewrite_case(
+        artifacts,
+        spec_path,
+        spec,
+        3,
+        probe_method="PROTECTED_APPLICATION_ROUTE",
+    )
+
+    completed = _run(repo, artifacts, spec_path, tmp_path / "manifest.json")
+
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == '{"code":"SECURITY_ABUSE_CASE_BINDING_MISMATCH"}'
+
+
+def test_rejects_source_runtime_attestation_for_live_probe(tmp_path: Path) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path)
+    _rewrite_case(
+        artifacts,
+        spec_path,
+        spec,
+        0,
+        probe_method="SOURCE_RUNTIME_ATTESTATION",
+    )
+
+    completed = _run(repo, artifacts, spec_path, tmp_path / "manifest.json")
+
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == '{"code":"SECURITY_ABUSE_CASE_BINDING_MISMATCH"}'
+
+
 def test_reports_failed_run_when_target_changes(tmp_path: Path) -> None:
     repo, artifacts, spec_path, spec = _fixture(tmp_path)
     _rewrite_case(artifacts, spec_path, spec, 3, target_after_sha256="3" * 64)
@@ -395,6 +437,28 @@ def test_reports_failed_run_when_target_changes(tmp_path: Path) -> None:
     assert manifest["status"] == "FAILED"
     assert manifest["target_unchanged_for_every_case"] is False
     assert manifest["cases"][3]["status"] == "FAILED"
+
+
+def test_accepts_authorized_target_change_between_case_windows(tmp_path: Path) -> None:
+    repo, artifacts, spec_path, spec = _fixture(tmp_path)
+    _rewrite_case(
+        artifacts,
+        spec_path,
+        spec,
+        5,
+        target_before_sha256="2" * 64,
+        target_after_sha256="2" * 64,
+    )
+    output = tmp_path / "manifest.json"
+
+    completed = _run(repo, artifacts, spec_path, output)
+
+    assert completed.returncode == 0
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    assert manifest["status"] == "PASSED"
+    assert manifest["target_unchanged_for_every_case"] is True
+    assert manifest["cases"][5]["target_before_sha256"] == "2" * 64
+    assert manifest["cases"][5]["target_after_sha256"] == "2" * 64
 
 
 def test_reports_failed_run_when_denial_reaches_provider_mutation(tmp_path: Path) -> None:
