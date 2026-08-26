@@ -1921,7 +1921,7 @@ async def test_reference_target_reset_migrates_the_retained_v4_baseline_to_v5() 
 
 
 @_async_test
-async def test_reference_target_reset_rewrites_a_stable_only_v3_baseline() -> None:
+async def test_reference_target_reset_rewrites_a_stable_only_current_baseline() -> None:
     before = _service(
         100,
         0,
