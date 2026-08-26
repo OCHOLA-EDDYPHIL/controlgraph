@@ -67,17 +67,16 @@ locals {
       ])
     }
     key_problem = {
-      display_name    = "ControlGraph signing key problem"
-      severity        = "CRITICAL"
-      owner           = "security-audit"
-      resource        = "cloudkms_cryptokeyversion"
-      resource_filter = "(resource.type=\"cloudkms_cryptokey\" OR resource.type=\"cloudkms_cryptokeyversion\")"
-      runbook         = "key-rotation-or-disablement"
+      display_name = "ControlGraph signing key problem"
+      severity     = "CRITICAL"
+      owner        = "security-audit"
+      resource     = "cloudkms_cryptokeyversion"
+      runbook      = "key-rotation-or-disablement"
       filter = join(" AND ", [
-        "(resource.type=\"cloudkms_cryptokey\" OR resource.type=\"cloudkms_cryptokeyversion\")",
+        "resource.type=\"cloudkms_cryptokeyversion\"",
         "resource.labels.key_ring_id=\"controlgraph-signing\"",
         "protoPayload.serviceName=\"cloudkms.googleapis.com\"",
-        "(protoPayload.status.code>0 OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyPrimaryVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion\")",
+        "(protoPayload.status.code>0 OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion\")",
       ])
     }
     verifier_disagreement = {
