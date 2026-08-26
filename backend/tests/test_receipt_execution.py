@@ -573,12 +573,12 @@ def _cloud_run_result(
         outcome=outcome,
         requested_traffic=(
             CloudRunTrafficAllocation(
-                revision="controlgraph-reference-target-stable-v6",
+                revision="controlgraph-reference-target-stable-v7",
                 percent=90,
                 tag="stable",
             ),
             CloudRunTrafficAllocation(
-                revision="controlgraph-reference-target-candidate-v6",
+                revision="controlgraph-reference-target-candidate-v7",
                 percent=10,
                 tag="candidate",
             ),
@@ -1284,12 +1284,12 @@ def test_cloud_run_failed_safe_mapping_is_lossless(
 ) -> None:
     traffic = (
         CloudRunTrafficAllocation(
-            revision="controlgraph-reference-target-stable-v6",
+            revision="controlgraph-reference-target-stable-v7",
             percent=90,
             tag="stable",
         ),
         CloudRunTrafficAllocation(
-            revision="controlgraph-reference-target-candidate-v6",
+            revision="controlgraph-reference-target-candidate-v7",
             percent=10,
             tag="candidate",
         ),
