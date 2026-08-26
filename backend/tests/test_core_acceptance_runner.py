@@ -230,13 +230,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v7",
+        "candidate_revision": "controlgraph-reference-target-candidate-v8",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v7",
+        "stable_revision": "controlgraph-reference-target-stable-v8",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -855,6 +855,115 @@ def test_hosted_cli_decodes_json_arrays_for_strict_tuple_contracts(
     assert model is not None and model.values == ("one", "two")
 
 
+def test_hosted_root_creation_retries_exact_unknown_with_same_command(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    run = SimpleNamespace(repo=tmp_path, project_number="123456789")
+    command_path = tmp_path / "root.json"
+    adopted = SimpleNamespace(outcome="ADOPTED")
+    responses = [
+        (4, {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}, None),
+        (0, {}, adopted),
+    ]
+    invocations: list[dict[str, Any]] = []
+    sleeps: list[int] = []
+
+    def run_cli(**kwargs: Any) -> tuple[int, dict[str, Any], Any]:
+        invocations.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    result = runner._submit_root_creation(run, command_path)
+
+    assert result is adopted
+    assert len(invocations) == 2
+    assert invocations[0]["arguments"] == invocations[1]["arguments"]
+    assert invocations[0]["allowed_statuses"] == frozenset({0, 4})
+    assert invocations[1]["allowed_statuses"] == frozenset({0, 4})
+    assert sleeps == [1]
+
+
+def test_hosted_root_creation_rejects_adoption_without_ambiguity(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "_run_cli",
+        lambda **_kwargs: (0, {}, SimpleNamespace(outcome="ADOPTED")),
+    )
+
+    try:
+        runner._submit_root_creation(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "root.json",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_ROOT_INVALID"
+    else:
+        raise AssertionError("an unambiguous root adoption was unexpectedly accepted")
+
+
+def test_hosted_root_creation_unknown_outcome_retry_is_bounded(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    calls = {"count": 0}
+    sleeps: list[int] = []
+
+    def run_cli(**_kwargs: Any) -> tuple[int, dict[str, str], None]:
+        calls["count"] += 1
+        return 4, {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}, None
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    try:
+        runner._submit_root_creation(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "root.json",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_ROOT_AMBIGUOUS"
+    else:
+        raise AssertionError("three ambiguous root attempts unexpectedly succeeded")
+
+    assert calls["count"] == 3
+    assert sleeps == [1, 1]
+
+
+def test_hosted_root_creation_does_not_retry_other_status_four_payloads(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    calls = {"count": 0}
+
+    def run_cli(**_kwargs: Any) -> tuple[int, dict[str, str], None]:
+        calls["count"] += 1
+        return 4, {"code": "ROOT_CREATION_OUTCOME_UNKNOWN", "detail": "extra"}, None
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+
+    try:
+        runner._submit_root_creation(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "root.json",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_ROOT_INVALID"
+    else:
+        raise AssertionError("a non-exact ambiguity payload was unexpectedly retried")
+
+    assert calls["count"] == 1
+
+
 def test_hosted_binding_uses_the_deployed_evidence_writer_identity(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1352,6 +1461,65 @@ def test_hosted_candidate_prewarm_fails_closed_when_never_ready(
         raise AssertionError("unready candidate was unexpectedly accepted")
 
 
+def test_hosted_health_load_projects_fast_and_slow_receipt_windows() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    load_start = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    raw_load = {
+        "anchor": runner._utc(load_start),
+        "mode": "healthy",
+        "request_count": 360,
+        "schema_version": runner._LOAD_RESULT_SCHEMA,
+        "status": "COMPLETE",
+        "token_persisted": False,
+        "windows": [
+            {
+                "accepted": 120,
+                "started_at": runner._utc(load_start + timedelta(minutes=index)),
+                "submitted": 120,
+                "window_index": index + 1,
+            }
+            for index in range(3)
+        ],
+    }
+
+    cases = (
+        ("2026-08-26T11:59:45Z", load_start, (1, 2)),
+        ("2026-08-26T12:00:15Z", load_start + timedelta(minutes=1), (2, 3)),
+    )
+    for receipt_updated_at, expected_anchor, expected_indices in cases:
+        health_anchor = runner._derive_health_anchor(
+            load_start=load_start,
+            receipt_updated_at=receipt_updated_at,
+        )
+        projected = runner._project_health_load(
+            raw_load,
+            load_start=load_start,
+            health_anchor=health_anchor,
+        )
+
+        assert health_anchor == expected_anchor
+        assert projected["anchor"] == runner._utc(expected_anchor)
+        assert projected["request_count"] == 240
+        assert len(projected["windows"]) == 2
+        assert tuple(window["window_index"] for window in projected["windows"]) == (
+            expected_indices
+        )
+
+
+def test_hosted_health_load_rejects_receipt_outside_overlap() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+
+    try:
+        runner._derive_health_anchor(
+            load_start=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+            receipt_updated_at="2026-08-26T12:01:15Z",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID"
+    else:
+        raise AssertionError("an out-of-range apply receipt was unexpectedly aligned")
+
+
 def test_hosted_promotion_uses_five_second_schedule_lead(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1464,7 +1632,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v7",
+                            "revision": "controlgraph-reference-target-candidate-v8",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -1485,7 +1653,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v7",
+        "controlgraph-reference-target-candidate-v8",
     )
 
     assert flaky.calls == 3

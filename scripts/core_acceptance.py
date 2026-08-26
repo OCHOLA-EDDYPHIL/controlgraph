@@ -1236,6 +1236,38 @@ def _reset_target(run: _HostedExecution, case: CaseBindingV1) -> Any:
     return after
 
 
+def _submit_root_creation(run: _HostedExecution, command_path: Path) -> Any:
+    from controlgraph_canary.contracts.root_creation import RootCreationResultV2
+
+    saw_unknown_outcome = False
+    for attempt in range(3):
+        status, payload, result = _run_cli(
+            repo=run.repo,
+            entry_point="controlgraph-canary",
+            arguments=(
+                "create-rollout-root",
+                "--project-number",
+                run.project_number,
+                "--command-file",
+                str(command_path),
+            ),
+            model_type=RootCreationResultV2,
+            allowed_statuses=frozenset({0, 4}),
+        )
+        if status == 0 and result is not None:
+            if result.outcome == "CREATED" or (
+                saw_unknown_outcome and result.outcome == "ADOPTED"
+            ):
+                return result
+            raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
+        if payload != {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
+        saw_unknown_outcome = True
+        if attempt < 2:
+            time.sleep(1)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_AMBIGUOUS")
+
+
 def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     from controlgraph_canary.contracts.codec import canonical_json_bytes
     from controlgraph_canary.contracts.operator_observability import (
@@ -1244,7 +1276,6 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     from controlgraph_canary.contracts.root_creation import (
         ROOT_CREATION_COMMAND_V1,
         RootCreationCommandV1,
-        RootCreationResultV2,
     )
 
     _, _, snapshot = _run_cli(
@@ -1275,19 +1306,7 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     )
     command_path = run.command_path(case, "root")
     _write_command(command_path, command)
-    _, _, root_result = _run_cli(
-        repo=run.repo,
-        entry_point="controlgraph-canary",
-        arguments=(
-            "create-rollout-root",
-            "--project-number",
-            run.project_number,
-            "--command-file",
-            str(command_path),
-        ),
-        model_type=RootCreationResultV2,
-    )
-    assert root_result is not None
+    root_result = _submit_root_creation(run, command_path)
     root = root_result.root
     plan = root.content.rollout_plan
     policy_bindings = tuple(
@@ -1296,8 +1315,7 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
         if item.policy_schema_version == root.content.health_policy.schema_version
     )
     if (
-        root_result.outcome != "CREATED"
-        or root.content.target.project_id != run.spec.target.project_id
+        root.content.target.project_id != run.spec.target.project_id
         or root.content.target.region != run.spec.target.region
         or root.content.target.environment != run.spec.target.environment
         or root.content.target.service_name != run.spec.target.service_name
@@ -1518,7 +1536,7 @@ def main():
         })
         return 2
     windows = []
-    for index in (0, 1):
+    for index in (0, 1, 2):
         window_start = anchor + index * 60
         while time.time() < window_start + 2:
             time.sleep(min(0.25, window_start + 2 - time.time()))
@@ -1552,10 +1570,7 @@ def main():
             "window_index": index + 1,
         })
     credential = ""
-    ok = len(windows) == 2 and all(
-        item["submitted"] >= 100 and item["accepted"] == item["submitted"]
-        for item in windows
-    )
+    ok = len(windows) == 3 and all(item["submitted"] >= 100 for item in windows)
     emit({
         "anchor": anchor_text,
         "mode": mode,
@@ -2074,6 +2089,53 @@ def _prewarm_candidate(*, candidate_url: str, deadline: datetime) -> None:
     raise AcceptanceError("ACCEPTANCE_HOSTED_CANDIDATE_UNREADY") from last_error
 
 
+def _derive_health_anchor(*, load_start: datetime, receipt_updated_at: str) -> datetime:
+    receipt_time = _parse_utc(receipt_updated_at)
+    health_anchor = receipt_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    if health_anchor not in {load_start, load_start + timedelta(minutes=1)}:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
+    return health_anchor
+
+
+def _project_health_load(
+    load: dict[str, Any],
+    *,
+    load_start: datetime,
+    health_anchor: datetime,
+) -> dict[str, Any]:
+    windows = load.get("windows")
+    if (
+        health_anchor not in {load_start, load_start + timedelta(minutes=1)}
+        or not isinstance(windows, list)
+        or len(windows) != 3
+        or any(
+            not isinstance(window, dict)
+            or type(window.get("submitted")) is not int
+            for window in windows
+        )
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+    bound_windows = cast(list[dict[str, Any]], windows)
+    expected_starts = tuple(
+        _utc(load_start + timedelta(minutes=index)) for index in range(3)
+    )
+    if tuple(
+        window.get("started_at") for window in bound_windows
+    ) != expected_starts:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+    offset = int((health_anchor - load_start).total_seconds() // 60)
+    selected = bound_windows[offset : offset + 2]
+    if len(selected) != 2:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
+    projected = dict(load)
+    projected["anchor"] = _utc(health_anchor)
+    projected["request_count"] = sum(
+        cast(int, window["submitted"]) for window in selected
+    )
+    projected["windows"] = selected
+    return projected
+
+
 def _health_load(
     run: _HostedExecution,
     case: CaseBindingV1,
@@ -2097,56 +2159,70 @@ def _health_load(
     )
     try:
         earliest = datetime.now(UTC) + timedelta(seconds=240)
-        anchor = earliest.replace(second=0, microsecond=0)
-        if anchor < earliest:
-            anchor += timedelta(minutes=1)
-        execution = _execute_job(run, job_name, asynchronous=True, anchor=anchor)
+        planned_anchor = earliest.replace(second=0, microsecond=0)
+        if planned_anchor < earliest:
+            planned_anchor += timedelta(minutes=1)
+        load_start = planned_anchor - timedelta(minutes=1)
+        execution = _execute_job(run, job_name, asynchronous=True, anchor=load_start)
         ready = _load_log_record(run, execution, _LOAD_READY_SCHEMA, attempts=75)
         if (
             ready.get("status") != "READY"
             or ready.get("mode") != mode
-            or ready.get("anchor") != _utc(anchor)
+            or ready.get("anchor") != _utc(load_start)
             or ready.get("token_persisted") is not False
             or _parse_utc(cast(str, ready.get("token_acquired_at")))
-            > anchor - timedelta(seconds=60)
+            > load_start - timedelta(seconds=60)
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
-        apply_at = anchor - timedelta(seconds=59)
+        apply_at = load_start - timedelta(seconds=59)
         while datetime.now(UTC) < apply_at:
             time.sleep(min(5.0, max(0.05, (apply_at - datetime.now(UTC)).total_seconds())))
         dispatch, receipt = _apply_canary(run, case, root_result)
-        receipt_time = _parse_utc(receipt.receipt.updated_at)
-        derived_anchor = receipt_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        if derived_anchor != anchor:
-            raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
-        _prewarm_candidate(candidate_url=candidate_url, deadline=anchor)
+        health_anchor = _derive_health_anchor(
+            load_start=load_start,
+            receipt_updated_at=receipt.receipt.updated_at,
+        )
+        _prewarm_candidate(candidate_url=candidate_url, deadline=health_anchor)
         loaded = _read_traffic(run, case, "canary-loaded")
         _require_split(loaded, run.spec, stable=90, candidate=10)
-        while datetime.now(UTC) < anchor + timedelta(seconds=125):
-            remaining = (anchor + timedelta(seconds=125) - datetime.now(UTC)).total_seconds()
+        load_complete_at = load_start + timedelta(seconds=185)
+        while datetime.now(UTC) < load_complete_at:
+            remaining = (load_complete_at - datetime.now(UTC)).total_seconds()
             time.sleep(min(5.0, max(0.05, remaining)))
         load = _load_log_record(run, execution, _LOAD_RESULT_SCHEMA, attempts=20)
         windows = load.get("windows")
         if (
             load.get("status") != "COMPLETE"
             or load.get("mode") != mode
-            or load.get("anchor") != _utc(anchor)
+            or load.get("anchor") != _utc(load_start)
             or load.get("token_persisted") is not False
             or not isinstance(windows, list)
-            or len(windows) != 2
+            or len(windows) != 3
             or any(
                 not isinstance(window, dict)
                 or type(window.get("submitted")) is not int
                 or cast(int, window["submitted"]) < 100
-                or window.get("accepted") != window.get("submitted")
                 for window in windows
             )
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+        load = _project_health_load(
+            load,
+            load_start=load_start,
+            health_anchor=health_anchor,
+        )
+        if any(
+            type(window.get("accepted")) is not int
+            or window.get("accepted") != window.get("submitted")
+            for window in cast(list[dict[str, Any]], load["windows"])
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     finally:
         _delete_load_job(run, job_name)
-    while datetime.now(UTC) < anchor + timedelta(seconds=250):
-        remaining = (anchor + timedelta(seconds=250) - datetime.now(UTC)).total_seconds()
+    while datetime.now(UTC) < health_anchor + timedelta(seconds=250):
+        remaining = (
+            health_anchor + timedelta(seconds=250) - datetime.now(UTC)
+        ).total_seconds()
         time.sleep(min(5.0, max(0.05, remaining)))
     first_command = _health_command(
         run,

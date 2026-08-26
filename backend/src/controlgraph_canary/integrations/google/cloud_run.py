@@ -66,10 +66,10 @@ _REVISION_ALLOCATION: Final = (
     run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
 )
 _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: Final = (
-    "controlgraph-reference-target-stable-v4"
+    "controlgraph-reference-target-stable-v7"
 )
 _PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: Final = (
-    "controlgraph-reference-target-candidate-v4"
+    "controlgraph-reference-target-candidate-v7"
 )
 _KNOWN_PRECONDITION_FAILURES: Final = (
     api_exceptions.Aborted,

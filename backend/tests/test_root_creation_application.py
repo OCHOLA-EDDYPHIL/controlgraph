@@ -37,8 +37,8 @@ from controlgraph_canary.contracts.root_creation import (
 PROJECT = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v7"
-CANDIDATE = f"{SERVICE}-candidate-v7"
+STABLE = f"{SERVICE}-stable-v8"
+CANDIDATE = f"{SERVICE}-candidate-v8"
 CAPABILITY_KEY = (
     f"projects/{PROJECT}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
