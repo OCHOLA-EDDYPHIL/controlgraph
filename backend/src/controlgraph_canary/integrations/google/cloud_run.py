@@ -66,7 +66,10 @@ _REVISION_ALLOCATION: Final = (
     run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
 )
 _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: Final = (
-    "controlgraph-reference-target-stable-v1"
+    "controlgraph-reference-target-stable-v4"
+)
+_PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: Final = (
+    "controlgraph-reference-target-candidate-v4"
 )
 _KNOWN_PRECONDITION_FAILURES: Final = (
     api_exceptions.Aborted,
@@ -941,7 +944,6 @@ class CloudRunV2ReferenceTargetResetter:
             or service.latest_created_revision != REFERENCE_TARGET_CANDIDATE_REVISION
             or service.latest_ready_revision
             not in {
-                _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION,
                 REFERENCE_TARGET_STABLE_REVISION,
                 REFERENCE_TARGET_CANDIDATE_REVISION,
             }
@@ -955,21 +957,19 @@ class CloudRunV2ReferenceTargetResetter:
             raise ReferenceTargetResetError(
                 ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
             )
-        if allow_reset_precursor and any(
-            self._is_stable_only_baseline(
+        if allow_reset_precursor:
+            if self._is_stable_only_baseline(
                 service.traffic,
-                revision=revision,
-            )
-            and self._is_stable_only_baseline(
+                revision=REFERENCE_TARGET_STABLE_REVISION,
+            ) and self._is_stable_only_baseline(
                 service.traffic_statuses,
-                revision=revision,
-            )
-            for revision in (
-                _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION,
-                REFERENCE_TARGET_STABLE_REVISION,
-            )
-        ):
-            return None
+                revision=REFERENCE_TARGET_STABLE_REVISION,
+            ):
+                return None
+            if self._is_previous_baseline(
+                service.traffic
+            ) and self._is_previous_baseline(service.traffic_statuses):
+                return None
         traffic = self._traffic_pair(service.traffic)
         statuses = self._traffic_pair(service.traffic_statuses)
         if traffic != statuses or traffic not in {(100, 0), (90, 10), (0, 100)}:
@@ -1001,6 +1001,22 @@ class CloudRunV2ReferenceTargetResetter:
             and allocations[0].percent == 100
             and allocations[0].tag == "stable"
         )
+
+    def _is_previous_baseline(
+        self,
+        allocations: Sequence[CloudRunTrafficAllocation | CloudRunTrafficStatus],
+    ) -> bool:
+        if len(allocations) != 2:
+            return False
+        expected = {
+            _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: (100, "stable"),
+            _PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: (0, "candidate"),
+        }
+        observed = {
+            allocation.revision: (allocation.percent, allocation.tag)
+            for allocation in allocations
+        }
+        return observed == expected
 
     def _expected_revision_configuration(
         self,
