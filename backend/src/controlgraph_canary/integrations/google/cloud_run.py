@@ -51,7 +51,9 @@ from controlgraph_canary.contracts.models import CapabilityAction, MutationInten
 from controlgraph_canary.contracts.promotion_execution import PromotionMutationIntentV2
 from controlgraph_canary.contracts.recovery_execution import RecoveryMutationIntentV2
 
-type CloudRunMutationIntent = MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2
+type CloudRunMutationIntent = (
+    MutationIntent | PromotionMutationIntentV2 | RecoveryMutationIntentV2
+)
 
 CLOUD_RUN_REGION: Final = "us-central1"
 CLOUD_RUN_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
@@ -63,8 +65,12 @@ _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,1
 _REVISION_ALLOCATION: Final = (
     run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
 )
-_PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: Final = "controlgraph-reference-target-stable-v4"
-_PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: Final = "controlgraph-reference-target-candidate-v4"
+_PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: Final = (
+    "controlgraph-reference-target-stable-v4"
+)
+_PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: Final = (
+    "controlgraph-reference-target-candidate-v4"
+)
 _KNOWN_PRECONDITION_FAILURES: Final = (
     api_exceptions.Aborted,
     api_exceptions.Conflict,
@@ -303,7 +309,9 @@ class CloudRunV2Adapter:
         configuration: CloudRunTargetConfiguration,
         service_role: ServiceRole,
         configured_project_id: str,
-        mutation_purpose: CloudRunMutationPurpose = (CloudRunMutationPurpose.STANDARD_EXECUTION),
+        mutation_purpose: CloudRunMutationPurpose = (
+            CloudRunMutationPurpose.STANDARD_EXECUTION
+        ),
         services_client_factory: ServicesClientFactory | None = None,
         revisions_client_factory: RevisionsClientFactory | None = None,
     ) -> None:
@@ -559,7 +567,8 @@ class CloudRunV2Adapter:
                 and intent.candidate_percent == 100
                 and intent.concurrency is None
                 and intent.desired_poststate_sha256 == expected_poststate_sha256
-                and intent.authorization.desired_poststate_sha256 == expected_poststate_sha256
+                and intent.authorization.desired_poststate_sha256
+                == expected_poststate_sha256
                 and intent.provider_etag == intent.authorization.provider_etag
             )
         recovery_v2_is_exact = True
@@ -591,9 +600,12 @@ class CloudRunV2Adapter:
                 and intent.concurrency == expected_concurrency
                 and intent.expected_prestate_sha256 == expected_prestate_sha256
                 and intent.desired_poststate_sha256 == desired_poststate_sha256
-                and intent.authorization.expected_prestate_sha256 == expected_prestate_sha256
-                and intent.authorization.desired_poststate_sha256 == desired_poststate_sha256
-                and intent.provider_etag == intent.authorization.current_provider_etag
+                and intent.authorization.expected_prestate_sha256
+                == expected_prestate_sha256
+                and intent.authorization.desired_poststate_sha256
+                == desired_poststate_sha256
+                and intent.provider_etag
+                == intent.authorization.current_provider_etag
             )
         if (
             not exact_intent_type
@@ -785,7 +797,9 @@ class CloudRunV2ReferenceTargetResetter:
             allow_reset_precursor=True,
         )
         if before.service.etag != request.expected_etag:
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.PRECONDITION_FAILED)
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+            )
         if before_traffic == (100, 0):
             confirmed = await self._read_target()
             if (
@@ -793,7 +807,9 @@ class CloudRunV2ReferenceTargetResetter:
                 or confirmed.service.etag != before.service.etag
                 or confirmed.service.generation != before.service.generation
             ):
-                raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.PRECONDITION_FAILED)
+                raise ReferenceTargetResetError(
+                    ReferenceTargetResetErrorCode.PRECONDITION_FAILED
+                )
             return ReferenceTargetResetResult(
                 configuration=self.configuration,
                 request=request,
@@ -811,13 +827,17 @@ class CloudRunV2ReferenceTargetResetter:
         except asyncio.CancelledError:
             raise
         except Exception:
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN) from None
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+            ) from None
         if (
             observed_traffic != (100, 0)
             or observed.service.generation <= before.service.generation
             or observed.service.etag == before.service.etag
         ):
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN)
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
+            )
         outcome = (
             ReferenceTargetResetOutcome.RESET_APPLIED
             if acknowledged
@@ -903,7 +923,9 @@ class CloudRunV2ReferenceTargetResetter:
         allow_reset_precursor: bool = False,
     ) -> tuple[int, int] | None:
         if type(state) is not CloudRunTargetState:
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.TARGET_STATE_DENIED)
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
         service = state.service
         stable = state.stable_revision
         candidate = state.candidate_revision
@@ -932,7 +954,9 @@ class CloudRunV2ReferenceTargetResetter:
             or candidate.ready_state is not CloudRunReadyState.READY
             or candidate.generation != candidate.observed_generation
         ):
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.TARGET_STATE_DENIED)
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
         if allow_reset_precursor:
             if self._is_stable_only_baseline(
                 service.traffic,
@@ -942,14 +966,16 @@ class CloudRunV2ReferenceTargetResetter:
                 revision=REFERENCE_TARGET_STABLE_REVISION,
             ):
                 return None
-            if self._is_previous_baseline(service.traffic) and self._is_previous_baseline(
-                service.traffic_statuses
-            ):
+            if self._is_previous_baseline(
+                service.traffic
+            ) and self._is_previous_baseline(service.traffic_statuses):
                 return None
         traffic = self._traffic_pair(service.traffic)
         statuses = self._traffic_pair(service.traffic_statuses)
         if traffic != statuses or traffic not in {(100, 0), (90, 10), (0, 100)}:
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.TARGET_STATE_DENIED)
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
         if traffic == (100, 0) and (
             len(service.traffic) != 2
             or len(service.traffic_statuses) != 2
@@ -959,7 +985,9 @@ class CloudRunV2ReferenceTargetResetter:
                 len(service.traffic) == 2 and len(service.traffic_statuses) == 2
             ):
                 return None
-            raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.TARGET_STATE_DENIED)
+            raise ReferenceTargetResetError(
+                ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+            )
         return traffic
 
     def _is_stable_only_baseline(
@@ -985,7 +1013,8 @@ class CloudRunV2ReferenceTargetResetter:
             _PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: (0, "candidate"),
         }
         observed = {
-            allocation.revision: (allocation.percent, allocation.tag) for allocation in allocations
+            allocation.revision: (allocation.percent, allocation.tag)
+            for allocation in allocations
         }
         return observed == expected
 
@@ -1054,7 +1083,9 @@ class CloudRunV2ReferenceTargetResetter:
                 allocation.revision not in expected_tags
                 or allocation.tag != expected_tags[allocation.revision]
             ):
-                raise ReferenceTargetResetError(ReferenceTargetResetErrorCode.TARGET_STATE_DENIED)
+                raise ReferenceTargetResetError(
+                    ReferenceTargetResetErrorCode.TARGET_STATE_DENIED
+                )
             observed[allocation.revision] = allocation.percent
         return (
             observed.get(REFERENCE_TARGET_STABLE_REVISION, 0),
@@ -1176,7 +1207,9 @@ class CloudRunV2OperationReadback:
             or target.service_name != CLOUD_RUN_REFERENCE_SERVICE
         ):
             raise ValueError("Cloud Run operation readback target is not configured")
-        if operations_client_factory is not None and not callable(operations_client_factory):
+        if operations_client_factory is not None and not callable(
+            operations_client_factory
+        ):
             raise TypeError("Cloud Run operations client factory must be callable")
         self._target = target
         self._operation_name = re.compile(
@@ -1258,7 +1291,9 @@ class CloudRunV2ReceiptReadback:
         *,
         configuration: CloudRunTargetConfiguration,
         configured_project_id: str,
-        mutation_purpose: CloudRunMutationPurpose = (CloudRunMutationPurpose.STANDARD_EXECUTION),
+        mutation_purpose: CloudRunMutationPurpose = (
+            CloudRunMutationPurpose.STANDARD_EXECUTION
+        ),
         services_client_factory: ReadOnlyServicesClientFactory | None = None,
     ) -> None:
         if type(configuration) is not CloudRunTargetConfiguration:
@@ -1347,7 +1382,9 @@ class CloudRunV2ReceiptReadback:
         ):
             return _closed_readback(service.etag)
 
-        traffic = tuple((item.revision, item.percent, item.tag) for item in service.traffic)
+        traffic = tuple(
+            (item.revision, item.percent, item.tag) for item in service.traffic
+        )
         observed_traffic = tuple(
             (item.revision, item.percent, item.tag) for item in service.traffic_statuses
         )
@@ -1358,11 +1395,13 @@ class CloudRunV2ReceiptReadback:
             stable_percent = 100
             candidate_percent = 0
         else:
-            if traffic != observed_traffic or tuple(
-                (revision, tag) for revision, _, tag in traffic
-            ) != (
-                (configuration.stable_revision, "stable"),
-                (configuration.candidate_revision, "candidate"),
+            if (
+                traffic != observed_traffic
+                or tuple((revision, tag) for revision, _, tag in traffic)
+                != (
+                    (configuration.stable_revision, "stable"),
+                    (configuration.candidate_revision, "candidate"),
+                )
             ):
                 return _closed_readback(service.etag)
             stable_percent = traffic[0][1]
@@ -1721,14 +1760,20 @@ def _decode_revision_configuration(
     if not timeout_seconds.is_integer():
         raise ValueError("Cloud Run revision timeout must use whole seconds")
     execution_environment = {
-        run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN1: (CloudRunExecutionEnvironment.GEN1),
-        run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN2: (CloudRunExecutionEnvironment.GEN2),
+        run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN1: (
+            CloudRunExecutionEnvironment.GEN1
+        ),
+        run_v2.ExecutionEnvironment.EXECUTION_ENVIRONMENT_GEN2: (
+            CloudRunExecutionEnvironment.GEN2
+        ),
     }.get(value.execution_environment)
     if execution_environment is None:
         raise ValueError("Cloud Run revision execution environment is unknown")
     vpc_egress = {
         run_v2.VpcAccess.VpcEgress.ALL_TRAFFIC: CloudRunVpcEgress.ALL_TRAFFIC,
-        run_v2.VpcAccess.VpcEgress.PRIVATE_RANGES_ONLY: (CloudRunVpcEgress.PRIVATE_RANGES_ONLY),
+        run_v2.VpcAccess.VpcEgress.PRIVATE_RANGES_ONLY: (
+            CloudRunVpcEgress.PRIVATE_RANGES_ONLY
+        ),
     }.get(value.vpc_access.egress)
     if vpc_egress is None:
         raise ValueError("Cloud Run revision VPC egress is unknown")

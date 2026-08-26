@@ -120,22 +120,24 @@ def _route_policy(role: ServiceRole) -> RouteAuthenticationPolicy:
         else CallerRole.EXECUTION_TASK_CALLER
     )
     account = (
-        "cg-recovery-task-caller" if role is ServiceRole.RECOVERY else "cg-execution-task-caller"
+        "cg-recovery-task-caller"
+        if role is ServiceRole.RECOVERY
+        else "cg-execution-task-caller"
     )
     return RouteAuthenticationPolicy(
         project_id=PROJECT_ID,
         project_number=PROJECT_NUMBER,
         service_role=role,
         path=protected_path(role),
-        audience=(f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"),
+        audience=(
+            f"https://controlgraph-{role.value}-{PROJECT_NUMBER}.us-central1.run.app"
+        ),
         caller=CallerBinding(
             role=caller_role,
             email=f"{account}@{PROJECT_ID}.iam.gserviceaccount.com",
             subject=SUBJECT,
         ),
     )
-
-
 NOW = datetime(2026, 8, 19, 12, 3, tzinfo=UTC)
 REFERENCE_IMAGE = (
     f"us-central1-docker.pkg.dev/{PROJECT_ID}/controlgraph-images/reference-target"
@@ -154,7 +156,9 @@ RESET_CANDIDATE_SAME_DIGEST = (
     f"@sha256:{'4' * 64}"
 )
 NETWORK_RESOURCE = f"projects/{PROJECT_ID}/global/networks/controlgraph"
-SUBNETWORK_RESOURCE = f"projects/{PROJECT_ID}/regions/us-central1/subnetworks/controlgraph"
+SUBNETWORK_RESOURCE = (
+    f"projects/{PROJECT_ID}/regions/us-central1/subnetworks/controlgraph"
+)
 
 
 def _async_test[**P](
@@ -201,7 +205,9 @@ def _configuration(
         stable_concurrency=stable_concurrency,
         candidate_concurrency=candidate_concurrency,
         network_resource=network_resource
-        or (f"projects/{configured_target.project_id}/global/networks/controlgraph"),
+        or (
+            f"projects/{configured_target.project_id}/global/networks/controlgraph"
+        ),
         subnetwork_resource=subnetwork_resource
         or (
             f"projects/{configured_target.project_id}/regions/{configured_target.region}/"
@@ -410,7 +416,9 @@ def _snapshot(root: RolloutRootV2) -> RootBundle:
         concurrency=root.content.rollout_plan.concurrency,
         service_generation=root.content.stable_snapshot.service_generation,
         provider_etag=root.content.stable_snapshot.provider_etag,
-        baseline_configuration_sha256=(root.content.stable_snapshot.configuration_sha256),
+        baseline_configuration_sha256=(
+            root.content.stable_snapshot.configuration_sha256
+        ),
         stable_revision_configuration_sha256=(
             root.content.rollout_plan.stable_revision_configuration_sha256
         ),
@@ -629,7 +637,9 @@ def _service(
         name=resource_name,
         uid="synthetic-service-uid",
         generation=generation,
-        observed_generation=(generation if observed_generation is None else observed_generation),
+        observed_generation=(
+            generation if observed_generation is None else observed_generation
+        ),
         etag=etag,
         reconciling=False,
         terminal_condition=run_v2.Condition(type_="Ready", state=ready_state),
@@ -645,7 +655,9 @@ def _service(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=stable_revision,
                 percent=(
-                    stable_percent if status_stable_percent is None else status_stable_percent
+                    stable_percent
+                    if status_stable_percent is None
+                    else status_stable_percent
                 ),
                 tag=traffic_tags[0],
             ),
@@ -666,14 +678,18 @@ def _service(
                 revision=stable_revision,
                 percent=stable_percent,
                 tag=status_tags[0],
-                uri=("https://stable.example.test" if status_tags[0] else ""),
+                uri=(
+                    "https://stable.example.test" if status_tags[0] else ""
+                ),
             ),
             run_v2.TrafficTargetStatus(
                 type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
                 revision=candidate_revision,
                 percent=candidate_percent,
                 tag=status_tags[1],
-                uri=("https://candidate.example.test" if status_tags[1] else ""),
+                uri=(
+                    "https://candidate.example.test" if status_tags[1] else ""
+                ),
             ),
         ],
         uri="https://service.example.test",
@@ -936,7 +952,10 @@ async def test_exact_service_and_revision_reads_use_only_fixed_resources() -> No
         target.stable_revision.configuration.execution_environment
         is CloudRunExecutionEnvironment.GEN2
     )
-    assert CLOUD_RUN_REVISION_CONFIGURATION_V1 == "controlgraph.cloud-run-revision-configuration/v1"
+    assert (
+        CLOUD_RUN_REVISION_CONFIGURATION_V1
+        == "controlgraph.cloud-run-revision-configuration/v1"
+    )
     assert CLOUD_RUN_REVISION_CONFIGURATION_DOMAIN == (
         b"controlgraph.cloud-run-revision-configuration-sha256/v1\0"
     )
@@ -971,7 +990,9 @@ async def test_service_read_preserves_a_provider_quoted_etag() -> None:
     ).read_target()
 
     assert state.service.etag == quoted_etag
-    assert state.service.latest_ready_revision == ("controlgraph-reference-target-stable-v1")
+    assert state.service.latest_ready_revision == (
+        "controlgraph-reference-target-stable-v1"
+    )
     assert state.service.latest_created_revision == CANDIDATE
     assert state.stable_revision.service_resource == SERVICE_RESOURCE
     assert state.stable_revision.etag == quoted_etag
@@ -989,12 +1010,16 @@ async def test_verifier_snapshot_reader_has_only_exact_read_operations() -> None
     revision = await reader.read_revision(STABLE)
 
     assert reader.service_role is ServiceRole.VERIFIER
-    assert reader.reader_identity == (f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com")
+    assert reader.reader_identity == (
+        f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
+    )
     assert service.target == _target()
     assert revision.revision == STABLE
     assert services.update_calls == []
     public_callables = {
-        name for name in dir(reader) if not name.startswith("_") and callable(getattr(reader, name))
+        name
+        for name in dir(reader)
+        if not name.startswith("_") and callable(getattr(reader, name))
     }
     assert public_callables == {"read_revision", "read_service", "read_target"}
     assert not hasattr(reader, "mutate")
@@ -1003,7 +1028,9 @@ async def test_verifier_snapshot_reader_has_only_exact_read_operations() -> None
 @_async_test
 async def test_snapshot_reader_gets_the_exact_positive_traffic_revision() -> None:
     traffic_revision = f"{SERVICE}-retained-v0"
-    services = _FakeServicesClient(service=_service(100, 0, stable_revision=traffic_revision))
+    services = _FakeServicesClient(
+        service=_service(100, 0, stable_revision=traffic_revision)
+    )
     revisions = _FakeRevisionsClient()
     resource = f"{SERVICE_RESOURCE}/revisions/{traffic_revision}"
     revisions.responses[resource] = _revision(traffic_revision)
@@ -1295,16 +1322,21 @@ async def test_revision_read_decodes_authoritative_ready_condition(
         ),
         _revision(
             STABLE,
-            service_account=(f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"),
+            service_account=(
+                f"controlgraph-executor@{PROJECT_ID}.iam.gserviceaccount.com"
+            ),
         ),
         _revision(
             STABLE,
-            network_resource=("projects/controlgraph-canary-b2c3d4/global/networks/controlgraph"),
+            network_resource=(
+                "projects/controlgraph-canary-b2c3d4/global/networks/controlgraph"
+            ),
         ),
         _revision(
             STABLE,
             subnetwork_resource=(
-                "projects/controlgraph-canary-b2c3d4/regions/us-central1/subnetworks/controlgraph"
+                "projects/controlgraph-canary-b2c3d4/regions/us-central1/"
+                "subnetworks/controlgraph"
             ),
         ),
     ],
@@ -1344,11 +1376,19 @@ async def test_revision_configuration_digest_excludes_provider_display_metadata(
     second_provider_revision.update_time = datetime(2026, 8, 19, 13, 1, tzinfo=UTC)
     second_provider_revision.log_uri = "https://console.example.test/second"
     second_provider_revision.creator = "second@example.test"
-    first_revisions.responses[f"{SERVICE_RESOURCE}/revisions/{STABLE}"] = first_provider_revision
-    second_revisions.responses[f"{SERVICE_RESOURCE}/revisions/{STABLE}"] = second_provider_revision
+    first_revisions.responses[
+        f"{SERVICE_RESOURCE}/revisions/{STABLE}"
+    ] = first_provider_revision
+    second_revisions.responses[
+        f"{SERVICE_RESOURCE}/revisions/{STABLE}"
+    ] = second_provider_revision
 
-    first = await _adapter(_FakeServicesClient(), revisions=first_revisions).read_revision(STABLE)
-    second = await _adapter(_FakeServicesClient(), revisions=second_revisions).read_revision(STABLE)
+    first = await _adapter(
+        _FakeServicesClient(), revisions=first_revisions
+    ).read_revision(STABLE)
+    second = await _adapter(
+        _FakeServicesClient(), revisions=second_revisions
+    ).read_revision(STABLE)
 
     assert first.configuration == second.configuration
     assert cloud_run_revision_configuration_sha256(first.configuration) == (
@@ -1395,7 +1435,9 @@ async def test_service_read_ignores_display_aliases_and_decodes_not_ready_states
         STABLE: None,
         f"{SERVICE}-new-display-v2": "renamed",
     }
-    assert {allocation.revision: allocation.tag for allocation in state.traffic_statuses} == {
+    assert {
+        allocation.revision: allocation.tag for allocation in state.traffic_statuses
+    } == {
         STABLE: "different",
         f"{SERVICE}-new-display-v2": None,
     }
@@ -1508,7 +1550,9 @@ async def test_known_rejections_are_failed_safe_without_retry(
     with pytest.raises(ValueError, match="failed-safe mutation result"):
         replace(result, operation_name="operations/forbidden")
     expected_reason = {
-        CloudRunMutationReason.PRECONDITION_FAILED: (ReasonCode.PROVIDER_PRECONDITION_FAILED),
+        CloudRunMutationReason.PRECONDITION_FAILED: (
+            ReasonCode.PROVIDER_PRECONDITION_FAILED
+        ),
         CloudRunMutationReason.PROVIDER_REJECTED: ReasonCode.PROVIDER_REQUEST_REJECTED,
     }[reason]
     assert map_cloud_run_mutation_result(result) == ReceiptMutationResult(
@@ -1786,7 +1830,8 @@ def test_reference_target_reset_configuration_is_exact_and_immutable() -> None:
         {"stable_image": "reference-stable:latest"},
         {
             "stable_image": (
-                f"us-central1-docker.pkg.dev/{PROJECT_ID}/other/reference-stable@sha256:{'4' * 64}"
+                f"us-central1-docker.pkg.dev/{PROJECT_ID}/other/reference-stable"
+                f"@sha256:{'4' * 64}"
             )
         },
         {"candidate_image": RESET_STABLE_IMAGE},
@@ -1994,7 +2039,10 @@ async def test_reference_target_reset_rejects_any_other_v4_traffic_shape(
     elif case == "extra-allocation":
         before.traffic.append(
             run_v2.TrafficTarget(
-                type_=(run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION),
+                type_=(
+                    run_v2.TrafficTargetAllocationType
+                    .TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
+                ),
                 revision=CANDIDATE,
                 percent=0,
                 tag="candidate",
