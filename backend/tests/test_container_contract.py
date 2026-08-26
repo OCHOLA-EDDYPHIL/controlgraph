@@ -41,7 +41,7 @@ def test_advisor_image_alone_installs_the_optional_model_runtime() -> None:
     assert "FROM advisor-runtime AS advisor" in dockerfile
     assert dockerfile.count("--extra advisor") == 2
     runtime_section, advisor_section = dockerfile.split(
-        "FROM python:3.12.13-slim-bookworm@sha256:",
+        "FROM python:3.12.13-alpine3.22@sha256:",
         maxsplit=2,
     )[1:]
     assert "--extra advisor" not in runtime_section
