@@ -79,10 +79,10 @@ def _initial_records(
     snapshot = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=target,
-        stable_revision="controlgraph-reference-target-stable-v4",
+        stable_revision="controlgraph-reference-target-stable-v5",
         traffic=(
             TrafficAllocation(
-                revision="controlgraph-reference-target-stable-v4",
+                revision="controlgraph-reference-target-stable-v5",
                 percent=100,
             ),
         ),
@@ -99,7 +99,7 @@ def _initial_records(
         root_id=root_id,
         target=target,
         stable_snapshot=snapshot,
-        candidate_revision="controlgraph-reference-target-candidate-v4",
+        candidate_revision="controlgraph-reference-target-candidate-v5",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
