@@ -2158,7 +2158,7 @@ def _health_load(
         expected_revision=run.spec.target.candidate_revision,
     )
     try:
-        earliest = datetime.now(UTC) + timedelta(seconds=240)
+        earliest = datetime.now(UTC) + timedelta(seconds=300)
         planned_anchor = earliest.replace(second=0, microsecond=0)
         if planned_anchor < earliest:
             planned_anchor += timedelta(minutes=1)

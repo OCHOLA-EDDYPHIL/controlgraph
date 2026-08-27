@@ -1543,6 +1543,19 @@ def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
     assert proof_margin_seconds > RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
 
 
+def test_hosted_health_load_preserves_cold_start_token_margin() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._health_load)
+    submitted_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    token_acquired_at = submitted_at + timedelta(seconds=159)
+    earliest = submitted_at + timedelta(seconds=300)
+    planned_anchor = earliest.replace(second=0, microsecond=0)
+    load_start = planned_anchor - timedelta(minutes=1)
+
+    assert "datetime.now(UTC) + timedelta(seconds=300)" in source
+    assert token_acquired_at <= load_start - timedelta(seconds=60)
+
+
 def test_hosted_promotion_uses_five_second_schedule_lead(
     tmp_path: Path,
     monkeypatch: Any,
