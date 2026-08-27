@@ -101,10 +101,10 @@ def rollout_root(
     snapshot = StableSnapshot(
         schema_version="controlgraph.stable-snapshot/v1",
         target=configured_target,
-        stable_revision="controlgraph-reference-target-stable-v9",
+        stable_revision="controlgraph-reference-target-stable-v10",
         traffic=(
             TrafficAllocation(
-                revision="controlgraph-reference-target-stable-v9",
+                revision="controlgraph-reference-target-stable-v10",
                 percent=100,
             ),
         ),
@@ -123,7 +123,7 @@ def rollout_root(
         root_id=root_id,
         target=configured_target,
         stable_snapshot=snapshot,
-        candidate_revision="controlgraph-reference-target-candidate-v9",
+        candidate_revision="controlgraph-reference-target-candidate-v10",
         stable_percent=90,
         candidate_percent=10,
         health_policy_sha256=ONE_DIGEST,
