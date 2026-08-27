@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -15,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, ConfigDict
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "core_acceptance.py"
@@ -145,6 +147,22 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
 
+def _test_identity_token(*, audience: str, email: str) -> str:
+    now = int(datetime.now(tz=UTC).timestamp())
+    encoded_claims = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "aud": audience,
+                "email": email,
+                "exp": now + 300,
+                "iat": now,
+                "iss": "https://accounts.google.com",
+            }
+        ).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    return f"e30.{encoded_claims}.signature"
+
+
 def _write(path: Path, value: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = _canonical(value)
@@ -231,13 +249,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v11",
+        "candidate_revision": "controlgraph-reference-target-candidate-v12",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v11",
+        "stable_revision": "controlgraph-reference-target-stable-v12",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -854,6 +872,209 @@ def test_hosted_cli_decodes_json_arrays_for_strict_tuple_contracts(
 
     assert decoded == {"values": ["one", "two"]}
     assert model is not None and model.values == ("one", "two")
+
+
+def test_service_account_identity_token_uses_direct_iam_credentials_request(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    audience = "https://controlgraph-api-123456789.us-central1.run.app"
+    service_account = "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
+    expected_token = _test_identity_token(audience=audience, email=service_account)
+    process_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+    request_calls: list[tuple[Any, int]] = []
+
+    def capture_process(
+        argv: tuple[str, ...],
+        **kwargs: Any,
+    ) -> tuple[int, bytes]:
+        process_calls.append((argv, kwargs))
+        return 0, b"opaque-source-credential\n"
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, maximum_bytes: int) -> bytes:
+            assert maximum_bytes == runner.MAX_ARTIFACT_BYTES + 1
+            return json.dumps({"token": expected_token}).encode("utf-8")
+
+    class Opener:
+        def open(self, request: Any, *, timeout: int) -> Response:
+            request_calls.append((request, timeout))
+            return Response()
+
+    monkeypatch.setattr(runner, "_capture_process", capture_process)
+    monkeypatch.setattr(runner, "_HTTP_OPENER", Opener())
+    run = SimpleNamespace(
+        repo=tmp_path,
+        api_origin=audience,
+        acceptance_identity="acceptance@example.invalid",
+        spec=SimpleNamespace(
+            target=SimpleNamespace(project_id="controlgraph-canary-abc123")
+        ),
+    )
+
+    assert runner._identity_token(run, service_account) == expected_token
+
+    assert process_calls == [
+        (
+            ("gcloud", "auth", "print-access-token", "acceptance@example.invalid"),
+            {"repo": tmp_path, "timeout": 60},
+        )
+    ]
+    request, timeout = request_calls[0]
+    assert len(request_calls) == 1
+    assert timeout == 30
+    assert request.full_url == (
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+        "cg-restricted-exporter%40controlgraph-canary-abc123.iam.gserviceaccount.com:"
+        "generateIdToken"
+    )
+    assert request.get_method() == "POST"
+    assert request.data == (
+        b'{"audience":"https://controlgraph-api-123456789.us-central1.run.app",'
+        b'"includeEmail":true}'
+    )
+    assert dict(request.header_items()) == {
+        "Accept": "application/json",
+        "Authorization": "Bearer opaque-source-credential",
+        "Content-type": "application/json",
+        "User-agent": "controlgraph-m8-core/1",
+        "X-goog-user-project": "controlgraph-canary-abc123",
+    }
+    assert "impersonate" not in " ".join(process_calls[0][0]).lower()
+    assert "generateAccessToken" not in request.full_url
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    (
+        (403, b'{"error":{"message":"provider-private-detail"}}'),
+        (200, b"not-json"),
+        (200, b"{}"),
+        (200, b'{"token":""}'),
+    ),
+)
+def test_service_account_identity_token_sanitizes_provider_failures(
+    tmp_path: Path,
+    monkeypatch: Any,
+    status: int,
+    payload: bytes,
+) -> None:
+    runner = _hosted_module(tmp_path)
+
+    class Response:
+        def __init__(self) -> None:
+            self.status = status
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, _maximum_bytes: int) -> bytes:
+            return payload
+
+    monkeypatch.setattr(
+        runner,
+        "_capture_process",
+        lambda *_args, **_kwargs: (0, b"opaque-source-credential\n"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_HTTP_OPENER",
+        SimpleNamespace(open=lambda *_args, **_kwargs: Response()),
+    )
+    run = SimpleNamespace(
+        repo=tmp_path,
+        acceptance_identity="acceptance@example.invalid",
+        spec=SimpleNamespace(
+            target=SimpleNamespace(project_id="controlgraph-canary-abc123")
+        ),
+    )
+
+    with pytest.raises(runner.AcceptanceError) as captured:
+        runner._service_account_identity_token(
+            run,
+            service_account=(
+                "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
+            ),
+            audience="https://controlgraph-api-123456789.us-central1.run.app",
+        )
+
+    assert captured.value.code == "ACCEPTANCE_HOSTED_IDENTITY_INVALID"
+    assert str(captured.value) == "ACCEPTANCE_HOSTED_IDENTITY_INVALID"
+    assert "provider-private-detail" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("token_audience", "token_email"),
+    (
+        ("https://wrong.example.invalid", "restricted@example.invalid"),
+        ("https://api.example.invalid", "wrong@example.invalid"),
+    ),
+)
+def test_service_account_identity_token_requires_exact_claims(
+    tmp_path: Path,
+    monkeypatch: Any,
+    token_audience: str,
+    token_email: str,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    audience = "https://api.example.invalid"
+    service_account = "restricted@example.invalid"
+    token = _test_identity_token(audience=token_audience, email=token_email)
+    monkeypatch.setattr(
+        runner,
+        "_service_account_identity_token",
+        lambda *_args, **_kwargs: token,
+    )
+    run = SimpleNamespace(repo=tmp_path, api_origin=audience)
+
+    with pytest.raises(runner.AcceptanceError) as captured:
+        runner._identity_token(run, service_account)
+
+    assert captured.value.code == "ACCEPTANCE_HOSTED_IDENTITY_INVALID"
+
+
+def test_operator_identity_token_path_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    token = _test_identity_token(
+        audience="https://api.example.invalid",
+        email="acceptance@example.invalid",
+    )
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def capture_process(
+        argv: tuple[str, ...],
+        **kwargs: Any,
+    ) -> tuple[int, bytes]:
+        calls.append((argv, kwargs))
+        return 0, f"{token}\n".encode("ascii")
+
+    class NoHttp:
+        def open(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("operator identity must not call IAM Credentials")
+
+    monkeypatch.setattr(runner, "_capture_process", capture_process)
+    monkeypatch.setattr(runner, "_HTTP_OPENER", NoHttp())
+    run = SimpleNamespace(repo=tmp_path, api_origin="https://api.example.invalid")
+
+    assert runner._identity_token(run) == token
+    assert calls == [
+        (("gcloud", "auth", "print-identity-token"), {"repo": tmp_path, "timeout": 60})
+    ]
 
 
 def test_hosted_root_creation_retries_exact_unknown_with_same_command(
@@ -1668,7 +1889,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v11",
+                            "revision": "controlgraph-reference-target-candidate-v12",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -1689,7 +1910,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v11",
+        "controlgraph-reference-target-candidate-v12",
     )
 
     assert flaky.calls == 3

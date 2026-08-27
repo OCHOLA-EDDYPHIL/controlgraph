@@ -175,9 +175,7 @@ def _stale_artifacts(kind: Any, *, race: bool) -> dict[str, Any]:
                 "stale-receipt.json",
             ),
             "queue-held.json": _artifact(_queue("hold", "PAUSED"), "queue-held.json"),
-            "queue-released.json": _artifact(
-                _queue("release", "RUNNING"), "queue-released.json"
-            ),
+            "queue-released.json": _artifact(_queue("release", "RUNNING"), "queue-released.json"),
         }
     )
     if race:
@@ -191,6 +189,223 @@ def _stale_artifacts(kind: Any, *, race: bool) -> dict[str, Any]:
             "race-attempt.json",
         )
     return artifacts
+
+
+def _coordinator_token_state(tmp_path: Path) -> Any:
+    run = SimpleNamespace(
+        repo=tmp_path,
+        acceptance_identity=IDENTITY,
+        spec=SimpleNamespace(target=SimpleNamespace(project_id=PROJECT)),
+    )
+    return FAULTS._ExecutionState(
+        run=run,
+        evidence_root=tmp_path,
+        cleanup_required=set(),
+    )
+
+
+def _coordinator_policies() -> tuple[dict[str, Any], dict[str, Any]]:
+    before = {
+        "etag": "before",
+    }
+    granted = {
+        "bindings": [
+            {
+                "members": [f"user:{IDENTITY}"],
+                "role": FAULTS._COORDINATOR_OIDC_ROLE,
+            },
+        ],
+        "etag": "granted",
+        "version": 1,
+    }
+    return before, granted
+
+
+def test_coordinator_token_uses_temporary_narrow_oidc_grant(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    audience = "https://controlgraph-verifier-123456789.us-central1.run.app"
+    service_account = f"controlgraph-coordinator@{PROJECT}.iam.gserviceaccount.com"
+    before, granted = _coordinator_policies()
+    policies = iter((before, granted, granted, before))
+    calls: list[tuple[str, Any]] = []
+
+    def gcloud_json(arguments: tuple[str, ...], **kwargs: Any) -> dict[str, Any]:
+        calls.append(("gcloud", (arguments, kwargs)))
+        if "get-iam-policy" in arguments:
+            return next(policies)
+        return granted if "add-iam-policy-binding" in arguments else before
+
+    def identity_token(run: Any, **kwargs: str) -> str:
+        calls.append(("mint", (run, kwargs)))
+        return "test-token"
+
+    monkeypatch.setattr(FAULTS.core, "_gcloud_json", gcloud_json)
+    monkeypatch.setattr(FAULTS.core, "_service_account_identity_token", identity_token)
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_jwt_claims",
+        lambda token: {"aud": audience, "email": service_account},
+    )
+    state = _coordinator_token_state(tmp_path)
+
+    assert FAULTS._coordinator_token(state, audience) == "test-token"
+    assert state.cleanup_required == set()
+    commands = [value[0] for kind, value in calls if kind == "gcloud"]
+    assert commands == [
+        (
+            "iam",
+            "service-accounts",
+            "get-iam-policy",
+            service_account,
+            f"--project={PROJECT}",
+        ),
+        (
+            "iam",
+            "service-accounts",
+            "add-iam-policy-binding",
+            service_account,
+            f"--project={PROJECT}",
+            f"--member=user:{IDENTITY}",
+            f"--role={FAULTS._COORDINATOR_OIDC_ROLE}",
+            "--condition=None",
+            "--quiet",
+        ),
+        (
+            "iam",
+            "service-accounts",
+            "get-iam-policy",
+            service_account,
+            f"--project={PROJECT}",
+        ),
+        (
+            "iam",
+            "service-accounts",
+            "get-iam-policy",
+            service_account,
+            f"--project={PROJECT}",
+        ),
+        (
+            "iam",
+            "service-accounts",
+            "remove-iam-policy-binding",
+            service_account,
+            f"--project={PROJECT}",
+            f"--member=user:{IDENTITY}",
+            f"--role={FAULTS._COORDINATOR_OIDC_ROLE}",
+            "--condition=None",
+            "--quiet",
+        ),
+        (
+            "iam",
+            "service-accounts",
+            "get-iam-policy",
+            service_account,
+            f"--project={PROJECT}",
+        ),
+    ]
+    mint_index = next(index for index, call in enumerate(calls) if call[0] == "mint")
+    remove_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "gcloud" and "remove-iam-policy-binding" in call[1][0]
+    )
+    assert mint_index < remove_index
+    assert calls[mint_index][1] == (
+        state.run,
+        {"service_account": service_account, "audience": audience},
+    )
+    command_text = " ".join(argument for command in commands for argument in command)
+    assert "roles/iam.serviceAccountTokenCreator" not in command_text
+    assert "--impersonate-service-account" not in command_text
+
+
+def test_coordinator_token_cleans_up_grant_when_mint_fails(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    before, granted = _coordinator_policies()
+    policies = iter((before, granted, granted, before))
+    commands: list[tuple[str, ...]] = []
+
+    def gcloud_json(arguments: tuple[str, ...], **_kwargs: Any) -> dict[str, Any]:
+        commands.append(arguments)
+        if "get-iam-policy" in arguments:
+            return next(policies)
+        return granted if "add-iam-policy-binding" in arguments else before
+
+    monkeypatch.setattr(FAULTS.core, "_gcloud_json", gcloud_json)
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_service_account_identity_token",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FAULTS.core.AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID")
+        ),
+    )
+    state = _coordinator_token_state(tmp_path)
+
+    with pytest.raises(
+        FAULTS.FaultAcceptanceError,
+        match="FAULT_VERIFIER_IDENTITY_INVALID",
+    ):
+        FAULTS._coordinator_token(state, "https://verifier.example.invalid")
+
+    assert any("remove-iam-policy-binding" in command for command in commands)
+    assert state.cleanup_required == set()
+
+
+def test_coordinator_token_rejects_preexisting_acceptance_grant(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _before, granted = _coordinator_policies()
+    commands: list[tuple[str, ...]] = []
+
+    def gcloud_json(arguments: tuple[str, ...], **_kwargs: Any) -> dict[str, Any]:
+        commands.append(arguments)
+        return granted
+
+    monkeypatch.setattr(FAULTS.core, "_gcloud_json", gcloud_json)
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_service_account_identity_token",
+        lambda *_args, **_kwargs: pytest.fail("a pre-existing grant must not be used"),
+    )
+    state = _coordinator_token_state(tmp_path)
+
+    with pytest.raises(FAULTS.FaultAcceptanceError, match="FAULT_IAM_EVIDENCE_INVALID"):
+        FAULTS._coordinator_token(state, "https://verifier.example.invalid")
+
+    assert len(commands) == 1
+    assert "get-iam-policy" in commands[0]
+    assert state.cleanup_required == set()
+
+
+def test_coordinator_token_marks_unrestored_grant_for_cleanup(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    before, granted = _coordinator_policies()
+    policies = iter((before, granted, granted, granted))
+
+    def gcloud_json(arguments: tuple[str, ...], **_kwargs: Any) -> dict[str, Any]:
+        if "get-iam-policy" in arguments:
+            return next(policies)
+        return granted
+
+    monkeypatch.setattr(FAULTS.core, "_gcloud_json", gcloud_json)
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_service_account_identity_token",
+        lambda *_args, **_kwargs: "test-token",
+    )
+    state = _coordinator_token_state(tmp_path)
+
+    with pytest.raises(FAULTS.FaultAcceptanceError, match="FAULT_IAM_RESTORE_FAILED"):
+        FAULTS._coordinator_token(state, "https://verifier.example.invalid")
+
+    assert state.cleanup_required == {FAULTS._COORDINATOR_OIDC_CLEANUP}
 
 
 def test_surface_is_exactly_seven_seeded_cases_without_self_attestation_inputs() -> None:
@@ -266,9 +481,7 @@ def test_stale_cases_require_real_denial_and_safe_queue_release() -> None:
         assert result.invariants == (FAULTS.SafetyInvariant.STALE_DENIAL,)
 
     broken = _stale_artifacts(FAULTS.FaultKind.DELAYED_TASK, race=False)
-    broken["queue-released.json"] = _artifact(
-        _queue("release", "PAUSED"), "queue-released.json"
-    )
+    broken["queue-released.json"] = _artifact(_queue("release", "PAUSED"), "queue-released.json")
     with pytest.raises(FAULTS.FaultAcceptanceError, match="FAULT_QUEUE_EVIDENCE_INVALID"):
         FAULTS._evaluate(_context(FAULTS.FaultKind.DELAYED_TASK), broken)
 
@@ -321,9 +534,7 @@ def test_duplicate_delivery_derives_one_root_unique_recovery_intent() -> None:
                     "fixed_head_sequence": 1,
                     "matched_count": 1,
                     "matched_entry_ids": ["timeline-entry"],
-                    "matched_record_sha256s": [
-                        FAULTS.hashlib.sha256(b"{}").hexdigest()
-                    ],
+                    "matched_record_sha256s": [FAULTS.hashlib.sha256(b"{}").hexdigest()],
                     "root_id": intent.root_id,
                     "scanned_entry_count": 1,
                     "schema_version": "controlgraph.recovery-intent-query/v1",
@@ -374,15 +585,11 @@ def test_monitoring_gap_derives_insufficient_evidence(monkeypatch: Any) -> None:
     )
     baseline = _read((90, 10), "2026-08-24T00:00:00Z", target_sha256="7" * 64)
     after = _read((90, 10), "2026-08-24T00:01:00Z", target_sha256="7" * 64)
-    artifacts = _target_artifacts(
-        ("before-target.json", baseline), ("after-target.json", after)
-    )
+    artifacts = _target_artifacts(("before-target.json", baseline), ("after-target.json", after))
     artifacts.update(
         {
             "health-result.json": _artifact(health, "health-result.json"),
-            "signed-health-proof.json": _artifact(
-                signed, "signed-health-proof.json"
-            ),
+            "signed-health-proof.json": _artifact(signed, "signed-health-proof.json"),
         }
     )
 
@@ -439,27 +646,25 @@ def test_api_timeout_derives_ambiguity_and_readback_only_follow_up(monkeypatch: 
         ("after-target.json", _read((100, 0), "2026-08-24T00:02:00Z", target_sha256="d" * 64)),
     )
     artifacts.update(
-            {
-                "promotion-command.json": _artifact(
-                    command, "promotion-command.json"
-                ),
-                "receipt.json": _artifact(observed, "receipt.json"),
-                "completion-bundle.json": _artifact(bundle, "completion-bundle.json"),
-                "classification.json": _artifact(classification, "classification.json"),
-                "client-timeout.json": _artifact(
-                    {
-                        "attempt_count": 1,
-                        "deadline_milliseconds": 1,
-                        "outcome": "TIMEOUT",
-                        "request_id": command.request_id,
-                        "request_sha256": "8" * 64,
-                        "retry_count": 0,
-                        "schema_version": "controlgraph.fault-client-timeout/v1",
-                    },
-                    "client-timeout.json",
-                ),
-            }
-        )
+        {
+            "promotion-command.json": _artifact(command, "promotion-command.json"),
+            "receipt.json": _artifact(observed, "receipt.json"),
+            "completion-bundle.json": _artifact(bundle, "completion-bundle.json"),
+            "classification.json": _artifact(classification, "classification.json"),
+            "client-timeout.json": _artifact(
+                {
+                    "attempt_count": 1,
+                    "deadline_milliseconds": 1,
+                    "outcome": "TIMEOUT",
+                    "request_id": command.request_id,
+                    "request_sha256": "8" * 64,
+                    "retry_count": 0,
+                    "schema_version": "controlgraph.fault-client-timeout/v1",
+                },
+                "client-timeout.json",
+            ),
+        }
+    )
 
     result = FAULTS._evaluate(ctx, artifacts)
 
@@ -493,9 +698,7 @@ def test_drift_and_probe_failures_require_exact_restoration() -> None:
         stable_percent=90,
         candidate_percent=10,
         expected_target_configuration_sha256=before.target_configuration_sha256,
-        expected_stable_revision_configuration_sha256=(
-            before.stable_revision_configuration_sha256
-        ),
+        expected_stable_revision_configuration_sha256=(before.stable_revision_configuration_sha256),
         expected_candidate_revision_configuration_sha256=(
             before.candidate_revision_configuration_sha256
         ),
@@ -521,9 +724,7 @@ def test_drift_and_probe_failures_require_exact_restoration() -> None:
         ("drifted-target.json", drifted),
         ("after-target.json", after),
     )
-    drift_artifacts["verification.json"] = _artifact(
-        drift_verification, "verification.json"
-    )
+    drift_artifacts["verification.json"] = _artifact(drift_verification, "verification.json")
     drift_artifacts["drift-update.json"] = _artifact(
         {
             "candidate_percent": 0,
@@ -602,9 +803,7 @@ def test_drift_and_probe_failures_require_exact_restoration() -> None:
         FAULTS.SafetyInvariant.SAFE_FALLBACK,
     )
 
-    probe_artifacts["iam-after.json"] = _artifact(
-        iam_denied, "iam-after.json"
-    )
+    probe_artifacts["iam-after.json"] = _artifact(iam_denied, "iam-after.json")
     with pytest.raises(FAULTS.FaultAcceptanceError, match="FAULT_PROBE_FAILURE_NOT_PROVEN"):
         FAULTS._evaluate(probe_ctx, probe_artifacts)
 
@@ -660,9 +859,7 @@ def test_execute_produces_all_cases_before_binding(
         monkeypatch.setattr(
             FAULTS,
             name,
-            lambda _state, _scenario, _sequence, selected=kind: calls.append(
-                selected.value
-            ),
+            lambda _state, _scenario, _sequence, selected=kind: calls.append(selected.value),
         )
     monkeypatch.setattr(
         FAULTS,
@@ -683,12 +880,8 @@ def test_execute_produces_all_cases_before_binding(
         output=output,
         project_number="123456789012",
         network_resource=f"projects/{PROJECT}/global/networks/controlgraph",
-        subnetwork_resource=(
-            f"projects/{PROJECT}/regions/us-central1/subnetworks/controlgraph"
-        ),
-        verifier_service_account=(
-            f"controlgraph-verifier@{PROJECT}.iam.gserviceaccount.com"
-        ),
+        subnetwork_resource=(f"projects/{PROJECT}/regions/us-central1/subnetworks/controlgraph"),
+        verifier_service_account=(f"controlgraph-verifier@{PROJECT}.iam.gserviceaccount.com"),
         restricted_exporter_service_account=(
             f"cg-restricted-exporter@{PROJECT}.iam.gserviceaccount.com"
         ),

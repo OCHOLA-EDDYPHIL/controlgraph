@@ -499,8 +499,8 @@ def create_runtime_service_app(
             return CloudRunV2SnapshotReader(
                 configuration=CloudRunTargetConfiguration(
                     target=target,
-                    stable_revision="controlgraph-reference-target-stable-v11",
-                    candidate_revision="controlgraph-reference-target-candidate-v11",
+                    stable_revision="controlgraph-reference-target-stable-v12",
+                    candidate_revision="controlgraph-reference-target-candidate-v12",
                     stable_concurrency=8,
                     candidate_concurrency=8,
                     network_resource=target_network_resource,
@@ -524,8 +524,8 @@ def create_runtime_service_app(
         ) -> CloudRunV2SnapshotReader:
             if (
                 request.target != target
-                or request.stable_revision != "controlgraph-reference-target-stable-v11"
-                or request.candidate_revision != "controlgraph-reference-target-candidate-v11"
+                or request.stable_revision != "controlgraph-reference-target-stable-v12"
+                or request.candidate_revision != "controlgraph-reference-target-candidate-v12"
                 or request.concurrency != 8
             ):
                 raise ValueError("target traffic request is not configured")
@@ -618,8 +618,8 @@ def create_runtime_service_app(
             reader=CloudRunV2SnapshotReader(
                 configuration=CloudRunTargetConfiguration(
                     target=target,
-                    stable_revision="controlgraph-reference-target-stable-v11",
-                    candidate_revision="controlgraph-reference-target-candidate-v11",
+                    stable_revision="controlgraph-reference-target-stable-v12",
+                    candidate_revision="controlgraph-reference-target-candidate-v12",
                     stable_concurrency=8,
                     candidate_concurrency=8,
                     network_resource=target_network_resource,
@@ -680,9 +680,9 @@ def create_runtime_service_app(
             if (
                 request.target != target
                 or request.stable_revision
-                != "controlgraph-reference-target-stable-v11"
+                != "controlgraph-reference-target-stable-v12"
                 or request.candidate_revision
-                != "controlgraph-reference-target-candidate-v11"
+                != "controlgraph-reference-target-candidate-v12"
                 or request.concurrency != 8
             ):
                 raise ValueError("independent verification request is not configured")
@@ -991,8 +991,8 @@ def create_runtime_service_app(
         )
         cloud_run_configuration = CloudRunTargetConfiguration(
             target=target,
-            stable_revision="controlgraph-reference-target-stable-v11",
-            candidate_revision="controlgraph-reference-target-candidate-v11",
+            stable_revision="controlgraph-reference-target-stable-v12",
+            candidate_revision="controlgraph-reference-target-candidate-v12",
             stable_concurrency=8,
             candidate_concurrency=8,
             network_resource=settings.target_network_resource,
@@ -1407,8 +1407,8 @@ def create_runtime_service_app(
             ),
             traffic_client=CoordinatorTargetTrafficClient(
                 target=target,
-                stable_revision="controlgraph-reference-target-stable-v11",
-                candidate_revision="controlgraph-reference-target-candidate-v11",
+                stable_revision="controlgraph-reference-target-stable-v12",
+                candidate_revision="controlgraph-reference-target-candidate-v12",
                 concurrency=8,
                 route=verifier_route,
                 transport=selected_transport,
@@ -1471,7 +1471,7 @@ def create_runtime_service_app(
                 verifier_identity=(
                     f"controlgraph-verifier@{settings.project_id}.iam.gserviceaccount.com"
                 ),
-                candidate_revision="controlgraph-reference-target-candidate-v11",
+                candidate_revision="controlgraph-reference-target-candidate-v12",
                 candidate_revision_configuration_sha256=(
                     settings.candidate_revision_configuration_sha256
                 ),
