@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -14,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, ConfigDict
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "core_acceptance.py"
@@ -144,6 +147,22 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
 
+def _test_identity_token(*, audience: str, email: str) -> str:
+    now = int(datetime.now(tz=UTC).timestamp())
+    encoded_claims = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "aud": audience,
+                "email": email,
+                "exp": now + 300,
+                "iat": now,
+                "iss": "https://accounts.google.com",
+            }
+        ).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    return f"e30.{encoded_claims}.signature"
+
+
 def _write(path: Path, value: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = _canonical(value)
@@ -230,13 +249,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v7",
+        "candidate_revision": "controlgraph-reference-target-candidate-v15",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v7",
+        "stable_revision": "controlgraph-reference-target-stable-v15",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -855,6 +874,318 @@ def test_hosted_cli_decodes_json_arrays_for_strict_tuple_contracts(
     assert model is not None and model.values == ("one", "two")
 
 
+def test_service_account_identity_token_uses_direct_iam_credentials_request(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    audience = "https://controlgraph-api-123456789.us-central1.run.app"
+    service_account = "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
+    expected_token = _test_identity_token(audience=audience, email=service_account)
+    process_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+    request_calls: list[tuple[Any, int]] = []
+
+    def capture_process(
+        argv: tuple[str, ...],
+        **kwargs: Any,
+    ) -> tuple[int, bytes]:
+        process_calls.append((argv, kwargs))
+        return 0, b"opaque-source-credential\n"
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, maximum_bytes: int) -> bytes:
+            assert maximum_bytes == runner.MAX_ARTIFACT_BYTES + 1
+            return json.dumps({"token": expected_token}).encode("utf-8")
+
+    class Opener:
+        def open(self, request: Any, *, timeout: int) -> Response:
+            request_calls.append((request, timeout))
+            return Response()
+
+    monkeypatch.setattr(runner, "_capture_process", capture_process)
+    monkeypatch.setattr(runner, "_HTTP_OPENER", Opener())
+    run = SimpleNamespace(
+        repo=tmp_path,
+        api_origin=audience,
+        acceptance_identity="acceptance@example.invalid",
+        spec=SimpleNamespace(
+            target=SimpleNamespace(project_id="controlgraph-canary-abc123")
+        ),
+    )
+
+    assert runner._identity_token(run, service_account) == expected_token
+
+    assert process_calls == [
+        (
+            ("gcloud", "auth", "print-access-token", "acceptance@example.invalid"),
+            {"repo": tmp_path, "timeout": 60},
+        )
+    ]
+    request, timeout = request_calls[0]
+    assert len(request_calls) == 1
+    assert timeout == 30
+    assert request.full_url == (
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+        "cg-restricted-exporter%40controlgraph-canary-abc123.iam.gserviceaccount.com:"
+        "generateIdToken"
+    )
+    assert request.get_method() == "POST"
+    assert request.data == (
+        b'{"audience":"https://controlgraph-api-123456789.us-central1.run.app",'
+        b'"includeEmail":true}'
+    )
+    assert dict(request.header_items()) == {
+        "Accept": "application/json",
+        "Authorization": "Bearer opaque-source-credential",
+        "Content-type": "application/json",
+        "User-agent": "controlgraph-m8-core/1",
+        "X-goog-user-project": "controlgraph-canary-abc123",
+    }
+    assert "impersonate" not in " ".join(process_calls[0][0]).lower()
+    assert "generateAccessToken" not in request.full_url
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    (
+        (403, b'{"error":{"message":"provider-private-detail"}}'),
+        (200, b"not-json"),
+        (200, b"{}"),
+        (200, b'{"token":""}'),
+    ),
+)
+def test_service_account_identity_token_sanitizes_provider_failures(
+    tmp_path: Path,
+    monkeypatch: Any,
+    status: int,
+    payload: bytes,
+) -> None:
+    runner = _hosted_module(tmp_path)
+
+    class Response:
+        def __init__(self) -> None:
+            self.status = status
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, _maximum_bytes: int) -> bytes:
+            return payload
+
+    monkeypatch.setattr(
+        runner,
+        "_capture_process",
+        lambda *_args, **_kwargs: (0, b"opaque-source-credential\n"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_HTTP_OPENER",
+        SimpleNamespace(open=lambda *_args, **_kwargs: Response()),
+    )
+    run = SimpleNamespace(
+        repo=tmp_path,
+        acceptance_identity="acceptance@example.invalid",
+        spec=SimpleNamespace(
+            target=SimpleNamespace(project_id="controlgraph-canary-abc123")
+        ),
+    )
+
+    with pytest.raises(runner.AcceptanceError) as captured:
+        runner._service_account_identity_token(
+            run,
+            service_account=(
+                "cg-restricted-exporter@controlgraph-canary-abc123.iam.gserviceaccount.com"
+            ),
+            audience="https://controlgraph-api-123456789.us-central1.run.app",
+        )
+
+    assert captured.value.code == "ACCEPTANCE_HOSTED_IDENTITY_INVALID"
+    assert str(captured.value) == "ACCEPTANCE_HOSTED_IDENTITY_INVALID"
+    assert "provider-private-detail" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("token_audience", "token_email"),
+    (
+        ("https://wrong.example.invalid", "restricted@example.invalid"),
+        ("https://api.example.invalid", "wrong@example.invalid"),
+    ),
+)
+def test_service_account_identity_token_requires_exact_claims(
+    tmp_path: Path,
+    monkeypatch: Any,
+    token_audience: str,
+    token_email: str,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    audience = "https://api.example.invalid"
+    service_account = "restricted@example.invalid"
+    token = _test_identity_token(audience=token_audience, email=token_email)
+    monkeypatch.setattr(
+        runner,
+        "_service_account_identity_token",
+        lambda *_args, **_kwargs: token,
+    )
+    run = SimpleNamespace(repo=tmp_path, api_origin=audience)
+
+    with pytest.raises(runner.AcceptanceError) as captured:
+        runner._identity_token(run, service_account)
+
+    assert captured.value.code == "ACCEPTANCE_HOSTED_IDENTITY_INVALID"
+
+
+def test_operator_identity_token_path_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    token = _test_identity_token(
+        audience="https://api.example.invalid",
+        email="acceptance@example.invalid",
+    )
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def capture_process(
+        argv: tuple[str, ...],
+        **kwargs: Any,
+    ) -> tuple[int, bytes]:
+        calls.append((argv, kwargs))
+        return 0, f"{token}\n".encode("ascii")
+
+    class NoHttp:
+        def open(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("operator identity must not call IAM Credentials")
+
+    monkeypatch.setattr(runner, "_capture_process", capture_process)
+    monkeypatch.setattr(runner, "_HTTP_OPENER", NoHttp())
+    run = SimpleNamespace(repo=tmp_path, api_origin="https://api.example.invalid")
+
+    assert runner._identity_token(run) == token
+    assert calls == [
+        (("gcloud", "auth", "print-identity-token"), {"repo": tmp_path, "timeout": 60})
+    ]
+
+
+def test_hosted_root_creation_retries_exact_unknown_with_same_command(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    run = SimpleNamespace(repo=tmp_path, project_number="123456789")
+    command_path = tmp_path / "root.json"
+    adopted = SimpleNamespace(outcome="ADOPTED")
+    responses = [
+        (4, {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}, None),
+        (0, {}, adopted),
+    ]
+    invocations: list[dict[str, Any]] = []
+    sleeps: list[int] = []
+
+    def run_cli(**kwargs: Any) -> tuple[int, dict[str, Any], Any]:
+        invocations.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    result = runner._submit_root_creation(run, command_path)
+
+    assert result is adopted
+    assert len(invocations) == 2
+    assert invocations[0]["arguments"] == invocations[1]["arguments"]
+    assert invocations[0]["allowed_statuses"] == frozenset({0, 4})
+    assert invocations[1]["allowed_statuses"] == frozenset({0, 4})
+    assert sleeps == [1]
+
+
+def test_hosted_root_creation_rejects_adoption_without_ambiguity(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "_run_cli",
+        lambda **_kwargs: (0, {}, SimpleNamespace(outcome="ADOPTED")),
+    )
+
+    try:
+        runner._submit_root_creation(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "root.json",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_ROOT_INVALID"
+    else:
+        raise AssertionError("an unambiguous root adoption was unexpectedly accepted")
+
+
+def test_hosted_root_creation_unknown_outcome_retry_is_bounded(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    calls = {"count": 0}
+    sleeps: list[int] = []
+
+    def run_cli(**_kwargs: Any) -> tuple[int, dict[str, str], None]:
+        calls["count"] += 1
+        return 4, {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}, None
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    try:
+        runner._submit_root_creation(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "root.json",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_ROOT_AMBIGUOUS"
+    else:
+        raise AssertionError("three ambiguous root attempts unexpectedly succeeded")
+
+    assert calls["count"] == 3
+    assert sleeps == [1, 1]
+
+
+def test_hosted_root_creation_does_not_retry_other_status_four_payloads(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    calls = {"count": 0}
+
+    def run_cli(**_kwargs: Any) -> tuple[int, dict[str, str], None]:
+        calls["count"] += 1
+        return 4, {"code": "ROOT_CREATION_OUTCOME_UNKNOWN", "detail": "extra"}, None
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+
+    try:
+        runner._submit_root_creation(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "root.json",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_ROOT_INVALID"
+    else:
+        raise AssertionError("a non-exact ambiguity payload was unexpectedly retried")
+
+    assert calls["count"] == 1
+
+
 def test_hosted_binding_uses_the_deployed_evidence_writer_identity(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1352,6 +1683,100 @@ def test_hosted_candidate_prewarm_fails_closed_when_never_ready(
         raise AssertionError("unready candidate was unexpectedly accepted")
 
 
+def test_hosted_health_load_projects_fast_and_slow_receipt_windows() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    load_start = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    raw_load = {
+        "anchor": runner._utc(load_start),
+        "mode": "healthy",
+        "request_count": 360,
+        "schema_version": runner._LOAD_RESULT_SCHEMA,
+        "status": "COMPLETE",
+        "token_persisted": False,
+        "windows": [
+            {
+                "accepted": 120,
+                "started_at": runner._utc(load_start + timedelta(minutes=index)),
+                "submitted": 120,
+                "window_index": index + 1,
+            }
+            for index in range(3)
+        ],
+    }
+
+    cases = (
+        ("2026-08-26T11:59:45Z", load_start, (1, 2)),
+        ("2026-08-26T12:00:15Z", load_start + timedelta(minutes=1), (2, 3)),
+    )
+    for receipt_updated_at, expected_anchor, expected_indices in cases:
+        health_anchor = runner._derive_health_anchor(
+            load_start=load_start,
+            receipt_updated_at=receipt_updated_at,
+        )
+        projected = runner._project_health_load(
+            raw_load,
+            load_start=load_start,
+            health_anchor=health_anchor,
+        )
+
+        assert health_anchor == expected_anchor
+        assert projected["anchor"] == runner._utc(expected_anchor)
+        assert projected["request_count"] == 240
+        assert len(projected["windows"]) == 2
+        assert tuple(window["window_index"] for window in projected["windows"]) == (
+            expected_indices
+        )
+
+
+def test_hosted_health_load_rejects_receipt_outside_overlap() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+
+    try:
+        runner._derive_health_anchor(
+            load_start=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+            receipt_updated_at="2026-08-26T12:01:15Z",
+        )
+    except runner.AcceptanceError as error:
+        assert error.code == "ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID"
+    else:
+        raise AssertionError("an out-of-range apply receipt was unexpectedly aligned")
+
+
+def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
+    from controlgraph_canary.application.receipt_execution import (
+        RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS,
+    )
+    from controlgraph_canary.contracts.health import create_rollout_health_policy_v2
+
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._health_load)
+    policy = create_rollout_health_policy_v2()
+    promotion_schedule_lead_seconds = 5
+    proof_margin_seconds = (
+        policy.maximum_observation_delay_seconds
+        - policy.observation_delay_seconds
+        - promotion_schedule_lead_seconds
+    )
+
+    assert "while datetime.now(UTC) < next_evaluation:" in source
+    assert "next_evaluation + timedelta" not in source
+    assert proof_margin_seconds == 115
+    assert proof_margin_seconds > RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
+
+
+def test_hosted_health_load_preserves_cold_start_token_margin() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._health_load)
+    submitted_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    token_acquired_at = submitted_at + timedelta(seconds=159)
+    earliest = submitted_at + timedelta(seconds=300)
+    planned_anchor = earliest.replace(second=0, microsecond=0)
+    load_start = planned_anchor - timedelta(minutes=1)
+
+    assert "datetime.now(UTC) + timedelta(seconds=300)" in source
+    assert token_acquired_at <= load_start - timedelta(seconds=60)
+
+
 def test_hosted_promotion_uses_five_second_schedule_lead(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1464,7 +1889,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v7",
+                            "revision": "controlgraph-reference-target-candidate-v15",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -1485,7 +1910,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v7",
+        "controlgraph-reference-target-candidate-v15",
     )
 
     assert flaky.calls == 3

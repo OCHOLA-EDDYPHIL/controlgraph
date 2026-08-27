@@ -25,6 +25,7 @@ from controlgraph_canary.application.cloud_run import (
     TARGET_CONFIGURATION_V1,
     CloudRunExecutionEnvironment,
     CloudRunMutationOutcome,
+    CloudRunMutationPurpose,
     CloudRunMutationReason,
     CloudRunMutationResult,
     CloudRunReadError,
@@ -100,8 +101,8 @@ PROJECT_ID = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
 SUBJECT = "123456789012345678901"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v7"
-CANDIDATE = f"{SERVICE}-candidate-v7"
+STABLE = f"{SERVICE}-stable-v15"
+CANDIDATE = f"{SERVICE}-candidate-v15"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
@@ -169,6 +170,10 @@ def _async_test[**P](
         asyncio.run(function(*args, **kwargs))
 
     return run
+
+
+async def _no_async_delay(_: float) -> None:
+    return None
 
 
 def _provider_error(error_type: type[Exception], detail: str) -> Exception:
@@ -805,10 +810,12 @@ def _receipt_readback(
     services: _GetOnlyServicesClient,
     *,
     configuration: CloudRunTargetConfiguration | None = None,
+    mutation_purpose: CloudRunMutationPurpose = CloudRunMutationPurpose.STANDARD_EXECUTION,
 ) -> CloudRunV2ReceiptReadback:
     return CloudRunV2ReceiptReadback(
         configuration=configuration or _configuration(),
         configured_project_id=PROJECT_ID,
+        mutation_purpose=mutation_purpose,
         services_client_factory=lambda: services,
     )
 
@@ -1088,6 +1095,106 @@ async def test_receipt_readback_uses_a_fresh_exact_get_and_provider_state() -> N
     assert not hasattr(readback, "update_service")
 
 
+@_async_test
+async def test_receipt_readback_waits_for_provider_state_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsettled = _service(
+        0,
+        100,
+        status_stable_percent=90,
+        status_candidate_percent=10,
+        etag="etag-readback-unsettled",
+    )
+    settled = _service(0, 100, etag="etag-readback-settled")
+    services = _GetOnlyServicesClient(unsettled, settled)
+    delays: list[float] = []
+
+    async def no_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+    expected = replace(
+        target_configuration_projection(
+            _verified().request.intent,
+            expected_concurrency=8,
+        ),
+        stable_percent=0,
+        candidate_percent=100,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-readback-settled",
+    )
+    assert delays == [1.0]
+    assert len(services.get_calls) == 2
+
+
+@_async_test
+async def test_recovery_receipt_readback_waits_for_provider_state_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsettled = _service(
+        90,
+        10,
+        status_stable_percent=100,
+        status_candidate_percent=0,
+        etag="etag-recovery-unsettled",
+    )
+    settled = _service(100, 0, etag="etag-recovery-settled")
+    del unsettled.traffic[1]
+    del settled.traffic[1]
+    del settled.traffic_statuses[1]
+    services = _GetOnlyServicesClient(unsettled, settled)
+    monkeypatch.setattr(asyncio, "sleep", _no_async_delay)
+    expected = replace(
+        target_configuration_projection(
+            _verified().request.intent,
+            expected_concurrency=8,
+        ),
+        stable_percent=100,
+        candidate_percent=0,
+    )
+
+    observation = await _receipt_readback(
+        services,
+        mutation_purpose=CloudRunMutationPurpose.STABLE_RECOVERY,
+    ).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-recovery-settled",
+    )
+    assert len(services.get_calls) == 2
+
+
+@_async_test
+async def test_receipt_readback_uses_one_total_provider_settle_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = _GetOnlyServicesClient(_service())
+    real_timeout = asyncio.timeout
+    budgets: list[float | None] = []
+
+    def record_timeout(delay: float | None) -> asyncio.Timeout:
+        budgets.append(delay)
+        return real_timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", record_timeout)
+    expected = target_configuration_projection(
+        _verified().request.intent,
+        expected_concurrency=8,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation.state == expected
+    assert budgets == [5.0]
+
+
 @pytest.mark.parametrize(
     "expected",
     [
@@ -1103,14 +1210,14 @@ async def test_receipt_readback_uses_a_fresh_exact_get_and_provider_state() -> N
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            stable_revision=f"{SERVICE}-stable-v8",
+            stable_revision=f"{SERVICE}-stable-v16",
         ),
         replace(
             target_configuration_projection(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            candidate_revision=f"{SERVICE}-candidate-v8",
+            candidate_revision=f"{SERVICE}-candidate-v16",
         ),
         replace(
             target_configuration_projection(
@@ -1134,10 +1241,10 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
 
 
 @pytest.mark.parametrize(
-    ("provider_response", "observed_etag"),
+    ("provider_response", "observed_etag", "expected_calls"),
     [
-        (RuntimeError("synthetic unavailable detail"), None),
-        (object(), None),
+        (RuntimeError("synthetic unavailable detail"), None, 1),
+        (object(), None, 1),
         (
             _service(
                 ready_state=cast(
@@ -1146,26 +1253,42 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
                 )
             ),
             "etag-after-8",
+            4,
+        ),
+        (
+            _service(
+                ready_state=cast(
+                    run_v2.Condition.State,
+                    run_v2.Condition.State.CONDITION_FAILED,
+                )
+            ),
+            "etag-after-8",
+            1,
         ),
         (
             _service(stable_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
         (
             _service(status_stable_percent=100, status_candidate_percent=0),
             "etag-after-8",
+            4,
         ),
         (
             _service(template_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
         (
             _service(latest_created_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
         (
             _service(latest_ready_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
     ],
 )
@@ -1173,8 +1296,11 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
 async def test_receipt_readback_fails_closed_on_unavailable_or_unsettled_state(
     provider_response: object,
     observed_etag: str | None,
+    expected_calls: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     services = _GetOnlyServicesClient(provider_response)
+    monkeypatch.setattr(asyncio, "sleep", _no_async_delay)
     expected = target_configuration_projection(
         _verified().request.intent,
         expected_concurrency=8,
@@ -1186,7 +1312,7 @@ async def test_receipt_readback_fails_closed_on_unavailable_or_unsettled_state(
         state=None,
         observed_etag=observed_etag,
     )
-    assert len(services.get_calls) == 1
+    assert len(services.get_calls) == expected_calls
 
 
 @_async_test
@@ -1761,7 +1887,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-        "8f81bb323549adedec2bee5540a7dd69db291bde82440d471e3e735d7713ac1c"
+        "35e6e60370aa2638770057f99046b01e408d8b53867dfca7ce5b73e26b125265"
     )
 
 
@@ -1789,8 +1915,8 @@ def test_target_configuration_digest_excludes_non_poststate_fields() -> None:
     ("changes", "expected_concurrency"),
     [
         ({"target": _target(project_id="controlgraph-canary-d4e5f6")}, 8),
-        ({"stable_revision": f"{SERVICE}-stable-v8"}, 8),
-        ({"candidate_revision": f"{SERVICE}-candidate-v8"}, 8),
+        ({"stable_revision": f"{SERVICE}-stable-v16"}, 8),
+        ({"candidate_revision": f"{SERVICE}-candidate-v16"}, 8),
         ({"stable_percent": 80, "candidate_percent": 20}, 8),
         ({}, 9),
     ],
@@ -1888,16 +2014,16 @@ async def test_reference_target_reset_uses_one_conditional_traffic_update_and_re
 
 
 @_async_test
-async def test_reference_target_reset_migrates_the_exact_v4_baseline_to_v7() -> None:
+async def test_reference_target_reset_migrates_the_exact_v13_baseline_to_v14() -> None:
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v4",
-        candidate_revision="controlgraph-reference-target-candidate-v4",
+        stable_revision="controlgraph-reference-target-stable-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v14",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v4"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v14"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
@@ -2017,18 +2143,18 @@ async def test_reference_target_reset_denies_non_candidate_latest_ready_readback
     ["wrong-tag", "wrong-percent", "extra-allocation", "status-mismatch"],
 )
 @_async_test
-async def test_reference_target_reset_rejects_any_other_v4_traffic_shape(
+async def test_reference_target_reset_rejects_any_other_v13_traffic_shape(
     case: str,
 ) -> None:
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v4",
-        candidate_revision="controlgraph-reference-target-candidate-v4",
+        stable_revision="controlgraph-reference-target-stable-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v14",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v4"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v14"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )

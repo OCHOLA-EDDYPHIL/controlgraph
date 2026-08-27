@@ -75,8 +75,8 @@ def create_ambiguous_receipt_readback_resolver(
     target = _reference_target(settings)
     cloud_run_configuration = CloudRunTargetConfiguration(
         target=target,
-        stable_revision="controlgraph-reference-target-stable-v7",
-        candidate_revision="controlgraph-reference-target-candidate-v7",
+        stable_revision="controlgraph-reference-target-stable-v15",
+        candidate_revision="controlgraph-reference-target-candidate-v15",
         stable_concurrency=8,
         candidate_concurrency=8,
         network_resource=settings.target_network_resource,

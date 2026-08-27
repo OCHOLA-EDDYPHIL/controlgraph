@@ -438,7 +438,7 @@ jq -n --arg source "$CG_SOURCE_SHA" --arg tag "$CG_SOURCE_TAG" \
     steps:{DEPLOY_FROZEN_ARTIFACTS:"PASSED",FINAL_SIGN_OFF:"PASSED",
       RUN_ACCEPTANCE:"PASSED",VALIDATE_EVIDENCE_LINKS:"PASSED",VERIFY_CHECKSUMS:"PASSED"},
     outputs:{
-      terraform_plan:{artifact_id:"clean-room-terraform-plan",
+      terraform_plan:{artifact_id:"terraform-plan",
         path:"clean-room/terraform-plan.json",sha256:$runtime_plan},
       core_acceptance_manifest:{artifact_id:"clean-room-core-acceptance",
         path:"clean-room/core-acceptance-manifest.json",sha256:$rehearsed},
