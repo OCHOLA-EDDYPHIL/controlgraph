@@ -171,6 +171,10 @@ def _async_test[**P](
     return run
 
 
+async def _no_async_delay(_: float) -> None:
+    return None
+
+
 def _provider_error(error_type: type[Exception], detail: str) -> Exception:
     return error_type(detail)
 
@@ -1088,6 +1092,44 @@ async def test_receipt_readback_uses_a_fresh_exact_get_and_provider_state() -> N
     assert not hasattr(readback, "update_service")
 
 
+@_async_test
+async def test_receipt_readback_waits_for_provider_state_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsettled = _service(
+        0,
+        100,
+        status_stable_percent=90,
+        status_candidate_percent=10,
+        etag="etag-readback-unsettled",
+    )
+    settled = _service(0, 100, etag="etag-readback-settled")
+    services = _GetOnlyServicesClient(unsettled, settled)
+    delays: list[float] = []
+
+    async def no_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+    expected = replace(
+        target_configuration_projection(
+            _verified().request.intent,
+            expected_concurrency=8,
+        ),
+        stable_percent=0,
+        candidate_percent=100,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-readback-settled",
+    )
+    assert delays == [1.0]
+    assert len(services.get_calls) == 2
+
+
 @pytest.mark.parametrize(
     "expected",
     [
@@ -1134,10 +1176,10 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
 
 
 @pytest.mark.parametrize(
-    ("provider_response", "observed_etag"),
+    ("provider_response", "observed_etag", "expected_calls"),
     [
-        (RuntimeError("synthetic unavailable detail"), None),
-        (object(), None),
+        (RuntimeError("synthetic unavailable detail"), None, 1),
+        (object(), None, 1),
         (
             _service(
                 ready_state=cast(
@@ -1146,26 +1188,32 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
                 )
             ),
             "etag-after-8",
+            4,
         ),
         (
             _service(stable_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
         (
             _service(status_stable_percent=100, status_candidate_percent=0),
             "etag-after-8",
+            4,
         ),
         (
             _service(template_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
         (
             _service(latest_created_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
         (
             _service(latest_ready_revision=f"{SERVICE}-unapproved-v2"),
             "etag-after-8",
+            1,
         ),
     ],
 )
@@ -1173,8 +1221,11 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
 async def test_receipt_readback_fails_closed_on_unavailable_or_unsettled_state(
     provider_response: object,
     observed_etag: str | None,
+    expected_calls: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     services = _GetOnlyServicesClient(provider_response)
+    monkeypatch.setattr(asyncio, "sleep", _no_async_delay)
     expected = target_configuration_projection(
         _verified().request.intent,
         expected_concurrency=8,
@@ -1186,7 +1237,7 @@ async def test_receipt_readback_fails_closed_on_unavailable_or_unsettled_state(
         state=None,
         observed_etag=observed_etag,
     )
-    assert len(services.get_calls) == 1
+    assert len(services.get_calls) == expected_calls
 
 
 @_async_test
