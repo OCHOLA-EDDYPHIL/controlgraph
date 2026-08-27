@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -230,13 +231,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v8",
+        "candidate_revision": "controlgraph-reference-target-candidate-v9",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v8",
+        "stable_revision": "controlgraph-reference-target-stable-v9",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -1520,6 +1521,28 @@ def test_hosted_health_load_rejects_receipt_outside_overlap() -> None:
         raise AssertionError("an out-of-range apply receipt was unexpectedly aligned")
 
 
+def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
+    from controlgraph_canary.application.receipt_execution import (
+        RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS,
+    )
+    from controlgraph_canary.contracts.health import create_rollout_health_policy_v2
+
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._health_load)
+    policy = create_rollout_health_policy_v2()
+    promotion_schedule_lead_seconds = 5
+    proof_margin_seconds = (
+        policy.maximum_observation_delay_seconds
+        - policy.observation_delay_seconds
+        - promotion_schedule_lead_seconds
+    )
+
+    assert "while datetime.now(UTC) < next_evaluation:" in source
+    assert "next_evaluation + timedelta" not in source
+    assert proof_margin_seconds == 115
+    assert proof_margin_seconds > RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
+
+
 def test_hosted_promotion_uses_five_second_schedule_lead(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1632,7 +1655,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v8",
+                            "revision": "controlgraph-reference-target-candidate-v9",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -1653,7 +1676,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v8",
+        "controlgraph-reference-target-candidate-v9",
     )
 
     assert flaky.calls == 3

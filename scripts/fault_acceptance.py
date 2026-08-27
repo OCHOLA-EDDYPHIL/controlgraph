@@ -1505,7 +1505,7 @@ def _build_promotion_command(
         idempotency_key=core._stable_id(
             state.run.run_inputs_sha256, case, "promotion-idempotency"
         ),
-        scheduled_at=core._utc(datetime.now(UTC) + timedelta(seconds=10)),
+        scheduled_at=core._utc(datetime.now(UTC) + timedelta(seconds=5)),
         verified_apply_receipt=apply_receipt.verified_apply_receipt,
         health_chain_locator=health.promotion_health_chain,
     )

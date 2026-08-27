@@ -229,6 +229,34 @@ def test_surface_is_exactly_seven_seeded_cases_without_self_attestation_inputs()
         )
 
 
+def test_fault_promotion_uses_five_second_schedule_lead(monkeypatch: Any) -> None:
+    fixed_now = FAULTS.datetime(2026, 8, 27, 12, 0, tzinfo=FAULTS.UTC)
+
+    class _FixedDateTime(FAULTS.datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> Any:
+            assert tz is FAULTS.UTC
+            return fixed_now
+
+    monkeypatch.setattr(FAULTS, "datetime", _FixedDateTime)
+    monkeypatch.setattr(
+        FAULTS,
+        "PromotionCommandV2",
+        lambda **values: SimpleNamespace(**values),
+    )
+    command = FAULTS._build_promotion_command(
+        SimpleNamespace(run=SimpleNamespace(run_inputs_sha256="a" * 64)),
+        SimpleNamespace(case_id="fault-api-timeout"),
+        root_result=SimpleNamespace(
+            root=SimpleNamespace(root_id=f"cgroot:{'b' * 64}", root_sha256="b" * 64)
+        ),
+        apply_receipt=SimpleNamespace(verified_apply_receipt=SimpleNamespace()),
+        health=SimpleNamespace(promotion_health_chain=SimpleNamespace()),
+    )
+
+    assert command.scheduled_at == "2026-08-27T12:00:05Z"
+
+
 def test_stale_cases_require_real_denial_and_safe_queue_release() -> None:
     for kind, race in (
         (FAULTS.FaultKind.DELAYED_TASK, False),

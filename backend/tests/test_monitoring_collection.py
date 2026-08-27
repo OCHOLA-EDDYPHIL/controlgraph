@@ -36,7 +36,7 @@ from controlgraph_canary.contracts import (
 
 PROJECT = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
-CANDIDATE = f"{SERVICE}-candidate-v8"
+CANDIDATE = f"{SERVICE}-candidate-v9"
 ROOT_SHA256 = "1" * 64
 ROOT_ID = f"cgroot:{ROOT_SHA256}"
 
@@ -192,12 +192,12 @@ def test_derived_query_id_and_digest_regression_vector() -> None:
 
     assert tuple((query.query_id, canonical_sha256(query)) for query in queries) == (
         (
-            "cgmonq:86a9ba0f1943dba938733ae22056087d3d20e82f1cc3d033218d6c6cddc3b45a",
-            "d3b4da9fbe808856b4340383c2deab15866b726992073dcec9757da7b6e79137",
+            "cgmonq:3b8e20fdfd037840eda63f3b72133e252c06e5e9b89d7b28ad7258dce5b8925d",
+            "7b85ca999e973f23f948c633e7c07ce0962c702ecf30d0912208da85b719e4ce",
         ),
         (
-            "cgmonq:3b936da2340f25cefa685aadaa76c5bea3842a6e40e93b764a085b72a57591d2",
-            "d1cc06e01ac45d023d5eb9ddcb9e81ca14051d5da101fe0e1e2afdc287470921",
+            "cgmonq:ecf793e5c9563c9f97e9ffba2c64d0de3ed46794091729f02c5ae1f705954bf1",
+            "c1f627b369e24111b47250ee7bb0c4da19a0b1ec27561cc092cfd7fa850edbc4",
         ),
     )
 
