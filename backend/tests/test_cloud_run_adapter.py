@@ -25,6 +25,7 @@ from controlgraph_canary.application.cloud_run import (
     TARGET_CONFIGURATION_V1,
     CloudRunExecutionEnvironment,
     CloudRunMutationOutcome,
+    CloudRunMutationPurpose,
     CloudRunMutationReason,
     CloudRunMutationResult,
     CloudRunReadError,
@@ -809,10 +810,12 @@ def _receipt_readback(
     services: _GetOnlyServicesClient,
     *,
     configuration: CloudRunTargetConfiguration | None = None,
+    mutation_purpose: CloudRunMutationPurpose = CloudRunMutationPurpose.STANDARD_EXECUTION,
 ) -> CloudRunV2ReceiptReadback:
     return CloudRunV2ReceiptReadback(
         configuration=configuration or _configuration(),
         configured_project_id=PROJECT_ID,
+        mutation_purpose=mutation_purpose,
         services_client_factory=lambda: services,
     )
 
@@ -1130,6 +1133,68 @@ async def test_receipt_readback_waits_for_provider_state_to_settle(
     assert len(services.get_calls) == 2
 
 
+@_async_test
+async def test_recovery_receipt_readback_waits_for_provider_state_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsettled = _service(
+        90,
+        10,
+        status_stable_percent=100,
+        status_candidate_percent=0,
+        etag="etag-recovery-unsettled",
+    )
+    settled = _service(100, 0, etag="etag-recovery-settled")
+    del unsettled.traffic[1]
+    del settled.traffic[1]
+    del settled.traffic_statuses[1]
+    services = _GetOnlyServicesClient(unsettled, settled)
+    monkeypatch.setattr(asyncio, "sleep", _no_async_delay)
+    expected = replace(
+        target_configuration_projection(
+            _verified().request.intent,
+            expected_concurrency=8,
+        ),
+        stable_percent=100,
+        candidate_percent=0,
+    )
+
+    observation = await _receipt_readback(
+        services,
+        mutation_purpose=CloudRunMutationPurpose.STABLE_RECOVERY,
+    ).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-recovery-settled",
+    )
+    assert len(services.get_calls) == 2
+
+
+@_async_test
+async def test_receipt_readback_uses_one_total_provider_settle_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = _GetOnlyServicesClient(_service())
+    real_timeout = asyncio.timeout
+    budgets: list[float | None] = []
+
+    def record_timeout(delay: float | None) -> asyncio.Timeout:
+        budgets.append(delay)
+        return real_timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", record_timeout)
+    expected = target_configuration_projection(
+        _verified().request.intent,
+        expected_concurrency=8,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation.state == expected
+    assert budgets == [5.0]
+
+
 @pytest.mark.parametrize(
     "expected",
     [
@@ -1189,6 +1254,16 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
             ),
             "etag-after-8",
             4,
+        ),
+        (
+            _service(
+                ready_state=cast(
+                    run_v2.Condition.State,
+                    run_v2.Condition.State.CONDITION_FAILED,
+                )
+            ),
+            "etag-after-8",
+            1,
         ),
         (
             _service(stable_revision=f"{SERVICE}-unapproved-v2"),

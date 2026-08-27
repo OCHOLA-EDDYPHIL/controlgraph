@@ -1367,40 +1367,48 @@ class CloudRunV2ReceiptReadback:
             return _closed_readback()
 
         request = run_v2.GetServiceRequest(name=configuration.service_resource)
-        for attempt in range(_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS):
-            try:
-                client = await self._services_client()
-                async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+        observed_etag: str | None = None
+        try:
+            client = await self._services_client()
+            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+                for attempt in range(_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS):
                     provider_service = await client.get_service(
                         request,
                         retry=None,
                         timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
                     )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return _closed_readback()
-
-            try:
-                service = _decode_service(provider_service, configuration=configuration)
-            except (TypeError, ValueError):
-                return _closed_readback()
-            traffic = tuple(
-                (item.revision, item.percent, item.tag) for item in service.traffic
-            )
-            observed_traffic = tuple(
-                (item.revision, item.percent, item.tag) for item in service.traffic_statuses
-            )
-            unsettled = (
-                service.reconciling
-                or service.ready_state is not CloudRunReadyState.READY
-                or service.generation != service.observed_generation
-                or traffic != observed_traffic
-            )
-            if unsettled and attempt + 1 < _CLOUD_RUN_READBACK_SETTLE_ATTEMPTS:
-                await asyncio.sleep(_CLOUD_RUN_READBACK_SETTLE_DELAY_SECONDS)
-                continue
-            break
+                    service = _decode_service(
+                        provider_service,
+                        configuration=configuration,
+                    )
+                    observed_etag = service.etag
+                    traffic = tuple(
+                        (item.revision, item.percent, item.tag)
+                        for item in service.traffic
+                    )
+                    observed_traffic = tuple(
+                        (item.revision, item.percent, item.tag)
+                        for item in service.traffic_statuses
+                    )
+                    if service.ready_state is CloudRunReadyState.FAILED:
+                        return _closed_readback(service.etag)
+                    unsettled = (
+                        service.reconciling
+                        or service.ready_state is CloudRunReadyState.NOT_READY
+                        or service.generation != service.observed_generation
+                        or traffic != observed_traffic
+                    )
+                    if (
+                        unsettled
+                        and attempt + 1 < _CLOUD_RUN_READBACK_SETTLE_ATTEMPTS
+                    ):
+                        await asyncio.sleep(_CLOUD_RUN_READBACK_SETTLE_DELAY_SECONDS)
+                        continue
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _closed_readback(observed_etag)
         if (
             unsettled
             or service.template_revision != configuration.candidate_revision
