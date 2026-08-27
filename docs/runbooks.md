@@ -24,9 +24,10 @@ channel. The alert includes links to this runbook and project Logs Explorer.
 | Evidence failure | Required evidence is absent, stale, unavailable, inconclusive, or misbound | Error | Security audit | Timeline reason, evidence digest, and signing-key version |
 
 The root digest and epoch in an application signal are correlation fields, not metric labels.
-Provider alerts correlate by their fixed queue or key resource. An alert that stops receiving
-matching samples closes after 30 minutes and sends the recovery notification; the owner must still
-record the independently verified recovery evidence before resolving the incident record.
+Provider alerts correlate by their fixed queue or key resource. After matching samples stop,
+Monitoring can close the incident on a subsequent evaluation; the 30-minute auto-close is the
+absent-data fallback. A closure sends the recovery notification, but the owner must still record
+the independently verified recovery evidence before resolving the incident record.
 
 ## Incident rules
 
