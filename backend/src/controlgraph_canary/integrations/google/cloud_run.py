@@ -60,16 +60,18 @@ CLOUD_RUN_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
 CLOUD_RUN_RPC_TIMEOUT_SECONDS: Final = 5.0
 _CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS: Final = 15.0
 CLOUD_RUN_OPERATION_TIMEOUT_SECONDS: Final = 30.0
+_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS: Final = 4
+_CLOUD_RUN_READBACK_SETTLE_DELAY_SECONDS: Final = 1.0
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _REVISION_ALLOCATION: Final = (
     run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
 )
 _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: Final = (
-    "controlgraph-reference-target-stable-v8"
+    "controlgraph-reference-target-stable-v9"
 )
 _PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: Final = (
-    "controlgraph-reference-target-candidate-v8"
+    "controlgraph-reference-target-candidate-v9"
 )
 _KNOWN_PRECONDITION_FAILURES: Final = (
     api_exceptions.Aborted,
@@ -1365,39 +1367,56 @@ class CloudRunV2ReceiptReadback:
             return _closed_readback()
 
         request = run_v2.GetServiceRequest(name=configuration.service_resource)
+        observed_etag: str | None = None
         try:
             client = await self._services_client()
             async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
-                provider_service = await client.get_service(
-                    request,
-                    retry=None,
-                    timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
-                )
+                for attempt in range(_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS):
+                    provider_service = await client.get_service(
+                        request,
+                        retry=None,
+                        timeout=CLOUD_RUN_RPC_TIMEOUT_SECONDS,
+                    )
+                    service = _decode_service(
+                        provider_service,
+                        configuration=configuration,
+                    )
+                    observed_etag = service.etag
+                    traffic = tuple(
+                        (item.revision, item.percent, item.tag)
+                        for item in service.traffic
+                    )
+                    observed_traffic = tuple(
+                        (item.revision, item.percent, item.tag)
+                        for item in service.traffic_statuses
+                    )
+                    if service.ready_state is CloudRunReadyState.FAILED:
+                        return _closed_readback(service.etag)
+                    unsettled = (
+                        service.reconciling
+                        or service.ready_state is CloudRunReadyState.NOT_READY
+                        or service.generation != service.observed_generation
+                        or traffic != observed_traffic
+                    )
+                    if (
+                        unsettled
+                        and attempt + 1 < _CLOUD_RUN_READBACK_SETTLE_ATTEMPTS
+                    ):
+                        await asyncio.sleep(_CLOUD_RUN_READBACK_SETTLE_DELAY_SECONDS)
+                        continue
+                    break
         except asyncio.CancelledError:
             raise
         except Exception:
-            return _closed_readback()
-
-        try:
-            service = _decode_service(provider_service, configuration=configuration)
-        except (TypeError, ValueError):
-            return _closed_readback()
+            return _closed_readback(observed_etag)
         if (
-            service.reconciling
-            or service.ready_state is not CloudRunReadyState.READY
-            or service.generation != service.observed_generation
+            unsettled
             or service.template_revision != configuration.candidate_revision
             or service.latest_created_revision != configuration.candidate_revision
             or service.latest_ready_revision != configuration.candidate_revision
         ):
             return _closed_readback(service.etag)
 
-        traffic = tuple(
-            (item.revision, item.percent, item.tag) for item in service.traffic
-        )
-        observed_traffic = tuple(
-            (item.revision, item.percent, item.tag) for item in service.traffic_statuses
-        )
         if recovery_readback:
             required_traffic = ((configuration.stable_revision, 100, "stable"),)
             if traffic != required_traffic or observed_traffic != required_traffic:
