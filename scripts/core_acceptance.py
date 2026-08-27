@@ -3077,7 +3077,7 @@ def _raw_timeline(run: _HostedExecution, token: str) -> tuple[Any, ...]:
     for _page in range(1_000):
         query: list[tuple[str, str]] = [
             ("after_sequence", str(sequence)),
-            ("limit", "5"),
+            ("limit", "1"),
         ]
         if cursor is not None:
             query.insert(1, ("after_entry_sha256", cursor))
