@@ -82,6 +82,10 @@ from controlgraph_canary.contracts.models import (
     ExecutionReceipt,
     ReceiptOutcome,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    create_recovery_apply_receipt_locator,
+    recovery_target_configuration_sha256,
+)
 from controlgraph_canary.contracts.root_creation import (
     SIGNED_EVIDENCE_EVENT_V1,
     SignedEvidenceEventV1,
@@ -96,6 +100,7 @@ from controlgraph_canary.contracts.service_claim_release import (
     SERVICE_CLAIM_RELEASE_INVOCATION_V1,
     SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1,
     SERVICE_CLAIM_TARGET_CLASSIFICATION_EVIDENCE_SUBJECT_V1,
+    STRANDED_STABLE_CLAIM_RELEASE_COMMAND_V1,
     ServiceClaimClassificationAttestationV1,
     ServiceClaimClassificationRequestV1,
     ServiceClaimClassificationResultV1,
@@ -110,15 +115,23 @@ from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseRelayResponseV1,
     ServiceClaimReleaseResultV1,
     ServiceClaimTargetClassificationEvidenceSubjectV1,
+    StrandedStableClaimEvidenceSubjectV1,
+    StrandedStableClaimReleaseCommandV1,
     service_claim_classification_request_sha256,
     service_claim_release_request_sha256,
 )
 from controlgraph_canary.contracts.storage import (
     AuthorityStorageKind,
     ServiceClaimStatus,
+    ServiceClaimTargetClassification,
+    ServiceClaimTerminalRootState,
     evidence_chain_head_document_id,
     execution_receipt_logical_id,
     signed_evidence_event_document_id,
+)
+from controlgraph_canary.http.service import (
+    _decode_api_command,
+    _should_record_service_claim_release,
 )
 from controlgraph_canary.integrations.google.firestore import (
     FirestoreAuthorityStore,
@@ -132,6 +145,7 @@ NOW = datetime(2026, 8, 20, 15, 0, tzinfo=UTC)
 OPERATOR = "operator@example.test"
 OPERATOR_SUBJECT = "123456789012345678901"
 TERMINAL_KEY = "terminal-promote-001"
+STRANDED_APPLY_KEY = "apply-stranded-001"
 
 
 def _api_audience() -> str:
@@ -245,6 +259,80 @@ def _receipt(
     )
 
 
+def _stranded_apply_receipt() -> StoredRecord[ExecutionReceipt]:
+    bundle = _root_bundle()
+    root = bundle.root.value
+    claim = bundle.service_claim.value
+    return StoredRecord(
+        ExecutionReceipt(
+            schema_version="controlgraph.execution-receipt/v1",
+            receipt_id=execution_receipt_logical_id(claim.target, STRANDED_APPLY_KEY),
+            request_id="request-apply-stranded-001",
+            idempotency_key=STRANDED_APPLY_KEY,
+            capability_sha256="5" * 64,
+            mutation_sha256="6" * 64,
+            plan_sha256=canonical_sha256(root.content.rollout_plan),
+            expected_poststate_sha256=recovery_target_configuration_sha256(
+                root,
+                stable_percent=90,
+                candidate_percent=10,
+            ),
+            target=claim.target,
+            root_id=claim.root_id,
+            root_sha256=claim.root_sha256,
+            epoch=1,
+            action=CapabilityAction.APPLY_CANARY,
+            provider_etag=root.content.stable_snapshot.provider_etag,
+            dispatch_not_after="2026-08-20T15:10:00Z",
+            outcome=ReceiptOutcome.VERIFIED,
+            reason_code=None,
+            provider_operation="operations/apply-stranded-001",
+            observed_etag="provider-after-apply-001",
+            observed_authority_epoch=1,
+            created_at="2026-08-20T14:58:00Z",
+            updated_at="2026-08-20T14:59:00Z",
+            evidence_ids=("receipt-evidence-apply-001",),
+        ),
+        2,
+    )
+
+
+def _stranded_invocation(
+    receipt: StoredRecord[ExecutionReceipt] | None = None,
+) -> ServiceClaimReleaseInvocationV1:
+    bundle = _root_bundle()
+    selected = receipt or _stranded_apply_receipt()
+    principal = _principal()
+    return ServiceClaimReleaseInvocationV1(
+        schema_version=SERVICE_CLAIM_RELEASE_INVOCATION_V1,
+        command=StrandedStableClaimReleaseCommandV1(
+            schema_version=STRANDED_STABLE_CLAIM_RELEASE_COMMAND_V1,
+            root_id=bundle.root.value.root_id,
+            expected_root_sha256=bundle.root.value.root_sha256,
+            expected_epoch=1,
+            expected_service_claim_sha256=canonical_sha256(
+                bundle.service_claim.value
+            ),
+            expected_service_claim_revision=bundle.service_claim.revision,
+            verified_apply_receipt=create_recovery_apply_receipt_locator(
+                selected.value,
+                storage_revision=selected.revision,
+            ),
+            reason="hosted acceptance interrupted after verified apply",
+            request_id="request-release-stranded-001",
+            idempotency_key="release-stranded-001",
+            confirmation="RELEASE_STRANDED_STABLE_CLAIM",
+        ),
+        attempt_id="release-stranded-attempt-001",
+        operator_identity=principal.email,
+        operator_subject=principal.subject,
+        operator_issuer="https://accounts.google.com",
+        operator_audience=principal.audience,
+        operator_issued_at=principal.issued_at,
+        operator_expires_at=principal.expires_at,
+    )
+
+
 def _receipt_binding(receipt: ExecutionReceipt) -> MutationBinding:
     return MutationBinding(
         idempotency_key=receipt.idempotency_key,
@@ -269,8 +357,9 @@ def _receipt_binding(receipt: ExecutionReceipt) -> MutationBinding:
 
 async def _persist_terminal_receipt(
     store: FirestoreAuthorityStore,
+    source: StoredRecord[ExecutionReceipt] | None = None,
 ) -> StoredRecord[ExecutionReceipt]:
-    terminal = _receipt().value
+    terminal = (source or _receipt()).value
     claimed = ExecutionReceipt.model_validate(
         {
             **terminal.model_dump(mode="python"),
@@ -815,6 +904,160 @@ def test_release_fences_classifies_and_atomically_persists_exact_chain() -> None
     _validate_service_claim_finalize_commit(store.target, final_expected, final_commit)
 
 
+def test_stranded_stable_claim_release_fences_then_independently_classifies() -> None:
+    receipt = _stranded_apply_receipt()
+    invocation = _stranded_invocation(receipt)
+    store = _Store(invocation)
+    store.state = replace(store.state, terminal_receipt=receipt)
+    releaser, evidence, classification = _releaser(store)
+
+    result = asyncio.run(releaser.release(invocation, principal=_principal()))
+
+    assert len(store.fence_commits) == 1
+    assert len(store.finalize_commits) == 1
+    assert [event.kind for event in evidence.calls] == [
+        EvidenceKind.OUTCOME_AMBIGUOUS,
+        EvidenceKind.EPOCH_ADVANCED,
+        EvidenceKind.TARGET_VERIFIED,
+    ]
+    assert len(classification.calls) == 1
+    classification_request = classification.calls[0]
+    assert (
+        classification_request.expected_classification
+        is ServiceClaimTargetClassification.STABLE_RESTORED
+    )
+    assert store.state.root_bundle is not None
+    claim = store.state.root_bundle.service_claim.value
+    assert claim.status is ServiceClaimStatus.RELEASED
+    assert claim.terminal_root_proof is not None
+    assert (
+        claim.terminal_root_proof.state
+        is ServiceClaimTerminalRootState.STRANDED_STABLE
+    )
+    assert claim.target_classification_proof is not None
+    assert (
+        claim.target_classification_proof.classification
+        is ServiceClaimTargetClassification.STABLE_RESTORED
+    )
+    assert result.terminal_receipt_id == receipt.value.receipt_id
+    fence_expected, fence_commit = store.fence_commits[0]
+    assert type(fence_commit.terminal_subject) is StrandedStableClaimEvidenceSubjectV1
+    assert fence_commit.terminal_subject.classification_pending is True
+    assert fence_commit.terminal_evidence.event.target_configuration_sha256 is None
+    final_expected, final_commit = store.finalize_commits[0]
+    _validate_service_claim_fence_commit(store.target, fence_expected, fence_commit)
+    _validate_service_claim_finalize_commit(store.target, final_expected, final_commit)
+
+
+@pytest.mark.parametrize(
+    ("tamper", "failure_code"),
+    [
+        ("claim-digest", ServiceClaimReleaseFailureCode.CLAIM_NOT_ACTIVE),
+        ("claim-revision", ServiceClaimReleaseFailureCode.CLAIM_NOT_ACTIVE),
+        ("receipt-digest", ServiceClaimReleaseFailureCode.TERMINAL_RECEIPT_INVALID),
+    ],
+)
+def test_stranded_release_rejects_nonexact_break_glass_binding(
+    tamper: str,
+    failure_code: ServiceClaimReleaseFailureCode,
+) -> None:
+    receipt = _stranded_apply_receipt()
+    invocation = _stranded_invocation(receipt)
+    command = invocation.command
+    assert type(command) is StrandedStableClaimReleaseCommandV1
+    if tamper == "claim-digest":
+        command = command.model_copy(
+            update={"expected_service_claim_sha256": "f" * 64}
+        )
+    elif tamper == "claim-revision":
+        command = command.model_copy(update={"expected_service_claim_revision": 1})
+    else:
+        command = command.model_copy(
+            update={
+                "verified_apply_receipt": command.verified_apply_receipt.model_copy(
+                    update={"receipt_sha256": "f" * 64}
+                )
+            }
+        )
+    invocation = invocation.model_copy(update={"command": command})
+    store = _Store(invocation)
+    store.state = replace(store.state, terminal_receipt=receipt)
+    releaser, evidence, classification = _releaser(store)
+
+    with pytest.raises(ServiceClaimReleaseError) as failure:
+        asyncio.run(releaser.release(invocation, principal=_principal()))
+
+    assert failure.value.code is failure_code
+    assert evidence.calls == []
+    assert classification.calls == []
+    assert store.fence_commits == []
+
+
+def test_stranded_release_classification_failure_retains_audited_fence() -> None:
+    receipt = _stranded_apply_receipt()
+    invocation = _stranded_invocation(receipt)
+    store = _Store(invocation)
+    store.state = replace(store.state, terminal_receipt=receipt)
+    key = make_root_v3_records().root.content.evidence_signing_key_version
+    classification = _ClassificationClient(key)
+    classification.error = RuntimeError("synthetic verifier outage")
+    releaser, evidence, _ = _releaser(store, classification=classification)
+
+    with pytest.raises(ServiceClaimReleaseError) as failure:
+        asyncio.run(releaser.release(invocation, principal=_principal()))
+
+    assert failure.value.code is ServiceClaimReleaseFailureCode.CLASSIFICATION_DENIED
+    assert store.state.root_bundle is not None
+    assert store.state.root_bundle.service_claim.value.status is ServiceClaimStatus.RELEASING
+    assert store.state.root_bundle.authority.value.current_epoch == 2
+    assert store.state.progress is not None
+    assert store.state.result is None
+    assert [event.kind for event in evidence.calls] == [
+        EvidenceKind.OUTCOME_AMBIGUOUS,
+        EvidenceKind.EPOCH_ADVANCED,
+    ]
+
+
+def test_stranded_release_request_digest_binds_break_glass_fields() -> None:
+    invocation = _stranded_invocation()
+    command = invocation.command
+    assert type(command) is StrandedStableClaimReleaseCommandV1
+    baseline = service_claim_release_request_sha256(invocation)
+    alternatives = (
+        command.model_copy(update={"reason": "different audited reason"}),
+        command.model_copy(update={"expected_service_claim_revision": 1}),
+        command.model_copy(
+            update={
+                "verified_apply_receipt": command.verified_apply_receipt.model_copy(
+                    update={"receipt_sha256": "f" * 64}
+                )
+            }
+        ),
+    )
+
+    assert all(
+        service_claim_release_request_sha256(
+            invocation.model_copy(update={"command": alternative})
+        )
+        != baseline
+        for alternative in alternatives
+    )
+
+
+def test_operator_http_decoder_admits_only_the_exact_stranded_command() -> None:
+    command = _stranded_invocation().command
+
+    decoded = _decode_api_command(canonical_json_bytes(command))
+
+    assert type(decoded) is StrandedStableClaimReleaseCommandV1
+    assert decoded == command
+
+
+def test_stranded_release_is_not_projected_as_a_legacy_recovery() -> None:
+    assert _should_record_service_claim_release(_invocation())
+    assert not _should_record_service_claim_release(_stranded_invocation())
+
+
 @pytest.mark.parametrize(
     "invalid_kind",
     [None, "terminal", "fence", "classification", "release"],
@@ -953,6 +1196,20 @@ def _released_store() -> tuple[
 ]:
     invocation = _invocation()
     store = _Store(invocation)
+    releaser, _, _ = _releaser(store)
+    result = asyncio.run(releaser.release(invocation, principal=_principal()))
+    return invocation, store, result
+
+
+def _released_stranded_store() -> tuple[
+    ServiceClaimReleaseInvocationV1,
+    _Store,
+    ServiceClaimReleaseResultV1,
+]:
+    receipt = _stranded_apply_receipt()
+    invocation = _stranded_invocation(receipt)
+    store = _Store(invocation)
+    store.state = replace(store.state, terminal_receipt=receipt)
     releaser, _, _ = _releaser(store)
     result = asyncio.run(releaser.release(invocation, principal=_principal()))
     return invocation, store, result
@@ -1312,7 +1569,10 @@ class _FailingRelayTransport:
         raise TimeoutError("coordinator response was not observed")
 
 
-def test_typed_api_relay_preserves_deterministic_coordinator_denial() -> None:
+@pytest.mark.parametrize("invocation_factory", [_invocation, _stranded_invocation])
+def test_typed_api_relay_preserves_deterministic_coordinator_denial(
+    invocation_factory,
+) -> None:  # type: ignore[no-untyped-def]
     denial = ServiceClaimReleaseRelayResponseV1(
         schema_version=SERVICE_CLAIM_RELEASE_RELAY_RESPONSE_V1,
         result=None,
@@ -1333,7 +1593,7 @@ def test_typed_api_relay_preserves_deterministic_coordinator_denial() -> None:
     with pytest.raises(ServiceClaimReleaseError) as failure:
         asyncio.run(
             client.release(
-                _invocation().command,
+                invocation_factory().command,
                 _principal(),
             )
         )
@@ -1682,5 +1942,60 @@ def test_firestore_classification_failure_retains_the_exact_fence(
         assert after.progress == exact_progress
         assert after.chain_head == exact_head
         assert after.result is None
+
+    asyncio.run(scenario())
+
+
+def test_firestore_stranded_release_uses_existing_two_stage_cas_records() -> None:
+    async def scenario() -> None:
+        client = _FakeClient()
+        runner = _FakeTransactionRunner()
+        first = _firestore_store(client, runner)
+        second = _firestore_store(client, runner)
+        records = make_root_v3_records()
+        await first.create_or_adopt_root_creation_bundle(
+            records.root,
+            records.service_claim,
+            records.authority,
+            records.lineage_anchor,
+            records.signed_evidence,
+            records.creation_result,
+        )
+        receipt = await _persist_terminal_receipt(first, _stranded_apply_receipt())
+        invocation = _stranded_invocation(receipt)
+        key = records.root.content.evidence_signing_key_version
+        times = iter((NOW, NOW + timedelta(seconds=2)))
+        releaser = ServiceClaimReleaser(
+            store=first,
+            evidence_client=_EvidenceClient(key),
+            classification_client=_ClassificationClient(key),
+            operator_policy=_policy(),
+            clock=lambda: next(times),
+        )
+
+        result = await releaser.release(
+            invocation,
+            principal=_principal(),
+        )
+        replayed = await _firestore_releaser(second).release(
+            invocation,
+            principal=_principal(),
+        )
+        state = await second.read_service_claim_release_state(invocation)
+
+        assert replayed == result
+        assert state.root_bundle is not None
+        assert state.root_bundle.service_claim.value.status is ServiceClaimStatus.RELEASED
+        assert state.root_bundle.service_claim.value.terminal_root_proof is not None
+        assert (
+            state.root_bundle.service_claim.value.terminal_root_proof.state
+            is ServiceClaimTerminalRootState.STRANDED_STABLE
+        )
+        assert state.progress is not None
+        assert (
+            type(state.progress.value.terminal_subject)
+            is StrandedStableClaimEvidenceSubjectV1
+        )
+        assert state.result is not None
 
     asyncio.run(scenario())

@@ -90,6 +90,7 @@ from controlgraph_canary.contracts.root_trust import stable_snapshots_match
 from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseCommandV1,
     ServiceClaimReleaseResultV1,
+    StrandedStableClaimReleaseCommandV1,
 )
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.http.identity_headers import (
@@ -122,6 +123,7 @@ type OperatorApiCommand = (
     | EpochRevocationCommandV1
     | EpochRevocationProofCommandV1
     | ServiceClaimReleaseCommandV1
+    | StrandedStableClaimReleaseCommandV1
     | RecoveryAbandonmentCommandV1
 )
 type OperatorApiResult = (
@@ -151,6 +153,7 @@ _OPERATOR_API_COMMAND_TYPES = (
     EpochRevocationCommandV1,
     EpochRevocationProofCommandV1,
     ServiceClaimReleaseCommandV1,
+    StrandedStableClaimReleaseCommandV1,
     RecoveryAbandonmentCommandV1,
 )
 
@@ -335,6 +338,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonical service-claim release command path, or '-' for stdin",
     )
 
+    stranded_claim_parser = subparsers.add_parser(
+        "release-stranded-stable-claim",
+        help="fence, verify, and release one exact stranded synthetic APPLY claim",
+    )
+    stranded_claim_parser.add_argument("--project-number", required=True)
+    stranded_claim_parser.add_argument(
+        "--command-file",
+        required=True,
+        help="canonical stranded-claim release command path, or '-' for stdin",
+    )
+
     abandon_recovery_parser = subparsers.add_parser(
         "abandon-ambiguous-recovery",
         help=(
@@ -477,6 +491,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "release-service-claim":
         return _run_service_claim_release(args)
+
+    if args.command == "release-stranded-stable-claim":
+        return _run_stranded_stable_claim_release(args)
 
     if args.command == "abandon-ambiguous-recovery":
         return _run_recovery_abandonment(args)
@@ -998,6 +1015,52 @@ def _run_service_claim_release(
     return 0
 
 
+def _run_stranded_stable_claim_release(
+    args: argparse.Namespace,
+    *,
+    command_runner: GcloudCommandRunner | None = None,
+    http_poster: OneShotHttpPoster | None = None,
+) -> int:
+    """Release one exact stranded claim through the sealed operator API."""
+
+    try:
+        command = _read_stranded_stable_claim_release_command(args.command_file)
+        response_body = _post_operator_command(
+            args.project_number,
+            command,
+            command_runner=command_runner,
+            http_poster=http_poster,
+        )
+    except (ContractError, OSError, TypeError, ValueError):
+        _print_cli_error("STRANDED_STABLE_CLAIM_RELEASE_COMMAND_INVALID")
+        return 2
+    except _OperatorApiError as error:
+        return _report_operator_api_failure(
+            "STRANDED_STABLE_CLAIM_RELEASE",
+            error,
+        )
+    try:
+        result = decode_contract(response_body, ServiceClaimReleaseResultV1)
+    except ContractError:
+        _print_cli_error("STRANDED_STABLE_CLAIM_RELEASE_RESPONSE_INVALID")
+        return 6
+    if (
+        result.request_id != command.request_id
+        or result.idempotency_key != command.idempotency_key
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.fenced_epoch != command.expected_epoch + 1
+        or result.terminal_receipt_id
+        != command.verified_apply_receipt.receipt_id
+        or result.terminal_receipt_sha256
+        != command.verified_apply_receipt.receipt_sha256
+    ):
+        _print_cli_error("STRANDED_STABLE_CLAIM_RELEASE_RESPONSE_INVALID")
+        return 6
+    _print_contract_result(result)
+    return 0
+
+
 def _run_recovery_abandonment(
     args: argparse.Namespace,
     *,
@@ -1164,6 +1227,15 @@ def _read_service_claim_release_command(source: str) -> ServiceClaimReleaseComma
     return decode_contract(
         _read_bounded_command_bytes(source),
         ServiceClaimReleaseCommandV1,
+    )
+
+
+def _read_stranded_stable_claim_release_command(
+    source: str,
+) -> StrandedStableClaimReleaseCommandV1:
+    return decode_contract(
+        _read_bounded_command_bytes(source),
+        StrandedStableClaimReleaseCommandV1,
     )
 
 

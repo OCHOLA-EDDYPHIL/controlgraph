@@ -93,6 +93,10 @@ from controlgraph_canary.contracts.promotion_execution import (
     promotion_dispatch_id,
     promotion_dispatch_v2_id,
 )
+from controlgraph_canary.contracts.recovery_execution import (
+    create_recovery_apply_receipt_locator,
+    recovery_target_configuration_sha256,
+)
 from controlgraph_canary.contracts.revocation import (
     EpochRevocationAuditV1,
     EpochRevocationCommitV1,
@@ -113,6 +117,7 @@ from controlgraph_canary.contracts.root_creation import (
     capability_lineage_anchor,
 )
 from controlgraph_canary.contracts.service_claim_release import (
+    ServiceClaimReleaseCommandV1,
     ServiceClaimReleaseFenceCommitV1,
     ServiceClaimReleaseFinalizeCommitV1,
     ServiceClaimReleaseIdentityKind,
@@ -120,6 +125,9 @@ from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseInvocationV1,
     ServiceClaimReleaseProgressV1,
     ServiceClaimReleaseResultV1,
+    ServiceClaimTerminalEvidenceSubjectV1,
+    StrandedStableClaimEvidenceSubjectV1,
+    StrandedStableClaimReleaseCommandV1,
     service_claim_release_evidence_id,
     service_claim_release_request_sha256,
 )
@@ -862,11 +870,18 @@ def _validate_claim_release(
 def _terminal_receipt_release_mapping(
     receipt: ExecutionReceipt,
     claim: ServiceClaimRecord,
+    command: ServiceClaimReleaseCommandV1 | StrandedStableClaimReleaseCommandV1,
 ) -> tuple[
     ServiceClaimTerminalRootState,
     ServiceClaimTargetClassification,
     str,
 ]:
+    if type(command) is StrandedStableClaimReleaseCommandV1:
+        return (
+            ServiceClaimTerminalRootState.STRANDED_STABLE,
+            ServiceClaimTargetClassification.STABLE_RESTORED,
+            claim.stable_target_configuration_sha256,
+        )
     if receipt.action is CapabilityAction.PROMOTE_CANDIDATE:
         return (
             ServiceClaimTerminalRootState.PROMOTED,
@@ -880,6 +895,48 @@ def _terminal_receipt_release_mapping(
             claim.stable_target_configuration_sha256,
         )
     raise ValueError("terminal receipt action cannot release a service claim")
+
+
+def _stranded_apply_receipt_is_exact(
+    configured_target: TargetBinding,
+    root: RolloutRootV3,
+    receipt_record: StoredRecord[ExecutionReceipt],
+    command: StrandedStableClaimReleaseCommandV1,
+) -> bool:
+    receipt = receipt_record.value
+    try:
+        locator = create_recovery_apply_receipt_locator(
+            receipt,
+            storage_revision=receipt_record.revision,
+        )
+        expected_poststate_sha256 = recovery_target_configuration_sha256(
+            root,
+            stable_percent=90,
+            candidate_percent=10,
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        locator == command.verified_apply_receipt
+        and receipt.receipt_id
+        == execution_receipt_logical_id(
+            configured_target,
+            command.verified_apply_receipt.idempotency_key,
+        )
+        and receipt.target == configured_target
+        and receipt.root_id == root.root_id
+        and receipt.root_sha256 == root.root_sha256
+        and receipt.epoch == command.expected_epoch
+        and receipt.action is CapabilityAction.APPLY_CANARY
+        and receipt.plan_sha256 == canonical_sha256(root.content.rollout_plan)
+        and receipt.provider_etag == root.content.stable_snapshot.provider_etag
+        and receipt.expected_poststate_sha256 == expected_poststate_sha256
+        and receipt.outcome is ReceiptOutcome.VERIFIED
+        and receipt.reason_code is None
+        and receipt.provider_operation is not None
+        and receipt.observed_etag is not None
+        and receipt.observed_authority_epoch == command.expected_epoch
+    )
 
 
 def _validate_service_claim_fence_commit(
@@ -943,7 +1000,7 @@ def _validate_service_claim_fence_commit(
     claim = claim_value
     authority = bundle.authority.value
     terminal_state, _, target_configuration_sha256 = (
-        _terminal_receipt_release_mapping(receipt, claim)
+        _terminal_receipt_release_mapping(receipt, claim, command)
     )
     terminal_subject = commit.terminal_subject
     terminal_proof = commit.replacement_claim.terminal_root_proof
@@ -952,6 +1009,79 @@ def _validate_service_claim_fence_commit(
     replacement_claim = commit.replacement_claim
     if terminal_proof is None:
         raise ValueError("service claim fence lacks terminal proof")
+    if type(command) is StrandedStableClaimReleaseCommandV1:
+        receipt_is_exact = (
+            type(root) is RolloutRootV3
+            and bundle.service_claim.revision
+            == command.expected_service_claim_revision
+            and canonical_sha256(claim) == command.expected_service_claim_sha256
+            and _stranded_apply_receipt_is_exact(
+                configured_target,
+                root,
+                receipt_record,
+                command,
+            )
+        )
+        terminal_subject_is_exact = (
+            type(terminal_subject) is StrandedStableClaimEvidenceSubjectV1
+            and terminal_subject.state
+            is ServiceClaimTerminalRootState.STRANDED_STABLE
+            and terminal_subject.expected_stable_target_configuration_sha256
+            == target_configuration_sha256
+            and terminal_subject.expected_service_claim_sha256
+            == command.expected_service_claim_sha256
+            and terminal_subject.expected_service_claim_revision
+            == command.expected_service_claim_revision
+            and terminal_subject.verified_apply_receipt
+            == command.verified_apply_receipt
+            and terminal_subject.reason == command.reason
+            and terminal_subject.confirmation == command.confirmation
+            and terminal_subject.classification_pending is True
+        )
+        terminal_event_is_exact = (
+            terminal_event.kind is EvidenceKind.OUTCOME_AMBIGUOUS
+            and terminal_event.receipt_id == receipt.receipt_id
+            and terminal_event.target_configuration_sha256 is None
+        )
+    elif type(command) is ServiceClaimReleaseCommandV1:
+        receipt_is_exact = (
+            receipt_record.revision >= 1
+            and receipt.receipt_id
+            == execution_receipt_logical_id(
+                configured_target,
+                command.terminal_receipt_idempotency_key,
+            )
+            and receipt.idempotency_key
+            == command.terminal_receipt_idempotency_key
+            and receipt.target == configured_target
+            and receipt.root_id == root.root_id
+            and receipt.root_sha256 == root.root_sha256
+            and receipt.outcome is ReceiptOutcome.VERIFIED
+            and receipt.reason_code is None
+            and receipt.observed_etag is not None
+            and receipt.expected_poststate_sha256 == target_configuration_sha256
+            and receipt.epoch <= authority.current_epoch
+        )
+        terminal_subject_is_exact = (
+            type(terminal_subject) is ServiceClaimTerminalEvidenceSubjectV1
+            and terminal_subject.state is terminal_state
+            and terminal_subject.target_configuration_sha256
+            == target_configuration_sha256
+            and terminal_subject.receipt_id == receipt.receipt_id
+            and terminal_subject.receipt_sha256 == canonical_sha256(receipt)
+            and terminal_subject.receipt_revision == receipt_record.revision
+            and terminal_subject.receipt_epoch == receipt.epoch
+            and terminal_subject.receipt_action is receipt.action
+            and terminal_subject.receipt_outcome is ReceiptOutcome.VERIFIED
+        )
+        terminal_event_is_exact = (
+            terminal_event.kind is EvidenceKind.TARGET_VERIFIED
+            and terminal_event.receipt_id == receipt.receipt_id
+            and terminal_event.target_configuration_sha256
+            == target_configuration_sha256
+        )
+    else:
+        raise TypeError("service claim release command is not exact")
     if (
         root.content.target != configured_target
         or root.root_id != command.root_id
@@ -963,21 +1093,7 @@ def _validate_service_claim_fence_commit(
         or authority.root_id != root.root_id
         or authority.root_sha256 != root.root_sha256
         or authority.current_epoch != command.expected_epoch
-        or receipt_record.revision < 1
-        or receipt.receipt_id
-        != execution_receipt_logical_id(
-            configured_target,
-            command.terminal_receipt_idempotency_key,
-        )
-        or receipt.idempotency_key != command.terminal_receipt_idempotency_key
-        or receipt.target != configured_target
-        or receipt.root_id != root.root_id
-        or receipt.root_sha256 != root.root_sha256
-        or receipt.outcome is not ReceiptOutcome.VERIFIED
-        or receipt.reason_code is not None
-        or receipt.observed_etag is None
-        or receipt.expected_poststate_sha256 != target_configuration_sha256
-        or receipt.epoch > authority.current_epoch
+        or not receipt_is_exact
         or receipt.updated_at > progress.fenced_at
         or previous_head.updated_at > progress.fenced_at
         or replacement_authority.changed_by != invocation.operator_identity
@@ -991,15 +1107,7 @@ def _validate_service_claim_fence_commit(
         or terminal_subject.target != configured_target
         or terminal_subject.root_id != root.root_id
         or terminal_subject.root_sha256 != root.root_sha256
-        or terminal_subject.state is not terminal_state
-        or terminal_subject.target_configuration_sha256
-        != target_configuration_sha256
-        or terminal_subject.receipt_id != receipt.receipt_id
-        or terminal_subject.receipt_sha256 != canonical_sha256(receipt)
-        or terminal_subject.receipt_revision != receipt_record.revision
-        or terminal_subject.receipt_epoch != receipt.epoch
-        or terminal_subject.receipt_action is not receipt.action
-        or terminal_subject.receipt_outcome is not ReceiptOutcome.VERIFIED
+        or not terminal_subject_is_exact
         or terminal_subject.evidence_id != terminal_event.evidence_id
         or terminal_subject.confirmed_by != "controlgraph.coordinator/v1"
         or terminal_subject.confirmed_at != progress.fenced_at
@@ -1008,7 +1116,7 @@ def _validate_service_claim_fence_commit(
         or terminal_proof.root_sha256 != terminal_subject.root_sha256
         or terminal_proof.state is not terminal_subject.state
         or terminal_proof.target_configuration_sha256
-        != terminal_subject.target_configuration_sha256
+        != target_configuration_sha256
         or terminal_proof.evidence_id != terminal_event.evidence_id
         or terminal_proof.evidence_sha256 != canonical_sha256(terminal)
         or terminal_proof.confirmed_by != terminal_subject.confirmed_by
@@ -1022,8 +1130,7 @@ def _validate_service_claim_fence_commit(
         or terminal_event.occurred_at != progress.fenced_at
         or terminal_event.reason_code is not None
         or terminal_event.provider_operation is not None
-        or terminal_event.target_configuration_sha256
-        != target_configuration_sha256
+        or not terminal_event_is_exact
         or fence_subject.target != configured_target
         or fence_subject.root_id != root.root_id
         or fence_subject.root_sha256 != root.root_sha256
@@ -1076,8 +1183,6 @@ def _validate_service_claim_fence_commit(
         or terminal_event.sequence != previous_head.sequence + 1
         or terminal_event.previous_event_sha256 != previous_head.evidence_sha256
         or terminal_event.subject_sha256 != canonical_sha256(commit.terminal_subject)
-        or terminal_event.kind is not EvidenceKind.TARGET_VERIFIED
-        or terminal_event.receipt_id != receipt.receipt_id
         or fence_event.evidence_id
         != service_claim_release_evidence_id(request_sha256, "fence")
         or fence_event.sequence != terminal_event.sequence + 1
@@ -1204,8 +1309,105 @@ def _validate_service_claim_finalize_commit(
     if classification_proof is None or terminal_proof is None:
         raise ValueError("service claim release lacks verifier classification proof")
     terminal_state, expected_classification, target_configuration_sha256 = (
-        _terminal_receipt_release_mapping(terminal_receipt, claim)
+        _terminal_receipt_release_mapping(terminal_receipt, claim, command)
     )
+    if type(command) is StrandedStableClaimReleaseCommandV1:
+        active_claim = claim.model_copy(
+            update={
+                "status": ServiceClaimStatus.ACTIVE,
+                "release_fence_epoch": None,
+                "release_fence_authority_revision": None,
+                "release_fenced_by": None,
+                "release_fence_request_id": None,
+                "release_fence_evidence_id": None,
+                "release_fenced_at": None,
+                "released_by": None,
+                "release_request_id": None,
+                "release_evidence_id": None,
+                "released_at": None,
+                "terminal_root_proof": None,
+                "target_classification_proof": None,
+            }
+        )
+        receipt_is_exact = (
+            type(root) is RolloutRootV3
+            and bundle.service_claim.revision
+            == command.expected_service_claim_revision + 1
+            and canonical_sha256(active_claim)
+            == command.expected_service_claim_sha256
+            and _stranded_apply_receipt_is_exact(
+                configured_target,
+                root,
+                expected.terminal_receipt,
+                command,
+            )
+        )
+        terminal_subject_is_exact = (
+            type(progress.terminal_subject)
+            is StrandedStableClaimEvidenceSubjectV1
+            and progress.terminal_subject.state
+            is ServiceClaimTerminalRootState.STRANDED_STABLE
+            and progress.terminal_subject.expected_stable_target_configuration_sha256
+            == target_configuration_sha256
+            and progress.terminal_subject.expected_service_claim_sha256
+            == command.expected_service_claim_sha256
+            and progress.terminal_subject.expected_service_claim_revision
+            == command.expected_service_claim_revision
+            and progress.terminal_subject.verified_apply_receipt
+            == command.verified_apply_receipt
+            and progress.terminal_subject.reason == command.reason
+            and progress.terminal_subject.confirmation == command.confirmation
+            and progress.terminal_subject.classification_pending is True
+        )
+        terminal_event_is_exact = (
+            terminal_evidence.event.kind is EvidenceKind.OUTCOME_AMBIGUOUS
+            and terminal_evidence.event.receipt_id == terminal_receipt.receipt_id
+            and terminal_evidence.event.target_configuration_sha256 is None
+        )
+    elif type(command) is ServiceClaimReleaseCommandV1:
+        receipt_is_exact = (
+            terminal_receipt.receipt_id
+            == execution_receipt_logical_id(
+                configured_target,
+                command.terminal_receipt_idempotency_key,
+            )
+            and terminal_receipt.idempotency_key
+            == command.terminal_receipt_idempotency_key
+            and terminal_receipt.target == configured_target
+            and terminal_receipt.root_id == root.root_id
+            and terminal_receipt.root_sha256 == root.root_sha256
+            and terminal_receipt.outcome is ReceiptOutcome.VERIFIED
+            and terminal_receipt.reason_code is None
+            and terminal_receipt.observed_etag is not None
+            and terminal_receipt.expected_poststate_sha256
+            == target_configuration_sha256
+            and terminal_receipt.epoch <= command.expected_epoch
+        )
+        terminal_subject_is_exact = (
+            type(progress.terminal_subject)
+            is ServiceClaimTerminalEvidenceSubjectV1
+            and progress.terminal_subject.state is terminal_state
+            and progress.terminal_subject.target_configuration_sha256
+            == target_configuration_sha256
+            and progress.terminal_subject.receipt_id
+            == terminal_receipt.receipt_id
+            and progress.terminal_subject.receipt_sha256
+            == canonical_sha256(terminal_receipt)
+            and progress.terminal_subject.receipt_revision
+            == expected.terminal_receipt.revision
+            and progress.terminal_subject.receipt_epoch == terminal_receipt.epoch
+            and progress.terminal_subject.receipt_action is terminal_receipt.action
+            and progress.terminal_subject.receipt_outcome
+            is ReceiptOutcome.VERIFIED
+        )
+        terminal_event_is_exact = (
+            terminal_evidence.event.kind is EvidenceKind.TARGET_VERIFIED
+            and terminal_evidence.event.receipt_id == terminal_receipt.receipt_id
+            and terminal_evidence.event.target_configuration_sha256
+            == target_configuration_sha256
+        )
+    else:
+        raise TypeError("service claim release command is not exact")
     if (
         root.content.target != configured_target
         or root.root_id != command.root_id
@@ -1235,22 +1437,7 @@ def _validate_service_claim_finalize_commit(
         or progress.fenced_epoch != authority.current_epoch
         or progress.fenced_authority_revision != authority.revision
         or progress.fenced_at != authority.changed_at
-        or terminal_receipt.receipt_id
-        != execution_receipt_logical_id(
-            configured_target,
-            command.terminal_receipt_idempotency_key,
-        )
-        or terminal_receipt.idempotency_key
-        != command.terminal_receipt_idempotency_key
-        or terminal_receipt.target != configured_target
-        or terminal_receipt.root_id != root.root_id
-        or terminal_receipt.root_sha256 != root.root_sha256
-        or terminal_receipt.outcome is not ReceiptOutcome.VERIFIED
-        or terminal_receipt.reason_code is not None
-        or terminal_receipt.observed_etag is None
-        or terminal_receipt.expected_poststate_sha256
-        != target_configuration_sha256
-        or terminal_receipt.epoch > command.expected_epoch
+        or not receipt_is_exact
         or terminal_state is not terminal_proof.state
         or terminal_proof.target != configured_target
         or terminal_proof.root_id != root.root_id
@@ -1264,17 +1451,7 @@ def _validate_service_claim_finalize_commit(
         or progress.terminal_subject.target != configured_target
         or progress.terminal_subject.root_id != root.root_id
         or progress.terminal_subject.root_sha256 != root.root_sha256
-        or progress.terminal_subject.state is not terminal_state
-        or progress.terminal_subject.target_configuration_sha256
-        != target_configuration_sha256
-        or progress.terminal_subject.receipt_id != terminal_receipt.receipt_id
-        or progress.terminal_subject.receipt_sha256
-        != canonical_sha256(terminal_receipt)
-        or progress.terminal_subject.receipt_revision
-        != expected.terminal_receipt.revision
-        or progress.terminal_subject.receipt_epoch != terminal_receipt.epoch
-        or progress.terminal_subject.receipt_action is not terminal_receipt.action
-        or progress.terminal_subject.receipt_outcome is not ReceiptOutcome.VERIFIED
+        or not terminal_subject_is_exact
         or progress.terminal_subject.evidence_id
         != terminal_evidence.event.evidence_id
         or progress.terminal_subject.confirmed_by
@@ -1284,15 +1461,12 @@ def _validate_service_claim_finalize_commit(
         or terminal_evidence.event.root_sha256 != root.root_sha256
         or terminal_evidence.event.target != configured_target
         or terminal_evidence.event.epoch != terminal_receipt.epoch
-        or terminal_evidence.event.kind is not EvidenceKind.TARGET_VERIFIED
         or terminal_evidence.event.actor != "controlgraph.coordinator/v1"
         or terminal_evidence.event.request_id != command.request_id
-        or terminal_evidence.event.receipt_id != terminal_receipt.receipt_id
         or terminal_evidence.event.occurred_at != progress.fenced_at
         or terminal_evidence.event.subject_sha256
         != canonical_sha256(progress.terminal_subject)
-        or terminal_evidence.event.target_configuration_sha256
-        != target_configuration_sha256
+        or not terminal_event_is_exact
         or terminal_evidence.signing_key_version
         != root.content.evidence_signing_key_version
         or progress.fence_subject.target != configured_target
@@ -3314,13 +3488,23 @@ class FirestoreAuthorityStore:
                     if decoded_head_evidence is None:
                         raise AuthorityStoreCorruptRecord
 
+            if type(command) is StrandedStableClaimReleaseCommandV1:
+                terminal_receipt_idempotency_key = (
+                    command.verified_apply_receipt.idempotency_key
+                )
+            elif type(command) is ServiceClaimReleaseCommandV1:
+                terminal_receipt_idempotency_key = (
+                    command.terminal_receipt_idempotency_key
+                )
+            else:
+                raise AuthorityStoreCorruptRecord
             receipt_logical_id = execution_receipt_logical_id(
                 self._target,
-                command.terminal_receipt_idempotency_key,
+                terminal_receipt_idempotency_key,
             )
             receipt_document_id = execution_receipt_document_id(
                 self._target,
-                command.terminal_receipt_idempotency_key,
+                terminal_receipt_idempotency_key,
             )
             decoded_receipt = await self._transaction_read(
                 transaction,

@@ -1236,6 +1236,38 @@ def _reset_target(run: _HostedExecution, case: CaseBindingV1) -> Any:
     return after
 
 
+def _submit_root_creation(run: _HostedExecution, command_path: Path) -> Any:
+    from controlgraph_canary.contracts.root_creation import RootCreationResultV2
+
+    saw_unknown_outcome = False
+    for attempt in range(3):
+        status, payload, result = _run_cli(
+            repo=run.repo,
+            entry_point="controlgraph-canary",
+            arguments=(
+                "create-rollout-root",
+                "--project-number",
+                run.project_number,
+                "--command-file",
+                str(command_path),
+            ),
+            model_type=RootCreationResultV2,
+            allowed_statuses=frozenset({0, 4}),
+        )
+        if status == 0 and result is not None:
+            if result.outcome == "CREATED" or (
+                saw_unknown_outcome and result.outcome == "ADOPTED"
+            ):
+                return result
+            raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
+        if payload != {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
+        saw_unknown_outcome = True
+        if attempt < 2:
+            time.sleep(1)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_AMBIGUOUS")
+
+
 def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     from controlgraph_canary.contracts.codec import canonical_json_bytes
     from controlgraph_canary.contracts.operator_observability import (
@@ -1244,7 +1276,6 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     from controlgraph_canary.contracts.root_creation import (
         ROOT_CREATION_COMMAND_V1,
         RootCreationCommandV1,
-        RootCreationResultV2,
     )
 
     _, _, snapshot = _run_cli(
@@ -1275,19 +1306,7 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
     )
     command_path = run.command_path(case, "root")
     _write_command(command_path, command)
-    _, _, root_result = _run_cli(
-        repo=run.repo,
-        entry_point="controlgraph-canary",
-        arguments=(
-            "create-rollout-root",
-            "--project-number",
-            run.project_number,
-            "--command-file",
-            str(command_path),
-        ),
-        model_type=RootCreationResultV2,
-    )
-    assert root_result is not None
+    root_result = _submit_root_creation(run, command_path)
     root = root_result.root
     plan = root.content.rollout_plan
     policy_bindings = tuple(
@@ -1296,8 +1315,7 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
         if item.policy_schema_version == root.content.health_policy.schema_version
     )
     if (
-        root_result.outcome != "CREATED"
-        or root.content.target.project_id != run.spec.target.project_id
+        root.content.target.project_id != run.spec.target.project_id
         or root.content.target.region != run.spec.target.region
         or root.content.target.environment != run.spec.target.environment
         or root.content.target.service_name != run.spec.target.service_name
@@ -1372,6 +1390,8 @@ def _poll_receipt(
         if status != 0 and payload.get("code") not in {
             "EXECUTION_RECEIPT_NOT_FOUND",
             "EXECUTION_RECEIPT_OUTCOME_UNKNOWN",
+            "RECEIPT_READ_OUTCOME_UNKNOWN",
+            "RECEIPT_READ_AUTH_UNAVAILABLE",
         }:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RECEIPT_INVALID")
         time.sleep(2)
@@ -1421,22 +1441,29 @@ def token(audience):
     return value
 
 def one(url, credential, mode, expected_revision, timeout_seconds=5):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": "Bearer " + credential,
-            "User-Agent": "controlgraph-m8-core/1",
-        },
-    )
     code = 0
     body = b""
-    try:
-        with OPENER.open(request, timeout=timeout_seconds) as response:
-            code = response.status
-            body = response.read(4096)
-    except urllib.error.HTTPError as error:
-        code = error.code
-        body = error.read(4096)
+    for attempt in range(3):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": "Bearer " + credential,
+                "User-Agent": "controlgraph-m8-core/1",
+            },
+        )
+        try:
+            with OPENER.open(request, timeout=timeout_seconds) as response:
+                code = response.status
+                body = response.read(4096)
+            break
+        except urllib.error.HTTPError as error:
+            code = error.code
+            body = error.read(4096)
+            break
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            if attempt == 2:
+                raise
+            time.sleep(0.75)
     if mode in {"probe-stable", "healthy"}:
         marker = "controlgraph-stable-v1" if mode == "probe-stable" else "controlgraph-candidate-v1"
         try:
@@ -1509,7 +1536,7 @@ def main():
         })
         return 2
     windows = []
-    for index in (0, 1):
+    for index in (0, 1, 2):
         window_start = anchor + index * 60
         while time.time() < window_start + 2:
             time.sleep(min(0.25, window_start + 2 - time.time()))
@@ -1543,10 +1570,7 @@ def main():
             "window_index": index + 1,
         })
     credential = ""
-    ok = len(windows) == 2 and all(
-        item["submitted"] >= 100 and item["accepted"] == item["submitted"]
-        for item in windows
-    )
+    ok = len(windows) == 3 and all(item["submitted"] >= 100 for item in windows)
     emit({
         "anchor": anchor_text,
         "mode": mode,
@@ -2047,6 +2071,71 @@ def _evaluate_health(
     raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_AMBIGUOUS")
 
 
+def _prewarm_candidate(*, candidate_url: str, deadline: datetime) -> None:
+    """Ramp the scaled-to-zero candidate until it answers one request."""
+
+    probe_url = f"{candidate_url}/v1/probe"
+    request = urllib.request.Request(probe_url, method="GET")
+    last_error: Exception | None = None
+    while datetime.now(UTC) < deadline - timedelta(seconds=5):
+        try:
+            with urllib.request.urlopen(request, timeout=8):
+                return
+        except urllib.error.HTTPError:
+            return
+        except (OSError, TimeoutError, urllib.error.URLError) as error:
+            last_error = error
+            time.sleep(0.5)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_CANDIDATE_UNREADY") from last_error
+
+
+def _derive_health_anchor(*, load_start: datetime, receipt_updated_at: str) -> datetime:
+    receipt_time = _parse_utc(receipt_updated_at)
+    health_anchor = receipt_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    if health_anchor not in {load_start, load_start + timedelta(minutes=1)}:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
+    return health_anchor
+
+
+def _project_health_load(
+    load: dict[str, Any],
+    *,
+    load_start: datetime,
+    health_anchor: datetime,
+) -> dict[str, Any]:
+    windows = load.get("windows")
+    if (
+        health_anchor not in {load_start, load_start + timedelta(minutes=1)}
+        or not isinstance(windows, list)
+        or len(windows) != 3
+        or any(
+            not isinstance(window, dict)
+            or type(window.get("submitted")) is not int
+            for window in windows
+        )
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+    bound_windows = cast(list[dict[str, Any]], windows)
+    expected_starts = tuple(
+        _utc(load_start + timedelta(minutes=index)) for index in range(3)
+    )
+    if tuple(
+        window.get("started_at") for window in bound_windows
+    ) != expected_starts:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+    offset = int((health_anchor - load_start).total_seconds() // 60)
+    selected = bound_windows[offset : offset + 2]
+    if len(selected) != 2:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
+    projected = dict(load)
+    projected["anchor"] = _utc(health_anchor)
+    projected["request_count"] = sum(
+        cast(int, window["submitted"]) for window in selected
+    )
+    projected["windows"] = selected
+    return projected
+
+
 def _health_load(
     run: _HostedExecution,
     case: CaseBindingV1,
@@ -2069,56 +2158,71 @@ def _health_load(
         expected_revision=run.spec.target.candidate_revision,
     )
     try:
-        earliest = datetime.now(UTC) + timedelta(seconds=240)
-        anchor = earliest.replace(second=0, microsecond=0)
-        if anchor < earliest:
-            anchor += timedelta(minutes=1)
-        execution = _execute_job(run, job_name, asynchronous=True, anchor=anchor)
+        earliest = datetime.now(UTC) + timedelta(seconds=300)
+        planned_anchor = earliest.replace(second=0, microsecond=0)
+        if planned_anchor < earliest:
+            planned_anchor += timedelta(minutes=1)
+        load_start = planned_anchor - timedelta(minutes=1)
+        execution = _execute_job(run, job_name, asynchronous=True, anchor=load_start)
         ready = _load_log_record(run, execution, _LOAD_READY_SCHEMA, attempts=75)
         if (
             ready.get("status") != "READY"
             or ready.get("mode") != mode
-            or ready.get("anchor") != _utc(anchor)
+            or ready.get("anchor") != _utc(load_start)
             or ready.get("token_persisted") is not False
             or _parse_utc(cast(str, ready.get("token_acquired_at")))
-            > anchor - timedelta(seconds=60)
+            > load_start - timedelta(seconds=60)
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
-        apply_at = anchor - timedelta(seconds=59)
+        apply_at = load_start - timedelta(seconds=59)
         while datetime.now(UTC) < apply_at:
             time.sleep(min(5.0, max(0.05, (apply_at - datetime.now(UTC)).total_seconds())))
         dispatch, receipt = _apply_canary(run, case, root_result)
-        receipt_time = _parse_utc(receipt.receipt.updated_at)
-        derived_anchor = receipt_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        if derived_anchor != anchor:
-            raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
+        health_anchor = _derive_health_anchor(
+            load_start=load_start,
+            receipt_updated_at=receipt.receipt.updated_at,
+        )
+        _prewarm_candidate(candidate_url=candidate_url, deadline=health_anchor)
         loaded = _read_traffic(run, case, "canary-loaded")
         _require_split(loaded, run.spec, stable=90, candidate=10)
-        while datetime.now(UTC) < anchor + timedelta(seconds=125):
-            remaining = (anchor + timedelta(seconds=125) - datetime.now(UTC)).total_seconds()
+        load_complete_at = load_start + timedelta(seconds=185)
+        while datetime.now(UTC) < load_complete_at:
+            remaining = (load_complete_at - datetime.now(UTC)).total_seconds()
             time.sleep(min(5.0, max(0.05, remaining)))
         load = _load_log_record(run, execution, _LOAD_RESULT_SCHEMA, attempts=20)
         windows = load.get("windows")
         if (
             load.get("status") != "COMPLETE"
             or load.get("mode") != mode
-            or load.get("anchor") != _utc(anchor)
+            or load.get("anchor") != _utc(load_start)
             or load.get("token_persisted") is not False
             or not isinstance(windows, list)
-            or len(windows) != 2
+            or len(windows) != 3
             or any(
                 not isinstance(window, dict)
                 or type(window.get("submitted")) is not int
                 or cast(int, window["submitted"]) < 100
-                or window.get("accepted") != window.get("submitted")
                 for window in windows
             )
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
+        load = _project_health_load(
+            load,
+            load_start=load_start,
+            health_anchor=health_anchor,
+        )
+        if any(
+            type(window.get("accepted")) is not int
+            or window.get("accepted") != window.get("submitted")
+            for window in cast(list[dict[str, Any]], load["windows"])
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     finally:
         _delete_load_job(run, job_name)
-    while datetime.now(UTC) < anchor + timedelta(seconds=250):
-        remaining = (anchor + timedelta(seconds=250) - datetime.now(UTC)).total_seconds()
+    while datetime.now(UTC) < health_anchor + timedelta(seconds=250):
+        remaining = (
+            health_anchor + timedelta(seconds=250) - datetime.now(UTC)
+        ).total_seconds()
         time.sleep(min(5.0, max(0.05, remaining)))
     first_command = _health_command(
         run,
@@ -2138,8 +2242,9 @@ def _health_load(
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_INVALID")
     next_evaluation = _parse_utc(first.next_evaluation_at)
-    while datetime.now(UTC) < next_evaluation + timedelta(seconds=10):
-        remaining = (next_evaluation + timedelta(seconds=10) - datetime.now(UTC)).total_seconds()
+    # Preserve the terminal proof's bounded execution window for the receipt worker.
+    while datetime.now(UTC) < next_evaluation:
+        remaining = (next_evaluation - datetime.now(UTC)).total_seconds()
         time.sleep(min(5.0, max(0.05, remaining)))
     second_command = _health_command(
         run,
@@ -2187,7 +2292,7 @@ def _promote(
         expected_epoch=1,
         request_id=request_id,
         idempotency_key=idempotency_key,
-        scheduled_at=_utc(datetime.now(UTC) + timedelta(seconds=10)),
+        scheduled_at=_utc(datetime.now(UTC) + timedelta(seconds=5)),
         verified_apply_receipt=apply_receipt.verified_apply_receipt,
         health_chain_locator=terminal.promotion_health_chain,
     )
@@ -2796,21 +2901,81 @@ def _jwt_claims(token: str) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
-def _identity_token(run: _HostedExecution, service_account: str | None = None) -> str:
-    arguments = ["gcloud", "auth", "print-identity-token"]
-    if service_account is not None:
-        arguments.extend(
-            (
-                f"--impersonate-service-account={service_account}",
-                f"--audiences={run.api_origin}",
-                "--include-email",
-            )
-        )
-    _, payload = _capture_process(arguments, repo=run.repo, timeout=60)
+def _service_account_identity_token(
+    run: _HostedExecution,
+    *,
+    service_account: str,
+    audience: str,
+) -> str:
     try:
-        token = payload.decode("ascii").strip()
-    except UnicodeDecodeError as error:
+        _, access_token_payload = _capture_process(
+            ("gcloud", "auth", "print-access-token", run.acceptance_identity),
+            repo=run.repo,
+            timeout=60,
+        )
+        access_token = access_token_payload.decode("ascii").strip()
+        if (
+            not access_token
+            or len(access_token) > MAX_ARTIFACT_BYTES
+            or any(character.isspace() for character in access_token)
+        ):
+            raise ValueError
+        body = json.dumps(
+            {"audience": audience, "includeEmail": True},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        account = urllib.parse.quote(service_account, safe="")
+        request = urllib.request.Request(
+            "https://iamcredentials.googleapis.com/v1/"
+            f"projects/-/serviceAccounts/{account}:generateIdToken",
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "controlgraph-m8-core/1",
+                "X-Goog-User-Project": run.spec.target.project_id,
+            },
+            method="POST",
+        )
+        response = _HTTP_OPENER.open(request, timeout=30)
+        with response:
+            if response.status != 200:
+                raise ValueError
+            payload = response.read(MAX_ARTIFACT_BYTES + 1)
+        if len(payload) > MAX_ARTIFACT_BYTES:
+            raise ValueError
+        value = json.loads(payload)
+        if not isinstance(value, dict):
+            raise TypeError
+        token = value.get("token")
+    except Exception as error:
         raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID") from error
+    if (
+        type(token) is not str
+        or not token
+        or any(character.isspace() for character in token)
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID")
+    return token
+
+
+def _identity_token(run: _HostedExecution, service_account: str | None = None) -> str:
+    if service_account is None:
+        _, payload = _capture_process(
+            ("gcloud", "auth", "print-identity-token"), repo=run.repo, timeout=60
+        )
+        try:
+            token = payload.decode("ascii").strip()
+        except UnicodeDecodeError as error:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID") from error
+    else:
+        token = _service_account_identity_token(
+            run,
+            service_account=service_account,
+            audience=run.api_origin,
+        )
     claims = _jwt_claims(token)
     if service_account is not None and (
         claims.get("email") != service_account or claims.get("aud") != run.api_origin
@@ -2912,7 +3077,7 @@ def _raw_timeline(run: _HostedExecution, token: str) -> tuple[Any, ...]:
     for _page in range(1_000):
         query: list[tuple[str, str]] = [
             ("after_sequence", str(sequence)),
-            ("limit", "25"),
+            ("limit", "1"),
         ]
         if cursor is not None:
             query.insert(1, ("after_entry_sha256", cursor))

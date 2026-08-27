@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -100,6 +101,8 @@ _SEED_DOMAIN: Final = b"controlgraph.fault-acceptance-seed/v1\0"
 _IDENTITY_DOMAIN: Final = b"controlgraph.acceptance-identity/v1\0"
 _FAULT_INPUT_DOMAIN: Final = b"controlgraph.fault-acceptance-run-inputs/v1\0"
 _VERIFIER_ORIGIN = "https://controlgraph-verifier-{project_number}.us-central1.run.app"
+_COORDINATOR_OIDC_ROLE: Final = "roles/iam.serviceAccountOpenIdTokenCreator"
+_COORDINATOR_OIDC_CLEANUP: Final = "coordinator-openid-token-creator"
 
 
 class FaultAcceptanceError(ValueError):
@@ -224,6 +227,7 @@ _SCENARIO_ACTIONS: Final[dict[FaultKind, tuple[str, str]]] = {
 }
 
 type _ModelType = type[StrictContractModel]
+type _NormalizedIamPolicy = tuple[int, tuple[tuple[str, tuple[str, ...]], ...]]
 _T = TargetTrafficReadResultV1
 _TYPED_LAYOUT: Final[dict[FaultKind, tuple[tuple[str, _ModelType], ...]]] = {
     FaultKind.DELAYED_TASK: (
@@ -300,7 +304,10 @@ def _scenario(
     run_inputs_sha256: str | None = None,
 ) -> _Scenario:
     digest = hashlib.sha256(
-        _SEED_DOMAIN + str(run_seed).encode("ascii") + b"\0" + kind.value.encode("ascii")
+        _SEED_DOMAIN
+        + str(run_seed).encode("ascii")
+        + b"\0"
+        + kind.value.encode("ascii")
     ).digest()
     slug = kind.value.lower().replace("_", "-")
     boundary, injection = _SCENARIO_ACTIONS[kind]
@@ -313,7 +320,9 @@ def _scenario(
         run_inputs_sha256=(
             run_inputs_sha256
             if run_inputs_sha256 is not None
-            else hashlib.sha256(_SEED_DOMAIN + str(run_seed).encode("ascii")).hexdigest()
+            else hashlib.sha256(
+                _SEED_DOMAIN + str(run_seed).encode("ascii")
+            ).hexdigest()
         ),
     )
 
@@ -321,9 +330,7 @@ def _scenario(
 def _race_scenario(base: _Scenario, attempt: int) -> _Scenario:
     if not 1 <= attempt <= 3:
         raise FaultAcceptanceError("FAULT_RACE_ATTEMPT_INVALID")
-    digest = hashlib.sha256(
-        f"{base.random_seed}\0{attempt}".encode("ascii")
-    ).digest()
+    digest = hashlib.sha256(f"{base.random_seed}\0{attempt}".encode("ascii")).digest()
     return _Scenario(
         kind=base.kind,
         scenario_id=f"{base.scenario_id}-a{attempt}",
@@ -429,7 +436,9 @@ def _traffic(result: TargetTrafficReadResultV1) -> tuple[int, int]:
 def _state(result: TargetTrafficReadResultV1) -> tuple[object, ...]:
     return (
         tuple(sorted((item.revision, item.percent) for item in result.traffic)),
-        tuple(sorted((item.revision, item.percent) for item in result.traffic_statuses)),
+        tuple(
+            sorted((item.revision, item.percent) for item in result.traffic_statuses)
+        ),
         result.concurrency,
         result.stable_revision_configuration_sha256,
         result.candidate_revision_configuration_sha256,
@@ -442,7 +451,9 @@ def _reads(
     artifacts: Mapping[str, _LoadedArtifact],
     *names: str,
 ) -> tuple[TargetTrafficReadResultV1, ...]:
-    results = tuple(_typed(artifacts, name, TargetTrafficReadResultV1) for name in names)
+    results = tuple(
+        _typed(artifacts, name, TargetTrafficReadResultV1) for name in names
+    )
     for result in results:
         _require_read(ctx, result)
     if tuple(item.observed_at for item in results) != tuple(
@@ -480,12 +491,16 @@ def _stale_case(
     _queue(_raw(artifacts, "queue-released.json"), ctx, "release", "RUNNING")
     if race:
         attempt = _raw(artifacts, "race-attempt.json")
-        if attempt != {
-            "attempt": attempt.get("attempt"),
-            "maximum_attempts": 3,
-            "scenario_id": ctx.scenario.scenario_id,
-            "schema_version": "controlgraph.revocation-race-attempt/v1",
-        } or type(attempt.get("attempt")) is not int:
+        if (
+            attempt
+            != {
+                "attempt": attempt.get("attempt"),
+                "maximum_attempts": 3,
+                "scenario_id": ctx.scenario.scenario_id,
+                "schema_version": "controlgraph.revocation-race-attempt/v1",
+            }
+            or type(attempt.get("attempt")) is not int
+        ):
             raise FaultAcceptanceError("FAULT_RACE_ATTEMPT_INVALID")
     ordered = (
         receipt.created_at <= revocation.committed_at <= receipt.updated_at
@@ -533,7 +548,9 @@ def _duplicate_case(
 ) -> _DerivedCase:
     (after,) = _reads(ctx, artifacts, "after-target.json")
     first = _typed(artifacts, "first-health-result.json", HealthEvaluationResultV2)
-    duplicate = _typed(artifacts, "duplicate-health-result.json", HealthEvaluationResultV2)
+    duplicate = _typed(
+        artifacts, "duplicate-health-result.json", HealthEvaluationResultV2
+    )
     intent = _typed(artifacts, "recovery-intent.json", RecoveryIntentV1)
     query = _raw(artifacts, "recovery-intent-query.json")
     dispatch = first.recovery_dispatch
@@ -598,9 +615,7 @@ def _monitoring_gap_case(
 ) -> _DerivedCase:
     before, after = _reads(ctx, artifacts, "before-target.json", "after-target.json")
     health = _typed(artifacts, "health-result.json", HealthEvaluationResultV2)
-    signed = _typed(
-        artifacts, "signed-health-proof.json", SignedHealthDecisionProofV1
-    )
+    signed = _typed(artifacts, "signed-health-proof.json", SignedHealthDecisionProofV1)
     proof = signed.proof
     observation = proof.observation
     decision = proof.decision
@@ -643,7 +658,11 @@ def _api_timeout_case(
     ctx: _Context, artifacts: Mapping[str, _LoadedArtifact]
 ) -> _DerivedCase:
     before, readback, after = _reads(
-        ctx, artifacts, "before-target.json", "readback-target.json", "after-target.json"
+        ctx,
+        artifacts,
+        "before-target.json",
+        "readback-target.json",
+        "after-target.json",
     )
     observed = _typed(artifacts, "receipt.json", ExecutionReceiptReadResultV1)
     command = _typed(artifacts, "promotion-command.json", PromotionCommandV2)
@@ -742,7 +761,8 @@ def _configuration_drift_case(
         or request.target != ctx.target
         or request.stable_revision != ctx.stable_revision
         or request.candidate_revision != ctx.candidate_revision
-        or before.target_configuration_sha256 != request.expected_target_configuration_sha256
+        or before.target_configuration_sha256
+        != request.expected_target_configuration_sha256
         or before.stable_revision_configuration_sha256
         != request.expected_stable_revision_configuration_sha256
         or before.candidate_revision_configuration_sha256
@@ -798,8 +818,8 @@ def _traffic_change(value: Mapping[str, Any], ctx: _Context) -> tuple[int, int]:
 
 def _policy_bindings(
     value: Mapping[str, Any],
-) -> tuple[int, tuple[tuple[str, tuple[str, ...]], ...]]:
-    bindings = value.get("bindings")
+) -> _NormalizedIamPolicy:
+    bindings = value.get("bindings", [])
     version = value.get("version", 1)
     if (
         not set(value).issubset({"bindings", "etag", "version"})
@@ -827,11 +847,39 @@ def _policy_bindings(
     return version, tuple(sorted(normalized))
 
 
-def _remove_member(
-    policy: tuple[int, tuple[tuple[str, tuple[str, ...]], ...]],
+def _add_member(
+    policy: _NormalizedIamPolicy,
     role: str,
     member: str,
-) -> tuple[int, tuple[tuple[str, tuple[str, ...]], ...]]:
+) -> _NormalizedIamPolicy:
+    version, bindings = policy
+    result: list[tuple[str, tuple[str, ...]]] = []
+    found_role = False
+    for binding_role, members in bindings:
+        if binding_role == role:
+            if member in members:
+                raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID")
+            found_role = True
+            result.append((binding_role, tuple(sorted((*members, member)))))
+        else:
+            result.append((binding_role, members))
+    if not found_role:
+        result.append((role, (member,)))
+    return version, tuple(sorted(result))
+
+
+def _has_member(policy: _NormalizedIamPolicy, role: str, member: str) -> bool:
+    return any(
+        binding_role == role and member in members
+        for binding_role, members in policy[1]
+    )
+
+
+def _remove_member(
+    policy: _NormalizedIamPolicy,
+    role: str,
+    member: str,
+) -> _NormalizedIamPolicy:
     version, bindings = policy
     result: list[tuple[str, tuple[str, ...]]] = []
     found = False
@@ -866,7 +914,8 @@ def _probe_failure_case(
     iam_denied = _policy_bindings(_raw(artifacts, "iam-denied.json"))
     iam_after = _policy_bindings(_raw(artifacts, "iam-after.json"))
     verifier_member = (
-        f"serviceAccount:controlgraph-verifier@{ctx.target.project_id}.iam.gserviceaccount.com"
+        f"serviceAccount:controlgraph-verifier@{ctx.target.project_id}"
+        ".iam.gserviceaccount.com"
     )
     if (
         iam_denied != _remove_member(iam_before, "roles/run.invoker", verifier_member)
@@ -876,7 +925,10 @@ def _probe_failure_case(
         or attestation.status is not ProbeAttestationStatus.INCONCLUSIVE
         or attestation.reason is not ProbeAttestationReason.TRANSPORT_UNAVAILABLE
         or observation.unavailable_count != 20
-        or any(sample.outcome.value != "TRANSPORT_UNAVAILABLE" for sample in observation.samples)
+        or any(
+            sample.outcome.value != "TRANSPORT_UNAVAILABLE"
+            for sample in observation.samples
+        )
         or request.request_id != ctx.scenario.request_id("verification")
         or request.target != ctx.target
         or request.stable_revision != ctx.stable_revision
@@ -898,9 +950,7 @@ def _probe_failure_case(
     )
 
 
-def _evaluate(
-    ctx: _Context, artifacts: Mapping[str, _LoadedArtifact]
-) -> _DerivedCase:
+def _evaluate(ctx: _Context, artifacts: Mapping[str, _LoadedArtifact]) -> _DerivedCase:
     if ctx.scenario.kind is FaultKind.DELAYED_TASK:
         return _stale_case(ctx, artifacts, race=False)
     if ctx.scenario.kind is FaultKind.DUPLICATE_DELIVERY:
@@ -926,9 +976,7 @@ def _write_evidence(
     name: str,
     value: StrictContractModel | Mapping[str, Any],
 ) -> bytes:
-    allowed = {item[0] for item in _TYPED_LAYOUT[kind]}.union(
-        _RAW_LAYOUT.get(kind, ())
-    )
+    allowed = {item[0] for item in _TYPED_LAYOUT[kind]}.union(_RAW_LAYOUT.get(kind, ()))
     if name not in allowed:
         raise FaultAcceptanceError("FAULT_OUTPUT_INVALID")
     payload = (
@@ -1050,7 +1098,10 @@ def _signed_health_proof(
     _pages, _raw, records = _timeline_snapshot(run)
     matches: list[SignedHealthDecisionProofV1] = []
     for record in records:
-        if record.get("schema_version") != "controlgraph.signed-health-decision-proof/v1":
+        if (
+            record.get("schema_version")
+            != "controlgraph.signed-health-decision-proof/v1"
+        ):
             continue
         try:
             signed = SignedHealthDecisionProofV1.model_validate(record)
@@ -1144,6 +1195,81 @@ def _change_verifier_invoker(
     )
 
 
+def _coordinator_service_account(run: core._HostedExecution) -> str:
+    return (
+        f"controlgraph-coordinator@{run.spec.target.project_id}.iam.gserviceaccount.com"
+    )
+
+
+def _coordinator_iam_policy(run: core._HostedExecution) -> dict[str, Any]:
+    value = core._gcloud_json(
+        (
+            "iam",
+            "service-accounts",
+            "get-iam-policy",
+            _coordinator_service_account(run),
+            f"--project={run.spec.target.project_id}",
+        ),
+        repo=run.repo,
+    )
+    if not isinstance(value, dict):
+        raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID")
+    _policy_bindings(value)
+    return cast(dict[str, Any], value)
+
+
+def _change_coordinator_oidc_grant(
+    run: core._HostedExecution,
+    *,
+    action: str,
+) -> None:
+    if (
+        action not in {"add", "remove"}
+        or _IDENTITY.fullmatch(run.acceptance_identity) is None
+    ):
+        raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID")
+    value = core._gcloud_json(
+        (
+            "iam",
+            "service-accounts",
+            f"{action}-iam-policy-binding",
+            _coordinator_service_account(run),
+            f"--project={run.spec.target.project_id}",
+            f"--member=user:{run.acceptance_identity}",
+            f"--role={_COORDINATOR_OIDC_ROLE}",
+            "--condition=None",
+            "--quiet",
+        ),
+        repo=run.repo,
+    )
+    if not isinstance(value, dict):
+        raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID")
+    _policy_bindings(value)
+
+
+def _restore_coordinator_oidc_grant(
+    state: _ExecutionState,
+    before: _NormalizedIamPolicy,
+) -> None:
+    run = state.run
+    member = f"user:{run.acceptance_identity}"
+    current: _NormalizedIamPolicy | None = None
+    with suppress(FaultAcceptanceError, core.AcceptanceError):
+        current = _policy_bindings(_coordinator_iam_policy(run))
+    if current is None or _has_member(current, _COORDINATOR_OIDC_ROLE, member):
+        with suppress(FaultAcceptanceError, core.AcceptanceError):
+            _change_coordinator_oidc_grant(run, action="remove")
+    try:
+        after = _policy_bindings(_coordinator_iam_policy(run))
+    except (FaultAcceptanceError, core.AcceptanceError) as error:
+        state.cleanup_required.add(_COORDINATOR_OIDC_CLEANUP)
+        raise FaultAcceptanceError("FAULT_IAM_RESTORE_FAILED") from error
+    if after != before:
+        state.cleanup_required.add(_COORDINATOR_OIDC_CLEANUP)
+        raise FaultAcceptanceError("FAULT_IAM_RESTORE_FAILED")
+    state.cleanup_required.discard(_COORDINATOR_OIDC_CLEANUP)
+
+
 def _verification_request(
     root_result: Any,
     apply_receipt: ExecutionReceiptReadResultV1,
@@ -1192,27 +1318,41 @@ def _verification_request(
     )
 
 
-def _coordinator_token(run: core._HostedExecution, audience: str) -> str:
-    coordinator = (
-        f"controlgraph-coordinator@{run.spec.target.project_id}.iam.gserviceaccount.com"
-    )
-    _, payload = core._capture_process(
-        (
-            "gcloud",
-            "auth",
-            "print-identity-token",
-            f"--impersonate-service-account={coordinator}",
-            f"--audiences={audience}",
-            "--include-email",
-        ),
-        repo=run.repo,
-        timeout=60,
-    )
+def _coordinator_token(state: _ExecutionState, audience: str) -> str:
+    run = state.run
+    coordinator = _coordinator_service_account(run)
+    member = f"user:{run.acceptance_identity}"
     try:
-        token = payload.decode("ascii").strip()
-    except UnicodeDecodeError as error:
+        before = _policy_bindings(_coordinator_iam_policy(run))
+        expected = _add_member(before, _COORDINATOR_OIDC_ROLE, member)
+    except (FaultAcceptanceError, core.AcceptanceError) as error:
+        raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID") from error
+    attempted = False
+    try:
+        attempted = True
+        state.cleanup_required.add(_COORDINATOR_OIDC_CLEANUP)
+        try:
+            _change_coordinator_oidc_grant(run, action="add")
+            granted = _policy_bindings(_coordinator_iam_policy(run))
+        except (FaultAcceptanceError, core.AcceptanceError) as error:
+            raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID") from error
+        if granted != expected:
+            raise FaultAcceptanceError("FAULT_IAM_EVIDENCE_INVALID")
+        try:
+            token = core._service_account_identity_token(
+                run,
+                service_account=coordinator,
+                audience=audience,
+            )
+        except core.AcceptanceError as error:
+            raise FaultAcceptanceError("FAULT_VERIFIER_IDENTITY_INVALID") from error
+    finally:
+        if attempted:
+            _restore_coordinator_oidc_grant(state, before)
+    try:
+        claims = core._jwt_claims(token)
+    except core.AcceptanceError as error:
         raise FaultAcceptanceError("FAULT_VERIFIER_IDENTITY_INVALID") from error
-    claims = core._jwt_claims(token)
     if claims.get("email") != coordinator or claims.get("aud") != audience:
         raise FaultAcceptanceError("FAULT_VERIFIER_IDENTITY_INVALID")
     return token
@@ -1231,7 +1371,7 @@ def _invoke_verifier(
         verification=request,
     )
     origin = _VERIFIER_ORIGIN.format(project_number=state.run.project_number)
-    token = _coordinator_token(state.run, origin)
+    token = _coordinator_token(state, origin)
     try:
         status, payload, _headers = core._http_request(
             url=f"{origin}/v1/internal/verify",
@@ -1505,7 +1645,7 @@ def _build_promotion_command(
         idempotency_key=core._stable_id(
             state.run.run_inputs_sha256, case, "promotion-idempotency"
         ),
-        scheduled_at=core._utc(datetime.now(UTC) + timedelta(seconds=10)),
+        scheduled_at=core._utc(datetime.now(UTC) + timedelta(seconds=5)),
         verified_apply_receipt=apply_receipt.verified_apply_receipt,
         health_chain_locator=health.promotion_health_chain,
     )
@@ -1571,7 +1711,10 @@ def _execute_api_timeout(
         health=health,
     )
     status, response, headers = _one_timed_operator_request(state.run, command)
-    if status != 200 or headers.get("content-type", "").split(";", 1)[0] != "application/json":
+    if (
+        status != 200
+        or headers.get("content-type", "").split(";", 1)[0] != "application/json"
+    ):
         raise FaultAcceptanceError("FAULT_API_TIMEOUT_FOLLOW_UP_INVALID")
     try:
         from controlgraph_canary.contracts.promotion_execution import (
@@ -1829,7 +1972,9 @@ def _execute_revocation_race(
             apply_receipt=apply_receipt,
             terminal=health,
         )
-        _wait_until(core._parse_utc(promotion_command.scheduled_at) + timedelta(seconds=1))
+        _wait_until(
+            core._parse_utc(promotion_command.scheduled_at) + timedelta(seconds=1)
+        )
         barrier = threading.Barrier(2)
 
         def release_queue(race_barrier: threading.Barrier = barrier) -> dict[str, Any]:
@@ -1952,16 +2097,18 @@ def _verify_source(repo: Path, source_commit: str) -> None:
     package_file = getattr(controlgraph_canary, "__file__", None)
     try:
         package_path = Path(package_file).resolve(strict=True) if package_file else None
-        expected_package = (root / "backend/src/controlgraph_canary/__init__.py").resolve(
-            strict=True
-        )
+        expected_package = (
+            root / "backend/src/controlgraph_canary/__init__.py"
+        ).resolve(strict=True)
         script_path = Path(__file__).resolve(strict=True)
         expected_script = (root / "scripts/fault_acceptance.py").resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise FaultAcceptanceError("FAULT_SOURCE_INVALID") from error
     if (
         not root.is_dir()
-        or any(item.returncode != 0 for item in (top, head, dirty, local_main, remote_main))
+        or any(
+            item.returncode != 0 for item in (top, head, dirty, local_main, remote_main)
+        )
         or Path(top.stdout.strip()).resolve() != root
         or head.stdout.strip() != source_commit
         or dirty.stdout
@@ -2067,10 +2214,7 @@ def execute_fault_suite(
     acceptance_identity: str,
     confirmation: str,
 ) -> bytes:
-    if (
-        confirmation != CONFIRMATION
-        or os.environ.get(CONFIRMATION_ENV) != CONFIRMATION
-    ):
+    if confirmation != CONFIRMATION or os.environ.get(CONFIRMATION_ENV) != CONFIRMATION:
         raise FaultAcceptanceError("FAULT_CONFIRMATION_REQUIRED")
     if re.fullmatch(r"[1-9][0-9]{5,19}", project_number) is None:
         raise FaultAcceptanceError("FAULT_RUN_BINDING_INVALID")

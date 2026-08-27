@@ -20,6 +20,7 @@ locals {
     "iamcredentials.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
+    "policytroubleshooter.googleapis.com",
     "run.googleapis.com",
     "sts.googleapis.com",
   ])

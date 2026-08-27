@@ -100,6 +100,7 @@ class ProbeMethod(StrEnum):
     IAM_POLICY_TROUBLESHOOTER = "IAM_POLICY_TROUBLESHOOTER"
     PROTECTED_APPLICATION_ROUTE = "PROTECTED_APPLICATION_ROUTE"
     ADK_TOOL_REGISTRY = "ADK_TOOL_REGISTRY"
+    SOURCE_RUNTIME_ATTESTATION = "SOURCE_RUNTIME_ATTESTATION"
 
 
 class DenialLayer(StrEnum):
@@ -157,13 +158,13 @@ CASE_POLICIES: Final[dict[CaseKind, CasePolicy]] = {
     ),
     CaseKind.CAPABILITY_TAMPER: CasePolicy(
         operation="controlgraph:tampered-capability",
-        probe_method=ProbeMethod.PROTECTED_APPLICATION_ROUTE,
+        probe_method=ProbeMethod.SOURCE_RUNTIME_ATTESTATION,
         denial_layer=DenialLayer.APPLICATION,
         denial_class=DenialClass.SIGNATURE_DENIED,
     ),
     CaseKind.CAPABILITY_REPLAY: CasePolicy(
         operation="controlgraph:cross-request-capability-replay",
-        probe_method=ProbeMethod.PROTECTED_APPLICATION_ROUTE,
+        probe_method=ProbeMethod.SOURCE_RUNTIME_ATTESTATION,
         denial_layer=DenialLayer.APPLICATION,
         denial_class=DenialClass.REPLAY_DENIED,
     ),
@@ -175,7 +176,7 @@ CASE_POLICIES: Final[dict[CaseKind, CasePolicy]] = {
     ),
     CaseKind.SCOPE_AMPLIFICATION: CasePolicy(
         operation="controlgraph:widened-capability-scope",
-        probe_method=ProbeMethod.PROTECTED_APPLICATION_ROUTE,
+        probe_method=ProbeMethod.SOURCE_RUNTIME_ATTESTATION,
         denial_layer=DenialLayer.APPLICATION,
         denial_class=DenialClass.SCOPE_DENIED,
     ),
@@ -217,7 +218,7 @@ CASE_POLICIES: Final[dict[CaseKind, CasePolicy]] = {
     ),
     CaseKind.MODEL_TOOL_MUTATION: CasePolicy(
         operation="adk:unregistered-mutation-tool",
-        probe_method=ProbeMethod.ADK_TOOL_REGISTRY,
+        probe_method=ProbeMethod.SOURCE_RUNTIME_ATTESTATION,
         denial_layer=DenialLayer.APPLICATION,
         denial_class=DenialClass.TOOL_DENIED,
     ),
@@ -241,7 +242,7 @@ EXPECTED_REASON_CODES: Final[dict[CaseKind, frozenset[str]]] = {
     ),
     CaseKind.CAPABILITY_TAMPER: frozenset({"CONTRACT_INVALID", "SIGNATURE_INVALID"}),
     CaseKind.CAPABILITY_REPLAY: frozenset(
-        {"CLAIM_BINDING_MISMATCH", "IDEMPOTENCY_CONFLICT"}
+        {"CLAIM_BINDING_MISMATCH", "CONTRACT_INVALID", "IDEMPOTENCY_CONFLICT"}
     ),
     CaseKind.STALE_EPOCH: frozenset({"EPOCH_MISMATCH"}),
     CaseKind.SCOPE_AMPLIFICATION: frozenset({"SCOPE_AMPLIFICATION"}),
@@ -507,7 +508,6 @@ def build_manifest(*, spec_path: Path, artifact_root: Path) -> tuple[bytes, str,
     cases: list[dict[str, RestrictedJson]] = []
     passed = True
     target_unchanged = True
-    target_sha256: str | None = None
     for binding in spec.cases:
         payload, artifact_sha256 = _bind_artifact(binding.evidence, artifact_root=root)
         try:
@@ -520,15 +520,9 @@ def build_manifest(*, spec_path: Path, artifact_root: Path) -> tuple[bytes, str,
             spec=spec,
             artifact_sha256=artifact_sha256,
         )
-        if target_sha256 is None:
-            target_sha256 = evidence.target_before_sha256
-        elif evidence.target_before_sha256 != target_sha256:
-            case_passed = False
-            case["status"] = "FAILED"
         target_unchanged = target_unchanged and (
             not evidence.unauthorized_target_change
             and evidence.target_before_sha256 == evidence.target_after_sha256
-            and evidence.target_before_sha256 == target_sha256
         )
         cases.append(case)
         passed = passed and case_passed

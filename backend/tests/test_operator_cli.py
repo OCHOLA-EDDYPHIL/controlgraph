@@ -15,7 +15,7 @@ from recovery_v2_test_data import (
     make_unhealthy_v3_recovery_bundle,
 )
 from root_v2_test_data import PROJECT_NUMBER, make_root_v2_records
-from test_service_claim_release import _released_store
+from test_service_claim_release import _released_store, _released_stranded_store
 
 import controlgraph_canary.cli as cli_module
 from controlgraph_canary.cli import (
@@ -27,6 +27,7 @@ from controlgraph_canary.cli import (
     _run_root_creation,
     _run_service_claim_release,
     _run_stable_snapshot_capture,
+    _run_stranded_stable_claim_release,
     _run_target_traffic_read,
 )
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES
@@ -79,6 +80,7 @@ from controlgraph_canary.contracts.root_creation import (
 )
 from controlgraph_canary.contracts.service_claim_release import (
     ServiceClaimReleaseCommandV1,
+    StrandedStableClaimReleaseCommandV1,
 )
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 from controlgraph_canary.http.identity_headers import (
@@ -307,6 +309,14 @@ def _success_fixtures(tmp_path: Path) -> list[tuple[Any, argparse.Namespace, obj
     release_file = tmp_path / "service-claim-release-command.json"
     release_file.write_bytes(canonical_json_bytes(release_command))
 
+    stranded_invocation, _stranded_store, stranded_result = (
+        _released_stranded_store()
+    )
+    stranded_command = stranded_invocation.command
+    assert type(stranded_command) is StrandedStableClaimReleaseCommandV1
+    stranded_file = tmp_path / "stranded-stable-claim-release-command.json"
+    stranded_file.write_bytes(canonical_json_bytes(stranded_command))
+
     return [
         (
             _run_stable_snapshot_capture,
@@ -368,6 +378,15 @@ def _success_fixtures(tmp_path: Path) -> list[tuple[Any, argparse.Namespace, obj
             ),
             release_command,
             release_result,
+        ),
+        (
+            _run_stranded_stable_claim_release,
+            argparse.Namespace(
+                project_number=PROJECT_NUMBER,
+                command_file=str(stranded_file),
+            ),
+            stranded_command,
+            stranded_result,
         ),
     ]
 
@@ -482,6 +501,17 @@ def test_parser_exposes_only_named_operator_commands_and_typed_fields() -> None:
     )
     assert release.command_file == "release.json"
 
+    stranded = parser.parse_args(
+        [
+            "release-stranded-stable-claim",
+            "--project-number",
+            PROJECT_NUMBER,
+            "--command-file",
+            "stranded-release.json",
+        ]
+    )
+    assert stranded.command_file == "stranded-release.json"
+
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -534,6 +564,34 @@ def test_main_routes_service_claim_release_to_the_typed_runner(
     assert len(observed) == 1
     assert observed[0].project_number == PROJECT_NUMBER
     assert observed[0].command_file == "release.json"
+
+
+def test_main_routes_stranded_claim_release_to_the_typed_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[argparse.Namespace] = []
+
+    def run(args: argparse.Namespace) -> int:
+        observed.append(args)
+        return 19
+
+    monkeypatch.setattr(cli_module, "_run_stranded_stable_claim_release", run)
+
+    assert (
+        cli_module.main(
+            [
+                "release-stranded-stable-claim",
+                "--project-number",
+                PROJECT_NUMBER,
+                "--command-file",
+                "stranded-release.json",
+            ]
+        )
+        == 19
+    )
+    assert len(observed) == 1
+    assert observed[0].project_number == PROJECT_NUMBER
+    assert observed[0].command_file == "stranded-release.json"
 
 
 def test_all_operator_commands_use_one_fixed_shell_free_api_post(

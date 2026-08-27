@@ -67,17 +67,16 @@ locals {
       ])
     }
     key_problem = {
-      display_name    = "ControlGraph signing key problem"
-      severity        = "CRITICAL"
-      owner           = "security-audit"
-      resource        = "cloudkms_cryptokeyversion"
-      resource_filter = "(resource.type=\"cloudkms_cryptokey\" OR resource.type=\"cloudkms_cryptokeyversion\")"
-      runbook         = "key-rotation-or-disablement"
+      display_name = "ControlGraph signing key problem"
+      severity     = "CRITICAL"
+      owner        = "security-audit"
+      resource     = "global"
+      runbook      = "key-rotation-or-disablement"
       filter = join(" AND ", [
-        "(resource.type=\"cloudkms_cryptokey\" OR resource.type=\"cloudkms_cryptokeyversion\")",
+        "resource.type=\"cloudkms_cryptokeyversion\"",
         "resource.labels.key_ring_id=\"controlgraph-signing\"",
         "protoPayload.serviceName=\"cloudkms.googleapis.com\"",
-        "(protoPayload.status.code>0 OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyPrimaryVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion\")",
+        "(protoPayload.status.code>0 OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.UpdateCryptoKeyVersion\" OR protoPayload.methodName=\"google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion\")",
       ])
     }
     verifier_disagreement = {
@@ -228,7 +227,7 @@ check "operational_alert_set_is_closed" {
       ]) &&
       alltrue([
         for alert in google_monitoring_alert_policy.operational :
-        alert.notification_channels == [google_monitoring_notification_channel.operator_email.name]
+        toset(alert.notification_channels) == toset([google_monitoring_notification_channel.operator_email.name])
       ])
     )
     error_message = "Operational alerts must cover the fixed signal set and notify only the explicit operator channel."

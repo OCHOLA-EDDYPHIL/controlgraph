@@ -103,6 +103,7 @@ class ServiceClaimTerminalRootState(StrEnum):
 
     PROMOTED = "PROMOTED"
     RECOVERED = "RECOVERED"
+    STRANDED_STABLE = "STRANDED_STABLE"
 
 
 class ServiceClaimTargetClassification(StrEnum):
@@ -257,6 +258,9 @@ class ServiceClaimRecord(StrictContractModel):
         expected_configuration = {
             ServiceClaimTerminalRootState.PROMOTED: (self.candidate_target_configuration_sha256),
             ServiceClaimTerminalRootState.RECOVERED: (self.stable_target_configuration_sha256),
+            ServiceClaimTerminalRootState.STRANDED_STABLE: (
+                self.stable_target_configuration_sha256
+            ),
         }[terminal.state]
         if terminal.target_configuration_sha256 != expected_configuration:
             raise ValueError("terminal root proof does not match the expected target state")
@@ -288,6 +292,9 @@ class ServiceClaimRecord(StrictContractModel):
                 ServiceClaimTargetClassification.CANDIDATE_PROMOTED
             ),
             ServiceClaimTerminalRootState.RECOVERED: (
+                ServiceClaimTargetClassification.STABLE_RESTORED
+            ),
+            ServiceClaimTerminalRootState.STRANDED_STABLE: (
                 ServiceClaimTargetClassification.STABLE_RESTORED
             ),
         }[terminal.state]

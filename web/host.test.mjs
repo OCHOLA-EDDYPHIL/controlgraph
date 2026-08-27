@@ -40,6 +40,10 @@ describe("operator console host boundary", () => {
     const dockerfile = readFileSync(new URL("./Dockerfile", import.meta.url), "utf8");
 
     expect(dockerfile).toContain("COPY --chown=node:node --chmod=0444 host.mjs ./host.mjs");
+    expect(dockerfile).toContain("FROM node:22-alpine3.22@sha256:");
+    expect(dockerfile).toContain(
+      "RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx",
+    );
   });
 
   it("restores the untouched credential after Cloud Run removes its proxy signature", () => {

@@ -249,7 +249,7 @@ class RecoveryCapabilityClient(Protocol):
 
 @runtime_checkable
 class RecoveryCapabilityTimelineRecorder(Protocol):
-    """Persist the capability returned by the authenticated issuer boundary."""
+    """Persist a signature-verified capability returned by the issuer."""
 
     @property
     def target(self) -> TargetBinding: ...
@@ -260,6 +260,13 @@ class RecoveryCapabilityTimelineRecorder(Protocol):
         *,
         signature_verified: bool,
     ) -> None: ...
+
+
+@runtime_checkable
+class RecoveryCapabilityEnvelopeVerifier(Protocol):
+    """Verify one recovery capability envelope against configured trust."""
+
+    def verify(self, capability: SignedCapability) -> None: ...
 
 
 @runtime_checkable
@@ -1139,6 +1146,7 @@ class RecoveryRolloutCoordinator:
         dispatch_store: RecoveryDispatchStore,
         task_dispatcher: RecoveryTaskDispatcher,
         clock: Callable[[], datetime] | None = None,
+        capability_verifier: RecoveryCapabilityEnvelopeVerifier | None = None,
         timeline_recorder: RecoveryCapabilityTimelineRecorder | None = None,
     ) -> None:
         if (
@@ -1156,6 +1164,14 @@ class RecoveryRolloutCoordinator:
             or dispatch_store.target != target
             or not isinstance(task_dispatcher, RecoveryTaskDispatcher)
             or (clock is not None and not callable(clock))
+            or (capability_verifier is None) != (timeline_recorder is None)
+            or (
+                capability_verifier is not None
+                and not isinstance(
+                    capability_verifier,
+                    RecoveryCapabilityEnvelopeVerifier,
+                )
+            )
             or (
                 timeline_recorder is not None
                 and (
@@ -1174,6 +1190,7 @@ class RecoveryRolloutCoordinator:
         self._dispatch_store = dispatch_store
         self._task_dispatcher = task_dispatcher
         self._clock = clock or _now
+        self._capability_verifier = capability_verifier
         self._timeline_recorder = timeline_recorder
 
     async def dispatch(
@@ -1395,10 +1412,12 @@ class RecoveryRolloutCoordinator:
         capability = issuance.capability
         claims = capability.claims
         try:
+            if self._capability_verifier is not None:
+                self._capability_verifier.verify(capability)
             if self._timeline_recorder is not None:
                 await self._timeline_recorder.record_signed_capability(
                     capability,
-                    signature_verified=False,
+                    signature_verified=True,
                 )
             mutation = RecoveryMutationIntentV2(
                 schema_version=RECOVERY_MUTATION_INTENT_V2,
