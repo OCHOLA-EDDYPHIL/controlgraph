@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -1518,6 +1519,28 @@ def test_hosted_health_load_rejects_receipt_outside_overlap() -> None:
         assert error.code == "ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID"
     else:
         raise AssertionError("an out-of-range apply receipt was unexpectedly aligned")
+
+
+def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
+    from controlgraph_canary.application.receipt_execution import (
+        RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS,
+    )
+    from controlgraph_canary.contracts.health import create_rollout_health_policy_v2
+
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._health_load)
+    policy = create_rollout_health_policy_v2()
+    promotion_schedule_lead_seconds = 5
+    proof_margin_seconds = (
+        policy.maximum_observation_delay_seconds
+        - policy.observation_delay_seconds
+        - promotion_schedule_lead_seconds
+    )
+
+    assert "while datetime.now(UTC) < next_evaluation:" in source
+    assert "next_evaluation + timedelta" not in source
+    assert proof_margin_seconds == 115
+    assert proof_margin_seconds > RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
 
 
 def test_hosted_promotion_uses_five_second_schedule_lead(

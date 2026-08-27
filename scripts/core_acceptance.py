@@ -2242,8 +2242,9 @@ def _health_load(
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_INVALID")
     next_evaluation = _parse_utc(first.next_evaluation_at)
-    while datetime.now(UTC) < next_evaluation + timedelta(seconds=10):
-        remaining = (next_evaluation + timedelta(seconds=10) - datetime.now(UTC)).total_seconds()
+    # Preserve the terminal proof's bounded execution window for the receipt worker.
+    while datetime.now(UTC) < next_evaluation:
+        remaining = (next_evaluation - datetime.now(UTC)).total_seconds()
         time.sleep(min(5.0, max(0.05, remaining)))
     second_command = _health_command(
         run,
