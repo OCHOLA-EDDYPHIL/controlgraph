@@ -354,9 +354,21 @@ class _TimelineRecorder:
         self.calls.append((signed, signature_verified))
 
 
+class _CapabilityEnvelopeVerifier:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.calls: list[SignedCapability] = []
+
+    def verify(self, capability: SignedCapability) -> None:
+        self.calls.append(capability)
+        if self.error is not None:
+            raise self.error
+
+
 def _rollout_coordinator(
     capability_client: _CapabilityClient,
     enqueuer: _RecordingEnqueuer,
+    capability_verifier: _CapabilityEnvelopeVerifier | None = None,
     timeline_recorder: _TimelineRecorder | None = None,
 ) -> CanaryRolloutCoordinator:
     return CanaryRolloutCoordinator(
@@ -367,6 +379,7 @@ def _rollout_coordinator(
             enqueuer,
         ),
         clock=lambda: NOW,
+        capability_verifier=capability_verifier,
         timeline_recorder=timeline_recorder,
     )
 
@@ -584,20 +597,48 @@ def test_coordinator_derives_exact_task_only_from_signed_claims() -> None:
     assert result.enqueue_disposition == TaskEnqueueDisposition.CREATED.value
 
 
-def test_coordinator_records_issued_capability_without_claiming_signature_verification() -> None:
+def test_coordinator_records_issued_capability_after_signature_verification() -> None:
     capability = _capability()
+    verifier = _CapabilityEnvelopeVerifier()
     recorder = _TimelineRecorder()
     enqueuer = _RecordingEnqueuer()
     coordinator = _rollout_coordinator(
         _CapabilityClient(capability),
         enqueuer,
+        capability_verifier=verifier,
         timeline_recorder=recorder,
     )
 
     asyncio.run(coordinator.dispatch(_command()))
 
-    assert recorder.calls == [(capability, False)]
+    assert verifier.calls == [capability]
+    assert recorder.calls == [(capability, True)]
     assert len(enqueuer.calls) == 1
+
+
+def test_coordinator_denies_tampered_capability_when_verification_fails() -> None:
+    marker = "synthetic-capability-verification-detail"
+    capability = _capability().model_copy(
+        update={"signature": encode_base64url(b"tampered-signature")}
+    )
+    verifier = _CapabilityEnvelopeVerifier(RuntimeError(marker))
+    recorder = _TimelineRecorder()
+    enqueuer = _RecordingEnqueuer()
+    coordinator = _rollout_coordinator(
+        _CapabilityClient(capability),
+        enqueuer,
+        capability_verifier=verifier,
+        timeline_recorder=recorder,
+    )
+
+    with pytest.raises(CanaryExecutionError) as denied:
+        asyncio.run(coordinator.dispatch(_command()))
+
+    assert denied.value.code is CanaryExecutionErrorCode.ISSUANCE_DENIED
+    assert marker not in str(denied.value)
+    assert verifier.calls == [capability]
+    assert recorder.calls == []
+    assert enqueuer.calls == []
 
 
 @pytest.mark.parametrize(

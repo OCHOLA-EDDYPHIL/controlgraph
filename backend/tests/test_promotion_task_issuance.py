@@ -123,6 +123,8 @@ from controlgraph_canary.contracts.models import (
     MutationIntent,
     ReasonCode,
     ReceiptOutcome,
+    SignedCapability,
+    TargetBinding,
 )
 from controlgraph_canary.contracts.promotion_execution import (
     PROMOTION_CAPABILITY_ISSUANCE_COMMAND_V2,
@@ -309,6 +311,31 @@ class _HoldingEnqueuer:
             task_name=task.name,
             disposition=TaskEnqueueDisposition.CREATED,
         )
+
+
+class _CapabilityEnvelopeVerifier:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.calls: list[SignedCapability] = []
+
+    def verify(self, capability: SignedCapability) -> None:
+        self.calls.append(capability)
+        if self.error is not None:
+            raise self.error
+
+
+class _TimelineRecorder:
+    def __init__(self, target: TargetBinding) -> None:
+        self.target = target
+        self.calls: list[tuple[SignedCapability, bool]] = []
+
+    async def record_signed_capability(
+        self,
+        signed: SignedCapability,
+        *,
+        signature_verified: bool,
+    ) -> None:
+        self.calls.append((signed, signature_verified))
 
 
 class _AmbiguousEnqueuer(_HoldingEnqueuer):
@@ -874,6 +901,8 @@ def _rollout_coordinator(
     *,
     clock: Callable[[], datetime] = lambda: ISSUE_TIME,
     client_capture: list[_DirectPromotionCapabilityClient] | None = None,
+    capability_verifier: _CapabilityEnvelopeVerifier | None = None,
+    timeline_recorder: _TimelineRecorder | None = None,
 ) -> PromotionRolloutCoordinator:
     service = CapabilityIssuanceService(
         issuer=issuer,
@@ -898,7 +927,65 @@ def _rollout_coordinator(
             enqueuer,
         ),
         clock=clock,
+        capability_verifier=capability_verifier,
+        timeline_recorder=timeline_recorder,
     )
+
+
+def test_promotion_records_capability_after_signature_verification() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        verifier = _CapabilityEnvelopeVerifier()
+        recorder = _TimelineRecorder(records.root.content.target)
+        enqueuer = _HoldingEnqueuer()
+        coordinator = _rollout_coordinator(
+            store,
+            _issuer(store, records, ec.generate_private_key(ec.SECP256R1())),
+            records,
+            enqueuer,
+            capability_verifier=verifier,
+            timeline_recorder=recorder,
+        )
+
+        await coordinator.dispatch(_promotion_command(records, source.value))
+
+        assert len(verifier.calls) == 1
+        assert recorder.calls == [(verifier.calls[0], True)]
+        assert len(enqueuer.attempts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_promotion_fails_closed_when_capability_verification_fails() -> None:
+    async def scenario() -> None:
+        store, records = await _created_store()
+        source = await _write_verified_apply_receipt(store, records)
+        marker = "synthetic-promotion-verification-detail"
+        verifier = _CapabilityEnvelopeVerifier(RuntimeError(marker))
+        recorder = _TimelineRecorder(records.root.content.target)
+        enqueuer = _HoldingEnqueuer()
+        coordinator = _rollout_coordinator(
+            store,
+            _issuer(store, records, ec.generate_private_key(ec.SECP256R1())),
+            records,
+            enqueuer,
+            capability_verifier=verifier,
+            timeline_recorder=recorder,
+        )
+        command = _promotion_command(records, source.value)
+
+        with pytest.raises(CanaryExecutionError) as denied:
+            await coordinator.dispatch(command)
+
+        assert denied.value.code is CanaryExecutionErrorCode.ISSUANCE_DENIED
+        assert marker not in str(denied.value)
+        assert len(verifier.calls) == 1
+        assert recorder.calls == []
+        assert enqueuer.attempts == []
+        assert await store.read_promotion_dispatch_v2(command) is None
+
+    asyncio.run(scenario())
 
 
 def _promotion_request(command: PromotionCommandV2) -> PromotionCapabilityIssuanceRequestV2:

@@ -19,6 +19,9 @@ from controlgraph_canary.application.canary_execution import (
     CanaryExecutionErrorCode,
     CapabilityTimelineRecorder,
 )
+from controlgraph_canary.application.capability_issuance import (
+    CapabilityEnvelopeVerifier,
+)
 from controlgraph_canary.application.health_orchestration import (
     HealthAttestationVerifier,
     verify_healthy_promotion_chain,
@@ -282,6 +285,7 @@ class PromotionRolloutCoordinator:
         dispatch_store: PromotionDispatchStoreV2,
         task_dispatcher: TaskDispatcher,
         clock: Callable[[], datetime] | None = None,
+        capability_verifier: CapabilityEnvelopeVerifier | None = None,
         timeline_recorder: CapabilityTimelineRecorder | None = None,
     ) -> None:
         if (
@@ -297,6 +301,11 @@ class PromotionRolloutCoordinator:
             or dispatch_store.target != target
             or type(task_dispatcher) is not TaskDispatcher
             or (clock is not None and not callable(clock))
+            or (capability_verifier is None) != (timeline_recorder is None)
+            or (
+                capability_verifier is not None
+                and not isinstance(capability_verifier, CapabilityEnvelopeVerifier)
+            )
             or (
                 timeline_recorder is not None
                 and (
@@ -312,6 +321,7 @@ class PromotionRolloutCoordinator:
         self._dispatch_store = dispatch_store
         self._task_dispatcher = task_dispatcher
         self._clock = clock or _now_utc_second
+        self._capability_verifier = capability_verifier
         self._timeline_recorder = timeline_recorder
 
     async def dispatch(
@@ -460,10 +470,12 @@ class PromotionRolloutCoordinator:
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
         claims = capability.claims
         try:
+            if self._capability_verifier is not None:
+                self._capability_verifier.verify(capability)
             if self._timeline_recorder is not None:
                 await self._timeline_recorder.record_signed_capability(
                     capability,
-                    signature_verified=False,
+                    signature_verified=True,
                 )
             intent = PromotionMutationIntentV2(
                 schema_version=PROMOTION_MUTATION_INTENT_V2,

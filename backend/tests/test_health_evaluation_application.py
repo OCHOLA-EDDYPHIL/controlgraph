@@ -36,7 +36,7 @@ def _initial_state():  # type: ignore[no-untyped-def]
         root_id="cgroot:" + "1" * 64,
         root_sha256="1" * 64,
         epoch=1,
-        candidate_revision="controlgraph-reference-target-candidate-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v15",
         observation_started_at="2026-08-21T12:00:00Z",
     )
 
@@ -81,7 +81,7 @@ def test_initial_state_recomputes_the_canonical_policy_digest() -> None:
         root_id="cgroot:" + "1" * 64,
         root_sha256="1" * 64,
         epoch=1,
-        candidate_revision="controlgraph-reference-target-candidate-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v15",
         observation_started_at="2026-08-21T12:00:00Z",
     )
 
@@ -262,7 +262,7 @@ def test_mapper_rejects_timestamps_outside_the_evaluator_horizon(
         root_id="cgroot:" + "1" * 64,
         root_sha256="1" * 64,
         epoch=1,
-        candidate_revision="controlgraph-reference-target-candidate-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v15",
         observation_started_at=observation_started_at,
     )
 

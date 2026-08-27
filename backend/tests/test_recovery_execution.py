@@ -59,6 +59,7 @@ from controlgraph_canary.contracts.codec import (
     canonical_sha256,
     decode_contract,
 )
+from controlgraph_canary.contracts.models import SignedCapability, TargetBinding
 from controlgraph_canary.contracts.recovery_execution import (
     RecoveryAuthorizationV1,
     RecoveryCapabilityIssuanceResultV2,
@@ -248,6 +249,31 @@ class _TaskDispatcher:
         )
 
 
+class _CapabilityEnvelopeVerifier:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.calls: list[SignedCapability] = []
+
+    def verify(self, capability: SignedCapability) -> None:
+        self.calls.append(capability)
+        if self.error is not None:
+            raise self.error
+
+
+class _TimelineRecorder:
+    def __init__(self, target: TargetBinding) -> None:
+        self.target = target
+        self.calls: list[tuple[SignedCapability, bool]] = []
+
+    async def record_signed_capability(
+        self,
+        signed: SignedCapability,
+        *,
+        signature_verified: bool,
+    ) -> None:
+        self.calls.append((signed, signature_verified))
+
+
 class _RecoveryApiTransport:
     def __init__(self, response: RecoveryDispatchResultV2) -> None:
         self._response = canonical_json_bytes(response)
@@ -261,6 +287,9 @@ class _RecoveryApiTransport:
 def _coordinator(
     store: _DispatchStore,
     bundle: RecoveryV2Bundle | None = None,
+    *,
+    capability_verifier: _CapabilityEnvelopeVerifier | None = None,
+    timeline_recorder: _TimelineRecorder | None = None,
 ) -> tuple[RecoveryRolloutCoordinator, _Resolver, _CapabilityClient, _TaskDispatcher]:
     selected_bundle = bundle or _recovery_bundle()
     resolver = _Resolver(selected_bundle.authorization)
@@ -276,6 +305,8 @@ def _coordinator(
             selected_bundle.authorization.issued_at,
             "%Y-%m-%dT%H:%M:%SZ",
         ).replace(tzinfo=UTC),
+        capability_verifier=capability_verifier,
+        timeline_recorder=timeline_recorder,
     )
     return coordinator, resolver, capability, dispatcher
 
@@ -418,6 +449,55 @@ def test_operator_recovery_coordinator_dispatches_once_and_adopts_terminal_resul
         assert store.dispatch_record is not None
         assert store.dispatch_record.revision == 2
         assert store.dispatch_record.value.state is RecoveryDispatchState.CREATED
+
+    asyncio.run(scenario())
+
+
+def test_recovery_records_capability_after_signature_verification() -> None:
+    async def scenario() -> None:
+        bundle = make_revoked_v2_recovery_bundle()
+        store = _DispatchStore(bundle)
+        verifier = _CapabilityEnvelopeVerifier()
+        recorder = _TimelineRecorder(bundle.root.content.target)
+        coordinator, _, _, dispatcher = _coordinator(
+            store,
+            bundle,
+            capability_verifier=verifier,
+            timeline_recorder=recorder,
+        )
+
+        await coordinator.dispatch(bundle.command)
+
+        assert verifier.calls == [bundle.issuance_result.capability]
+        assert recorder.calls == [(bundle.issuance_result.capability, True)]
+        assert dispatcher.dispatch_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_recovery_fails_closed_when_capability_verification_fails() -> None:
+    async def scenario() -> None:
+        bundle = make_revoked_v2_recovery_bundle()
+        store = _DispatchStore(bundle)
+        marker = "synthetic-recovery-verification-detail"
+        verifier = _CapabilityEnvelopeVerifier(RuntimeError(marker))
+        recorder = _TimelineRecorder(bundle.root.content.target)
+        coordinator, _, _, dispatcher = _coordinator(
+            store,
+            bundle,
+            capability_verifier=verifier,
+            timeline_recorder=recorder,
+        )
+
+        with pytest.raises(RecoveryExecutionError) as denied:
+            await coordinator.dispatch(bundle.command)
+
+        assert denied.value.code is RecoveryExecutionErrorCode.ISSUANCE_DENIED
+        assert marker not in str(denied.value)
+        assert verifier.calls == [bundle.issuance_result.capability]
+        assert recorder.calls == []
+        assert dispatcher.dispatch_calls == 0
+        assert store.dispatch_record is None
 
     asyncio.run(scenario())
 

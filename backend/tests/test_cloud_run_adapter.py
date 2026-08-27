@@ -101,8 +101,8 @@ PROJECT_ID = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
 SUBJECT = "123456789012345678901"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v14"
-CANDIDATE = f"{SERVICE}-candidate-v14"
+STABLE = f"{SERVICE}-stable-v15"
+CANDIDATE = f"{SERVICE}-candidate-v15"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
@@ -1210,14 +1210,14 @@ async def test_receipt_readback_uses_one_total_provider_settle_budget(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            stable_revision=f"{SERVICE}-stable-v15",
+            stable_revision=f"{SERVICE}-stable-v16",
         ),
         replace(
             target_configuration_projection(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            candidate_revision=f"{SERVICE}-candidate-v15",
+            candidate_revision=f"{SERVICE}-candidate-v16",
         ),
         replace(
             target_configuration_projection(
@@ -1887,7 +1887,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-        "86aacfe379946222b14b1223793c18552285ffa2db0a2e771968923ec8201aee"
+        "35e6e60370aa2638770057f99046b01e408d8b53867dfca7ce5b73e26b125265"
     )
 
 
@@ -1915,8 +1915,8 @@ def test_target_configuration_digest_excludes_non_poststate_fields() -> None:
     ("changes", "expected_concurrency"),
     [
         ({"target": _target(project_id="controlgraph-canary-d4e5f6")}, 8),
-        ({"stable_revision": f"{SERVICE}-stable-v15"}, 8),
-        ({"candidate_revision": f"{SERVICE}-candidate-v15"}, 8),
+        ({"stable_revision": f"{SERVICE}-stable-v16"}, 8),
+        ({"candidate_revision": f"{SERVICE}-candidate-v16"}, 8),
         ({"stable_percent": 80, "candidate_percent": 20}, 8),
         ({}, 9),
     ],
@@ -2018,12 +2018,12 @@ async def test_reference_target_reset_migrates_the_exact_v13_baseline_to_v14() -
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v13",
-        candidate_revision="controlgraph-reference-target-candidate-v13",
+        stable_revision="controlgraph-reference-target-stable-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v14",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v13"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v14"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
@@ -2149,12 +2149,12 @@ async def test_reference_target_reset_rejects_any_other_v13_traffic_shape(
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v13",
-        candidate_revision="controlgraph-reference-target-candidate-v13",
+        stable_revision="controlgraph-reference-target-stable-v14",
+        candidate_revision="controlgraph-reference-target-candidate-v14",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v13"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v14"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )

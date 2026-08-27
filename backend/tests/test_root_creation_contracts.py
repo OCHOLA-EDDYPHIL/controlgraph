@@ -39,8 +39,8 @@ from controlgraph_canary.contracts.base import MAX_SAFE_INTEGER
 PROJECT = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v14"
-CANDIDATE = f"{SERVICE}-candidate-v14"
+STABLE = f"{SERVICE}-stable-v15"
+CANDIDATE = f"{SERVICE}-candidate-v15"
 CAPABILITY_KEY = (
     f"projects/{PROJECT}/locations/us-central1/keyRings/controlgraph-signing/"
     "cryptoKeys/capability-signing/cryptoKeyVersions/1"
@@ -422,9 +422,9 @@ def test_each_variable_health_policy_field_changes_its_hash(field: str, value: i
     ("field", "value"),
     [
         ("stable_snapshot_sha256", "4" * 64),
-        ("stable_revision", f"{SERVICE}-stable-v15"),
+        ("stable_revision", f"{SERVICE}-stable-v16"),
         ("stable_revision_configuration_sha256", "4" * 64),
-        ("candidate_revision", f"{SERVICE}-candidate-v15"),
+        ("candidate_revision", f"{SERVICE}-candidate-v16"),
         ("candidate_revision_configuration_sha256", "4" * 64),
         ("concurrency", 9),
         ("health_policy_sha256", "4" * 64),
@@ -446,9 +446,9 @@ def test_target_change_changes_plan_hash() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("stable_revision", f"{SERVICE}-stable-v15"),
+        ("stable_revision", f"{SERVICE}-stable-v16"),
         ("stable_revision_configuration_sha256", "4" * 64),
-        ("candidate_revision", f"{SERVICE}-candidate-v15"),
+        ("candidate_revision", f"{SERVICE}-candidate-v16"),
         ("candidate_revision_configuration_sha256", "4" * 64),
         ("concurrency", 9),
         ("plan_sha256", "4" * 64),
