@@ -2901,21 +2901,81 @@ def _jwt_claims(token: str) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
-def _identity_token(run: _HostedExecution, service_account: str | None = None) -> str:
-    arguments = ["gcloud", "auth", "print-identity-token"]
-    if service_account is not None:
-        arguments.extend(
-            (
-                f"--impersonate-service-account={service_account}",
-                f"--audiences={run.api_origin}",
-                "--include-email",
-            )
-        )
-    _, payload = _capture_process(arguments, repo=run.repo, timeout=60)
+def _service_account_identity_token(
+    run: _HostedExecution,
+    *,
+    service_account: str,
+    audience: str,
+) -> str:
     try:
-        token = payload.decode("ascii").strip()
-    except UnicodeDecodeError as error:
+        _, access_token_payload = _capture_process(
+            ("gcloud", "auth", "print-access-token", run.acceptance_identity),
+            repo=run.repo,
+            timeout=60,
+        )
+        access_token = access_token_payload.decode("ascii").strip()
+        if (
+            not access_token
+            or len(access_token) > MAX_ARTIFACT_BYTES
+            or any(character.isspace() for character in access_token)
+        ):
+            raise ValueError
+        body = json.dumps(
+            {"audience": audience, "includeEmail": True},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        account = urllib.parse.quote(service_account, safe="")
+        request = urllib.request.Request(
+            "https://iamcredentials.googleapis.com/v1/"
+            f"projects/-/serviceAccounts/{account}:generateIdToken",
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "controlgraph-m8-core/1",
+                "X-Goog-User-Project": run.spec.target.project_id,
+            },
+            method="POST",
+        )
+        response = _HTTP_OPENER.open(request, timeout=30)
+        with response:
+            if response.status != 200:
+                raise ValueError
+            payload = response.read(MAX_ARTIFACT_BYTES + 1)
+        if len(payload) > MAX_ARTIFACT_BYTES:
+            raise ValueError
+        value = json.loads(payload)
+        if not isinstance(value, dict):
+            raise TypeError
+        token = value.get("token")
+    except Exception as error:
         raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID") from error
+    if (
+        type(token) is not str
+        or not token
+        or any(character.isspace() for character in token)
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID")
+    return token
+
+
+def _identity_token(run: _HostedExecution, service_account: str | None = None) -> str:
+    if service_account is None:
+        _, payload = _capture_process(
+            ("gcloud", "auth", "print-identity-token"), repo=run.repo, timeout=60
+        )
+        try:
+            token = payload.decode("ascii").strip()
+        except UnicodeDecodeError as error:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID") from error
+    else:
+        token = _service_account_identity_token(
+            run,
+            service_account=service_account,
+            audience=run.api_origin,
+        )
     claims = _jwt_claims(token)
     if service_account is not None and (
         claims.get("email") != service_account or claims.get("aud") != run.api_origin
