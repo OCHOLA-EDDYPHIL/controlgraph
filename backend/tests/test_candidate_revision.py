@@ -33,7 +33,7 @@ from controlgraph_canary.contracts.models import TargetBinding
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
-CANDIDATE = f"{SERVICE}-candidate-v15"
+CANDIDATE = f"{SERVICE}-candidate-v16"
 READER_IDENTITY = f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
@@ -315,7 +315,7 @@ def test_reader_target_role_and_identity_mismatch_deny_before_read(
     "revision",
     [
         _revision(target=_target(project_id="controlgraph-canary-b2c3d4")),
-        _revision(revision=f"{SERVICE}-stable-v15"),
+        _revision(revision=f"{SERVICE}-stable-v16"),
     ],
 )
 @_async_test

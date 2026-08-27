@@ -249,13 +249,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v15",
+        "candidate_revision": "controlgraph-reference-target-candidate-v16",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v15",
+        "stable_revision": "controlgraph-reference-target-stable-v16",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -1540,6 +1540,140 @@ def test_hosted_probe_records_stay_within_restricted_canonical_json() -> None:
     assert b'"status":"COMPLETE"' in encoded
 
 
+def test_hosted_timeline_evidence_compacts_large_pages_with_complete_bindings() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    digests = tuple(character * 64 for character in ("a", "b", "c"))
+    audience = SimpleNamespace(value="OPERATOR")
+    pages = []
+    after_sequence = 0
+    after_entry_sha256 = None
+    for index, digest in enumerate(digests, start=1):
+        command = SimpleNamespace(
+            audience=audience,
+            after_sequence=after_sequence,
+            after_entry_sha256=after_entry_sha256,
+        )
+        document = {
+            "command": {
+                "audience": audience.value,
+                "after_entry_sha256": after_entry_sha256,
+                "after_sequence": after_sequence,
+            },
+            "entries": [
+                {
+                    "entry_sha256": digest,
+                    "payload": "x" * 24_000,
+                    "previous_entry_sha256": after_entry_sha256,
+                    "sequence": index,
+                }
+            ],
+            "has_more": index < len(digests),
+            "head_entry_sha256": digests[-1],
+            "head_sequence": len(digests),
+            "next_after_entry_sha256": digest,
+            "next_after_sequence": index,
+            "schema_version": "controlgraph.timeline-page/v1",
+        }
+
+        def model_dump(*, mode: str, value: dict[str, Any] = document) -> dict[str, Any]:
+            assert mode == "json"
+            return value
+
+        pages.append(
+            SimpleNamespace(
+                command=command,
+                entries=(
+                    SimpleNamespace(
+                        entry_sha256=digest,
+                        previous_entry_sha256=after_entry_sha256,
+                        sequence=index,
+                    ),
+                ),
+                has_more=index < len(digests),
+                head_entry_sha256=digests[-1],
+                head_sequence=len(digests),
+                model_dump=model_dump,
+                next_after_entry_sha256=digest,
+                next_after_sequence=index,
+            )
+        )
+        after_sequence = index
+        after_entry_sha256 = digest
+
+    with pytest.raises(runner.ContractError):
+        runner.canonical_json_value_bytes(
+            [page.model_dump(mode="json") for page in pages]
+        )
+
+    release_document = {
+        "root_id": "cgroot:" + "d" * 64,
+        "schema_version": "controlgraph.service-claim-release-result/v1",
+    }
+
+    def release_dump(*, mode: str) -> dict[str, Any]:
+        assert mode == "json"
+        return release_document
+
+    evidence = runner._timeline_evidence(
+        tuple(pages),
+        release=SimpleNamespace(model_dump=release_dump),
+    )
+    summary = evidence["summary"]
+    page_sha256s = [
+        hashlib.sha256(
+            runner.canonical_json_value_bytes(page.model_dump(mode="json"))
+        ).hexdigest()
+        for page in pages
+    ]
+
+    assert summary["audience"] == "OPERATOR"
+    assert summary["page_count"] == 3
+    assert summary["entry_count"] == 3
+    assert summary["head_sequence"] == 3
+    assert summary["head_entry_sha256"] == digests[-1]
+    assert [item["page_sha256"] for item in summary["page_bindings"]] == page_sha256s
+    assert summary["page_set_sha256"] == hashlib.sha256(
+        runner._TIMELINE_PAGE_SET_DOMAIN
+        + runner.canonical_json_value_bytes(page_sha256s)
+    ).hexdigest()
+    assert summary["page_set_sha256"] != hashlib.sha256(
+        runner._TIMELINE_PAGE_SET_DOMAIN
+        + runner.canonical_json_value_bytes(list(reversed(page_sha256s)))
+    ).hexdigest()
+    assert evidence["release"] == release_document
+    assert runner._timeline_evidence(
+        tuple(pages),
+        release=SimpleNamespace(model_dump=release_dump),
+    ) == evidence
+    encoded = runner._canonical_object(evidence)
+    assert len(encoded) < runner.MAX_CONTRACT_BYTES
+    assert b'"payload"' not in encoded
+
+
+def test_hosted_timeline_evidence_rejects_cursor_gaps() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    digest = "a" * 64
+    page = SimpleNamespace(
+        command=SimpleNamespace(
+            audience=SimpleNamespace(value="OPERATOR"),
+            after_sequence=1,
+            after_entry_sha256=digest,
+        ),
+        entries=(),
+        has_more=False,
+        head_entry_sha256=digest,
+        head_sequence=1,
+        next_after_entry_sha256=digest,
+        next_after_sequence=1,
+    )
+
+    for pages in ((), (page,)):
+        with pytest.raises(runner.AcceptanceError) as raised:
+            runner._timeline_evidence(pages)
+
+        assert raised.value.code == "ACCEPTANCE_HOSTED_TIMELINE_INVALID"
+
+
 def test_hosted_policy_binding_compares_plain_artifact_digest() -> None:
     """The spec artifact digest is plain SHA-256 of canonical policy bytes.
 
@@ -1889,7 +2023,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v15",
+                            "revision": "controlgraph-reference-target-candidate-v16",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -1910,7 +2044,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v15",
+        "controlgraph-reference-target-candidate-v16",
     )
 
     assert flaky.calls == 3
