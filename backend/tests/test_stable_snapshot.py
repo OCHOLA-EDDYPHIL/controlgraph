@@ -40,8 +40,8 @@ from controlgraph_canary.contracts.models import TargetBinding, TrafficAllocatio
 
 PROJECT_ID = "controlgraph-canary-a1b2c3"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v13"
-CANDIDATE = f"{SERVICE}-candidate-v13"
+STABLE = f"{SERVICE}-stable-v14"
+CANDIDATE = f"{SERVICE}-candidate-v14"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 READER_IDENTITY = f"controlgraph-verifier@{PROJECT_ID}.iam.gserviceaccount.com"
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
@@ -326,7 +326,7 @@ async def test_capture_uses_two_matching_reads_and_ignores_mutable_aliases() -> 
     assert snapshot.service_generation == 7
     assert snapshot.provider_etag == "service-etag-7"
     assert snapshot.configuration_sha256 == (
-            "dee4345d405a95d35d12c108761287b52965b8cd1d4b85e2eea56a7986d2076a"
+            "3694b28654b6159e735f5932a313168042b617d8bb2f87d6efc797fdbf228442"
     )
     assert snapshot.stable_revision_configuration_sha256 == (
         cloud_run_revision_configuration_sha256(_revision_configuration())
@@ -707,7 +707,7 @@ def test_configuration_digest_binds_immutable_revision_and_serving_state() -> No
 
     assert STABLE_CONFIGURATION_V1 == "controlgraph.stable-configuration/v1"
     assert STABLE_CONFIGURATION_DOMAIN == b"controlgraph.stable-configuration-sha256/v1\0"
-    assert baseline == "dee4345d405a95d35d12c108761287b52965b8cd1d4b85e2eea56a7986d2076a"
+    assert baseline == "3694b28654b6159e735f5932a313168042b617d8bb2f87d6efc797fdbf228442"
     assert all(
         stable_configuration_sha256(changed_service, changed_revision, changed_traffic)
         != baseline

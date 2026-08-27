@@ -98,12 +98,12 @@ def test_serve_disables_uvicorn_access_log(monkeypatch: pytest.MonkeyPatch) -> N
     [
         (
             "serve-reference-stable",
-            "controlgraph-reference-target-stable-v13",
+            "controlgraph-reference-target-stable-v14",
             "controlgraph-stable-v1",
         ),
         (
             "serve-reference-candidate",
-            "controlgraph-reference-target-candidate-v13",
+            "controlgraph-reference-target-candidate-v14",
             "controlgraph-candidate-v1",
         ),
     ],

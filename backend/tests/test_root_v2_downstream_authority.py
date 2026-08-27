@@ -119,8 +119,8 @@ def test_atomic_root_boundary_rejects_persisted_widening_and_tamper(
     [
         {"root_sha256": ZERO_DIGEST},
         {"plan_sha256": ZERO_DIGEST},
-        {"stable_revision": "controlgraph-reference-target-stable-v14"},
-        {"candidate_revision": "controlgraph-reference-target-candidate-v14"},
+        {"stable_revision": "controlgraph-reference-target-stable-v15"},
+        {"candidate_revision": "controlgraph-reference-target-candidate-v15"},
         {"issuer": "controlgraph-executor@controlgraph-canary-abc123.iam.gserviceaccount.com"},
         {"subject": "controlgraph-recovery@controlgraph-canary-abc123.iam.gserviceaccount.com"},
         {"audience": service_audience("recovery")},
