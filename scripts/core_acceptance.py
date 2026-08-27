@@ -2137,6 +2137,10 @@ def _project_health_load(
     return projected
 
 
+def _accepted_health_append_disposition(value: object) -> bool:
+    return value in ("CREATED", "ADOPTED")
+
+
 def _health_load(
     run: _HostedExecution,
     case: CaseBindingV1,
@@ -2238,7 +2242,7 @@ def _health_load(
     if (
         first.terminal_status.value != "wait"
         or first.terminal_sequence != 1
-        or first.append_disposition != "CREATED"
+        or not _accepted_health_append_disposition(first.append_disposition)
         or first.next_evaluation_at is None
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_INVALID")
@@ -2261,7 +2265,7 @@ def _health_load(
     if (
         second.terminal_status.value != expected
         or second.terminal_sequence != 2
-        or second.append_disposition != "CREATED"
+        or not _accepted_health_append_disposition(second.append_disposition)
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_INVALID")
     return load, dispatch, receipt, second
