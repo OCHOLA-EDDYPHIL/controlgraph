@@ -69,6 +69,7 @@ _LOAD_JOB_LABEL_KEY = "controlgraph-purpose"
 _LOAD_JOB_LABEL = "m8-core-acceptance"
 _LOAD_RESULT_SCHEMA = "controlgraph.core-acceptance-load-result/v1"
 _LOAD_READY_SCHEMA = "controlgraph.core-acceptance-load-ready/v1"
+_TIMELINE_PAGE_SET_DOMAIN = b"controlgraph.timeline-acceptance-page-set/v1\0"
 _LOAD_JOB_PERMISSIONS = (
     "iam.serviceAccounts.actAs",
     "logging.logEntries.list",
@@ -2440,7 +2441,7 @@ def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcom
                 EvidenceKind.EXECUTOR_EPOCH_CHECK: promotion_receipt,
                 EvidenceKind.EXECUTION_RECEIPT: promotion_receipt,
                 EvidenceKind.HEALTH_DECISION: health,
-                EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
+                EvidenceKind.TIMELINE: _timeline_evidence(pages, release=release),
             },
             terminal_result=terminal_result,
         )
@@ -2540,7 +2541,7 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
                     "schema_version": "controlgraph.recovery-service-identity-binding/v1",
                     "service": recovery_service,
                 },
-                EvidenceKind.TIMELINE: {"pages": pages, "release": _model_dict(release)},
+                EvidenceKind.TIMELINE: _timeline_evidence(pages, release=release),
             },
             terminal_result=terminal_result,
         )
@@ -2822,10 +2823,7 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
                 EvidenceKind.EXECUTOR_EPOCH_CHECK: stale_receipt,
                 EvidenceKind.STALE_DENIAL: stale_receipt,
                 EvidenceKind.EXECUTION_RECEIPT: recovery_receipt,
-                EvidenceKind.TIMELINE: {
-                    "pages": pages,
-                    "release": _model_dict(release),
-                },
+                EvidenceKind.TIMELINE: _timeline_evidence(pages, release=release),
             },
             terminal_result=terminal_result,
         )
@@ -3146,6 +3144,93 @@ def _read_operator_timeline(run: _HostedExecution) -> tuple[Any, ...]:
     return pages
 
 
+def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
+    if not pages:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    first = pages[0]
+    audience = first.command.audience
+    expected_sequence = first.command.after_sequence
+    expected_entry_sha256 = first.command.after_entry_sha256
+    head = (first.head_sequence, first.head_entry_sha256)
+    if expected_sequence != 0 or expected_entry_sha256 is not None:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    summaries: list[dict[str, object]] = []
+    page_sha256s: list[str] = []
+    entry_count = 0
+    for page in pages:
+        if (
+            (page.head_sequence, page.head_entry_sha256) != head
+            or page.command.audience != audience
+            or page.command.after_sequence != expected_sequence
+            or page.command.after_entry_sha256 != expected_entry_sha256
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+        page_sequence = page.command.after_sequence
+        page_entry_sha256 = page.command.after_entry_sha256
+        for entry in page.entries:
+            page_sequence += 1
+            if (
+                entry.sequence != page_sequence
+                or entry.previous_entry_sha256 != page_entry_sha256
+            ):
+                raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+            page_entry_sha256 = entry.entry_sha256
+        if (
+            page.next_after_sequence != page_sequence
+            or page.next_after_entry_sha256 != page_entry_sha256
+            or page.has_more != (page.next_after_sequence < head[0])
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+        page_sha256 = hashlib.sha256(
+            _canonical_object(_model_dict(page))
+        ).hexdigest()
+        page_sha256s.append(page_sha256)
+        summaries.append(
+            {
+                "after_entry_sha256": page.command.after_entry_sha256,
+                "after_sequence": page.command.after_sequence,
+                "entry_count": len(page.entries),
+                "next_after_entry_sha256": page.next_after_entry_sha256,
+                "next_after_sequence": page.next_after_sequence,
+                "page_sha256": page_sha256,
+            }
+        )
+        entry_count += len(page.entries)
+        expected_sequence = page.next_after_sequence
+        expected_entry_sha256 = page.next_after_entry_sha256
+    if (
+        pages[-1].has_more
+        or expected_sequence != head[0]
+        or expected_entry_sha256 != head[1]
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    return {
+        "audience": audience.value,
+        "entry_count": entry_count,
+        "head_entry_sha256": head[1],
+        "head_sequence": head[0],
+        "page_count": len(pages),
+        "page_bindings": tuple(summaries),
+        "page_set_sha256": hashlib.sha256(
+            _TIMELINE_PAGE_SET_DOMAIN
+            + canonical_json_value_bytes(cast(RestrictedJson, page_sha256s))
+        ).hexdigest(),
+        "schema_version": "controlgraph.timeline-page-summary/v1",
+    }
+
+
+def _timeline_evidence(
+    pages: Sequence[Any],
+    *,
+    release: Any | None = None,
+) -> dict[str, object]:
+    return {
+        "release": _model_dict(release) if release is not None else None,
+        "schema_version": "controlgraph.timeline-acceptance-evidence/v1",
+        "summary": _timeline_page_summary(pages),
+    }
+
+
 def _verified_capability_metadata(
     *,
     pages: Sequence[Any],
@@ -3269,7 +3354,7 @@ def _run_verifier_case(
             EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
             EvidenceKind.DATA_PATH_PROBE: probe,
             EvidenceKind.INDEPENDENT_VERIFICATION: (configuration, probe),
-            EvidenceKind.TIMELINE: pages,
+            EvidenceKind.TIMELINE: _timeline_evidence(pages),
         },
         terminal_result="VERIFIED",
     )
@@ -3342,7 +3427,7 @@ def _run_ambiguity_case(
             EvidenceKind.CLOUD_RUN_CONFIGURATION: reset,
             EvidenceKind.EXECUTION_RECEIPT: receipt,
             EvidenceKind.AMBIGUITY_CLASSIFICATION: classification,
-            EvidenceKind.TIMELINE: pages,
+            EvidenceKind.TIMELINE: _timeline_evidence(pages),
         },
         terminal_result=classification.status.value,
     )
@@ -3373,7 +3458,10 @@ def _run_timeline_console_case(
         "status_code": status,
     }
     return _CaseOutcome(
-        observations={EvidenceKind.TIMELINE: pages, EvidenceKind.CONSOLE_READ: console},
+        observations={
+            EvidenceKind.TIMELINE: _timeline_evidence(pages),
+            EvidenceKind.CONSOLE_READ: console,
+        },
         terminal_result="READABLE",
     )
 
@@ -3450,7 +3538,7 @@ def _run_advisor_case(
         observations={
             EvidenceKind.COORDINATOR: result,
             EvidenceKind.MODEL_AUDIT: audit,
-            EvidenceKind.TIMELINE: pages,
+            EvidenceKind.TIMELINE: _timeline_evidence(pages),
         },
         terminal_result="ADVISORY_ONLY",
     )
