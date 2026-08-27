@@ -18,8 +18,8 @@ from controlgraph_canary.contracts.independent_verification import (
 
 REFERENCE_PROBE_VERSION: Final = "controlgraph.reference-probe/v1"
 REFERENCE_SERVICE_NAME: Final = "controlgraph-reference-target"
-STABLE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-stable-v16"
-CANDIDATE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-candidate-v16"
+STABLE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-stable-v17"
+CANDIDATE_REVISION: Final = f"{REFERENCE_SERVICE_NAME}-candidate-v17"
 STABLE_MARKER: Final = "controlgraph-stable-v1"
 CANDIDATE_MARKER: Final = "controlgraph-candidate-v1"
 _NONCE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
