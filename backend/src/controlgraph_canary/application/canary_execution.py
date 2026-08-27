@@ -10,6 +10,7 @@ from typing import Literal, Protocol, cast, runtime_checkable
 
 from controlgraph_canary.application.capability_issuance import (
     AuthenticatedIssuancePrincipal,
+    CapabilityEnvelopeVerifier,
     CapabilityIssuanceRequest,
     CapabilityIssuer,
     PromotionCapabilityIssuanceRequestV2,
@@ -101,7 +102,7 @@ class ApplyCanaryCoordinator(Protocol):
 
 @runtime_checkable
 class CapabilityTimelineRecorder(Protocol):
-    """Record an issuer-authenticated capability without claiming signature verification."""
+    """Record a signature-verified capability returned by the issuer."""
 
     @property
     def target(self) -> TargetBinding: ...
@@ -321,6 +322,7 @@ class CanaryRolloutCoordinator:
         capability_client: ApplyCanaryCapabilityClient,
         task_dispatcher: TaskDispatcher,
         clock: Callable[[], datetime] | None = None,
+        capability_verifier: CapabilityEnvelopeVerifier | None = None,
         timeline_recorder: CapabilityTimelineRecorder | None = None,
     ) -> None:
         if (
@@ -332,6 +334,11 @@ class CanaryRolloutCoordinator:
             or not isinstance(capability_client, ApplyCanaryCapabilityClient)
             or type(task_dispatcher) is not TaskDispatcher
             or (clock is not None and not callable(clock))
+            or (capability_verifier is None) != (timeline_recorder is None)
+            or (
+                capability_verifier is not None
+                and not isinstance(capability_verifier, CapabilityEnvelopeVerifier)
+            )
             or (
                 timeline_recorder is not None
                 and (
@@ -345,6 +352,7 @@ class CanaryRolloutCoordinator:
         self._capability_client = capability_client
         self._task_dispatcher = task_dispatcher
         self._clock = clock or _now_utc_second
+        self._capability_verifier = capability_verifier
         self._timeline_recorder = timeline_recorder
 
     async def dispatch(
@@ -369,10 +377,17 @@ class CanaryRolloutCoordinator:
         ):
             raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED)
         try:
+            if self._capability_verifier is not None:
+                self._capability_verifier.verify(capability)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CanaryExecutionError(CanaryExecutionErrorCode.ISSUANCE_DENIED) from None
+        try:
             if self._timeline_recorder is not None:
                 await self._timeline_recorder.record_signed_capability(
                     capability,
-                    signature_verified=False,
+                    signature_verified=True,
                 )
             intent = MutationIntent(
                 schema_version="controlgraph.mutation-intent/v1",
