@@ -21,7 +21,7 @@ run "stable_revision_starts_at_the_bounded_baseline" {
     condition = (
       google_cloud_run_v2_service.reference.name == "controlgraph-reference-target" &&
       google_cloud_run_v2_service.reference.ingress == "INGRESS_TRAFFIC_INTERNAL_ONLY" &&
-      google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-stable-v17" &&
+      google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-stable-v18" &&
       google_cloud_run_v2_service.reference.template[0].containers[0].image == var.stable_image
     )
     error_message = "The stable deployment must remain target-bound to its fixed private revision and image."
@@ -35,7 +35,7 @@ run "stable_revision_starts_at_the_bounded_baseline" {
       length(google_cloud_run_v2_service.reference.traffic) == 1 &&
       length([
         for target in google_cloud_run_v2_service.reference.traffic : target
-        if target.revision == "controlgraph-reference-target-stable-v17" &&
+        if target.revision == "controlgraph-reference-target-stable-v18" &&
         target.percent == 100 && target.tag == "stable"
       ]) == 1
     )
@@ -47,8 +47,8 @@ run "stable_revision_starts_at_the_bounded_baseline" {
       output.target.baseline_reset.project_id == var.project_id &&
       output.target.baseline_reset.region == "us-central1" &&
       output.target.baseline_reset.service_name == "controlgraph-reference-target" &&
-      output.target.baseline_reset.stable_revision == "controlgraph-reference-target-stable-v17" &&
-      output.target.baseline_reset.candidate_revision == "controlgraph-reference-target-candidate-v17" &&
+      output.target.baseline_reset.stable_revision == "controlgraph-reference-target-stable-v18" &&
+      output.target.baseline_reset.candidate_revision == "controlgraph-reference-target-candidate-v18" &&
       output.target.baseline_reset.stable_image == var.stable_image &&
       output.target.baseline_reset.candidate_image == var.candidate_image &&
       output.target.baseline_reset.network_resource == var.network &&
@@ -71,7 +71,7 @@ run "candidate_configuration_shape_is_bounded" {
 
   assert {
     condition = (
-      google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-candidate-v17" &&
+      google_cloud_run_v2_service.reference.template[0].revision == "controlgraph-reference-target-candidate-v18" &&
       google_cloud_run_v2_service.reference.template[0].containers[0].image == var.candidate_image &&
       google_cloud_run_v2_service.reference.template[0].execution_environment == "EXECUTION_ENVIRONMENT_GEN2" &&
       google_cloud_run_v2_service.reference.template[0].containers[0].resources[0].limits["memory"] == "512Mi" &&
@@ -84,12 +84,12 @@ run "candidate_configuration_shape_is_bounded" {
     condition = (
       length([
         for target in google_cloud_run_v2_service.reference.traffic : target
-        if target.revision == "controlgraph-reference-target-stable-v17" &&
+        if target.revision == "controlgraph-reference-target-stable-v18" &&
         target.percent == 100 && target.tag == "stable"
       ]) == 1 &&
       length([
         for target in google_cloud_run_v2_service.reference.traffic : target
-        if target.revision == "controlgraph-reference-target-candidate-v17" &&
+        if target.revision == "controlgraph-reference-target-candidate-v18" &&
         target.percent == 0 && target.tag == "candidate"
       ]) == 1
     )

@@ -95,8 +95,8 @@ def evidence_key_version(project_id: str = DEFAULT_PROJECT_ID) -> str:
 def root_records(
     *,
     target: TargetBinding | None = None,
-    stable_revision: str = "controlgraph-reference-target-stable-v17",
-    candidate_revision: str = "controlgraph-reference-target-candidate-v17",
+    stable_revision: str = "controlgraph-reference-target-stable-v18",
+    candidate_revision: str = "controlgraph-reference-target-candidate-v18",
     concurrency: int = 40,
     service_generation: int = 7,
     provider_etag: str = "etag-stable-7",
