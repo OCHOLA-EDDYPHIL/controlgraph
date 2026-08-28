@@ -2050,7 +2050,7 @@ def _evaluate_health(
 
     command_path = run.command_path(case, f"health-{label}")
     _write_command(command_path, command)
-    for _attempt in range(3):
+    for _attempt in range(10):
         status, payload, result = _run_cli(
             repo=run.repo,
             entry_point="controlgraph-canary",

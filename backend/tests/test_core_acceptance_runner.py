@@ -1186,6 +1186,44 @@ def test_hosted_root_creation_does_not_retry_other_status_four_payloads(
     assert calls["count"] == 1
 
 
+def test_hosted_health_evaluation_adopts_after_delayed_unknown(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    result = SimpleNamespace(terminal_status="unhealthy")
+    responses = [
+        (4, {"code": "HEALTH_EVALUATION_OUTCOME_UNKNOWN"}, None),
+    ] * 4 + [(0, {}, result)]
+    invocations: list[dict[str, Any]] = []
+    sleeps: list[int] = []
+
+    def run_cli(**kwargs: Any) -> tuple[int, dict[str, Any], Any]:
+        invocations.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner, "_write_command", lambda *_args: None)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    run = SimpleNamespace(
+        repo=tmp_path,
+        project_number="123456789",
+        command_path=lambda _case, _label: tmp_path / "health.json",
+    )
+
+    observed = runner._evaluate_health(
+        run,
+        SimpleNamespace(),
+        command=SimpleNamespace(),
+        label="second",
+    )
+
+    assert observed is result
+    assert len(invocations) == 5
+    assert all(call["allowed_statuses"] == frozenset({0, 4}) for call in invocations)
+    assert sleeps == [1, 1, 1, 1]
+
+
 def test_hosted_binding_uses_the_deployed_evidence_writer_identity(
     tmp_path: Path,
     monkeypatch: Any,
