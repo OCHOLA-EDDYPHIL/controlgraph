@@ -2078,7 +2078,9 @@ def _prewarm_candidate(*, candidate_url: str, deadline: datetime) -> None:
     probe_url = f"{candidate_url}/v1/probe"
     request = urllib.request.Request(probe_url, method="GET")
     last_error: Exception | None = None
-    while datetime.now(UTC) < deadline - timedelta(seconds=5):
+    attempted = False
+    while not attempted or datetime.now(UTC) < deadline - timedelta(seconds=5):
+        attempted = True
         try:
             with urllib.request.urlopen(request, timeout=8):
                 return

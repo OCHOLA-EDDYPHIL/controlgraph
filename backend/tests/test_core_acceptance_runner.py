@@ -1841,7 +1841,7 @@ def test_hosted_candidate_prewarm_returns_on_first_answer(
     monkeypatch.setattr(runner.urllib.request, "urlopen", answering)
     runner._prewarm_candidate(
         candidate_url="https://candidate.example",
-        deadline=datetime.now(UTC) + timedelta(seconds=30),
+        deadline=datetime.now(UTC),
     )
     assert calls["count"] == 1
 
