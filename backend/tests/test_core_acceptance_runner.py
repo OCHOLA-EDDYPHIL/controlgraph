@@ -1317,11 +1317,11 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
     queue_actions: list[str] = []
 
     monkeypatch.setattr(runner, "_create_root", lambda *_args: SimpleNamespace(root=root))
-    monkeypatch.setattr(
-        runner,
-        "_health_load",
-        lambda *_args, **_kwargs: (object(), object(), object(), object()),
-    )
+    def health_load(*_args: Any, **kwargs: Any) -> tuple[object, ...]:
+        kwargs["before_terminal"]()
+        return object(), object(), object(), object()
+
+    monkeypatch.setattr(runner, "_health_load", health_load)
     monkeypatch.setattr(
         runner,
         "_queue_control",
@@ -1350,6 +1350,17 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
         reset_completed=True,
     )
     assert failure["execution_queue_cleanup_required"] is True
+
+
+def test_revocation_fetches_proof_after_stale_receipt() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._run_revocation_case)
+
+    release = source.index('_queue_control(run, "release")')
+    receipt = source.index("stale_receipt = _poll_receipt(")
+    proof = source.index("proof = _revocation_proof(")
+
+    assert release < receipt < proof
 
 
 def _hosted_module(tmp_path: Path) -> Any:
@@ -1945,6 +1956,9 @@ def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
 
     assert "while datetime.now(UTC) < next_evaluation:" in source
     assert "next_evaluation + timedelta" not in source
+    assert source.index("before_terminal()") < source.index(
+        "while datetime.now(UTC) < next_evaluation:"
+    )
     assert proof_margin_seconds == 115
     assert proof_margin_seconds > RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
 

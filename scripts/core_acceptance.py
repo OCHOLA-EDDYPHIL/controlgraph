@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -2147,6 +2147,7 @@ def _health_load(
     *,
     mode: Literal["healthy", "unhealthy"],
     root_result: Any,
+    before_terminal: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], Any, Any, Any]:
     audience, candidate_url = _reference_urls(run)
     destination = (
@@ -2247,6 +2248,8 @@ def _health_load(
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_HEALTH_INVALID")
     next_evaluation = _parse_utc(first.next_evaluation_at)
+    if before_terminal is not None:
+        before_terminal()
     # Preserve the terminal proof's bounded execution window for the receipt worker.
     while datetime.now(UTC) < next_evaluation:
         remaining = (next_evaluation - datetime.now(UTC)).total_seconds()
@@ -2591,11 +2594,8 @@ def _queue_control(run: _HostedExecution, action: Literal["hold", "release"]) ->
     return result
 
 
-def _revoke(run: _HostedExecution, case: CaseBindingV1, root: Any) -> tuple[Any, Any]:
-    from controlgraph_canary.contracts.revocation import (
-        EpochRevocationCallOutcomeV1,
-        EpochRevocationProofV1,
-    )
+def _revoke(run: _HostedExecution, case: CaseBindingV1, root: Any) -> Any:
+    from controlgraph_canary.contracts.revocation import EpochRevocationCallOutcomeV1
 
     request_id = _stable_id(run.run_inputs_sha256, case, "revoke-request")
     idempotency_key = _stable_id(run.run_inputs_sha256, case, "revoke-idempotency")
@@ -2628,6 +2628,13 @@ def _revoke(run: _HostedExecution, case: CaseBindingV1, root: Any) -> tuple[Any,
     result = outcome.result
     if result.root_id != root.root_id or result.previous_epoch != 1 or result.new_epoch != 2:
         raise AcceptanceError("ACCEPTANCE_HOSTED_REVOCATION_INVALID")
+    return outcome
+
+
+def _revocation_proof(run: _HostedExecution, outcome: Any) -> Any:
+    from controlgraph_canary.contracts.revocation import EpochRevocationProofV1
+
+    result = outcome.result
     _, _, proof = _run_cli(
         repo=run.repo,
         entry_point="controlgraph-canary",
@@ -2667,7 +2674,7 @@ def _revoke(run: _HostedExecution, case: CaseBindingV1, root: Any) -> tuple[Any,
     assert proof is not None
     if proof.result != result or proof.authority.current_epoch != 2:
         raise AcceptanceError("ACCEPTANCE_HOSTED_REVOCATION_INVALID")
-    return outcome, proof
+    return proof
 
 
 def _recover_revoked(
@@ -2743,11 +2750,17 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
     terminal_idempotency_key: str | None = None
     released = False
     try:
+        def hold_execution_queue() -> None:
+            _queue_control(run, "hold")
+            run.execution_queue_cleanup_required = True
+
         load, apply_dispatch, apply_receipt, health = _health_load(
-            run, case, mode="healthy", root_result=root_result
+            run,
+            case,
+            mode="healthy",
+            root_result=root_result,
+            before_terminal=hold_execution_queue,
         )
-        _queue_control(run, "hold")
-        run.execution_queue_cleanup_required = True
         promotion_dispatch, promotion_command = _promote(
             run,
             case,
@@ -2755,7 +2768,7 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
             apply_receipt=apply_receipt,
             terminal=health,
         )
-        revocation, proof = _revoke(run, case, root_result.root)
+        revocation = _revoke(run, case, root_result.root)
         _queue_control(run, "release")
         run.execution_queue_cleanup_required = False
         stale_receipt = _poll_receipt(
@@ -2775,6 +2788,7 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
             or stale_receipt.receipt.observed_authority_epoch != 2
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_STALE_DENIAL_INVALID")
+        proof = _revocation_proof(run, revocation)
         unchanged = _read_traffic(run, case, "after-stale-denial")
         _require_split(unchanged, run.spec, stable=90, candidate=10)
         recovery_dispatch, recovery_receipt = _recover_revoked(
