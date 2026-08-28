@@ -597,17 +597,53 @@ def test_verifier_accepts_only_exact_v2_health_authorized_promotion() -> None:
     assert reader.reads == [authorization.root_id]
 
 
-def test_initial_verifier_denies_noncurrent_epoch_before_lineage_validation() -> None:
+def test_stale_promotion_persists_epoch_denial_at_final_authority_gate() -> None:
     private_key = ec.generate_private_key(ec.SECP256R1())
     authorization = _authorization()
     task = _task(authorization, private_key)
     reader = _RootReader(authority_epoch=2)
+    execution_time = datetime(2026, 8, 21, 12, 9, tzinfo=UTC)
+    verified, _ = _verify(
+        task,
+        private_key,
+        clock=execution_time,
+        reader=reader,
+    )
+    expected = TargetConfigurationProjection(
+        target=authorization.target,
+        stable_revision=authorization.stable_revision,
+        candidate_revision=authorization.candidate_revision,
+        stable_percent=0,
+        candidate_percent=100,
+        concurrency=authorization.concurrency,
+    )
+    store = _ReceiptStore(authorization.target)
+    mutation = _ReceiptMutationAdapter(authorization.target)
+    readback = _ReceiptReadback(authorization.target, expected)
+    coordinator = ReceiptExecutionCoordinator(
+        store=store,
+        final_gate=FinalMutationGate(
+            authority_reader=reader,
+            adapter=mutation,
+            route_policy=_route_policy(),
+            source_receipt_reader=_SourceReceiptReader(authorization),
+            clock=lambda: execution_time,
+        ),
+        readback=readback,
+        clock=lambda: execution_time,
+    )
 
-    with pytest.raises(CapabilityVerificationError) as denied:
-        _verify(task, private_key, reader=reader)
+    result = asyncio.run(coordinator.execute(verified))
 
-    assert denied.value.code is ReasonCode.EPOCH_MISMATCH
-    assert reader.reads == [authorization.root_id]
+    assert type(result) is ReceiptExecutionStored
+    assert result.receipt.value.outcome is ReceiptOutcome.DENIED
+    assert result.receipt.value.reason_code is ReasonCode.EPOCH_MISMATCH
+    assert result.receipt.value.observed_authority_epoch == 2
+    assert result.receipt.revision == 1
+    assert store.record == result.receipt
+    assert mutation.intents == []
+    assert readback.requests == []
+    assert reader.reads == [authorization.root_id, authorization.root_id]
 
 
 def test_verifier_rejects_valid_compact_authorization_outside_current_root() -> None:

@@ -314,8 +314,6 @@ class CapabilityVerifier:
         self._validate_time(request, now_second)
         self._validate_route_and_identity(request)
         root_state = await self._read_root_boundary(request.intent.root_id)
-        if root_state.authority.current_epoch != request.intent.epoch:
-            raise _deny(ReasonCode.EPOCH_MISMATCH)
         root = root_state.root
         anchor = root_state.lineage_anchor
         self._validate_root_bindings(request, root, anchor, now_second)
