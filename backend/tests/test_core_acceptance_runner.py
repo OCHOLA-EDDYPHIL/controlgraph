@@ -262,13 +262,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v20",
+        "candidate_revision": "controlgraph-reference-target-candidate-v21",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v20",
+        "stable_revision": "controlgraph-reference-target-stable-v21",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -1405,8 +1405,10 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
         execution_queue_cleanup_required=False,
         root_ids=set(),
         unreleased_root_ids=set(),
+        spec=object(),
     )
     queue_actions: list[str] = []
+    traffic_reads: list[str] = []
 
     monkeypatch.setattr(runner, "_create_root", lambda *_args: SimpleNamespace(root=root))
 
@@ -1420,6 +1422,12 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
         "_queue_control",
         lambda _run, action: queue_actions.append(action),
     )
+    monkeypatch.setattr(
+        runner,
+        "_read_traffic",
+        lambda _run, _case, label: traffic_reads.append(label) or object(),
+    )
+    monkeypatch.setattr(runner, "_require_split", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "_promote", lambda *_args, **_kwargs: (object(), object()))
 
     def uncertain_revoke(*_args: Any, **_kwargs: Any) -> None:
@@ -1435,6 +1443,7 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
         raise AssertionError("uncertain revocation unexpectedly succeeded")
 
     assert queue_actions == ["hold"]
+    assert traffic_reads == ["before-stale-denial"]
     assert run.execution_queue_cleanup_required is True
     failure = runner._runner_failure_observation(
         run,
@@ -1449,11 +1458,15 @@ def test_revocation_fetches_proof_after_stale_receipt() -> None:
     runner = _hosted_module(Path(__file__).parent)
     source = inspect.getsource(runner._run_revocation_case)
 
+    baseline = source.index('"before-stale-denial"')
+    promotion = source.index("promotion_dispatch, promotion_command = _promote(")
+    revocation = source.index("revocation = _revoke(")
     release = source.index('_queue_control(run, "release")')
     receipt = source.index("stale_receipt = _poll_receipt(")
     proof = source.index("proof = _revocation_proof(")
 
-    assert release < receipt < proof
+    assert baseline < promotion < revocation < release < receipt < proof
+    assert "_read_traffic(" not in source[revocation:release]
 
 
 def test_revocation_invokes_fresh_advisor_before_recovery() -> None:
@@ -2540,7 +2553,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v20",
+                            "revision": "controlgraph-reference-target-candidate-v21",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -2561,7 +2574,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v20",
+        "controlgraph-reference-target-candidate-v21",
     )
 
     assert flaky.calls == 3

@@ -101,8 +101,8 @@ PROJECT_ID = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
 SUBJECT = "123456789012345678901"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v20"
-CANDIDATE = f"{SERVICE}-candidate-v20"
+STABLE = f"{SERVICE}-stable-v21"
+CANDIDATE = f"{SERVICE}-candidate-v21"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
@@ -1251,14 +1251,14 @@ async def test_receipt_readback_uses_one_total_provider_settle_budget(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            stable_revision=f"{SERVICE}-stable-v21",
+            stable_revision=f"{SERVICE}-stable-v22",
         ),
         replace(
             target_configuration_projection(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            candidate_revision=f"{SERVICE}-candidate-v21",
+            candidate_revision=f"{SERVICE}-candidate-v22",
         ),
         replace(
             target_configuration_projection(
@@ -1928,7 +1928,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-        "4c9b591f3b4f61573fbc151444e2057c29d9364624d738d677646033a9304a95"
+        "f1ff7540307befe226c69bba5cfa413b46c7a8a94648fde4bffef924c779f964"
     )
 
 
@@ -1956,8 +1956,8 @@ def test_target_configuration_digest_excludes_non_poststate_fields() -> None:
     ("changes", "expected_concurrency"),
     [
         ({"target": _target(project_id="controlgraph-canary-d4e5f6")}, 8),
-        ({"stable_revision": f"{SERVICE}-stable-v21"}, 8),
-        ({"candidate_revision": f"{SERVICE}-candidate-v21"}, 8),
+        ({"stable_revision": f"{SERVICE}-stable-v22"}, 8),
+        ({"candidate_revision": f"{SERVICE}-candidate-v22"}, 8),
         ({"stable_percent": 80, "candidate_percent": 20}, 8),
         ({}, 9),
     ],
@@ -2055,16 +2055,16 @@ async def test_reference_target_reset_uses_one_conditional_traffic_update_and_re
 
 
 @_async_test
-async def test_reference_target_reset_migrates_the_exact_v18_baseline_to_v19() -> None:
+async def test_reference_target_reset_migrates_the_exact_v20_baseline_to_v21() -> None:
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v19",
-        candidate_revision="controlgraph-reference-target-candidate-v19",
+        stable_revision="controlgraph-reference-target-stable-v20",
+        candidate_revision="controlgraph-reference-target-candidate-v20",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v19"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v20"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
@@ -2184,18 +2184,18 @@ async def test_reference_target_reset_denies_non_candidate_latest_ready_readback
     ["wrong-tag", "wrong-percent", "extra-allocation", "status-mismatch"],
 )
 @_async_test
-async def test_reference_target_reset_rejects_any_other_v18_traffic_shape(
+async def test_reference_target_reset_rejects_any_other_v20_traffic_shape(
     case: str,
 ) -> None:
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v19",
-        candidate_revision="controlgraph-reference-target-candidate-v19",
+        stable_revision="controlgraph-reference-target-stable-v20",
+        candidate_revision="controlgraph-reference-target-candidate-v20",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v19"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v20"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
