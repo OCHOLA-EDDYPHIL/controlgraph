@@ -40,7 +40,7 @@ def _policy(**changes: object) -> HealthPolicy:
         "observation_started_at": 0,
         "window_seconds": 60,
         "observation_delay_seconds": 180,
-        "maximum_observation_delay_seconds": 300,
+        "maximum_observation_delay_seconds": 360,
         "minimum_request_count": 100,
         "healthy_maximum_error_rate_basis_points": 100,
         "unhealthy_minimum_error_rate_basis_points": 500,
@@ -297,7 +297,7 @@ def test_values_between_healthy_and_unhealthy_thresholds_wait(
             },
             HealthReason.MINIMUM_REQUESTS_NOT_MET,
         ),
-        ({"observed_at": 421}, HealthReason.SAMPLE_LATE),
+        ({"observed_at": 481}, HealthReason.SAMPLE_LATE),
         ({"service_name": "different-service"}, HealthReason.SAMPLE_SCOPE_MISMATCH),
     ],
 )
@@ -314,7 +314,7 @@ def test_partial_duplicate_late_small_and_out_of_scope_samples_fail_safe(
     )
     sample = _sample(2, policy, **sample_changes)
 
-    result = evaluate_health(policy, (sample,), prior_state, evaluated_at=421)
+    result = evaluate_health(policy, (sample,), prior_state, evaluated_at=481)
 
     assert result.decision is HealthDecisionKind.INSUFFICIENT_EVIDENCE
     assert result.reasons == (reason,)
@@ -466,18 +466,18 @@ def test_missing_observation_is_retryable_then_consumes_at_deadline() -> None:
     )
 
     retryable = evaluate_health(policy, (missing,), _state(policy), evaluated_at=240)
-    expired = evaluate_health(policy, (missing,), _state(policy), evaluated_at=360)
+    expired = evaluate_health(policy, (missing,), _state(policy), evaluated_at=420)
 
     assert retryable.decision is HealthDecisionKind.INSUFFICIENT_EVIDENCE
     assert retryable.reasons == (HealthReason.SAMPLE_MISSING,)
     assert retryable.state == _state(policy)
-    assert retryable.next_evaluation_at == 360
+    assert retryable.next_evaluation_at == 420
     assert expired.decision is HealthDecisionKind.INSUFFICIENT_EVIDENCE
     assert expired.reasons == (HealthReason.SAMPLE_MISSING,)
     assert expired.state.last_window_ended_at == 60
     assert expired.state.evaluated_windows == 1
     assert expired.state.last_observation_sha256 == missing.observation_sha256
-    assert expired.next_evaluation_at == 360
+    assert expired.next_evaluation_at == 420
 
 
 def test_error_rate_uses_ceiling_and_availability_uses_floor_basis_points() -> None:
@@ -498,7 +498,7 @@ def test_error_rate_uses_ceiling_and_availability_uses_floor_basis_points() -> N
 
 @pytest.mark.parametrize(
     ("evaluated_at", "consumed", "next_evaluation_at"),
-    [(240, False, 360), (360, True, 360), (400, True, 400)],
+    [(240, False, 420), (420, True, 420), (460, True, 460)],
 )
 def test_complete_zero_request_window_suppresses_the_entire_aggregate_tuple(
     evaluated_at: int,
@@ -545,7 +545,7 @@ def test_no_samples_and_mismatched_prior_state_are_insufficient() -> None:
         evaluated_windows=1,
     )
 
-    missing = evaluate_health(policy, (), state, evaluated_at=420)
+    missing = evaluate_health(policy, (), state, evaluated_at=480)
     mismatched = evaluate_health(
         policy,
         (_sample(2, policy),),
@@ -594,11 +594,11 @@ def test_missing_or_partial_data_is_retryable_until_the_collection_deadline() ->
 
     assert missing.decision is HealthDecisionKind.INSUFFICIENT_EVIDENCE
     assert missing.reasons == (HealthReason.NO_SAMPLES,)
-    assert missing.next_evaluation_at == 420
+    assert missing.next_evaluation_at == 480
     assert missing.state == state
     assert partial.decision is HealthDecisionKind.INSUFFICIENT_EVIDENCE
     assert partial.reasons == (HealthReason.SAMPLE_PARTIAL,)
-    assert partial.next_evaluation_at == 420
+    assert partial.next_evaluation_at == 480
     assert partial.state == state
 
 
@@ -844,7 +844,7 @@ def test_nonterminal_next_evaluation_never_precedes_evaluation_time() -> None:
 
 @pytest.mark.parametrize(
     ("evaluated_at", "expected_next_evaluation_at"),
-    [(360, 360), (400, 400)],
+    [(420, 420), (460, 460)],
 )
 def test_future_observation_never_schedules_in_the_past(
     evaluated_at: int,

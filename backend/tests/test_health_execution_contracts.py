@@ -166,7 +166,7 @@ def test_healthy_chain_binds_every_promotion_input_and_policy_late_bound() -> No
         chain.signed_proofs
     )
     assert promotion.valid_until == expected_valid_until
-    assert promotion.valid_until == "2026-08-21T12:11:00Z"
+    assert promotion.valid_until == "2026-08-21T12:12:00Z"
 
 
 def test_chain_rejects_a_substituted_predecessor_or_compact_proof() -> None:
@@ -194,7 +194,7 @@ def test_chain_rejects_a_substituted_predecessor_or_compact_proof() -> None:
 
     promotion = chain.healthy_promotion_proof
     assert promotion is not None
-    tampered_promotion = promotion.model_copy(update={"valid_until": "2026-08-21T12:12:00Z"})
+    tampered_promotion = promotion.model_copy(update={"valid_until": "2026-08-21T12:13:00Z"})
     with pytest.raises(ValidationError, match="promotion proof"):
         SignedHealthDecisionChainV1.model_validate(
             chain.model_copy(update={"healthy_promotion_proof": tampered_promotion})
@@ -287,12 +287,12 @@ def test_same_window_retry_is_admitted_only_at_the_policy_deadline() -> None:
     with pytest.raises(ValidationError, match="deadline retry"):
         create_signed_health_decision_chain(
             anchor=anchor,
-            signed_proofs=(ready_signed, retry("2026-08-21T12:09:00Z")),
+            signed_proofs=(ready_signed, retry("2026-08-21T12:10:00Z")),
         )
 
     deadline_chain = create_signed_health_decision_chain(
         anchor=anchor,
-        signed_proofs=(ready_signed, retry("2026-08-21T12:10:00Z")),
+        signed_proofs=(ready_signed, retry("2026-08-21T12:11:00Z")),
     )
     assert len(deadline_chain.signed_proofs) == 2
     assert deadline_chain.signed_proofs[-1].proof.decision.next_state.evaluated_windows == 1
@@ -389,7 +389,7 @@ def test_twenty_proof_chain_uses_manifest_identity_without_aggregate_encoding() 
     signed_proofs = []
     for window_index in range(1, anchor.policy.maximum_windows + 1):
         window_end_minute = 4 + window_index
-        for observation_minute in (window_end_minute + 3, window_end_minute + 5):
+        for observation_minute in (window_end_minute + 3, window_end_minute + 6):
             observation = make_missing_observation(
                 anchor,
                 window_index=window_index,

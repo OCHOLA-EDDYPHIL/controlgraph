@@ -91,7 +91,7 @@ def _policy(**changes: object) -> RolloutHealthPolicyV2:
         "window_seconds": 60,
         "window_semantics": "HALF_OPEN_START_INCLUSIVE_END_EXCLUSIVE",
         "observation_delay_seconds": 180,
-        "maximum_observation_delay_seconds": 300,
+        "maximum_observation_delay_seconds": 360,
         "minimum_request_count": 100,
         "healthy_maximum_error_rate_basis_points": 100,
         "unhealthy_minimum_error_rate_basis_points": 500,
@@ -426,7 +426,7 @@ def test_v2_policy_is_frozen_and_canonical() -> None:
     )
     assert policy.window_seconds == 60
     assert policy.observation_delay_seconds == 180
-    assert policy.maximum_observation_delay_seconds == 300
+    assert policy.maximum_observation_delay_seconds == 360
     assert policy.maximum_windows == 10
     assert policy.latency_source_conversion.endswith("TIES_TO_EVEN")
     assert create_rollout_health_policy_v2() == policy
@@ -689,7 +689,7 @@ def test_observation_rejects_sample_outside_its_exact_query() -> None:
         ),
         (
             {
-                "observed_at": "2026-08-21T12:06:01Z",
+                "observed_at": "2026-08-21T12:07:01Z",
                 "timing": MonitoringObservationTiming.LATE,
             },
             MonitoringObservationCompleteness.COMPLETE,

@@ -36,7 +36,7 @@ _REQUEST_LATENCY_METRIC: Final = "run.googleapis.com/request_latencies"
 _RESOURCE_TYPE: Final = "cloud_run_revision"
 _WINDOW_SECONDS: Final = 60
 _OBSERVATION_DELAY_SECONDS: Final = 180
-_MAXIMUM_OBSERVATION_DELAY_SECONDS: Final = 300
+_MAXIMUM_OBSERVATION_DELAY_SECONDS: Final = 360
 _MAXIMUM_WINDOWS: Final = 10
 _BASIS_POINTS: Final = 10_000
 _SAMPLE_SET_DIGEST_DOMAIN: Final = b"controlgraph.monitoring-sample-set/v1\0"
@@ -362,7 +362,7 @@ class RolloutHealthPolicyV2(StrictContractModel):
     window_seconds: Literal[60]
     window_semantics: Literal["HALF_OPEN_START_INCLUSIVE_END_EXCLUSIVE"]
     observation_delay_seconds: Literal[180]
-    maximum_observation_delay_seconds: Literal[300]
+    maximum_observation_delay_seconds: Literal[360]
     minimum_request_count: Literal[100]
     healthy_maximum_error_rate_basis_points: Literal[100]
     unhealthy_minimum_error_rate_basis_points: Literal[500]
