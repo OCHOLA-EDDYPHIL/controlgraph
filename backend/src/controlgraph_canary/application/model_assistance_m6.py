@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 from controlgraph_canary.application.authority_store import RootCreationBundle
+from controlgraph_canary.application.cloud_run import (
+    rollout_root_v3_target_configuration_sha256,
+)
 from controlgraph_canary.application.timeline import TimelineReadSlice
+from controlgraph_canary.application.timeline_projectors import timeline_actor_id
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.model_assistance import (
     ADVISOR_INVOCATION_REQUEST_V1,
@@ -27,11 +32,17 @@ from controlgraph_canary.contracts.model_assistance import (
     EvidenceConsistency,
     RolloutPhase,
 )
-from controlgraph_canary.contracts.models import TargetBinding
+from controlgraph_canary.contracts.models import (
+    EpochAuthorityRecord,
+    EpochChangeCause,
+    ReasonCode,
+    TargetBinding,
+)
 from controlgraph_canary.contracts.root_creation import RolloutRootV3
 from controlgraph_canary.contracts.timeline import (
     TIMELINE_PAGE_COMMAND_V1,
     TimelineAudience,
+    TimelineCorrelationKind,
     TimelineEntryV1,
     TimelineEventType,
     TimelineHeadV1,
@@ -43,6 +54,11 @@ from controlgraph_canary.contracts.timeline import (
 _TIMELINE_PAGE_SIZE = 100
 _MAX_TIMELINE_ENTRIES = 1_000
 _SNAPSHOT_LIFETIME_SECONDS = 240
+_TARGET_STATE = re.compile(
+    r"^stable_percent=(?P<stable>[0-9]{1,3});"
+    r"candidate_percent=(?P<candidate>[0-9]{1,3});"
+    r"target_configuration_sha256=(?P<configuration>[0-9a-f]{64})$"
+)
 
 
 @runtime_checkable
@@ -173,8 +189,25 @@ class M6DiagnosticSnapshotAssembler:
         fresh_until = _utc_text(
             assembly_time.astimezone(UTC) + timedelta(seconds=_SNAPSHOT_LIFETIME_SECONDS)
         )
-        target_entries = _latest_verification_entries(verifier_entries)
         receipt_entry = receipt_entries[-1]
+        authority_transition = _stale_epoch_transition(
+            entries,
+            receipt_entry=receipt_entry,
+            authority=authority,
+        )
+        target_entries = _latest_verification_entries(
+            verifier_entries,
+            receipt_entry=(receipt_entry if authority_transition is not None else None),
+            expected_target_configuration_sha256=(
+                rollout_root_v3_target_configuration_sha256(
+                    root,
+                    stable_percent=90,
+                    candidate_percent=10,
+                )
+                if authority_transition is not None
+                else None
+            ),
+        )
         monitoring_entry = monitoring_entries[-1]
         if (
             monitoring_entry.content.event.payload_sha256
@@ -183,9 +216,17 @@ class M6DiagnosticSnapshotAssembler:
             raise ValueError("advisor health evidence is inconsistent")
         health_evidence = (monitoring_entry, health_entry)
         terminal_entry = _latest_terminal_entry(entries)
-        timeline_entries = tuple(
+        timeline_summary_entries = tuple(
             sorted(
-                {item.entry_id: item for item in (terminal_entry, entries[-1])}.values(),
+                {
+                    item.entry_id: item
+                    for item in (
+                        terminal_entry,
+                        entries[-1],
+                        *(() if authority_transition is None else (authority_transition,)),
+                        *(() if authority_transition is None else (receipt_entry,)),
+                    )
+                }.values(),
                 key=lambda item: item.content.sequence,
             )
         )
@@ -247,7 +288,12 @@ class M6DiagnosticSnapshotAssembler:
                 target_entries,
                 source_sha256=_entry_set_sha256(target_entries),
                 fresh_until=fresh_until,
-                facts=_verification_facts(target_entries),
+                facts=_verification_facts(
+                    target_entries,
+                    receipt_entry=(
+                        receipt_entry if authority_transition is not None else None
+                    ),
+                ),
             ),
             health_summary=_summary(
                 DiagnosticEvidenceKind.HEALTH,
@@ -281,25 +327,15 @@ class M6DiagnosticSnapshotAssembler:
             ),
             timeline_summary=_summary(
                 DiagnosticEvidenceKind.TIMELINE,
-                timeline_entries,
+                timeline_summary_entries,
                 source_sha256=timeline_head.entry_sha256,
                 fresh_until=fresh_until,
-                facts=(
-                    (
-                        entries[-1],
-                        DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
-                        str(timeline_head.sequence),
-                    ),
-                    (
-                        entries[-1],
-                        DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT,
-                        entries[-1].content.event.event_type.value,
-                    ),
-                    (
-                        terminal_entry,
-                        DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION,
-                        terminal_entry.content.event.terminal_classification.value,
-                    ),
+                facts=_timeline_facts(
+                    latest_entry=entries[-1],
+                    terminal_entry=terminal_entry,
+                    timeline_head=timeline_head,
+                    receipt_entry=receipt_entry,
+                    authority_transition=authority_transition,
                 ),
             ),
             verifier_summary=_summary(
@@ -307,7 +343,12 @@ class M6DiagnosticSnapshotAssembler:
                 target_entries,
                 source_sha256=_entry_set_sha256(target_entries),
                 fresh_until=fresh_until,
-                facts=_verification_facts(target_entries),
+                facts=_verification_facts(
+                    target_entries,
+                    receipt_entry=(
+                        receipt_entry if authority_transition is not None else None
+                    ),
+                ),
             ),
         )
         return AdvisorInvocationRequestV1(
@@ -469,6 +510,8 @@ def _evidence_id(kind: DiagnosticEvidenceKind, entry: TimelineEntryV1) -> str:
 
 def _verification_facts(
     entries: tuple[TimelineEntryV1, ...],
+    *,
+    receipt_entry: TimelineEntryV1 | None = None,
 ) -> tuple[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str], ...]:
     facts: list[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str]] = []
     for entry in entries:
@@ -486,24 +529,191 @@ def _verification_facts(
                 ),
             )
         )
+        if (
+            receipt_entry is not None
+            and _required_display_value(entry, "OBSERVATION") == "CONFIGURATION"
+        ):
+            stable, candidate, configuration_sha256 = _target_state(entry)
+            facts.extend(
+                (
+                    (
+                        entry,
+                        DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT,
+                        str(stable),
+                    ),
+                    (
+                        entry,
+                        DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT,
+                        str(candidate),
+                    ),
+                    (
+                        entry,
+                        DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256,
+                        configuration_sha256,
+                    ),
+                    (
+                        entry,
+                        DiagnosticEvidenceFactName.TARGET_OBSERVED_AT,
+                        entry.content.event.occurred_at,
+                    ),
+                    (
+                        entry,
+                        DiagnosticEvidenceFactName.TARGET_OBSERVATION_RELATION,
+                        "AT_OR_AFTER_DENIAL",
+                    ),
+                )
+            )
     return tuple(facts)
 
 
 def _receipt_facts(
     entry: TimelineEntryV1,
 ) -> tuple[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str], ...]:
-    return (
+    facts = [
         (
             entry,
             DiagnosticEvidenceFactName.RECEIPT_OUTCOME,
             _required_display_value(entry, "OUTCOME"),
         ),
+        (
+            entry,
+            DiagnosticEvidenceFactName.WORK_EPOCH,
+            str(entry.content.event.epoch),
+        ),
+    ]
+    reason = _display_value(entry, "REASON_CODE")
+    if reason is not None:
+        facts.append(
+            (
+                entry,
+                DiagnosticEvidenceFactName.RECEIPT_REASON,
+                reason,
+            )
+        )
+    if (
+        entry.content.event.event_type is TimelineEventType.MUTATION_DENIED
+        and _display_value(entry, "OUTCOME") == "DENIED"
+    ):
+        facts.append(
+            (
+                entry,
+                DiagnosticEvidenceFactName.DENIAL_OCCURRED_AT,
+                entry.content.event.occurred_at,
+            )
+        )
+    return tuple(facts)
+
+
+def _timeline_facts(
+    *,
+    latest_entry: TimelineEntryV1,
+    terminal_entry: TimelineEntryV1,
+    timeline_head: TimelineHeadV1,
+    receipt_entry: TimelineEntryV1,
+    authority_transition: TimelineEntryV1 | None,
+) -> tuple[tuple[TimelineEntryV1, DiagnosticEvidenceFactName, str], ...]:
+    facts = [
+        (
+            latest_entry,
+            DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
+            str(timeline_head.sequence),
+        ),
+        (
+            latest_entry,
+            DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT,
+            latest_entry.content.event.event_type.value,
+        ),
+        (
+            terminal_entry,
+            DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION,
+            terminal_entry.content.event.terminal_classification.value,
+        ),
+    ]
+    if authority_transition is not None:
+        facts.extend(
+            (
+                (
+                    authority_transition,
+                    DiagnosticEvidenceFactName.AUTHORITY_TRANSITION,
+                    authority_transition.content.event.event_type.value,
+                ),
+                (
+                    authority_transition,
+                    DiagnosticEvidenceFactName.CURRENT_AUTHORITY_EPOCH,
+                    str(authority_transition.content.event.epoch),
+                ),
+                (
+                    receipt_entry,
+                    DiagnosticEvidenceFactName.RECEIPT_REASON,
+                    _required_display_value(receipt_entry, "REASON_CODE"),
+                ),
+                (
+                    receipt_entry,
+                    DiagnosticEvidenceFactName.WORK_EPOCH,
+                    str(receipt_entry.content.event.epoch),
+                ),
+            )
+        )
+    return tuple(facts)
+
+
+def _stale_epoch_transition(
+    entries: tuple[TimelineEntryV1, ...],
+    *,
+    receipt_entry: TimelineEntryV1,
+    authority: EpochAuthorityRecord,
+) -> TimelineEntryV1 | None:
+    reason = _display_value(receipt_entry, "REASON_CODE")
+    if reason != ReasonCode.EPOCH_MISMATCH.value:
+        return None
+    event = receipt_entry.content.event
+    if (
+        event.event_type is not TimelineEventType.MUTATION_DENIED
+        or _display_value(receipt_entry, "OUTCOME") != "DENIED"
+    ):
+        raise ValueError("advisor epoch-mismatch evidence is inconsistent")
+    if event.epoch >= authority.current_epoch:
+        return None
+    if authority.cause is not EpochChangeCause.OPERATOR_REVOCATION:
+        raise ValueError("advisor stale-denial authority evidence is inconsistent")
+    transitions = tuple(
+        entry
+        for entry in entries
+        if entry.content.event.event_type is TimelineEventType.AUTHORITY_EPOCH_ADVANCED
+        and entry.content.event.epoch == authority.current_epoch
+        and entry.content.event.occurred_at == authority.changed_at
+        and entry.content.event.actor_id == timeline_actor_id(authority.changed_by)
+        and _correlation_value(entry, TimelineCorrelationKind.EVIDENCE)
+        == authority.evidence_id
+        and _correlation_value(entry, TimelineCorrelationKind.REQUEST)
+        == authority.request_id
+        and entry.content.event.signature is not None
+        and entry.content.event.signature.purpose == "EVIDENCE"
+        and entry.content.event.verification_status is TimelineVerificationStatus.VERIFIED
     )
+    if len(transitions) != 1:
+        raise ValueError("advisor stale-denial evidence is inconsistent")
+    transition = transitions[0]
+    if transition.content.sequence >= receipt_entry.content.sequence:
+        raise ValueError("advisor stale-denial evidence is inconsistent")
+    return transition
 
 
 def _latest_verification_entries(
     entries: tuple[TimelineEntryV1, ...],
+    *,
+    receipt_entry: TimelineEntryV1 | None = None,
+    expected_target_configuration_sha256: str | None = None,
 ) -> tuple[TimelineEntryV1, ...]:
+    if (receipt_entry is None) != (expected_target_configuration_sha256 is None):
+        raise ValueError("advisor target evidence selection is invalid")
+    if receipt_entry is not None:
+        assert expected_target_configuration_sha256 is not None
+        return _post_denial_verification_entries(
+            entries,
+            receipt_entry=receipt_entry,
+            expected_target_configuration_sha256=expected_target_configuration_sha256,
+        )
     selected: dict[str, TimelineEntryV1] = {}
     for entry in entries:
         kind = _display_value(entry, "OBSERVATION")
@@ -512,6 +722,70 @@ def _latest_verification_entries(
     if set(selected) != {"CONFIGURATION", "PROBE"}:
         raise ValueError("advisor target evidence is incomplete")
     return tuple(sorted(selected.values(), key=lambda item: item.content.sequence))
+
+
+def _post_denial_verification_entries(
+    entries: tuple[TimelineEntryV1, ...],
+    *,
+    receipt_entry: TimelineEntryV1,
+    expected_target_configuration_sha256: str,
+) -> tuple[TimelineEntryV1, ...]:
+    receipt_event = receipt_entry.content.event
+    expected_verification = f"stale-denial:{receipt_event.payload_sha256[:32]}"
+    receipt_request = _correlation_value(receipt_entry, TimelineCorrelationKind.REQUEST)
+    selected: dict[str, TimelineEntryV1] = {}
+    for entry in entries:
+        event = entry.content.event
+        kind = _display_value(entry, "OBSERVATION")
+        if (
+            kind in {"CONFIGURATION", "PROBE"}
+            and event.epoch == receipt_event.epoch
+            and event.occurred_at >= receipt_event.occurred_at
+            and entry.content.sequence > receipt_entry.content.sequence
+            and _display_value(entry, "OUTCOME") == "MATCH"
+            and _display_value(entry, "ACTION") == "APPLY_CANARY_V1"
+            and _correlation_value(entry, TimelineCorrelationKind.REQUEST)
+            == receipt_request
+            and _correlation_value(entry, TimelineCorrelationKind.VERIFICATION)
+            == expected_verification
+        ):
+            selected[kind] = entry
+    if set(selected) != {"CONFIGURATION", "PROBE"}:
+        raise ValueError("advisor post-denial target evidence is incomplete")
+    configuration = selected["CONFIGURATION"]
+    stable, candidate, observed_configuration_sha256 = _target_state(configuration)
+    if (
+        (stable, candidate) != (90, 10)
+        or observed_configuration_sha256 != expected_target_configuration_sha256
+    ):
+        raise ValueError("advisor post-denial target evidence is inconsistent")
+    return tuple(sorted(selected.values(), key=lambda item: item.content.sequence))
+
+
+def _target_state(entry: TimelineEntryV1) -> tuple[int, int, str]:
+    state = _required_display_value(entry, "STATE")
+    match = _TARGET_STATE.fullmatch(state)
+    if match is None:
+        raise ValueError("advisor target state evidence is invalid")
+    return (
+        int(match.group("stable")),
+        int(match.group("candidate")),
+        match.group("configuration"),
+    )
+
+
+def _correlation_value(
+    entry: TimelineEntryV1,
+    kind: TimelineCorrelationKind,
+) -> str | None:
+    return next(
+        (
+            item.correlation_id
+            for item in entry.content.event.correlations
+            if item.kind is kind
+        ),
+        None,
+    )
 
 
 def _latest_terminal_entry(entries: tuple[TimelineEntryV1, ...]) -> TimelineEntryV1:

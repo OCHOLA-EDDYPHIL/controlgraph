@@ -35,9 +35,7 @@ from controlgraph_canary.contracts.models import TargetBinding
 PROJECT_ID = "controlgraph-canary-abc123"
 PROJECT_NUMBER = "123456789012"
 SUBJECT = "123456789012345678901"
-ADVISOR_AUDIENCE = (
-    f"https://controlgraph-advisor-{PROJECT_NUMBER}.us-central1.run.app"
-)
+ADVISOR_AUDIENCE = f"https://controlgraph-advisor-{PROJECT_NUMBER}.us-central1.run.app"
 
 
 def target() -> TargetBinding:
@@ -54,6 +52,7 @@ def evidence_summary(
     kind: DiagnosticEvidenceKind,
     *,
     digest_character: str,
+    stale_epoch_mismatch: bool = False,
 ) -> DiagnosticEvidenceSummaryV1:
     summary_code = dict(
         zip(
@@ -92,6 +91,42 @@ def evidence_summary(
             (DiagnosticEvidenceFactName.VERIFICATION_VERDICT, "MATCH"),
         ),
     }[kind]
+    if stale_epoch_mismatch and kind is DiagnosticEvidenceKind.RECEIPT:
+        fact_values = (
+            (DiagnosticEvidenceFactName.DENIAL_OCCURRED_AT, "2026-08-22T09:59:00Z"),
+            (DiagnosticEvidenceFactName.RECEIPT_OUTCOME, "DENIED"),
+            (DiagnosticEvidenceFactName.RECEIPT_REASON, "EPOCH_MISMATCH"),
+            (DiagnosticEvidenceFactName.WORK_EPOCH, "2"),
+        )
+    elif stale_epoch_mismatch and kind is DiagnosticEvidenceKind.TIMELINE:
+        fact_values = (
+            (
+                DiagnosticEvidenceFactName.AUTHORITY_TRANSITION,
+                "AUTHORITY_EPOCH_ADVANCED",
+            ),
+            (DiagnosticEvidenceFactName.CURRENT_AUTHORITY_EPOCH, "3"),
+            (DiagnosticEvidenceFactName.RECEIPT_REASON, "EPOCH_MISMATCH"),
+            (DiagnosticEvidenceFactName.TERMINAL_CLASSIFICATION, "DENIED"),
+            (DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE, "3"),
+            (DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT, "MUTATION_DENIED"),
+            (DiagnosticEvidenceFactName.WORK_EPOCH, "2"),
+        )
+    elif stale_epoch_mismatch and kind in {
+        DiagnosticEvidenceKind.TARGET,
+        DiagnosticEvidenceKind.VERIFIER,
+    }:
+        fact_values = (
+            (DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT, "10"),
+            (DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256, "9" * 64),
+            (
+                DiagnosticEvidenceFactName.TARGET_OBSERVATION_RELATION,
+                "AT_OR_AFTER_DENIAL",
+            ),
+            (DiagnosticEvidenceFactName.TARGET_OBSERVED_AT, "2026-08-22T09:59:00Z"),
+            (DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT, "90"),
+            (DiagnosticEvidenceFactName.VERIFICATION_KIND, "CONFIGURATION"),
+            (DiagnosticEvidenceFactName.VERIFICATION_VERDICT, "MATCH"),
+        )
     facts = tuple(
         sorted(
             (
@@ -129,6 +164,7 @@ def snapshot(
     authority_revoked: bool = False,
     stable_percent: int = 90,
     candidate_percent: int = 10,
+    stale_epoch_mismatch: bool = False,
 ) -> DiagnosticSnapshotV1:
     return DiagnosticSnapshotV1(
         schema_version=DIAGNOSTIC_SNAPSHOT_V1,
@@ -154,11 +190,27 @@ def snapshot(
             DiagnosticEvidenceKind.ROOT,
             digest_character="1",
         ),
-        target_summary=evidence_summary(DiagnosticEvidenceKind.TARGET, digest_character="2"),
+        target_summary=evidence_summary(
+            DiagnosticEvidenceKind.TARGET,
+            digest_character="2",
+            stale_epoch_mismatch=stale_epoch_mismatch,
+        ),
         health_summary=evidence_summary(DiagnosticEvidenceKind.HEALTH, digest_character="3"),
-        receipt_summary=evidence_summary(DiagnosticEvidenceKind.RECEIPT, digest_character="4"),
-        timeline_summary=evidence_summary(DiagnosticEvidenceKind.TIMELINE, digest_character="5"),
-        verifier_summary=evidence_summary(DiagnosticEvidenceKind.VERIFIER, digest_character="6"),
+        receipt_summary=evidence_summary(
+            DiagnosticEvidenceKind.RECEIPT,
+            digest_character="4",
+            stale_epoch_mismatch=stale_epoch_mismatch,
+        ),
+        timeline_summary=evidence_summary(
+            DiagnosticEvidenceKind.TIMELINE,
+            digest_character="5",
+            stale_epoch_mismatch=stale_epoch_mismatch,
+        ),
+        verifier_summary=evidence_summary(
+            DiagnosticEvidenceKind.VERIFIER,
+            digest_character="6",
+            stale_epoch_mismatch=stale_epoch_mismatch,
+        ),
     )
 
 
@@ -172,9 +224,9 @@ class VerifiedEvidenceReader:
         evidence_kind: DiagnosticEvidenceKind,
     ) -> DiagnosticEvidenceSummaryV1:
         self.calls.append(evidence_kind)
-        summary = {
-            item.evidence_kind: item for item in request.snapshot.evidence_summaries
-        }[evidence_kind]
+        summary = {item.evidence_kind: item for item in request.snapshot.evidence_summaries}[
+            evidence_kind
+        ]
         return summary
 
 
@@ -198,12 +250,13 @@ def recommendation(
     *,
     action: RequestedOperatorAction = RequestedOperatorAction.WAIT,
     confidence_basis_points: int = 9_000,
+    statement: str = "The cited records support this bounded operator review.",
     citation_kind: DiagnosticEvidenceKind = DiagnosticEvidenceKind.ROOT,
+    citation_kinds: tuple[DiagnosticEvidenceKind, ...] | None = None,
+    citation_evidence_ids: dict[DiagnosticEvidenceKind, str] | None = None,
 ) -> AdvisorRecommendationV1:
-    summary_by_kind = {
-        item.evidence_kind: item for item in request.snapshot.evidence_summaries
-    }
-    cited = summary_by_kind[citation_kind]
+    summary_by_kind = {item.evidence_kind: item for item in request.snapshot.evidence_summaries}
+    selected_kinds = citation_kinds or (citation_kind,)
     return AdvisorRecommendationV1(
         schema_version=ADVISOR_RECOMMENDATION_V1,
         recommendation_id="recommendation-1",
@@ -213,13 +266,18 @@ def recommendation(
         current_epoch=request.snapshot.current_epoch,
         findings=(
             DiagnosticFindingV1(
-                statement="The cited records support this bounded operator review.",
-                citations=(
+                statement=statement,
+                citations=tuple(
                     EvidenceCitationV1(
-                        evidence_kind=citation_kind,
-                        evidence_id=cited.evidence_ids[0],
-                        source_sha256=cited.source_sha256,
-                    ),
+                        evidence_kind=kind,
+                        evidence_id=(
+                            citation_evidence_ids[kind]
+                            if citation_evidence_ids is not None and kind in citation_evidence_ids
+                            else summary_by_kind[kind].evidence_ids[0]
+                        ),
+                        source_sha256=summary_by_kind[kind].source_sha256,
+                    )
+                    for kind in selected_kinds
                 ),
             ),
         ),

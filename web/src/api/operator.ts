@@ -1,5 +1,6 @@
 import {
   ContractCodecError,
+  assertUtcSecondTimestamp,
   canonicalSha256,
   canonicalJson,
   decodeVersionedCanonicalJson,
@@ -12,6 +13,12 @@ import {
   type TimelinePage,
   type TimelineQuery,
 } from "../contracts/timeline";
+import {
+  ADVISOR_OPERATOR_COMMAND_VERSION,
+  decodeAdvisorOperatorResult,
+  type AdvisorOperatorCommandWire,
+  type AdvisorOperatorResult,
+} from "../contracts/modelAssistance";
 
 const OPERATOR_TIMELINE_PATH = "/v1/operator/timeline";
 const OPERATOR_COMMAND_PATH = "/v1/operator/commands";
@@ -90,6 +97,16 @@ export interface RevocationResult {
   readonly committedAt: string;
 }
 
+export interface AdvisorCommand {
+  readonly rootId: string;
+  readonly rootSha256: string;
+  readonly expectedEpoch: number;
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+  readonly requestedAt: string;
+  readonly expectedTarget: TargetBinding;
+}
+
 export interface OperatorApi {
   authenticate(options?: {
     readonly fresh?: boolean;
@@ -97,6 +114,7 @@ export interface OperatorApi {
   }): Promise<OperatorIdentity>;
   readTimeline(query: TimelineQuery, signal?: AbortSignal): Promise<TimelinePage>;
   revoke(command: RevocationCommand, signal?: AbortSignal): Promise<RevocationResult>;
+  advise(command: AdvisorCommand, signal?: AbortSignal): Promise<AdvisorOperatorResult>;
 }
 
 export interface ControlGraphOperatorIdentityBridge {
@@ -763,6 +781,79 @@ export class FetchOperatorApi implements OperatorApi {
       deadline.dispose();
     }
   }
+
+  async advise(
+    command: AdvisorCommand,
+    signal?: AbortSignal,
+  ): Promise<AdvisorOperatorResult> {
+    const deadline = withDeadline(signal, MUTATION_DEADLINE_MS);
+    try {
+      const credential = await obtainCredential(this.credentials, true, deadline);
+      if (
+        this.authenticatedIdentity !== null &&
+        (credential.principal !== this.authenticatedIdentity.principal ||
+          credential.subject !== this.authenticatedIdentity.subject)
+      ) {
+        throw new OperatorApiError(
+          "AUTHENTICATION_REQUIRED",
+          "ADVISOR_OPERATOR_CHANGED",
+        );
+      }
+      assertIdentifier(command.requestId, "advisor request");
+      assertIdentifier(command.idempotencyKey, "advisor idempotency key");
+      assertIdentifier(command.rootId, "advisor root");
+      assertDigest(command.rootSha256, "advisor root digest");
+      try {
+        assertUtcSecondTimestamp(command.requestedAt);
+      } catch {
+        throw new OperatorApiError("RESPONSE_INVALID", "ADVISOR_REQUEST_TIME_INVALID");
+      }
+      if (
+        !Number.isSafeInteger(command.expectedEpoch) ||
+        command.expectedEpoch < 1 ||
+        command.rootId !== `cgroot:${command.rootSha256}`
+      ) {
+        throw new OperatorApiError("RESPONSE_INVALID", "ADVISOR_AUTHORITY_INVALID");
+      }
+      const wire: AdvisorOperatorCommandWire = {
+        schema_version: ADVISOR_OPERATOR_COMMAND_VERSION,
+        request_id: command.requestId,
+        idempotency_key: command.idempotencyKey,
+        target: command.expectedTarget,
+        root_id: command.rootId,
+        expected_root_sha256: command.rootSha256,
+        expected_epoch: command.expectedEpoch,
+        requested_at: command.requestedAt,
+      };
+      const body = canonicalJson(wire);
+      let response: Response;
+      try {
+        response = await this.fetcher(
+          safeApiUrl(this.origin, OPERATOR_COMMAND_PATH),
+          { ...requestInit(credential, deadline.signal, true), body },
+        );
+      } catch (error) {
+        unavailableOnDeadline(error, deadline);
+      }
+      if (!response.ok) {
+        throw await apiFailure(response);
+      }
+      requireJsonResponse(response);
+      try {
+        return await decodeAdvisorOperatorResult(await boundedText(response), wire);
+      } catch (error) {
+        if (error instanceof OperatorApiError) {
+          throw error;
+        }
+        if (error instanceof ContractCodecError) {
+          throw new OperatorApiError("RESPONSE_INVALID", "ADVISOR_RESPONSE_INVALID");
+        }
+        throw error;
+      }
+    } finally {
+      deadline.dispose();
+    }
+  }
 }
 
 export function createBrowserOperatorApi(): OperatorApi {
@@ -783,6 +874,20 @@ export function newRevocationIdentity(): {
   return {
     requestId: `console-revoke-${identity}`,
     idempotencyKey: `console-revoke-${identity}`,
+  };
+}
+
+export function newAdvisorIdentity(): {
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+} {
+  if (typeof globalThis.crypto?.randomUUID !== "function") {
+    throw new OperatorApiError("UNAVAILABLE");
+  }
+  const identity = globalThis.crypto.randomUUID();
+  return {
+    requestId: `console-advisor-${identity}`,
+    idempotencyKey: `console-advisor-${identity}`,
   };
 }
 

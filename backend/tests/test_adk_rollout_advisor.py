@@ -20,6 +20,7 @@ from controlgraph_canary.application.model_assistance import (
 from controlgraph_canary.contracts.model_assistance import (
     MAX_LLM_CALLS,
     MAX_MODEL_OUTPUT_TOKENS,
+    PROMPT_VERSION,
     DiagnosticToolId,
 )
 from controlgraph_canary.integrations.adk import rollout_advisor
@@ -101,6 +102,7 @@ def test_adk_runner_exposes_only_six_bounded_snapshot_tools(
     result = asyncio.run(advisor.recommend(request, registry))
 
     assert result == recommendation(request)
+    assert advisor.prompt_version == PROMPT_VERSION
     agent = _FakeRunner.created_agent
     assert agent is not None
     assert tuple(tool.__name__ for tool in agent.tools) == tuple(
@@ -114,6 +116,11 @@ def test_adk_runner_exposes_only_six_bounded_snapshot_tools(
     assert agent.sub_agents == []
     assert agent.code_executor is None
     assert agent.output_schema == rollout_advisor._vertex_response_schema()
+    assert "receipt work_epoch" in agent.instruction
+    assert "timeline evidence" in agent.instruction
+    assert "target or verifier" in agent.instruction
+    assert rollout_advisor._STALE_CAUSAL_PATH_TEMPLATE in agent.instruction
+    assert "Do not add prose to the clause or split those citations" in agent.instruction
     assert agent.model.client_kwargs["enterprise"] is True
     assert agent.model.client_kwargs["project"] == request.snapshot.target.project_id
     assert agent.model.client_kwargs["location"] == "global"
@@ -125,8 +132,7 @@ def test_adk_runner_exposes_only_six_bounded_snapshot_tools(
     assert agent.generate_content_config.max_output_tokens == MAX_MODEL_OUTPUT_TOKENS
     assert agent.generate_content_config.temperature == 0
     assert (
-        agent.generate_content_config.thinking_config.thinking_level
-        is types.ThinkingLevel.MINIMAL
+        agent.generate_content_config.thinking_config.thinking_level is types.ThinkingLevel.MINIMAL
     )
 
 

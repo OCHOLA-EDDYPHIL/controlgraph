@@ -3,11 +3,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   OperatorApiError,
   createBrowserOperatorApi,
+  newAdvisorIdentity,
   newRevocationIdentity,
   type OperatorApi,
   type RevocationResult,
 } from "./api/operator";
-import type { TimelineEntry } from "./contracts/timeline";
+import type { AdvisorOperatorResult } from "./contracts/modelAssistance";
+import type { TargetBinding, TimelineEntry } from "./contracts/timeline";
 import {
   displayField,
   eventPresentation,
@@ -42,6 +44,335 @@ type RevocationStatus =
   | "AMBIGUOUS"
   | "DENIED"
   | "FAILED";
+
+type AdvisorStatus = "IDLE" | "RUNNING" | "COMPLETE" | "STALE" | "FAILED";
+
+interface EligibleDenial {
+  readonly entry: TimelineEntry;
+  readonly target: TargetBinding;
+  readonly currentEpoch: number;
+}
+
+interface AdvisorBinding {
+  readonly entrySha256: string;
+  readonly rootSha256: string;
+  readonly currentEpoch: number;
+  readonly headSequence: number;
+  readonly headEntrySha256: string | null;
+}
+
+// Reserve the final 60 seconds of the backend's 300-second evidence lifetime for
+// the bounded model call and response validation.
+const ADVISOR_REQUEST_WINDOW_MS = 240_000;
+
+function uniqueCorrelation(
+  entry: TimelineEntry,
+  kind: "EVIDENCE" | "REQUEST",
+): string | null {
+  const matches = entry.correlations.filter((correlation) => correlation.kind === kind);
+  return matches.length === 1 ? matches[0]!.correlationId : null;
+}
+
+function isCorrelatedOperatorRevocation(
+  entry: TimelineEntry,
+  transition: TimelineEntry,
+  denialSequence: number,
+): boolean {
+  const evidenceId = uniqueCorrelation(transition, "EVIDENCE");
+  const requestId = uniqueCorrelation(transition, "REQUEST");
+  return (
+    evidenceId !== null &&
+    requestId !== null &&
+    entry.rootId === transition.rootId &&
+    entry.rootSha256 === transition.rootSha256 &&
+    entry.epoch === transition.epoch &&
+    entry.sequence < denialSequence &&
+    entry.occurredAt === transition.occurredAt &&
+    entry.eventType === "OPERATOR_ACTION_RECORDED" &&
+    entry.actorRole === "OPERATOR" &&
+    entry.signature === null &&
+    entry.verificationStatus === "NOT_APPLICABLE" &&
+    entry.displayFields.some(
+      (field) => field.name === "ACTION" && field.value === "REVOKE_EPOCH",
+    ) &&
+    uniqueCorrelation(entry, "EVIDENCE") === evidenceId &&
+    uniqueCorrelation(entry, "REQUEST") === requestId
+  );
+}
+
+function eligibleEpochMismatchDenial(
+  phase: ConsolePhase,
+  target: TargetBinding | null,
+  authority: ReviewedAuthority | null | {
+    readonly rootId: string;
+    readonly rootSha256: string;
+    readonly epoch: number;
+  },
+  entries: readonly TimelineEntry[],
+  nowMs: number,
+): EligibleDenial | null {
+  if (phase !== "LIVE" || target === null || authority === null) {
+    return null;
+  }
+  const latestReceipt = [...entries]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.rootId === authority.rootId &&
+        entry.rootSha256 === authority.rootSha256 &&
+        entry.eventType.startsWith("MUTATION_"),
+    );
+  if (latestReceipt === undefined || latestReceipt.eventType !== "MUTATION_DENIED") {
+    return null;
+  }
+  const reason = latestReceipt.displayFields.find(
+    (field) => field.name === "REASON_CODE",
+  )?.value;
+  const outcome = latestReceipt.displayFields.find(
+    (field) => field.name === "OUTCOME",
+  )?.value;
+  const authorityTransition = [...entries]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.rootId === authority.rootId &&
+        entry.rootSha256 === authority.rootSha256 &&
+        entry.eventType === "AUTHORITY_EPOCH_ADVANCED" &&
+        entry.actorRole === "OPERATOR" &&
+        entry.epoch === authority.epoch &&
+        entry.sequence < latestReceipt.sequence &&
+        entry.signature !== null &&
+        entry.signature.purpose === "EVIDENCE" &&
+        entry.verificationStatus === "VERIFIED" &&
+        entries.some((candidate) =>
+          isCorrelatedOperatorRevocation(candidate, entry, latestReceipt.sequence),
+        ),
+    );
+  const occurredAtMs = new Date(latestReceipt.occurredAt).valueOf();
+  const ageMs = nowMs - occurredAtMs;
+  if (
+    reason !== "EPOCH_MISMATCH" ||
+    outcome !== "DENIED" ||
+    latestReceipt.epoch + 1 !== authority.epoch ||
+    authorityTransition === undefined ||
+    !Number.isFinite(occurredAtMs) ||
+    ageMs < 0 ||
+    ageMs >= ADVISOR_REQUEST_WINDOW_MS
+  ) {
+    return null;
+  }
+  return { entry: latestReceipt, target, currentEpoch: authority.epoch };
+}
+
+function advisorResultMatchesView(
+  binding: AdvisorBinding | null,
+  result: AdvisorOperatorResult | null,
+  eligible: EligibleDenial | null,
+  entries: readonly TimelineEntry[],
+  head: { readonly afterSequence: number; readonly afterEntrySha256: string | null },
+): boolean {
+  if (binding === null || result === null || eligible === null) {
+    return false;
+  }
+  if (
+    eligible.entry.entrySha256 !== binding.entrySha256 ||
+    eligible.entry.rootSha256 !== binding.rootSha256 ||
+    eligible.currentEpoch !== binding.currentEpoch
+  ) {
+    return false;
+  }
+  if (
+    head.afterSequence === binding.headSequence &&
+    head.afterEntrySha256 === binding.headEntrySha256
+  ) {
+    return true;
+  }
+  const laterEntries = entries.filter(
+    (entry) => entry.sequence > binding.headSequence,
+  );
+  return (
+    laterEntries.length > 0 &&
+    laterEntries.at(-1)?.sequence === head.afterSequence &&
+    laterEntries.at(-1)?.entrySha256 === head.afterEntrySha256 &&
+    laterEntries.every(
+      (entry) =>
+        entry.eventType === "MODEL_ASSISTANCE_RECORDED" &&
+        entry.correlations.some(
+          (correlation) =>
+            correlation.kind === "MODEL" &&
+            correlation.correlationId === result.interaction_id,
+        ),
+    )
+  );
+}
+
+function actionLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function AdvisorInvestigation({
+  eligible,
+  status,
+  result,
+  run,
+}: {
+  readonly eligible: EligibleDenial | null;
+  readonly status: AdvisorStatus;
+  readonly result: AdvisorOperatorResult | null;
+  readonly run: () => Promise<void>;
+}) {
+  if (eligible === null && status !== "STALE") {
+    return null;
+  }
+  const recommendation = result?.response.recommendation ?? null;
+  return (
+    <section className="advisor-investigation" aria-labelledby="advisor-title">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Deterministic denial · advisory investigation</p>
+          <h2 id="advisor-title">Why the stale action could not proceed</h2>
+        </div>
+        <p>Gemini may explain cited evidence. It cannot authorize or mutate a rollout.</p>
+      </div>
+
+      {eligible !== null && (
+        <article className="denial-proof">
+          <div>
+            <span className="proof-kicker">Enforced before model analysis</span>
+            <strong>DENIED · EPOCH_MISMATCH</strong>
+            <p>
+              Work bound to epoch {eligible.entry.epoch} reached authority at epoch{" "}
+              {eligible.currentEpoch}. No provider mutation was authorized.
+            </p>
+          </div>
+          <dl>
+            <div>
+              <dt>Receipt evidence</dt>
+              <dd><code>{shortDigest(eligible.entry.entrySha256)}</code></dd>
+            </div>
+            <div>
+              <dt>Root</dt>
+              <dd><code>{shortDigest(eligible.entry.rootSha256)}</code></dd>
+            </div>
+          </dl>
+        </article>
+      )}
+
+      {status === "STALE" && (
+        <div className="advisor-state advisor-state--warning" role="status">
+          The authority or latest mutation receipt changed. The prior analysis was hidden.
+        </div>
+      )}
+      {status === "FAILED" && eligible !== null && (
+        <div className="advisor-state advisor-state--warning" role="alert">
+          Evidence analysis was unavailable. The deterministic denial remains unchanged.
+        </div>
+      )}
+
+      {eligible !== null && result === null && status !== "STALE" && (
+        <div className="advisor-launch">
+          <div>
+            <strong>Analyze current rollout evidence</strong>
+            <p>
+              Runs the six read-only diagnostic tools through Google ADK and
+              gemini-3.5-flash, then validates every returned citation.
+            </p>
+          </div>
+          <button
+            className="button button--advisory"
+            type="button"
+            disabled={status === "RUNNING"}
+            onClick={asyncAction(run)}
+          >
+            {status === "RUNNING" ? "Analyzing evidence…" : "Analyze current rollout evidence"}
+          </button>
+        </div>
+      )}
+
+      {result !== null && recommendation === null && (
+        <div className="advisor-state advisor-state--warning" role="status">
+          <strong>No model recommendation was accepted.</strong>
+          <span>
+            Safe fallback: {actionLabel(result.response.audit.fallback_code ?? "unknown")}.
+            Review the named deterministic evidence instead.
+          </span>
+        </div>
+      )}
+
+      {result !== null && recommendation !== null && (
+        <article className="advisor-result" aria-label="Validated Gemini evidence analysis">
+          <header>
+            <div>
+              <span className="proof-kicker">Validated advisory · operator review required</span>
+              <h3>{actionLabel(recommendation.requested_operator_action)}</h3>
+            </div>
+            <strong>{(recommendation.confidence_basis_points / 100).toFixed(2)}% confidence</strong>
+          </header>
+
+          <div className="advisor-boundary">
+            Authority effect: <strong>none</strong> · deterministic health override:{" "}
+            <strong>false</strong>
+          </div>
+
+          <div className="advisor-columns">
+            <section aria-labelledby="advisor-findings">
+              <h4 id="advisor-findings">Causal findings</h4>
+              <ol className="advisor-findings">
+                {recommendation.findings.map((finding, index) => (
+                  <li key={`${index}:${finding.statement}`}>
+                    <p>{finding.statement}</p>
+                    <ul aria-label={`Citations for finding ${index + 1}`}>
+                      {finding.citations.map((citation) => (
+                        <li key={`${citation.evidence_kind}:${citation.evidence_id}`}>
+                          <span>{citation.evidence_kind}</span>{" "}
+                          <code>{citation.evidence_id}</code>{" "}
+                          <code>{shortDigest(citation.source_sha256)}</code>
+                        </li>
+                      ))}
+                    </ul>
+                  </li>
+                ))}
+              </ol>
+            </section>
+            <section aria-labelledby="advisor-uncertainties">
+              <h4 id="advisor-uncertainties">Uncertainty retained</h4>
+              <ul className="advisor-uncertainties">
+                {recommendation.uncertainties.map((uncertainty) => (
+                  <li key={uncertainty}>{uncertainty}</li>
+                ))}
+              </ul>
+              {recommendation.manual_review_reason !== null && (
+                <p className="manual-review-reason">{recommendation.manual_review_reason}</p>
+              )}
+            </section>
+          </div>
+
+          <details className="advisor-audit">
+            <summary>Model and tool audit</summary>
+            <dl>
+              <div><dt>Model</dt><dd>{result.response.audit.model_id}</dd></div>
+              <div><dt>Prompt</dt><dd>{result.response.audit.prompt_version}</dd></div>
+              <div><dt>Interaction</dt><dd><code>{result.interaction_id}</code></dd></div>
+              <div><dt>Replay</dt><dd>{result.replayed ? "exact idempotent replay" : "fresh invocation"}</dd></div>
+            </dl>
+            <ol>
+              {result.response.audit.tool_calls.map((tool) => (
+                <li key={tool.sequence}>
+                  <strong>{tool.sequence}. {tool.tool_id}</strong>
+                  <span>{tool.status}</span>
+                  <code>in {shortDigest(tool.input_sha256)}</code>
+                  {tool.output_sha256 !== null && (
+                    <code>out {shortDigest(tool.output_sha256)}</code>
+                  )}
+                </li>
+              ))}
+            </ol>
+          </details>
+        </article>
+      )}
+    </section>
+  );
+}
 
 function asyncAction(action: () => Promise<unknown>): () => void {
   return () => {
@@ -478,6 +809,9 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
   const [revocationResult, setRevocationResult] = useState<RevocationResult | null>(null);
   const [revocationResolution, setRevocationResolution] =
     useState<RevocationResolution | null>(null);
+  const [advisorStatus, setAdvisorStatus] = useState<AdvisorStatus>("IDLE");
+  const [advisorResult, setAdvisorResult] = useState<AdvisorOperatorResult | null>(null);
+  const [advisorBinding, setAdvisorBinding] = useState<AdvisorBinding | null>(null);
   const reviewButtonRef = useRef<HTMLButtonElement>(null);
   const consoleContentRef = useRef<HTMLDivElement>(null);
   const dialogWasOpen = useRef(false);
@@ -485,6 +819,36 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
   const dialogOpen =
     reviewed !== null &&
     (revocationStatus === "REVIEWING" || revocationStatus === "SUBMITTING");
+
+  const eligibleDenial = useMemo(
+    () =>
+      eligibleEpochMismatchDenial(
+        view.phase,
+        view.target,
+        view.authority,
+        view.entries,
+        Date.now(),
+      ),
+    [view.authority, view.entries, view.phase, view.target],
+  );
+  const advisorResultIsCurrent = useMemo(
+    () =>
+      advisorResultMatchesView(
+        advisorBinding,
+        advisorResult,
+        eligibleDenial,
+        view.entries,
+        view.head,
+      ),
+    [advisorBinding, advisorResult, eligibleDenial, view.entries, view.head],
+  );
+
+  useEffect(() => {
+    if (advisorResult !== null && !advisorResultIsCurrent) {
+      setAdvisorResult(null);
+      setAdvisorStatus("STALE");
+    }
+  }, [advisorResult, advisorResultIsCurrent]);
 
   useEffect(() => {
     const content = consoleContentRef.current;
@@ -607,6 +971,61 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
     }
   };
 
+  const runAdvisorInvestigation = async (): Promise<void> => {
+    if (eligibleDenial === null || advisorStatus === "RUNNING") {
+      return;
+    }
+    const binding = {
+      entrySha256: eligibleDenial.entry.entrySha256,
+      rootSha256: eligibleDenial.entry.rootSha256,
+      currentEpoch: eligibleDenial.currentEpoch,
+      headSequence: view.head.afterSequence,
+      headEntrySha256: view.head.afterEntrySha256,
+    };
+    setAdvisorStatus("RUNNING");
+    setAdvisorResult(null);
+    setAdvisorBinding(binding);
+    try {
+      const identity = newAdvisorIdentity();
+      const requestedAt = new Date(Math.floor(Date.now() / 1_000) * 1_000)
+        .toISOString()
+        .replace(".000Z", "Z");
+      const result = await operatorApi.advise({
+        rootId: eligibleDenial.entry.rootId,
+        rootSha256: eligibleDenial.entry.rootSha256,
+        expectedEpoch: eligibleDenial.currentEpoch,
+        requestId: identity.requestId,
+        idempotencyKey: identity.idempotencyKey,
+        requestedAt,
+        expectedTarget: eligibleDenial.target,
+      });
+      const citationKinds = new Set(
+        result.response.recommendation?.findings.flatMap((finding) =>
+          finding.citations.map((citation) => citation.evidence_kind),
+        ) ?? [],
+      );
+      if (
+        result.response.audit.prompt_version !==
+          "controlgraph.rollout-advisor-prompt/v2" ||
+        (result.response.recommendation !== null &&
+          (!citationKinds.has("receipt") ||
+            !citationKinds.has("timeline") ||
+            (!citationKinds.has("target") && !citationKinds.has("verifier"))))
+      ) {
+        throw new OperatorApiError(
+          "RESPONSE_INVALID",
+          "ADVISOR_CAUSAL_EVIDENCE_INVALID",
+        );
+      }
+      await controller.reloadFromStart();
+      setAdvisorResult(result);
+      setAdvisorStatus("COMPLETE");
+    } catch {
+      setAdvisorResult(null);
+      setAdvisorStatus("FAILED");
+    }
+  };
+
   const phaseBusy = view.phase === "AUTHENTICATING" || view.phase === "LOADING";
   return (
     <div className="shell">
@@ -671,6 +1090,17 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
           result={revocationResult}
           resolution={revocationResolution}
           checkTimeline={checkAmbiguousRevocation}
+        />
+
+        <AdvisorInvestigation
+          eligible={eligibleDenial}
+          status={
+            advisorResult !== null && !advisorResultIsCurrent
+              ? "STALE"
+              : advisorStatus
+          }
+          result={advisorResultIsCurrent ? advisorResult : null}
+          run={runAdvisorInvestigation}
         />
 
         {view.target !== null && view.authority !== null && (

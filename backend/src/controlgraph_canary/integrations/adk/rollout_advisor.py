@@ -36,7 +36,14 @@ from controlgraph_canary.contracts.model_assistance import (
 _MODEL_HTTP_TIMEOUT_MS: Final = 19_000
 _TOOL_TIMEOUT_SECONDS: Final = 0.25
 _ADK_APP_NAME: Final = "controlgraph_read_only_advisor"
-_INSTRUCTION: Final = """You are the read-only ControlGraph rollout advisor.
+_STALE_CAUSAL_PATH_TEMPLATE: Final = (
+    "causal_path(work_epoch=<work_epoch>,"
+    "current_authority_epoch=<current_authority_epoch>,"
+    "reason=EPOCH_MISMATCH,target=90/10,"
+    "target_configuration_sha256=<target_configuration_sha256>,"
+    "relation=AT_OR_AFTER_DENIAL)"
+)
+_INSTRUCTION: Final = f"""You are the read-only ControlGraph rollout advisor.
 You have no authority to approve health, select a revision, mutate a target, enqueue work,
 sign a capability, change an epoch, or approve your own recommendation.
 Call each of the six supplied diagnostic tools exactly once using only the snapshot_sha256
@@ -48,6 +55,16 @@ is below the schema threshold, request manual_review and state the uncertainty. 
 structured response. Always include at least one uncertainty and set operator_review_required to
 true, authority_effect to none, and deterministic_health_override to false. Do not reveal private
 reasoning or chain-of-thought.
+When a fresh revoked snapshot records a DENIED receipt with EPOCH_MISMATCH, explain the causal
+sequence using the receipt work_epoch and denial time, the timeline authority transition/current
+epoch, and the independently verified post-denial target state. Exactly one finding statement must
+be the following clause, with every placeholder replaced by the exact cited fact value:
+{_STALE_CAUSAL_PATH_TEMPLATE}
+That same finding must cite the exact receipt record carrying the denial facts, the exact
+timeline evidence record carrying the authority transition facts, and the exact
+target or verifier record carrying the 90/10 traffic, target-configuration digest, and
+AT_OR_AFTER_DENIAL relation. Do not add prose to the clause or split those citations across
+findings. Never infer that an epoch transition itself changed target state.
 """
 
 
@@ -114,7 +131,7 @@ class GoogleAdkRolloutAdvisor:
         return MODEL_LOCATION
 
     @property
-    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v1"]:
+    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v2"]:
         return PROMPT_VERSION
 
     async def recommend(
@@ -221,9 +238,7 @@ class GoogleAdkRolloutAdvisor:
                     response = "".join(response_parts)
                     output_bytes += len(response.encode("utf-8"))
                     if output_bytes > MAX_MODEL_OUTPUT_BYTES:
-                        raise AdvisorModelFailure(
-                            AdvisorModelFailureCode.MALFORMED_OUTPUT
-                        )
+                        raise AdvisorModelFailure(AdvisorModelFailureCode.MALFORMED_OUTPUT)
                     final_responses.append(response)
         except asyncio.CancelledError:
             raise

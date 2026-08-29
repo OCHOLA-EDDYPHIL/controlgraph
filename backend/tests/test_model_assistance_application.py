@@ -24,18 +24,24 @@ from controlgraph_canary.application.model_assistance import (
     DiagnosticToolError,
     InvocationDiagnosticRegistry,
     ReadOnlyAdvisorService,
+    stale_denial_causal_path_clause,
     validate_recommendation,
 )
 from controlgraph_canary.application.root_trust import CoordinatorInternalRoute
-from controlgraph_canary.contracts.codec import canonical_json_bytes
+from controlgraph_canary.contracts.codec import canonical_json_bytes, canonical_sha256
 from controlgraph_canary.contracts.model_assistance import (
+    PROMPT_VERSION,
+    PROMPT_VERSION_V1,
     AdvisorFallbackCode,
+    AdvisorInteractionAuditV1,
     AdvisorInvocationRequestV1,
     AdvisorRecommendationV1,
     AdvisorResponseV1,
     AdvisorToolCallAuditV1,
     AdvisoryHealth,
+    DiagnosticEvidenceFactName,
     DiagnosticEvidenceKind,
+    DiagnosticSnapshotV1,
     DiagnosticToolId,
     EvidenceConsistency,
     RecommendationValidationCode,
@@ -45,6 +51,11 @@ from controlgraph_canary.contracts.model_assistance import (
 )
 
 NOW = datetime(2026, 8, 22, 10, 1, tzinfo=UTC)
+STALE_CAUSAL_PATH = stale_denial_causal_path_clause(
+    work_epoch=2,
+    current_authority_epoch=3,
+    target_configuration_sha256="9" * 64,
+)
 
 
 async def _call_all_tools(
@@ -79,8 +90,8 @@ class _SuccessfulModel:
         return "global"
 
     @property
-    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v1"]:
-        return "controlgraph.rollout-advisor-prompt/v1"
+    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v2"]:
+        return "controlgraph.rollout-advisor-prompt/v2"
 
     async def recommend(
         self,
@@ -128,6 +139,12 @@ class _MalformedModel(_SuccessfulModel):
         )
 
 
+class _LegacyPromptModel(_SuccessfulModel):
+    @property
+    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v1"]:
+        return "controlgraph.rollout-advisor-prompt/v1"
+
+
 def test_registry_returns_only_bound_summaries_once_each() -> None:
     request = invocation()
     reader = verified_evidence_reader()
@@ -157,9 +174,7 @@ def test_registry_rejects_cross_snapshot_input_before_returning_evidence() -> No
     )
 
     with pytest.raises(DiagnosticToolError, match="denied"):
-        asyncio.run(
-            registry.read(DiagnosticToolId.READ_ROOT_SUMMARY, "f" * 64)
-        )
+        asyncio.run(registry.read(DiagnosticToolId.READ_ROOT_SUMMARY, "f" * 64))
 
     assert len(registry.calls) == 1
     assert registry.calls[0].status is ToolCallStatus.DENIED
@@ -178,6 +193,257 @@ def test_validator_accepts_only_fully_cited_fresh_bound_recommendation() -> None
 
     assert result.accepted is True
     assert result.codes == (RecommendationValidationCode.ACCEPTED,)
+
+
+@pytest.mark.parametrize(
+    "target_evidence",
+    [DiagnosticEvidenceKind.TARGET, DiagnosticEvidenceKind.VERIFIER],
+)
+def test_fresh_revoked_epoch_mismatch_requires_causal_citations(
+    target_evidence: DiagnosticEvidenceKind,
+) -> None:
+    request = invocation(
+        phase=RolloutPhase.REVOKED,
+        authority_revoked=True,
+        stale_epoch_mismatch=True,
+    )
+    required = (
+        DiagnosticEvidenceKind.RECEIPT,
+        DiagnosticEvidenceKind.TIMELINE,
+        target_evidence,
+    )
+
+    accepted = validate_recommendation(
+        request,
+        recommendation(
+            request,
+            statement=STALE_CAUSAL_PATH,
+            citation_kinds=required,
+        ),
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+    missing_target_evidence = validate_recommendation(
+        request,
+        recommendation(
+            request,
+            statement=STALE_CAUSAL_PATH,
+            citation_kinds=required[:2],
+        ),
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+    missing_timeline = validate_recommendation(
+        request,
+        recommendation(
+            request,
+            statement=STALE_CAUSAL_PATH,
+            citation_kinds=(DiagnosticEvidenceKind.RECEIPT, target_evidence),
+        ),
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+    missing_receipt = validate_recommendation(
+        request,
+        recommendation(
+            request,
+            statement=STALE_CAUSAL_PATH,
+            citation_kinds=(DiagnosticEvidenceKind.TIMELINE, target_evidence),
+        ),
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+
+    assert accepted.codes == (RecommendationValidationCode.ACCEPTED,)
+    assert RecommendationValidationCode.CITATION_INVALID in missing_target_evidence.codes
+    assert RecommendationValidationCode.CITATION_INVALID in missing_timeline.codes
+    assert RecommendationValidationCode.CITATION_INVALID in missing_receipt.codes
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "The cited records support this bounded operator review.",
+        STALE_CAUSAL_PATH + " reason=TARGET_CHANGED",
+        STALE_CAUSAL_PATH.replace("work_epoch=2", "work_epoch=1"),
+        STALE_CAUSAL_PATH.replace(
+            "current_authority_epoch=3",
+            "current_authority_epoch=4",
+        ),
+        STALE_CAUSAL_PATH.replace("reason=EPOCH_MISMATCH", "reason=TARGET_CHANGED"),
+        STALE_CAUSAL_PATH.replace("target=90/10", "target=100/0"),
+        STALE_CAUSAL_PATH.replace("9" * 64, "8" * 64),
+        STALE_CAUSAL_PATH.replace(
+            "relation=AT_OR_AFTER_DENIAL",
+            "relation=BEFORE_DENIAL",
+        ),
+    ),
+)
+def test_stale_denial_rejects_noncanonical_causal_path(statement: str) -> None:
+    request = invocation(
+        phase=RolloutPhase.REVOKED,
+        authority_revoked=True,
+        stale_epoch_mismatch=True,
+    )
+
+    result = validate_recommendation(
+        request,
+        recommendation(
+            request,
+            statement=statement,
+            citation_kinds=(
+                DiagnosticEvidenceKind.RECEIPT,
+                DiagnosticEvidenceKind.TIMELINE,
+                DiagnosticEvidenceKind.TARGET,
+            ),
+        ),
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+
+    assert RecommendationValidationCode.CITATION_INVALID in result.codes
+
+
+def test_stale_denial_rejects_causal_citations_split_across_findings() -> None:
+    request = invocation(
+        phase=RolloutPhase.REVOKED,
+        authority_revoked=True,
+        stale_epoch_mismatch=True,
+    )
+    combined = recommendation(
+        request,
+        statement=STALE_CAUSAL_PATH,
+        citation_kinds=(
+            DiagnosticEvidenceKind.RECEIPT,
+            DiagnosticEvidenceKind.TIMELINE,
+            DiagnosticEvidenceKind.TARGET,
+        ),
+    )
+    citations = combined.findings[0].citations
+    split = combined.model_copy(
+        update={
+            "findings": tuple(
+                combined.findings[0].model_copy(update={"citations": (citation,)})
+                for citation in citations
+            )
+        }
+    )
+
+    result = validate_recommendation(
+        request,
+        split,
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+
+    assert RecommendationValidationCode.CITATION_INVALID in result.codes
+
+
+def test_stale_denial_rejects_duplicate_causal_findings() -> None:
+    request = invocation(
+        phase=RolloutPhase.REVOKED,
+        authority_revoked=True,
+        stale_epoch_mismatch=True,
+    )
+    recommendation_with_causal_path = recommendation(
+        request,
+        statement=STALE_CAUSAL_PATH,
+        citation_kinds=(
+            DiagnosticEvidenceKind.RECEIPT,
+            DiagnosticEvidenceKind.TIMELINE,
+            DiagnosticEvidenceKind.TARGET,
+        ),
+    )
+    duplicate = recommendation_with_causal_path.model_copy(
+        update={
+            "findings": (
+                recommendation_with_causal_path.findings[0],
+                recommendation_with_causal_path.findings[0],
+            )
+        }
+    )
+
+    result = validate_recommendation(
+        request,
+        duplicate,
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+
+    assert RecommendationValidationCode.CITATION_INVALID in result.codes
+
+
+@pytest.mark.parametrize(
+    "distractor_kind",
+    (
+        DiagnosticEvidenceKind.RECEIPT,
+        DiagnosticEvidenceKind.TIMELINE,
+        DiagnosticEvidenceKind.TARGET,
+    ),
+)
+def test_stale_denial_rejects_non_fact_bearing_citation_ids(
+    distractor_kind: DiagnosticEvidenceKind,
+) -> None:
+    original = invocation(
+        phase=RolloutPhase.REVOKED,
+        authority_revoked=True,
+        stale_epoch_mismatch=True,
+    )
+    snapshot_payload = original.snapshot.model_dump(mode="python")
+    for field, kind in (
+        ("receipt_summary", DiagnosticEvidenceKind.RECEIPT),
+        ("timeline_summary", DiagnosticEvidenceKind.TIMELINE),
+        ("target_summary", DiagnosticEvidenceKind.TARGET),
+    ):
+        summary = snapshot_payload[field]
+        summary["evidence_ids"] = (
+            f"{kind.value}-distractor",
+            *summary["evidence_ids"],
+        )
+    selected_snapshot = DiagnosticSnapshotV1.model_validate(snapshot_payload)
+    request = AdvisorInvocationRequestV1(
+        schema_version=original.schema_version,
+        correlation_id=original.correlation_id,
+        requested_at=original.requested_at,
+        snapshot=selected_snapshot,
+        snapshot_sha256=canonical_sha256(selected_snapshot),
+    )
+    summary_by_kind = {
+        summary.evidence_kind: summary for summary in request.snapshot.evidence_summaries
+    }
+    fact_name = {
+        DiagnosticEvidenceKind.RECEIPT: DiagnosticEvidenceFactName.RECEIPT_REASON,
+        DiagnosticEvidenceKind.TIMELINE: (DiagnosticEvidenceFactName.AUTHORITY_TRANSITION),
+        DiagnosticEvidenceKind.TARGET: (DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256),
+    }
+    exact_ids = {
+        kind: next(
+            fact.evidence_id for fact in summary_by_kind[kind].facts if fact.name is fact_name[kind]
+        )
+        for kind in fact_name
+    }
+    cited_ids = {
+        **exact_ids,
+        distractor_kind: f"{distractor_kind.value}-distractor",
+    }
+
+    result = validate_recommendation(
+        request,
+        recommendation(
+            request,
+            statement=STALE_CAUSAL_PATH,
+            citation_kinds=(
+                DiagnosticEvidenceKind.RECEIPT,
+                DiagnosticEvidenceKind.TIMELINE,
+                DiagnosticEvidenceKind.TARGET,
+            ),
+            citation_evidence_ids=cited_ids,
+        ),
+        tool_calls=_audits(request),
+        now=NOW,
+    )
+
+    assert RecommendationValidationCode.CITATION_INVALID in result.codes
 
 
 def test_validator_fails_closed_when_a_tool_was_not_called() -> None:
@@ -281,13 +547,39 @@ def test_service_returns_content_free_audit_for_valid_recommendation() -> None:
     assert response.recommendation is not None
     assert response.audit.validation.accepted is True
     assert response.audit.fallback_code is None
-    assert tuple(call.tool_id for call in response.audit.tool_calls) == tuple(
-        DiagnosticToolId
-    )
+    assert response.audit.prompt_version == PROMPT_VERSION
+    assert tuple(call.tool_id for call in response.audit.tool_calls) == tuple(DiagnosticToolId)
     audit_text = response.audit.model_dump_json()
     assert "instruction authority" not in audit_text
     assert "chain-of-thought" not in audit_text
     assert "Bearer" not in audit_text
+
+
+def test_current_audit_contract_decodes_legacy_prompt_metadata() -> None:
+    request = invocation()
+    service = ReadOnlyAdvisorService(
+        authentication_policy=authentication_policy(),
+        model=_SuccessfulModel(recommendation(request)),
+        clock=lambda: NOW,
+    )
+    current = asyncio.run(service.advise(request, authentication_context())).audit
+    payload = current.model_dump(mode="python")
+    payload["prompt_version"] = PROMPT_VERSION_V1
+
+    decoded = AdvisorInteractionAuditV1.model_validate(payload)
+
+    assert decoded.prompt_version == PROMPT_VERSION_V1
+
+
+def test_service_emits_only_the_current_prompt_version() -> None:
+    request = invocation()
+
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        ReadOnlyAdvisorService(
+            authentication_policy=authentication_policy(),
+            model=_LegacyPromptModel(recommendation(request)),
+            clock=lambda: NOW,
+        )
 
 
 def test_service_uses_the_coordinator_bound_snapshot_without_an_extra_reader() -> None:

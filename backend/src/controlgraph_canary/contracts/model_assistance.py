@@ -22,7 +22,7 @@ from controlgraph_canary.contracts.base import (
     UtcSecond,
 )
 from controlgraph_canary.contracts.codec import canonical_sha256
-from controlgraph_canary.contracts.models import TargetBinding
+from controlgraph_canary.contracts.models import ReasonCode, TargetBinding
 
 DIAGNOSTIC_EVIDENCE_SUMMARY_V1: Final = "controlgraph.diagnostic-evidence-summary/v1"
 DIAGNOSTIC_EVIDENCE_FACT_V1: Final = "controlgraph.diagnostic-evidence-fact/v1"
@@ -51,7 +51,8 @@ MODEL_ASSISTANCE_TIMELINE_AUDIT_V1: Final = (
 
 MODEL_ID: Final = "gemini-3.5-flash"
 MODEL_LOCATION: Final = "global"
-PROMPT_VERSION: Final = "controlgraph.rollout-advisor-prompt/v1"
+PROMPT_VERSION_V1: Final = "controlgraph.rollout-advisor-prompt/v1"
+PROMPT_VERSION: Final = "controlgraph.rollout-advisor-prompt/v2"
 
 MAX_EVIDENCE_AGE_SECONDS: Final = 300
 MAX_SNAPSHOT_LIFETIME_SECONDS: Final = 300
@@ -112,6 +113,16 @@ class DiagnosticEvidenceFactName(StrEnum):
     MONITORING_WINDOW = "monitoring_window"
     HEALTH_STATUS = "health_status"
     RECEIPT_OUTCOME = "receipt_outcome"
+    RECEIPT_REASON = "receipt_reason"
+    WORK_EPOCH = "work_epoch"
+    DENIAL_OCCURRED_AT = "denial_occurred_at"
+    CURRENT_AUTHORITY_EPOCH = "current_authority_epoch"
+    AUTHORITY_TRANSITION = "authority_transition"
+    TARGET_STABLE_PERCENT = "target_stable_percent"
+    TARGET_CANDIDATE_PERCENT = "target_candidate_percent"
+    TARGET_CONFIGURATION_SHA256 = "target_configuration_sha256"
+    TARGET_OBSERVED_AT = "target_observed_at"
+    TARGET_OBSERVATION_RELATION = "target_observation_relation"
     TIMELINE_HEAD_SEQUENCE = "timeline_head_sequence"
     TIMELINE_LATEST_EVENT = "timeline_latest_event"
     TERMINAL_CLASSIFICATION = "terminal_classification"
@@ -270,6 +281,15 @@ class DiagnosticEvidenceFactV1(StrictContractModel):
                 "FAILED_SAFE",
                 "AMBIGUOUS",
             },
+            DiagnosticEvidenceFactName.RECEIPT_REASON: {
+                reason.value for reason in ReasonCode
+            },
+            DiagnosticEvidenceFactName.AUTHORITY_TRANSITION: {
+                "AUTHORITY_EPOCH_ADVANCED",
+            },
+            DiagnosticEvidenceFactName.TARGET_OBSERVATION_RELATION: {
+                "AT_OR_AFTER_DENIAL",
+            },
             DiagnosticEvidenceFactName.TIMELINE_LATEST_EVENT: {
                 "AUTHORITY_ROOT_CREATED",
                 "AUTHORITY_EPOCH_ADVANCED",
@@ -304,10 +324,32 @@ class DiagnosticEvidenceFactV1(StrictContractModel):
             raise ValueError("diagnostic evidence fact value is outside its domain")
         if self.name in {
             DiagnosticEvidenceFactName.INITIAL_EPOCH,
+            DiagnosticEvidenceFactName.WORK_EPOCH,
+            DiagnosticEvidenceFactName.CURRENT_AUTHORITY_EPOCH,
+            DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT,
+            DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT,
             DiagnosticEvidenceFactName.MONITORING_WINDOW,
             DiagnosticEvidenceFactName.TIMELINE_HEAD_SEQUENCE,
         } and (not self.value.isascii() or not self.value.isdigit()):
             raise ValueError("diagnostic evidence numeric fact is invalid")
+        if self.name in {
+            DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT,
+            DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT,
+        } and not 0 <= int(self.value) <= 100:
+            raise ValueError("diagnostic evidence percentage fact is invalid")
+        if (
+            self.name is DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256
+            and re.fullmatch(r"[0-9a-f]{64}", self.value) is None
+        ):
+            raise ValueError("diagnostic target configuration digest is invalid")
+        if self.name in {
+            DiagnosticEvidenceFactName.DENIAL_OCCURRED_AT,
+            DiagnosticEvidenceFactName.TARGET_OBSERVED_AT,
+        }:
+            try:
+                _utc(self.value)
+            except ValueError as error:
+                raise ValueError("diagnostic evidence timestamp fact is invalid") from error
         if (
             self.name
             in {
@@ -497,6 +539,7 @@ class DiagnosticSnapshotV1(StrictContractModel):
             AdvisoryHealth.UNHEALTHY,
         }:
             raise ValueError("terminal health must contain a deterministic result")
+        _validate_stale_epoch_mismatch_facts(self)
         return self
 
     @property
@@ -743,7 +786,10 @@ class AdvisorInteractionAuditV1(StrictContractModel):
     correlation_id: Identifier
     model_id: Literal["gemini-3.5-flash"]
     model_location: Literal["global"]
-    prompt_version: Literal["controlgraph.rollout-advisor-prompt/v1"]
+    prompt_version: Literal[
+        "controlgraph.rollout-advisor-prompt/v1",
+        "controlgraph.rollout-advisor-prompt/v2",
+    ]
     registry_sha256: Sha256Digest
     snapshot_sha256: Sha256Digest
     tool_calls: Annotated[
@@ -1062,6 +1108,116 @@ def diagnostic_model_context(snapshot: DiagnosticSnapshotV1) -> DiagnosticModelC
     )
 
 
+def _fact_values(
+    summary: DiagnosticEvidenceSummaryV1,
+    name: DiagnosticEvidenceFactName,
+) -> tuple[str, ...]:
+    return tuple(fact.value for fact in summary.facts if fact.name is name)
+
+
+def _validate_stale_epoch_mismatch_facts(snapshot: DiagnosticSnapshotV1) -> None:
+    receipt_reasons = _fact_values(
+        snapshot.receipt_summary,
+        DiagnosticEvidenceFactName.RECEIPT_REASON,
+    )
+    if ReasonCode.EPOCH_MISMATCH.value not in receipt_reasons:
+        return
+    receipt_outcomes = _fact_values(
+        snapshot.receipt_summary,
+        DiagnosticEvidenceFactName.RECEIPT_OUTCOME,
+    )
+    receipt_work_epochs = _fact_values(
+        snapshot.receipt_summary,
+        DiagnosticEvidenceFactName.WORK_EPOCH,
+    )
+    denial_times = _fact_values(
+        snapshot.receipt_summary,
+        DiagnosticEvidenceFactName.DENIAL_OCCURRED_AT,
+    )
+    timeline_reasons = _fact_values(
+        snapshot.timeline_summary,
+        DiagnosticEvidenceFactName.RECEIPT_REASON,
+    )
+    timeline_work_epochs = _fact_values(
+        snapshot.timeline_summary,
+        DiagnosticEvidenceFactName.WORK_EPOCH,
+    )
+    authority_epochs = _fact_values(
+        snapshot.timeline_summary,
+        DiagnosticEvidenceFactName.CURRENT_AUTHORITY_EPOCH,
+    )
+    authority_transitions = _fact_values(
+        snapshot.timeline_summary,
+        DiagnosticEvidenceFactName.AUTHORITY_TRANSITION,
+    )
+    if (
+        receipt_outcomes != ("DENIED",)
+        or len(receipt_work_epochs) != 1
+        or len(denial_times) != 1
+    ):
+        raise ValueError("epoch-mismatch receipt evidence is incomplete")
+    if int(receipt_work_epochs[0]) >= snapshot.current_epoch:
+        return
+    if (
+        timeline_reasons != (ReasonCode.EPOCH_MISMATCH.value,)
+        or timeline_work_epochs != receipt_work_epochs
+        or authority_epochs != (str(snapshot.current_epoch),)
+        or len(authority_transitions) != 1
+        or not snapshot.authority_revoked
+        or snapshot.rollout_phase is not RolloutPhase.REVOKED
+    ):
+        raise ValueError("stale epoch-mismatch evidence is incomplete")
+    target_state = _stale_target_state(snapshot.target_summary)
+    verifier_state = _stale_target_state(snapshot.verifier_summary)
+    if (
+        target_state != verifier_state
+        or target_state[:2] != (90, 10)
+        or _utc(target_state[3]) < _utc(denial_times[0])
+        or _utc(snapshot.target_summary.observed_at) < _utc(denial_times[0])
+        or _utc(snapshot.verifier_summary.observed_at) < _utc(denial_times[0])
+    ):
+        raise ValueError("stale epoch-mismatch target evidence is incomplete")
+
+
+def _stale_target_state(
+    summary: DiagnosticEvidenceSummaryV1,
+) -> tuple[int, int, str, str]:
+    qualifying: list[tuple[int, int, str, str]] = []
+    for evidence_id in summary.evidence_ids:
+        facts = {
+            fact.name: fact.value
+            for fact in summary.facts
+            if fact.evidence_id == evidence_id
+        }
+        required = {
+            DiagnosticEvidenceFactName.VERIFICATION_KIND: "CONFIGURATION",
+            DiagnosticEvidenceFactName.VERIFICATION_VERDICT: "MATCH",
+            DiagnosticEvidenceFactName.TARGET_OBSERVATION_RELATION: (
+                "AT_OR_AFTER_DENIAL"
+            ),
+        }
+        if all(facts.get(name) == value for name, value in required.items()) and all(
+            name in facts
+            for name in {
+                DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT,
+                DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT,
+                DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256,
+                DiagnosticEvidenceFactName.TARGET_OBSERVED_AT,
+            }
+        ):
+            qualifying.append(
+                (
+                    int(facts[DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT]),
+                    int(facts[DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT]),
+                    facts[DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256],
+                    facts[DiagnosticEvidenceFactName.TARGET_OBSERVED_AT],
+                )
+            )
+    if len(qualifying) != 1:
+        raise ValueError("stale epoch-mismatch target evidence is incomplete")
+    return qualifying[0]
+
+
 def _utc(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
@@ -1095,6 +1251,7 @@ __all__ = [
     "MODEL_ID",
     "MODEL_LOCATION",
     "PROMPT_VERSION",
+    "PROMPT_VERSION_V1",
     "AdvisorDispositionCommandV1",
     "AdvisorDispositionInvocationV1",
     "AdvisorDispositionResultV1",

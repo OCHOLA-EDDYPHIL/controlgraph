@@ -70,6 +70,8 @@ _LOAD_JOB_LABEL = "m8-core-acceptance"
 _LOAD_RESULT_SCHEMA = "controlgraph.core-acceptance-load-result/v1"
 _LOAD_READY_SCHEMA = "controlgraph.core-acceptance-load-ready/v1"
 _TIMELINE_PAGE_SET_DOMAIN = b"controlgraph.timeline-acceptance-page-set/v1\0"
+_STALE_COMPLETION_READINESS_ATTEMPTS: Final = 30
+_STALE_COMPLETION_READINESS_DELAY_SECONDS: Final = 1.0
 _LOAD_JOB_PERMISSIONS = (
     "iam.serviceAccounts.actAs",
     "logging.logEntries.list",
@@ -181,6 +183,7 @@ class EvidenceKind(StrEnum):
     CONSOLE_READ = "CONSOLE_READ"
     COORDINATOR = "COORDINATOR"
     MODEL_AUDIT = "MODEL_AUDIT"
+    PUBLIC_REPLAY_SEED = "PUBLIC_REPLAY_SEED"
     RUNNER_FAILURE = "RUNNER_FAILURE"
 
 
@@ -235,6 +238,8 @@ REQUIRED_EVIDENCE: Final[dict[CaseKind, frozenset[EvidenceKind]]] = {
             EvidenceKind.EXECUTOR_EPOCH_CHECK,
             EvidenceKind.STALE_DENIAL,
             EvidenceKind.EXECUTION_RECEIPT,
+            EvidenceKind.COORDINATOR,
+            EvidenceKind.MODEL_AUDIT,
             EvidenceKind.TIMELINE,
         }
     ),
@@ -266,6 +271,7 @@ REQUIRED_EVIDENCE: Final[dict[CaseKind, frozenset[EvidenceKind]]] = {
             EvidenceKind.CLOUD_RUN_CONFIGURATION,
             EvidenceKind.COORDINATOR,
             EvidenceKind.MODEL_AUDIT,
+            EvidenceKind.PUBLIC_REPLAY_SEED,
             EvidenceKind.TIMELINE,
         }
     ),
@@ -802,8 +808,7 @@ def _validate_observation_artifact(
         raise AcceptanceError("ACCEPTANCE_EVIDENCE_INVALID")
     source = observation.get("source")
     if (
-        observation.get("schema_version")
-        != "controlgraph.hosted-acceptance-observation/v1"
+        observation.get("schema_version") != "controlgraph.hosted-acceptance-observation/v1"
         or observation.get("case_id") != binding.case_id
         or observation.get("evidence_id") != evidence.evidence_id
         or observation.get("kind") != evidence.kind.value
@@ -1153,6 +1158,9 @@ class _HostedExecution:
     service_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
     revocation_root: Any | None = None
     revocation_epoch: int | None = None
+    advisor_command: Any | None = None
+    advisor_result: Any | None = None
+    public_replay_seed_values: _PublicReplaySeedState | None = None
     execution_queue_cleanup_required: bool = False
 
     @property
@@ -1171,6 +1179,20 @@ class _HostedExecution:
 class _CaseOutcome:
     observations: Mapping[EvidenceKind, object]
     terminal_result: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicReplaySeedState:
+    authority_occurred_at: str
+    denial_occurred_at: str
+    unchanged_observed_at: str
+    advisor_requested_at: str
+    recovery_occurred_at: str
+    authority: Any
+    denial: Any
+    unchanged: Any
+    recovery: Any
+    advisor_causal_path_clause: str
 
 
 def _read_traffic(run: _HostedExecution, case: CaseBindingV1, label: str) -> Any:
@@ -1256,9 +1278,7 @@ def _submit_root_creation(run: _HostedExecution, command_path: Path) -> Any:
             allowed_statuses=frozenset({0, 4}),
         )
         if status == 0 and result is not None:
-            if result.outcome == "CREATED" or (
-                saw_unknown_outcome and result.outcome == "ADOPTED"
-            ):
+            if result.outcome == "CREATED" or (saw_unknown_outcome and result.outcome == "ADOPTED"):
                 return result
             raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
         if payload != {"code": "ROOT_CREATION_OUTCOME_UNKNOWN"}:
@@ -1328,9 +1348,7 @@ def _create_root(run: _HostedExecution, case: CaseBindingV1) -> Any:
         or root_result.initial_authority.current_epoch != 1
         or len(policy_bindings) != 1
         or policy_bindings[0].artifact.sha256
-        != hashlib.sha256(
-            canonical_json_bytes(root.content.health_policy)
-        ).hexdigest()
+        != hashlib.sha256(canonical_json_bytes(root.content.health_policy)).hexdigest()
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_ROOT_INVALID")
     return root_result
@@ -1820,9 +1838,7 @@ def _create_load_job(
             specification.get("template") if isinstance(specification, dict) else None
         )
         template_metadata = (
-            execution_template.get("metadata")
-            if isinstance(execution_template, dict)
-            else None
+            execution_template.get("metadata") if isinstance(execution_template, dict) else None
         )
         template_spec = (
             execution_template.get("spec") if isinstance(execution_template, dict) else None
@@ -1852,10 +1868,7 @@ def _create_load_job(
         labels_match = True
         for label_source in (template_metadata, described.get("metadata")):
             values = label_source.get("labels") if isinstance(label_source, dict) else None
-            if (
-                not isinstance(values, dict)
-                or values.get(_LOAD_JOB_LABEL_KEY) != _LOAD_JOB_LABEL
-            ):
+            if not isinstance(values, dict) or values.get(_LOAD_JOB_LABEL_KEY) != _LOAD_JOB_LABEL:
                 labels_match = False
         if (
             deployed_images != (_image(run.spec, ImageComponent.CONTROLLER),)
@@ -2112,19 +2125,14 @@ def _project_health_load(
         or not isinstance(windows, list)
         or len(windows) != 3
         or any(
-            not isinstance(window, dict)
-            or type(window.get("submitted")) is not int
+            not isinstance(window, dict) or type(window.get("submitted")) is not int
             for window in windows
         )
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     bound_windows = cast(list[dict[str, Any]], windows)
-    expected_starts = tuple(
-        _utc(load_start + timedelta(minutes=index)) for index in range(3)
-    )
-    if tuple(
-        window.get("started_at") for window in bound_windows
-    ) != expected_starts:
+    expected_starts = tuple(_utc(load_start + timedelta(minutes=index)) for index in range(3))
+    if tuple(window.get("started_at") for window in bound_windows) != expected_starts:
         raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_INVALID")
     offset = int((health_anchor - load_start).total_seconds() // 60)
     selected = bound_windows[offset : offset + 2]
@@ -2132,9 +2140,7 @@ def _project_health_load(
         raise AcceptanceError("ACCEPTANCE_HOSTED_LOAD_ALIGNMENT_INVALID")
     projected = dict(load)
     projected["anchor"] = _utc(health_anchor)
-    projected["request_count"] = sum(
-        cast(int, window["submitted"]) for window in selected
-    )
+    projected["request_count"] = sum(cast(int, window["submitted"]) for window in selected)
     projected["windows"] = selected
     return projected
 
@@ -2228,9 +2234,7 @@ def _health_load(
     finally:
         _delete_load_job(run, job_name)
     while datetime.now(UTC) < health_anchor + timedelta(seconds=250):
-        remaining = (
-            health_anchor + timedelta(seconds=250) - datetime.now(UTC)
-        ).total_seconds()
+        remaining = (health_anchor + timedelta(seconds=250) - datetime.now(UTC)).total_seconds()
         time.sleep(min(5.0, max(0.05, remaining)))
     first_command = _health_command(
         run,
@@ -2431,9 +2435,7 @@ def _run_healthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcom
         released = True
         run.unreleased_root_ids.discard(root.root_id)
         pages, raw = _read_timeline_evidence(run)
-        terminal_result = _terminal_result(
-            pages, root_id=root.root_id, expected="PROMOTED"
-        )
+        terminal_result = _terminal_result(pages, root_id=root.root_id, expected="PROMOTED")
         capability_metadata = _verified_capability_metadata(
             pages=pages,
             raw=raw,
@@ -2515,9 +2517,7 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
         released = True
         run.unreleased_root_ids.discard(root.root_id)
         pages, raw = _read_timeline_evidence(run)
-        terminal_result = _terminal_result(
-            pages, root_id=root.root_id, expected="RECOVERED"
-        )
+        terminal_result = _terminal_result(pages, root_id=root.root_id, expected="RECOVERED")
         capability_metadata = _verified_capability_metadata(
             pages=pages,
             raw=raw,
@@ -2528,10 +2528,7 @@ def _run_unhealthy_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutc
         )
         recovery_service = run.service_bindings.get("recovery")
         recovery_identity = root.content.authority_bounds.recovery_identity
-        if (
-            recovery_service is None
-            or recovery_service.get("service_account") != recovery_identity
-        ):
+        if recovery_service is None or recovery_service.get("service_account") != recovery_identity:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_IDENTITY_INVALID")
         return _CaseOutcome(
             observations={
@@ -2745,13 +2742,421 @@ def _recover_revoked(
     return dispatch, receipt
 
 
+def _advisor_command(run: _HostedExecution, case: CaseBindingV1, root: Any, epoch: int) -> Any:
+    from controlgraph_canary.contracts.model_assistance import (
+        ADVISOR_OPERATOR_COMMAND_V1,
+        AdvisorOperatorCommandV1,
+    )
+
+    return AdvisorOperatorCommandV1(
+        schema_version=ADVISOR_OPERATOR_COMMAND_V1,
+        request_id=_stable_id(run.run_inputs_sha256, case, "advisor-request"),
+        idempotency_key=_stable_id(run.run_inputs_sha256, case, "advisor-idempotency"),
+        target=root.content.target,
+        root_id=root.root_id,
+        expected_root_sha256=root.root_sha256,
+        expected_epoch=epoch,
+        requested_at=_utc_now(),
+    )
+
+
+def _invoke_advisor(run: _HostedExecution, command: Any) -> Any:
+    from controlgraph_canary.contracts.model_assistance import AdvisorOperatorResultV1
+
+    token = _identity_token(run)
+    try:
+        status, payload, headers = _http_request(
+            url=f"{run.api_origin}/v1/operator/commands",
+            token=token,
+            operator=True,
+            body=_canonical_object(_model_dict(command)),
+        )
+    finally:
+        token = ""
+    if status != 200 or headers.get("content-type", "").split(";", 1)[0] != "application/json":
+        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID")
+    try:
+        return AdvisorOperatorResultV1.model_validate_json(payload)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID") from error
+
+
+def _timeline_enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _timeline_display_values(entry: Any) -> dict[str, str]:
+    return {_timeline_enum_value(field.name): field.value for field in entry.display_fields}
+
+
+def _timeline_has_correlation(entry: Any, kind: str, value: str) -> bool:
+    return any(
+        _timeline_enum_value(correlation.kind) == kind and correlation.correlation_id == value
+        for correlation in entry.correlations
+    )
+
+
+def _stale_denial_completion_is_ready(
+    pages: Sequence[Any],
+    *,
+    root: Any,
+    revocation: Any,
+    stale_receipt: Any,
+    target_configuration_sha256: str,
+) -> bool:
+    receipt = stale_receipt.receipt
+    revocation_result = revocation.result
+    entries = tuple(
+        entry
+        for page in pages
+        for entry in page.entries
+        if entry.root_id == root.root_id and entry.root_sha256 == root.root_sha256
+    )
+    expected_verification = f"stale-denial:{stale_receipt.receipt_sha256[:32]}"
+    expected_actor = (
+        f"actor:{hashlib.sha256(revocation_result.operator_identity.encode('utf-8')).hexdigest()}"
+    )
+    transitions = tuple(
+        entry
+        for entry in entries
+        if _timeline_enum_value(entry.event_type) == "AUTHORITY_EPOCH_ADVANCED"
+        and entry.epoch == revocation_result.new_epoch
+        and entry.occurred_at == revocation_result.committed_at
+        and entry.actor_id == expected_actor
+        and entry.signature is not None
+        and entry.signature.purpose == "EVIDENCE"
+        and _timeline_enum_value(entry.verification_status) == "VERIFIED"
+        and _timeline_has_correlation(
+            entry,
+            "EVIDENCE",
+            revocation_result.evidence_id,
+        )
+        and _timeline_has_correlation(
+            entry,
+            "REQUEST",
+            revocation_result.request_id,
+        )
+    )
+    receipts = tuple(
+        entry
+        for entry in entries
+        if _timeline_enum_value(entry.event_type) == "MUTATION_DENIED"
+        and entry.epoch == receipt.epoch
+        and entry.occurred_at == receipt.updated_at
+        and entry.payload_sha256 == stale_receipt.receipt_sha256
+        and entry.signature is None
+        and _timeline_enum_value(entry.verification_status) == "NOT_APPLICABLE"
+        and _timeline_display_values(entry).get("OUTCOME") == "DENIED"
+        and _timeline_display_values(entry).get("REASON_CODE") == "EPOCH_MISMATCH"
+        and _timeline_has_correlation(entry, "RECEIPT", receipt.receipt_id)
+        and _timeline_has_correlation(entry, "REQUEST", receipt.request_id)
+    )
+    if len(transitions) != 1 or len(receipts) != 1:
+        return False
+    transition = transitions[0]
+    receipt_entry = receipts[0]
+    if transition.sequence >= receipt_entry.sequence:
+        return False
+
+    expected_state = (
+        "stable_percent=90;candidate_percent=10;"
+        f"target_configuration_sha256={target_configuration_sha256}"
+    )
+    verified: dict[str, Any] = {}
+    for entry in entries:
+        display = _timeline_display_values(entry)
+        observation = display.get("OBSERVATION")
+        if (
+            observation in {"CONFIGURATION", "PROBE"}
+            and _timeline_enum_value(entry.event_type) == "VERIFICATION_RECORDED"
+            and entry.epoch == receipt.epoch
+            and entry.sequence > receipt_entry.sequence
+            and _parse_utc(entry.occurred_at) >= _parse_utc(receipt.updated_at)
+            and entry.signature is not None
+            and entry.signature.purpose == "INDEPENDENT_VERIFICATION"
+            and _timeline_enum_value(entry.verification_status) == "VERIFIED"
+            and display.get("ACTION") == "APPLY_CANARY_V1"
+            and display.get("OUTCOME") == "MATCH"
+            and _timeline_has_correlation(entry, "REQUEST", receipt.request_id)
+            and _timeline_has_correlation(
+                entry,
+                "VERIFICATION",
+                expected_verification,
+            )
+            and (observation != "CONFIGURATION" or display.get("STATE") == expected_state)
+        ):
+            verified[observation] = entry
+    if set(verified) != {"CONFIGURATION", "PROBE"}:
+        return False
+
+    evidence_sequence = max(entry.sequence for entry in verified.values())
+    evidence_time = max(_parse_utc(entry.occurred_at) for entry in verified.values())
+    return any(
+        _timeline_enum_value(entry.event_type) == "TERMINAL_CLASSIFIED"
+        and entry.epoch == receipt.epoch
+        and entry.sequence > evidence_sequence
+        and _parse_utc(entry.occurred_at) >= evidence_time
+        and entry.signature is None
+        and _timeline_enum_value(entry.verification_status) == "VERIFIED"
+        and _timeline_enum_value(entry.terminal_classification) == "DENIED"
+        and _timeline_display_values(entry).get("ACTION") == "STALE_CAPABILITY_DENIAL"
+        and _timeline_display_values(entry).get("OUTCOME") == "COMPLETE"
+        and _timeline_display_values(entry).get("REASON_CODE") == "STALE_CAPABILITY_DENIAL_COMPLETE"
+        and _timeline_has_correlation(entry, "REQUEST", receipt.request_id)
+        and _timeline_has_correlation(
+            entry,
+            "VERIFICATION",
+            expected_verification,
+        )
+        for entry in entries
+    )
+
+
+def _wait_for_stale_denial_completion(
+    run: _HostedExecution,
+    *,
+    root: Any,
+    revocation: Any,
+    stale_receipt: Any,
+    target_configuration_sha256: str,
+) -> tuple[Any, ...]:
+    for attempt in range(_STALE_COMPLETION_READINESS_ATTEMPTS):
+        try:
+            pages = _read_operator_timeline(run)
+        except AcceptanceError as error:
+            if error.code != "ACCEPTANCE_HOSTED_TIMELINE_CHANGED":
+                raise
+        else:
+            if _stale_denial_completion_is_ready(
+                pages,
+                root=root,
+                revocation=revocation,
+                stale_receipt=stale_receipt,
+                target_configuration_sha256=target_configuration_sha256,
+            ):
+                return pages
+        if attempt + 1 < _STALE_COMPLETION_READINESS_ATTEMPTS:
+            time.sleep(_STALE_COMPLETION_READINESS_DELAY_SECONDS)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_STALE_COMPLETION_TIMEOUT")
+
+
+def _validate_advisor_result(
+    command: Any,
+    result: Any,
+    *,
+    replayed: bool,
+    original: Any | None = None,
+    expected_causal_path_clause: str | None = None,
+) -> None:
+    from controlgraph_canary.contracts.codec import canonical_sha256
+    from controlgraph_canary.contracts.model_assistance import DiagnosticToolId
+
+    audit = result.response.audit
+    recommendation = result.response.recommendation
+    citation_kinds = (
+        {
+            citation.evidence_kind.value
+            for finding in recommendation.findings
+            for citation in finding.citations
+        }
+        if recommendation is not None
+        else set()
+    )
+    causal_findings = (
+        tuple(
+            finding
+            for finding in recommendation.findings
+            if finding.statement == expected_causal_path_clause
+            and {citation.evidence_kind.value for citation in finding.citations}
+            >= {"receipt", "timeline"}
+            and {citation.evidence_kind.value for citation in finding.citations}.intersection(
+                {"target", "verifier"}
+            )
+        )
+        if recommendation is not None and expected_causal_path_clause is not None
+        else ()
+    )
+    if (
+        result.replayed is not replayed
+        or result.command_sha256 != canonical_sha256(command)
+        or result.root_id != command.root_id
+        or result.root_sha256 != command.expected_root_sha256
+        or result.epoch != command.expected_epoch
+        or recommendation is None
+        or not audit.validation.accepted
+        or tuple(code.value for code in audit.validation.codes) != ("accepted",)
+        or audit.prompt_version != "controlgraph.rollout-advisor-prompt/v2"
+        or len(audit.tool_calls) != len(DiagnosticToolId)
+        or tuple(call.sequence for call in audit.tool_calls)
+        != tuple(range(1, len(DiagnosticToolId) + 1))
+        or {call.tool_id for call in audit.tool_calls} != set(DiagnosticToolId)
+        or any(
+            call.status.value != "succeeded" or call.output_sha256 is None
+            for call in audit.tool_calls
+        )
+        or not {"receipt", "timeline"}.issubset(citation_kinds)
+        or not citation_kinds.intersection({"target", "verifier"})
+        or (expected_causal_path_clause is not None and len(causal_findings) != 1)
+        or recommendation.authority_effect != "none"
+        or recommendation.deterministic_health_override is not False
+        or recommendation.operator_review_required is not True
+        or (original is not None and result.model_copy(update={"replayed": False}) != original)
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID")
+
+
+def _public_traffic(result: Any) -> Any:
+    from controlgraph_canary.contracts.public_replay import (
+        PUBLIC_REPLAY_TRAFFIC_V1,
+        PublicReplayTrafficV1,
+    )
+
+    traffic = _traffic_percentages(result)
+    request = result.request
+    return PublicReplayTrafficV1(
+        schema_version=PUBLIC_REPLAY_TRAFFIC_V1,
+        stable_percent=traffic.get(request.stable_revision, 0),
+        candidate_percent=traffic.get(request.candidate_revision, 0),
+        target_configuration_sha256=result.target_configuration_sha256,
+    )
+
+
+def _public_advisor(
+    command: Any,
+    initial: Any,
+    replay: Any,
+    *,
+    expected_causal_path_clause: str,
+) -> Any:
+    from controlgraph_canary.contracts.codec import canonical_sha256
+    from controlgraph_canary.contracts.public_replay import (
+        PUBLIC_REPLAY_ADVISOR_V1,
+        PUBLIC_REPLAY_CITATION_V1,
+        PUBLIC_REPLAY_FINDING_V1,
+        PUBLIC_REPLAY_TOOL_CALL_V1,
+        PublicReplayAdvisorV1,
+        PublicReplayCitationV1,
+        PublicReplayFindingV1,
+        PublicReplayToolCallV1,
+    )
+
+    _validate_advisor_result(
+        command,
+        initial,
+        replayed=False,
+        expected_causal_path_clause=expected_causal_path_clause,
+    )
+    _validate_advisor_result(
+        command,
+        replay,
+        replayed=True,
+        original=initial,
+        expected_causal_path_clause=expected_causal_path_clause,
+    )
+    recommendation = initial.response.recommendation
+    assert recommendation is not None
+    audit = initial.response.audit
+    tool_calls: list[PublicReplayToolCallV1] = []
+    for call in audit.tool_calls:
+        if call.output_sha256 is None:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID")
+        tool_calls.append(
+            PublicReplayToolCallV1(
+                schema_version=PUBLIC_REPLAY_TOOL_CALL_V1,
+                sequence=call.sequence,
+                tool_id=call.tool_id.value,
+                input_sha256=call.input_sha256,
+                output_sha256=call.output_sha256,
+                status="succeeded",
+            )
+        )
+    return PublicReplayAdvisorV1(
+        schema_version=PUBLIC_REPLAY_ADVISOR_V1,
+        model_id=audit.model_id,
+        model_location=audit.model_location,
+        prompt_version=audit.prompt_version,
+        response_sha256=canonical_sha256(initial.response),
+        audit_sha256=canonical_sha256(audit),
+        registry_sha256=audit.registry_sha256,
+        snapshot_sha256=audit.snapshot_sha256,
+        structured_output_sha256=audit.structured_output_sha256,
+        validation="accepted",
+        authority_effect=recommendation.authority_effect,
+        deterministic_health_override=recommendation.deterministic_health_override,
+        operator_review_required=recommendation.operator_review_required,
+        requested_operator_action=recommendation.requested_operator_action.value,
+        confidence_basis_points=recommendation.confidence_basis_points,
+        findings=tuple(
+            PublicReplayFindingV1(
+                schema_version=PUBLIC_REPLAY_FINDING_V1,
+                statement=finding.statement,
+                citations=tuple(
+                    PublicReplayCitationV1(
+                        schema_version=PUBLIC_REPLAY_CITATION_V1,
+                        evidence_kind=citation.evidence_kind.value,
+                        evidence_id=citation.evidence_id,
+                        source_sha256=citation.source_sha256,
+                    )
+                    for citation in finding.citations
+                ),
+            )
+            for finding in recommendation.findings
+        ),
+        tool_calls=tuple(tool_calls),
+        replayed_without_model_call=True,
+    )
+
+
+def _public_timeline(pages: Sequence[Any], *, root_id: str) -> Any:
+    from controlgraph_canary.contracts.public_replay import (
+        PUBLIC_REPLAY_TIMELINE_ENTRY_V1,
+        PUBLIC_REPLAY_TIMELINE_V1,
+        PublicReplayTimelineEntryV1,
+        PublicReplayTimelineEventType,
+        PublicReplayTimelineV1,
+    )
+
+    summary = _timeline_page_summary(pages)
+    allowed = {item.value for item in PublicReplayTimelineEventType}
+    entries = tuple(
+        PublicReplayTimelineEntryV1(
+            schema_version=PUBLIC_REPLAY_TIMELINE_ENTRY_V1,
+            sequence=entry.sequence,
+            entry_sha256=entry.entry_sha256,
+            event_type=entry.event_type.value,
+            occurred_at=entry.occurred_at,
+            verification_status=entry.verification_status.value,
+        )
+        for page in pages
+        for entry in page.entries
+        if entry.root_id == root_id and entry.event_type.value in allowed
+    )
+    head_entry_sha256 = summary["head_entry_sha256"]
+    if not isinstance(head_entry_sha256, str):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    return PublicReplayTimelineV1(
+        schema_version=PUBLIC_REPLAY_TIMELINE_V1,
+        head_sequence=cast(int, summary["head_sequence"]),
+        head_entry_sha256=head_entry_sha256,
+        entry_count=cast(int, summary["entry_count"]),
+        page_count=cast(int, summary["page_count"]),
+        page_set_sha256=cast(str, summary["page_set_sha256"]),
+        entries=entries,
+    )
+
+
 def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOutcome:
+    from controlgraph_canary.application.model_assistance import (
+        stale_denial_causal_path_clause,
+    )
+
     root_result = _create_root(run, case)
     run.root_ids.add(root_result.root.root_id)
     run.unreleased_root_ids.add(root_result.root.root_id)
     terminal_idempotency_key: str | None = None
     released = False
     try:
+
         def hold_execution_queue() -> None:
             _queue_control(run, "hold")
             run.execution_queue_cleanup_required = True
@@ -2771,6 +3176,8 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
             terminal=health,
         )
         revocation = _revoke(run, case, root_result.root)
+        before_denial = _read_traffic(run, case, "before-stale-denial")
+        _require_split(before_denial, run.spec, stable=90, candidate=10)
         _queue_control(run, "release")
         run.execution_queue_cleanup_required = False
         stale_receipt = _poll_receipt(
@@ -2793,6 +3200,44 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
         proof = _revocation_proof(run, revocation)
         unchanged = _read_traffic(run, case, "after-stale-denial")
         _require_split(unchanged, run.spec, stable=90, candidate=10)
+        if (
+            unchanged.provider_etag != before_denial.provider_etag
+            or unchanged.service_generation != before_denial.service_generation
+            or unchanged.target_configuration_sha256 != before_denial.target_configuration_sha256
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_STALE_DENIAL_MUTATED_TARGET")
+        _wait_for_stale_denial_completion(
+            run,
+            root=root_result.root,
+            revocation=revocation,
+            stale_receipt=stale_receipt,
+            target_configuration_sha256=unchanged.target_configuration_sha256,
+        )
+        advisor_command = _advisor_command(
+            run,
+            case,
+            root_result.root,
+            revocation.result.new_epoch,
+        )
+        advisor_result = _invoke_advisor(run, advisor_command)
+        advisor_causal_path_clause = stale_denial_causal_path_clause(
+            work_epoch=stale_receipt.receipt.epoch,
+            current_authority_epoch=revocation.result.new_epoch,
+            target_configuration_sha256=unchanged.target_configuration_sha256,
+        )
+        _validate_advisor_result(
+            advisor_command,
+            advisor_result,
+            replayed=False,
+            expected_causal_path_clause=advisor_causal_path_clause,
+        )
+        after_advisor = _read_traffic(run, case, "after-stale-advisor")
+        if (
+            after_advisor.provider_etag != unchanged.provider_etag
+            or after_advisor.service_generation != unchanged.service_generation
+            or after_advisor.target_configuration_sha256 != unchanged.target_configuration_sha256
+        ):
+            raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_MUTATED_TARGET")
         recovery_dispatch, recovery_receipt = _recover_revoked(
             run,
             case,
@@ -2815,6 +3260,8 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
         run.unreleased_root_ids.discard(root_result.root.root_id)
         run.revocation_root = root_result.root
         run.revocation_epoch = release.fenced_epoch
+        run.advisor_command = advisor_command
+        run.advisor_result = advisor_result
         pages, raw = _read_timeline_evidence(run)
         terminal_result = _terminal_result(
             pages, root_id=root_result.root.root_id, expected="DENIED"
@@ -2831,6 +3278,53 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
                 }
             ),
         )
+        from controlgraph_canary.contracts.codec import canonical_sha256
+        from controlgraph_canary.contracts.public_replay import (
+            PUBLIC_REPLAY_AUTHORITY_ADVANCED_V1,
+            PUBLIC_REPLAY_RECOVERY_VERIFIED_V1,
+            PUBLIC_REPLAY_STALE_DENIAL_V1,
+            PUBLIC_REPLAY_TARGET_UNCHANGED_V1,
+            PublicReplayAuthorityAdvancedV1,
+            PublicReplayRecoveryVerifiedV1,
+            PublicReplayStaleDenialV1,
+            PublicReplayTargetUnchangedV1,
+        )
+
+        revocation_result = revocation.result
+        run.public_replay_seed_values = _PublicReplaySeedState(
+            authority_occurred_at=revocation_result.committed_at,
+            denial_occurred_at=stale_receipt.receipt.updated_at,
+            unchanged_observed_at=unchanged.observed_at,
+            advisor_requested_at=advisor_command.requested_at,
+            recovery_occurred_at=recovery_receipt.receipt.updated_at,
+            authority=PublicReplayAuthorityAdvancedV1(
+                schema_version=PUBLIC_REPLAY_AUTHORITY_ADVANCED_V1,
+                previous_epoch=revocation_result.previous_epoch,
+                new_epoch=revocation_result.new_epoch,
+                cause="OPERATOR_REVOCATION",
+                transition_sha256=canonical_sha256(revocation_result),
+            ),
+            denial=PublicReplayStaleDenialV1(
+                schema_version=PUBLIC_REPLAY_STALE_DENIAL_V1,
+                work_epoch=stale_receipt.receipt.epoch,
+                current_authority_epoch=stale_receipt.receipt.observed_authority_epoch,
+                outcome="DENIED",
+                reason_code="EPOCH_MISMATCH",
+                receipt_sha256=stale_receipt.receipt_sha256,
+            ),
+            unchanged=PublicReplayTargetUnchangedV1(
+                schema_version=PUBLIC_REPLAY_TARGET_UNCHANGED_V1,
+                before_denial=_public_traffic(before_denial),
+                after_denial=_public_traffic(unchanged),
+            ),
+            recovery=PublicReplayRecoveryVerifiedV1(
+                schema_version=PUBLIC_REPLAY_RECOVERY_VERIFIED_V1,
+                outcome="VERIFIED",
+                receipt_sha256=recovery_receipt.receipt_sha256,
+                traffic=_public_traffic(recovered),
+            ),
+            advisor_causal_path_clause=advisor_causal_path_clause,
+        )
         return _CaseOutcome(
             observations={
                 EvidenceKind.AUTHORITY_TRANSITION: {
@@ -2843,6 +3337,8 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
                 EvidenceKind.EXECUTOR_EPOCH_CHECK: stale_receipt,
                 EvidenceKind.STALE_DENIAL: stale_receipt,
                 EvidenceKind.EXECUTION_RECEIPT: recovery_receipt,
+                EvidenceKind.COORDINATOR: advisor_result,
+                EvidenceKind.MODEL_AUDIT: advisor_result.response.audit,
                 EvidenceKind.TIMELINE: _timeline_evidence(pages, release=release),
             },
             terminal_result=terminal_result,
@@ -2970,11 +3466,7 @@ def _service_account_identity_token(
         token = value.get("token")
     except Exception as error:
         raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID") from error
-    if (
-        type(token) is not str
-        or not token
-        or any(character.isspace() for character in token)
-    ):
+    if type(token) is not str or not token or any(character.isspace() for character in token):
         raise AcceptanceError("ACCEPTANCE_HOSTED_IDENTITY_INVALID")
     return token
 
@@ -3189,10 +3681,7 @@ def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
         page_entry_sha256 = page.command.after_entry_sha256
         for entry in page.entries:
             page_sequence += 1
-            if (
-                entry.sequence != page_sequence
-                or entry.previous_entry_sha256 != page_entry_sha256
-            ):
+            if entry.sequence != page_sequence or entry.previous_entry_sha256 != page_entry_sha256:
                 raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
             page_entry_sha256 = entry.entry_sha256
         if (
@@ -3201,9 +3690,7 @@ def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
             or page.has_more != (page.next_after_sequence < head[0])
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
-        page_sha256 = hashlib.sha256(
-            _canonical_object(_model_dict(page))
-        ).hexdigest()
+        page_sha256 = hashlib.sha256(_canonical_object(_model_dict(page))).hexdigest()
         page_sha256s.append(page_sha256)
         summaries.append(
             {
@@ -3218,11 +3705,7 @@ def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
         entry_count += len(page.entries)
         expected_sequence = page.next_after_sequence
         expected_entry_sha256 = page.next_after_entry_sha256
-    if (
-        pages[-1].has_more
-        or expected_sequence != head[0]
-        or expected_entry_sha256 != head[1]
-    ):
+    if pages[-1].has_more or expected_sequence != head[0] or expected_entry_sha256 != head[1]:
         raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
     return {
         "audience": audience.value,
@@ -3344,11 +3827,7 @@ def _run_verifier_case(
     coherent: list[tuple[Any, Any]] = []
     for items in verified_by_request.values():
         configuration = next(
-            (
-                item
-                for item in items
-                if item.signing_request.evidence.kind.value == "CONFIGURATION"
-            ),
+            (item for item in items if item.signing_request.evidence.kind.value == "CONFIGURATION"),
             None,
         )
         probe = next(
@@ -3491,61 +3970,30 @@ def _run_advisor_case(
     case: CaseBindingV1,
     baseline: Any,
 ) -> _CaseOutcome:
-    from controlgraph_canary.contracts.codec import canonical_sha256
-    from controlgraph_canary.contracts.model_assistance import (
-        ADVISOR_OPERATOR_COMMAND_V1,
-        AdvisorOperatorCommandV1,
-        AdvisorOperatorResultV1,
+    from controlgraph_canary.contracts.public_replay import (
+        PUBLIC_REPLAY_ADVISOR_VALIDATED_V1,
+        PUBLIC_REPLAY_SEED_V1,
+        PUBLIC_REPLAY_TIMELINE_COMMITTED_V1,
+        PublicReplayAdvisorValidatedV1,
+        PublicReplaySeedV1,
+        PublicReplayTimelineCommittedV1,
     )
 
-    if run.revocation_root is None or run.revocation_epoch is None:
-        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INPUT_UNAVAILABLE")
-    command = AdvisorOperatorCommandV1(
-        schema_version=ADVISOR_OPERATOR_COMMAND_V1,
-        request_id=_stable_id(run.run_inputs_sha256, case, "advisor-request"),
-        idempotency_key=_stable_id(run.run_inputs_sha256, case, "advisor-idempotency"),
-        target=run.revocation_root.content.target,
-        root_id=run.revocation_root.root_id,
-        expected_root_sha256=run.revocation_root.root_sha256,
-        expected_epoch=run.revocation_epoch,
-        requested_at=_utc_now(),
-    )
-    token = _identity_token(run)
-    try:
-        status, payload, headers = _http_request(
-            url=f"{run.api_origin}/v1/operator/commands",
-            token=token,
-            operator=True,
-            body=_canonical_object(_model_dict(command)),
-        )
-    finally:
-        token = ""
-    if status != 200 or headers.get("content-type", "").split(";", 1)[0] != "application/json":
-        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID")
-    try:
-        result = AdvisorOperatorResultV1.model_validate_json(payload)
-    except (TypeError, ValueError, ValidationError) as error:
-        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID") from error
-    audit = result.response.audit
-    recommendation = result.response.recommendation
     if (
-        result.replayed
-        or result.command_sha256 != canonical_sha256(command)
-        or result.root_id != command.root_id
-        or result.root_sha256 != command.expected_root_sha256
-        or result.epoch != command.expected_epoch
-        or not audit.tool_calls
-        or len(audit.tool_calls) > 6
-        or (
-            recommendation is not None
-            and (
-                recommendation.authority_effect != "none"
-                or recommendation.deterministic_health_override is not False
-                or recommendation.operator_review_required is not True
-            )
-        )
+        run.revocation_root is None
+        or run.advisor_command is None
+        or run.advisor_result is None
+        or run.public_replay_seed_values is None
     ):
-        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INVALID")
+        raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_INPUT_UNAVAILABLE")
+    result = _invoke_advisor(run, run.advisor_command)
+    _validate_advisor_result(
+        run.advisor_command,
+        result,
+        replayed=True,
+        original=run.advisor_result,
+        expected_causal_path_clause=(run.public_replay_seed_values.advisor_causal_path_clause),
+    )
     after = _read_traffic(run, case, "after-advisor")
     if (
         after.provider_etag != baseline.provider_etag
@@ -3554,10 +4002,39 @@ def _run_advisor_case(
     ):
         raise AcceptanceError("ACCEPTANCE_HOSTED_ADVISOR_MUTATED_TARGET")
     pages = _read_operator_timeline(run)
+    timeline_observed_at = _utc_now()
+    seed_values = run.public_replay_seed_values
+    seed = PublicReplaySeedV1(
+        schema_version=PUBLIC_REPLAY_SEED_V1,
+        authority_occurred_at=seed_values.authority_occurred_at,
+        denial_occurred_at=seed_values.denial_occurred_at,
+        unchanged_observed_at=seed_values.unchanged_observed_at,
+        advisor_requested_at=seed_values.advisor_requested_at,
+        recovery_occurred_at=seed_values.recovery_occurred_at,
+        authority=seed_values.authority,
+        denial=seed_values.denial,
+        unchanged=seed_values.unchanged,
+        advisor=PublicReplayAdvisorValidatedV1(
+            schema_version=PUBLIC_REPLAY_ADVISOR_VALIDATED_V1,
+            advisor=_public_advisor(
+                run.advisor_command,
+                run.advisor_result,
+                result,
+                expected_causal_path_clause=(seed_values.advisor_causal_path_clause),
+            ),
+        ),
+        recovery=seed_values.recovery,
+        timeline_observed_at=timeline_observed_at,
+        timeline=PublicReplayTimelineCommittedV1(
+            schema_version=PUBLIC_REPLAY_TIMELINE_COMMITTED_V1,
+            timeline=_public_timeline(pages, root_id=run.revocation_root.root_id),
+        ),
+    )
     return _CaseOutcome(
         observations={
             EvidenceKind.COORDINATOR: result,
-            EvidenceKind.MODEL_AUDIT: audit,
+            EvidenceKind.MODEL_AUDIT: result.response.audit,
+            EvidenceKind.PUBLIC_REPLAY_SEED: seed,
             EvidenceKind.TIMELINE: _timeline_evidence(pages),
         },
         terminal_result="ADVISORY_ONLY",
@@ -3655,7 +4132,11 @@ def _write_case_result(
                 evidence_id=evidence_id,
                 kind=kind,
                 observed_at=observed_at,
-                projection=EvidenceProjection.PRIVATE_DIGEST_ONLY,
+                projection=(
+                    EvidenceProjection.PUBLIC_REDACTED
+                    if kind is EvidenceKind.PUBLIC_REPLAY_SEED
+                    else EvidenceProjection.PRIVATE_DIGEST_ONLY
+                ),
                 run_inputs_sha256=run.run_inputs_sha256,
                 artifact=artifact,
             )
@@ -4106,9 +4587,7 @@ def execute_hosted(
             if elapsed_ms > case.maximum_duration_ms:
                 raise AcceptanceError("ACCEPTANCE_HOSTED_CASE_DURATION_EXCEEDED")
             observations = dict(outcome.observations)
-            terminal_configuration = observations.get(
-                EvidenceKind.CLOUD_RUN_CONFIGURATION, reset
-            )
+            terminal_configuration = observations.get(EvidenceKind.CLOUD_RUN_CONFIGURATION, reset)
             observations[EvidenceKind.CLOUD_RUN_CONFIGURATION] = {
                 "reset": reset,
                 "terminal": terminal_configuration,
@@ -4132,9 +4611,7 @@ def execute_hosted(
             if reset_succeeded:
                 flow_duration_ms = max(0, (time.monotonic_ns() - flow_started) // 1_000_000)
             else:
-                reset_duration_ms = max(
-                    0, (time.monotonic_ns() - reset_started) // 1_000_000
-                )
+                reset_duration_ms = max(0, (time.monotonic_ns() - reset_started) // 1_000_000)
             updated_cases.append(
                 _write_case_result(
                     run,

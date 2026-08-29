@@ -6,15 +6,19 @@ from pydantic import ValidationError
 
 from controlgraph_canary.contracts.codec import canonical_sha256
 from controlgraph_canary.contracts.model_assistance import (
+    DIAGNOSTIC_EVIDENCE_FACT_V1,
     MAX_TOOL_CALLS,
     MAX_TOOL_RESPONSE_BYTES,
     AdvisorRecommendationV1,
+    DiagnosticEvidenceFactName,
+    DiagnosticEvidenceFactV1,
     DiagnosticEvidenceKind,
     DiagnosticEvidenceSummaryCode,
     DiagnosticEvidenceSummaryV1,
     DiagnosticToolId,
     EvidenceConsistency,
     RequestedOperatorAction,
+    RolloutPhase,
     diagnostic_registry_v1,
 )
 
@@ -95,6 +99,31 @@ def test_evidence_contract_rejects_a_summary_code_from_another_record_family() -
                 "summary_code": DiagnosticEvidenceSummaryCode.HEALTH_EVIDENCE_VERIFIED,
             }
         )
+
+
+def test_stale_denial_facts_are_closed_and_causally_complete() -> None:
+    with pytest.raises(ValidationError, match="outside its domain"):
+        DiagnosticEvidenceFactV1(
+            schema_version=DIAGNOSTIC_EVIDENCE_FACT_V1,
+            evidence_id="receipt-record-1",
+            name=DiagnosticEvidenceFactName.RECEIPT_REASON,
+            value="MODEL_INFERRED_DENIAL",
+        )
+
+    value = snapshot(
+        phase=RolloutPhase.REVOKED,
+        authority_revoked=True,
+        stale_epoch_mismatch=True,
+    )
+    payload = value.model_dump(mode="python")
+    payload["timeline_summary"]["facts"] = tuple(
+        fact
+        for fact in payload["timeline_summary"]["facts"]
+        if fact["name"] != DiagnosticEvidenceFactName.CURRENT_AUTHORITY_EPOCH
+    )
+
+    with pytest.raises(ValidationError, match="stale epoch-mismatch evidence"):
+        value.__class__.model_validate(payload)
 
 
 def test_invocation_rejects_snapshot_digest_substitution() -> None:

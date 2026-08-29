@@ -59,6 +59,8 @@ CASES = (
             "EXECUTOR_EPOCH_CHECK",
             "STALE_DENIAL",
             "EXECUTION_RECEIPT",
+            "COORDINATOR",
+            "MODEL_AUDIT",
             "TIMELINE",
         ),
     ),
@@ -86,7 +88,13 @@ CASES = (
     ),
     (
         "BOUNDED_ADVISOR",
-        ("CLOUD_RUN_CONFIGURATION", "COORDINATOR", "MODEL_AUDIT", "TIMELINE"),
+        (
+            "CLOUD_RUN_CONFIGURATION",
+            "COORDINATOR",
+            "MODEL_AUDIT",
+            "PUBLIC_REPLAY_SEED",
+            "TIMELINE",
+        ),
     ),
 )
 
@@ -95,6 +103,7 @@ class _StrictTupleResponse(BaseModel):
     model_config = ConfigDict(strict=True)
 
     values: tuple[str, ...]
+
 
 EXPECTED_RESULTS = {
     "TARGET_RESET": "RESET_VERIFIED",
@@ -149,17 +158,21 @@ def _canonical(value: object) -> bytes:
 
 def _test_identity_token(*, audience: str, email: str) -> str:
     now = int(datetime.now(tz=UTC).timestamp())
-    encoded_claims = base64.urlsafe_b64encode(
-        json.dumps(
-            {
-                "aud": audience,
-                "email": email,
-                "exp": now + 300,
-                "iat": now,
-                "iss": "https://accounts.google.com",
-            }
-        ).encode("utf-8")
-    ).rstrip(b"=").decode("ascii")
+    encoded_claims = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "aud": audience,
+                    "email": email,
+                    "exp": now + 300,
+                    "iat": now,
+                    "iss": "https://accounts.google.com",
+                }
+            ).encode("utf-8")
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     return f"e30.{encoded_claims}.signature"
 
 
@@ -916,9 +929,7 @@ def test_service_account_identity_token_uses_direct_iam_credentials_request(
         repo=tmp_path,
         api_origin=audience,
         acceptance_identity="acceptance@example.invalid",
-        spec=SimpleNamespace(
-            target=SimpleNamespace(project_id="controlgraph-canary-abc123")
-        ),
+        spec=SimpleNamespace(target=SimpleNamespace(project_id="controlgraph-canary-abc123")),
     )
 
     assert runner._identity_token(run, service_account) == expected_token
@@ -939,8 +950,7 @@ def test_service_account_identity_token_uses_direct_iam_credentials_request(
     )
     assert request.get_method() == "POST"
     assert request.data == (
-        b'{"audience":"https://controlgraph-api-123456789.us-central1.run.app",'
-        b'"includeEmail":true}'
+        b'{"audience":"https://controlgraph-api-123456789.us-central1.run.app","includeEmail":true}'
     )
     assert dict(request.header_items()) == {
         "Accept": "application/json",
@@ -996,9 +1006,7 @@ def test_service_account_identity_token_sanitizes_provider_failures(
     run = SimpleNamespace(
         repo=tmp_path,
         acceptance_identity="acceptance@example.invalid",
-        spec=SimpleNamespace(
-            target=SimpleNamespace(project_id="controlgraph-canary-abc123")
-        ),
+        spec=SimpleNamespace(target=SimpleNamespace(project_id="controlgraph-canary-abc123")),
     )
 
     with pytest.raises(runner.AcceptanceError) as captured:
@@ -1279,12 +1287,8 @@ def test_hosted_binding_uses_the_deployed_evidence_writer_identity(
         run_inputs_sha256="1" * 64,
         project_number="123456789",
         network_resource=f"projects/{project_id}/global/networks/test",
-        subnetwork_resource=(
-            f"projects/{project_id}/regions/us-central1/subnetworks/test"
-        ),
-        verifier_service_account=(
-            f"controlgraph-verifier@{project_id}.iam.gserviceaccount.com"
-        ),
+        subnetwork_resource=(f"projects/{project_id}/regions/us-central1/subnetworks/test"),
+        verifier_service_account=(f"controlgraph-verifier@{project_id}.iam.gserviceaccount.com"),
         restricted_exporter_service_account=(
             f"cg-restricted-exporter@{project_id}.iam.gserviceaccount.com"
         ),
@@ -1317,6 +1321,7 @@ def test_uncertain_revocation_leaves_held_queue_for_explicit_cleanup(
     queue_actions: list[str] = []
 
     monkeypatch.setattr(runner, "_create_root", lambda *_args: SimpleNamespace(root=root))
+
     def health_load(*_args: Any, **kwargs: Any) -> tuple[object, ...]:
         kwargs["before_terminal"]()
         return object(), object(), object(), object()
@@ -1361,6 +1366,367 @@ def test_revocation_fetches_proof_after_stale_receipt() -> None:
     proof = source.index("proof = _revocation_proof(")
 
     assert release < receipt < proof
+
+
+def test_revocation_invokes_fresh_advisor_before_recovery() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._run_revocation_case)
+
+    receipt = source.index("stale_receipt = _poll_receipt(")
+    proof = source.index("proof = _revocation_proof(")
+    unchanged = source.index('"after-stale-denial"')
+    readiness = source.index("_wait_for_stale_denial_completion(")
+    advisor_command = source.index("advisor_command = _advisor_command(")
+    advisor_invocation = source.index("advisor_result = _invoke_advisor(")
+    causal_clause = source.index("advisor_causal_path_clause =")
+    causal_validation = source.index("expected_causal_path_clause=advisor_causal_path_clause")
+    recovery = source.index("recovery_dispatch, recovery_receipt = _recover_revoked(")
+
+    assert (
+        receipt
+        < proof
+        < unchanged
+        < readiness
+        < advisor_command
+        < advisor_invocation
+        < causal_clause
+        < causal_validation
+        < recovery
+    )
+    assert "revocation.result.new_epoch" in source
+
+
+def _advisor_result_with_causal_statement(statement: str) -> tuple[Any, Any]:
+    from controlgraph_canary.contracts.codec import canonical_sha256
+    from controlgraph_canary.contracts.model_assistance import (
+        ADVISOR_OPERATOR_COMMAND_V1,
+        AdvisorOperatorCommandV1,
+        DiagnosticEvidenceKind,
+        DiagnosticToolId,
+    )
+    from controlgraph_canary.contracts.models import TargetBinding
+
+    root_sha256 = "1" * 64
+    command = AdvisorOperatorCommandV1(
+        schema_version=ADVISOR_OPERATOR_COMMAND_V1,
+        request_id="advisor-request",
+        idempotency_key="advisor-idempotency",
+        target=TargetBinding(
+            schema_version="controlgraph.target-binding/v1",
+            project_id="controlgraph-canary-abc123",
+            region="us-central1",
+            environment="nonprod",
+            service_name="controlgraph-reference-target",
+        ),
+        root_id=f"cgroot:{root_sha256}",
+        expected_root_sha256=root_sha256,
+        expected_epoch=2,
+        requested_at="2026-08-28T00:00:00Z",
+    )
+    citations = tuple(
+        SimpleNamespace(evidence_kind=kind)
+        for kind in (
+            DiagnosticEvidenceKind.RECEIPT,
+            DiagnosticEvidenceKind.TIMELINE,
+            DiagnosticEvidenceKind.TARGET,
+        )
+    )
+    recommendation = SimpleNamespace(
+        findings=(SimpleNamespace(statement=statement, citations=citations),),
+        authority_effect="none",
+        deterministic_health_override=False,
+        operator_review_required=True,
+    )
+    audit = SimpleNamespace(
+        validation=SimpleNamespace(
+            accepted=True,
+            codes=(SimpleNamespace(value="accepted"),),
+        ),
+        prompt_version="controlgraph.rollout-advisor-prompt/v2",
+        tool_calls=tuple(
+            SimpleNamespace(
+                sequence=sequence,
+                tool_id=tool_id,
+                status=SimpleNamespace(value="succeeded"),
+                output_sha256="2" * 64,
+            )
+            for sequence, tool_id in enumerate(DiagnosticToolId, start=1)
+        ),
+    )
+    result = SimpleNamespace(
+        replayed=False,
+        command_sha256=canonical_sha256(command),
+        root_id=command.root_id,
+        root_sha256=command.expected_root_sha256,
+        epoch=command.expected_epoch,
+        response=SimpleNamespace(audit=audit, recommendation=recommendation),
+    )
+    return command, result
+
+
+def test_core_advisor_validation_requires_exact_causal_path_clause(tmp_path: Path) -> None:
+    from controlgraph_canary.application.model_assistance import (
+        stale_denial_causal_path_clause,
+    )
+
+    runner = _hosted_module(tmp_path)
+    expected = stale_denial_causal_path_clause(
+        work_epoch=1,
+        current_authority_epoch=2,
+        target_configuration_sha256="3" * 64,
+    )
+    command, accepted = _advisor_result_with_causal_statement(expected)
+    runner._validate_advisor_result(
+        command,
+        accepted,
+        replayed=False,
+        expected_causal_path_clause=expected,
+    )
+    _, rejected = _advisor_result_with_causal_statement(
+        expected.replace("target=90/10", "target=100/0")
+    )
+
+    with pytest.raises(runner.AcceptanceError) as raised:
+        runner._validate_advisor_result(
+            command,
+            rejected,
+            replayed=False,
+            expected_causal_path_clause=expected,
+        )
+
+    assert raised.value.code == "ACCEPTANCE_HOSTED_ADVISOR_INVALID"
+
+
+def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, ...]:
+    root_sha256 = "1" * 64
+    receipt_sha256 = "2" * 64
+    target_sha256 = "3" * 64
+    root = SimpleNamespace(root_id=f"cgroot:{root_sha256}", root_sha256=root_sha256)
+    revocation = SimpleNamespace(
+        result=SimpleNamespace(
+            new_epoch=2,
+            committed_at="2026-08-28T00:00:00Z",
+            operator_identity="operator@example.com",
+            evidence_id="cgevidence:revocation",
+            request_id="revocation-request",
+        )
+    )
+    receipt = SimpleNamespace(
+        receipt=SimpleNamespace(
+            epoch=1,
+            updated_at="2026-08-28T00:00:01Z",
+            receipt_id="cgreceipt:stale",
+            request_id="promotion-request",
+        ),
+        receipt_sha256=receipt_sha256,
+    )
+
+    def correlation(kind: str, value: str) -> Any:
+        return SimpleNamespace(kind=kind, correlation_id=value)
+
+    def field(name: str, value: str) -> Any:
+        return SimpleNamespace(name=name, value=value)
+
+    def entry(
+        sequence: int,
+        event_type: str,
+        occurred_at: str,
+        *,
+        epoch: int,
+        correlations: tuple[Any, ...],
+        fields: tuple[Any, ...],
+        signature_purpose: str | None,
+        verification_status: str,
+        terminal_classification: str = "NONE",
+        actor_id: str = "actor:test",
+        payload_sha256: str = "4" * 64,
+    ) -> Any:
+        return SimpleNamespace(
+            root_id=root.root_id,
+            root_sha256=root.root_sha256,
+            sequence=sequence,
+            event_type=event_type,
+            epoch=epoch,
+            occurred_at=occurred_at,
+            actor_id=actor_id,
+            signature=(
+                None if signature_purpose is None else SimpleNamespace(purpose=signature_purpose)
+            ),
+            verification_status=verification_status,
+            terminal_classification=terminal_classification,
+            payload_sha256=payload_sha256,
+            correlations=correlations,
+            display_fields=fields,
+        )
+
+    actor_id = (
+        "actor:" + hashlib.sha256(revocation.result.operator_identity.encode("utf-8")).hexdigest()
+    )
+    common_verification_correlations = (
+        correlation("REQUEST", receipt.receipt.request_id),
+        correlation("VERIFICATION", verification_id),
+    )
+    entries = (
+        entry(
+            1,
+            "AUTHORITY_EPOCH_ADVANCED",
+            revocation.result.committed_at,
+            epoch=2,
+            correlations=(
+                correlation("EVIDENCE", revocation.result.evidence_id),
+                correlation("REQUEST", revocation.result.request_id),
+            ),
+            fields=(field("SUMMARY", "Epoch Advanced"),),
+            signature_purpose="EVIDENCE",
+            verification_status="VERIFIED",
+            actor_id=actor_id,
+        ),
+        entry(
+            2,
+            "MUTATION_DENIED",
+            receipt.receipt.updated_at,
+            epoch=1,
+            correlations=(
+                correlation("RECEIPT", receipt.receipt.receipt_id),
+                correlation("REQUEST", receipt.receipt.request_id),
+            ),
+            fields=(field("OUTCOME", "DENIED"), field("REASON_CODE", "EPOCH_MISMATCH")),
+            signature_purpose=None,
+            verification_status="NOT_APPLICABLE",
+            payload_sha256=receipt.receipt_sha256,
+        ),
+        entry(
+            3,
+            "VERIFICATION_RECORDED",
+            "2026-08-28T00:00:02Z",
+            epoch=1,
+            correlations=common_verification_correlations,
+            fields=(
+                field("ACTION", "APPLY_CANARY_V1"),
+                field("OBSERVATION", "CONFIGURATION"),
+                field("OUTCOME", "MATCH"),
+                field(
+                    "STATE",
+                    "stable_percent=90;candidate_percent=10;"
+                    f"target_configuration_sha256={target_sha256}",
+                ),
+            ),
+            signature_purpose="INDEPENDENT_VERIFICATION",
+            verification_status="VERIFIED",
+        ),
+        entry(
+            4,
+            "VERIFICATION_RECORDED",
+            "2026-08-28T00:00:03Z",
+            epoch=1,
+            correlations=common_verification_correlations,
+            fields=(
+                field("ACTION", "APPLY_CANARY_V1"),
+                field("OBSERVATION", "PROBE"),
+                field("OUTCOME", "MATCH"),
+            ),
+            signature_purpose="INDEPENDENT_VERIFICATION",
+            verification_status="VERIFIED",
+        ),
+        entry(
+            5,
+            "TERMINAL_CLASSIFIED",
+            "2026-08-28T00:00:04Z",
+            epoch=1,
+            correlations=common_verification_correlations,
+            fields=(
+                field("ACTION", "STALE_CAPABILITY_DENIAL"),
+                field("OUTCOME", "COMPLETE"),
+                field("REASON_CODE", "STALE_CAPABILITY_DENIAL_COMPLETE"),
+            ),
+            signature_purpose=None,
+            verification_status="VERIFIED",
+            terminal_classification="DENIED",
+        ),
+    )
+    return (
+        root,
+        revocation,
+        receipt,
+        target_sha256,
+        (SimpleNamespace(entries=entries),),
+    )
+
+
+def test_stale_completion_readiness_waits_for_exact_correlated_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    receipt_sha256 = "2" * 64
+    expected_verification = f"stale-denial:{receipt_sha256[:32]}"
+    root, revocation, receipt, target_sha256, ready = _stale_completion_readiness_fixture(
+        verification_id=expected_verification
+    )
+    _, _, _, _, substituted = _stale_completion_readiness_fixture(
+        verification_id=f"stale-denial:{'9' * 32}"
+    )
+    observations = iter((substituted, ready))
+    reads: list[object] = []
+    sleeps: list[float] = []
+
+    def read_timeline(run: object) -> tuple[Any, ...]:
+        reads.append(run)
+        return next(observations)
+
+    monkeypatch.setattr(runner, "_read_operator_timeline", read_timeline)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    monkeypatch.setattr(runner, "_STALE_COMPLETION_READINESS_ATTEMPTS", 3)
+    run = object()
+
+    observed = runner._wait_for_stale_denial_completion(
+        run,
+        root=root,
+        revocation=revocation,
+        stale_receipt=receipt,
+        target_configuration_sha256=target_sha256,
+    )
+
+    assert observed is ready
+    assert reads == [run, run]
+    assert sleeps == [runner._STALE_COMPLETION_READINESS_DELAY_SECONDS]
+
+
+def test_stale_completion_readiness_fails_boundedly_when_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    root, revocation, receipt, target_sha256, substituted = _stale_completion_readiness_fixture(
+        verification_id=f"stale-denial:{'9' * 32}"
+    )
+    reads: list[object] = []
+    sleeps: list[float] = []
+
+    def read_timeline(run: object) -> tuple[Any, ...]:
+        reads.append(run)
+        return substituted
+
+    monkeypatch.setattr(runner, "_read_operator_timeline", read_timeline)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    monkeypatch.setattr(runner, "_STALE_COMPLETION_READINESS_ATTEMPTS", 3)
+    run = object()
+
+    with pytest.raises(runner.AcceptanceError) as raised:
+        runner._wait_for_stale_denial_completion(
+            run,
+            root=root,
+            revocation=revocation,
+            stale_receipt=receipt,
+            target_configuration_sha256=target_sha256,
+        )
+
+    assert raised.value.code == "ACCEPTANCE_HOSTED_STALE_COMPLETION_TIMEOUT"
+    assert reads == [run, run, run]
+    assert sleeps == [
+        runner._STALE_COMPLETION_READINESS_DELAY_SECONDS,
+        runner._STALE_COMPLETION_READINESS_DELAY_SECONDS,
+    ]
 
 
 def _hosted_module(tmp_path: Path) -> Any:
@@ -1429,9 +1795,7 @@ def test_hosted_load_job_verification_accepts_provider_json_envelope(
         error_code="ACCEPTANCE_SPEC_INVALID",
     )
     controller_image = next(
-        item.reference
-        for item in spec.images
-        if item.component is runner.ImageComponent.CONTROLLER
+        item.reference for item in spec.images if item.component is runner.ImageComponent.CONTROLLER
     )
     verifier = "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com"
     run = SimpleNamespace(
@@ -1484,9 +1848,7 @@ def test_hosted_load_job_verification_rejects_provider_drift(
         error_code="ACCEPTANCE_SPEC_INVALID",
     )
     controller_image = next(
-        item.reference
-        for item in spec.images
-        if item.component is runner.ImageComponent.CONTROLLER
+        item.reference for item in spec.images if item.component is runner.ImageComponent.CONTROLLER
     )
     verifier = "controlgraph-verifier@controlgraph-canary-abc123.iam.gserviceaccount.com"
     run = SimpleNamespace(
@@ -1650,9 +2012,7 @@ def test_hosted_timeline_evidence_compacts_large_pages_with_complete_bindings() 
         after_entry_sha256 = digest
 
     with pytest.raises(runner.ContractError):
-        runner.canonical_json_value_bytes(
-            [page.model_dump(mode="json") for page in pages]
-        )
+        runner.canonical_json_value_bytes([page.model_dump(mode="json") for page in pages])
 
     release_document = {
         "root_id": "cgroot:" + "d" * 64,
@@ -1669,9 +2029,7 @@ def test_hosted_timeline_evidence_compacts_large_pages_with_complete_bindings() 
     )
     summary = evidence["summary"]
     page_sha256s = [
-        hashlib.sha256(
-            runner.canonical_json_value_bytes(page.model_dump(mode="json"))
-        ).hexdigest()
+        hashlib.sha256(runner.canonical_json_value_bytes(page.model_dump(mode="json"))).hexdigest()
         for page in pages
     ]
 
@@ -1681,19 +2039,27 @@ def test_hosted_timeline_evidence_compacts_large_pages_with_complete_bindings() 
     assert summary["head_sequence"] == 3
     assert summary["head_entry_sha256"] == digests[-1]
     assert [item["page_sha256"] for item in summary["page_bindings"]] == page_sha256s
-    assert summary["page_set_sha256"] == hashlib.sha256(
-        runner._TIMELINE_PAGE_SET_DOMAIN
-        + runner.canonical_json_value_bytes(page_sha256s)
-    ).hexdigest()
-    assert summary["page_set_sha256"] != hashlib.sha256(
-        runner._TIMELINE_PAGE_SET_DOMAIN
-        + runner.canonical_json_value_bytes(list(reversed(page_sha256s)))
-    ).hexdigest()
+    assert (
+        summary["page_set_sha256"]
+        == hashlib.sha256(
+            runner._TIMELINE_PAGE_SET_DOMAIN + runner.canonical_json_value_bytes(page_sha256s)
+        ).hexdigest()
+    )
+    assert (
+        summary["page_set_sha256"]
+        != hashlib.sha256(
+            runner._TIMELINE_PAGE_SET_DOMAIN
+            + runner.canonical_json_value_bytes(list(reversed(page_sha256s)))
+        ).hexdigest()
+    )
     assert evidence["release"] == release_document
-    assert runner._timeline_evidence(
-        tuple(pages),
-        release=SimpleNamespace(model_dump=release_dump),
-    ) == evidence
+    assert (
+        runner._timeline_evidence(
+            tuple(pages),
+            release=SimpleNamespace(model_dump=release_dump),
+        )
+        == evidence
+    )
     encoded = runner._canonical_object(evidence)
     assert len(encoded) < runner.MAX_CONTRACT_BYTES
     assert b'"payload"' not in encoded
@@ -1744,9 +2110,7 @@ def test_hosted_policy_binding_compares_plain_artifact_digest() -> None:
         (SOURCE_ROOT / "contract-fixtures" / "health-v1" / "golden.json").read_text()
     )
     canonical = next(
-        item["canonical"]
-        for item in vector["vectors"]
-        if item["model"] == "RolloutHealthPolicyV2"
+        item["canonical"] for item in vector["vectors"] if item["model"] == "RolloutHealthPolicyV2"
     )
     assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == artifact_sha256
 

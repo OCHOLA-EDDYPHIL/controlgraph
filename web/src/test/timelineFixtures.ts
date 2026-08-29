@@ -56,6 +56,9 @@ export function timelineEntry(
     readonly terminalClassification?: TimelineTerminalClassification;
     readonly rootSha256?: string;
     readonly correlations?: readonly TimelineCorrelation[];
+    readonly occurredAt?: string;
+    readonly actorRole?: TimelineEntry["actorRole"];
+    readonly signature?: TimelineEntry["signature"];
   } = {},
 ): TimelineEntry {
   const entrySha256 = digest(sequence);
@@ -70,31 +73,36 @@ export function timelineEntry(
     eventType,
     evidenceClass: evidenceClass(eventType),
     actorRole:
-      eventType === "MODEL_ASSISTANCE_RECORDED"
+      options.actorRole ??
+      (eventType === "MODEL_ASSISTANCE_RECORDED"
         ? "ADVISOR"
         : eventType.startsWith("VERIFICATION") || eventType === "TERMINAL_CLASSIFIED"
           ? "VERIFIER"
-          : "COORDINATOR",
+          : "COORDINATOR"),
     actorId: null,
     rootId: `cgroot:${rootSha256}`,
     rootSha256,
     epoch: options.epoch ?? 1,
-    occurredAt: `2026-08-21T12:${String(sequence).padStart(2, "0")}:00Z`,
+    occurredAt:
+      options.occurredAt ?? `2026-08-21T12:${String(sequence).padStart(2, "0")}:00Z`,
     recordedAt: `2026-08-21T12:${String(sequence).padStart(2, "0")}:01Z`,
     correlations: options.correlations ?? [
       { kind: "EVIDENCE", correlationId: `evidence:${sequence}` },
     ],
     payloadSha256: digest(sequence + 100),
     policySha256: "b".repeat(64),
-    signature: {
-      purpose: "EVIDENCE",
-      signingKeyVersion:
-        "projects/controlgraph-canary-abc123/locations/us-central1/keyRings/controlgraph-signing/cryptoKeys/evidence-signing/cryptoKeyVersions/1",
-      signingAlgorithm: "EC_SIGN_P256_SHA256",
-      payloadSha256: digest(sequence + 100),
-      signingInputSha256: digest(sequence + 200),
-      signatureSha256: digest(sequence + 300),
-    },
+    signature:
+      options.signature === undefined
+        ? {
+            purpose: "EVIDENCE",
+            signingKeyVersion:
+              "projects/controlgraph-canary-abc123/locations/us-central1/keyRings/controlgraph-signing/cryptoKeys/evidence-signing/cryptoKeyVersions/1",
+            signingAlgorithm: "EC_SIGN_P256_SHA256",
+            payloadSha256: digest(sequence + 100),
+            signingInputSha256: digest(sequence + 200),
+            signatureSha256: digest(sequence + 300),
+          }
+        : options.signature,
     verificationStatus: options.verificationStatus ?? "NOT_APPLICABLE",
     terminalClassification: options.terminalClassification ?? "NONE",
     displayFields: options.fields ?? [field("SUMMARY", `Event ${sequence}`)],

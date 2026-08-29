@@ -89,8 +89,14 @@ NOW = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
 
 
 class _Verifier:
-    def __init__(self, *, unavailable: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        unavailable: bool = False,
+        observed_at: str | None = None,
+    ) -> None:
         self.unavailable = unavailable
+        self.observed_at = observed_at
         self.calls: list[IndependentVerificationInvocationV1] = []
 
     async def attest(
@@ -99,10 +105,16 @@ class _Verifier:
     ) -> VerifiedIndependentVerificationEvidenceV1:
         self.calls.append(invocation)
         if self.unavailable:
-            raise RuntimeError("synthetic verifier outage")
+            raise TimeoutError("synthetic verifier timeout")
         if invocation.kind is IndependentVerificationKind.CONFIGURATION:
-            return _configuration_evidence(invocation.verification)
-        return _probe_evidence(invocation.verification)
+            return _configuration_evidence(
+                invocation.verification,
+                observed_at=self.observed_at,
+            )
+        return _probe_evidence(
+            invocation.verification,
+            observed_at=self.observed_at,
+        )
 
 
 class _Timeline:
@@ -122,6 +134,7 @@ class _Timeline:
                 ExecutionReceipt,
                 SignedEvidenceEventV1 | None,
                 CompletionClassificationV1,
+                tuple[VerifiedIndependentVerificationEvidenceV1, ...],
             ]
         ] = []
 
@@ -147,9 +160,10 @@ class _Timeline:
         receipt: ExecutionReceipt,
         signed_authority: SignedEvidenceEventV1 | None,
         classification: CompletionClassificationV1,
+        *verified: VerifiedIndependentVerificationEvidenceV1,
     ) -> None:
         self.stale_denial_groups.append(
-            (receipt, signed_authority, classification)
+            (receipt, signed_authority, classification, verified)
         )
 
 
@@ -353,13 +367,16 @@ def _signed(
         schema_version=VERIFIED_INDEPENDENT_VERIFICATION_EVIDENCE_V1,
         signing_request=signing_request,
         signed_evidence=signed,
-        verified_at=request.observation_window_started_at,
+        verified_at=signing_request.evidence.occurred_at,
     )
 
 
 def _configuration_evidence(
     request: VerificationRequestV1,
+    *,
+    observed_at: str | None = None,
 ) -> VerifiedIndependentVerificationEvidenceV1:
+    occurred_at = observed_at or request.observation_window_started_at
     traffic = tuple(
         TrafficAllocation(revision=revision, percent=percent)
         for revision, percent in (
@@ -394,7 +411,7 @@ def _configuration_evidence(
         retrieved_by=(
             f"controlgraph-verifier@{request.target.project_id}.iam.gserviceaccount.com"
         ),
-        retrieved_at=request.observation_window_started_at,
+        retrieved_at=occurred_at,
     )
     observation = ConfigurationObservationV1(
         schema_version=CONFIGURATION_OBSERVATION_V1,
@@ -409,14 +426,17 @@ def _configuration_evidence(
         reason=ConfigurationAttestationReason.MATCH,
         observation=observation,
         attested_by=facts.retrieved_by,
-        attested_at=request.observation_window_started_at,
+        attested_at=occurred_at,
     )
     return _signed(request, _configuration_signing_request(result))
 
 
 def _probe_evidence(
     request: VerificationRequestV1,
+    *,
+    observed_at: str | None = None,
 ) -> VerifiedIndependentVerificationEvidenceV1:
+    occurred_at = observed_at or request.observation_window_started_at
     policy = fixed_probe_policy(request.stable_percent, request.candidate_percent)
     probe_request = ProbeRequestV1(
         schema_version=PROBE_REQUEST_V1,
@@ -424,7 +444,7 @@ def _probe_evidence(
         policy=policy,
         endpoint="https://controlgraph-reference-target-123.us-central1.run.app/v1/probe",
         nonce="n" * 32,
-        started_at=request.observation_window_started_at,
+        started_at=occurred_at,
     )
     stable_count = policy.stable_minimum
     samples = tuple(
@@ -432,8 +452,8 @@ def _probe_evidence(
             schema_version=PROBE_SAMPLE_OBSERVATION_V1,
             sample_index=index,
             correlation_id=f"{request.correlation_id}:{index}",
-            requested_at=request.observation_window_started_at,
-            completed_at=request.observation_window_started_at,
+            requested_at=occurred_at,
+            completed_at=occurred_at,
             outcome=(
                 ProbeSampleOutcome.STABLE
                 if index <= stable_count
@@ -472,7 +492,7 @@ def _probe_evidence(
         attested_by=(
             f"controlgraph-verifier@{request.target.project_id}.iam.gserviceaccount.com"
         ),
-        completed_at=request.observation_window_started_at,
+        completed_at=occurred_at,
     )
     return _signed(request, _probe_signing_request(result))
 
@@ -667,10 +687,11 @@ def test_stale_denial_workflow_binds_receipt_to_signed_epoch_advancement() -> No
     )
     authority_reader = _AuthorityReader(bundle, proof.signed_evidence)
     authority_verifier = _AuthorityEvidenceVerifier()
+    target_verifier = _Verifier(observed_at="2026-08-22T12:00:12Z")
     timeline = _Timeline(records.root.content.target)
     workflow = CoordinatorCompletionWorkflow(
         target=records.root.content.target,
-        verifier=_Verifier(unavailable=True),
+        verifier=target_verifier,
         classifier=CoordinatorCompletionClassificationService(
             target=records.root.content.target
         ),
@@ -687,6 +708,11 @@ def test_stale_denial_workflow_binds_receipt_to_signed_epoch_advancement() -> No
     assert result.status is CompletionStatus.COMPLETE
     assert result.reason is CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE
     assert result.request.verification.epoch == receipt.epoch
+    assert result.request.verification.action is CapabilityAction.APPLY_CANARY
+    assert (
+        result.request.verification.stable_percent,
+        result.request.verification.candidate_percent,
+    ) == (90, 10)
     assert result.request.verification.service_claim_sha256 == canonical_sha256(
         records.service_claim
     )
@@ -695,10 +721,16 @@ def test_stale_denial_workflow_binds_receipt_to_signed_epoch_advancement() -> No
         == proof.signed_evidence.event.occurred_at
     )
     assert authority_verifier.calls == [proof.signed_evidence]
-    assert timeline.stale_denial_groups == [(receipt, proof.signed_evidence, result)]
+    assert [call.kind for call in target_verifier.calls] == [
+        IndependentVerificationKind.CONFIGURATION,
+        IndependentVerificationKind.PROBE,
+    ]
+    stale_group = timeline.stale_denial_groups[0]
+    assert stale_group[:3] == (receipt, proof.signed_evidence, result)
+    assert len(stale_group[3]) == 2
 
 
-def test_stale_denial_supports_multi_epoch_and_historical_replay() -> None:
+def test_stale_denial_verifier_failure_preserves_denial_without_retry() -> None:
     records = make_root_v3_records()
     _, _, verified, signed = _receipt(CapabilityAction.RECOVER_STABLE)
     first = make_revocation_proof_records(
@@ -777,12 +809,15 @@ def test_stale_denial_supports_multi_epoch_and_historical_replay() -> None:
         epoch_evidence={3: epoch_three_evidence},
     )
     authority_verifier = _AuthorityEvidenceVerifier()
+    target_verifier = _Verifier(unavailable=True)
+    timeline = _Timeline(receipt.target)
     workflow = CoordinatorCompletionWorkflow(
         target=records.root.content.target,
-        verifier=_Verifier(unavailable=True),
+        verifier=target_verifier,
         classifier=CoordinatorCompletionClassificationService(
             target=records.root.content.target
         ),
+        timeline_recorder=timeline,
         authority_reader=authority_reader,
         authority_evidence_verifier=authority_verifier,
         signed_intent_reader=_IntentReader(signed, receipt.target),
@@ -820,7 +855,19 @@ def test_stale_denial_supports_multi_epoch_and_historical_replay() -> None:
 
     assert initial.status is CompletionStatus.COMPLETE
     assert initial.reason is CompletionReason.STALE_CAPABILITY_DENIAL_COMPLETE
+    assert initial.follow_up_required is False
+    assert initial.follow_up_after_seconds is None
+    assert initial.follow_up_attempt_limit is None
     assert replay == initial
+    assert receipt.outcome is ReceiptOutcome.DENIED
+    assert receipt.reason_code is ReasonCode.EPOCH_MISMATCH
+    assert all(group[0] == receipt and group[3] == () for group in timeline.stale_denial_groups)
+    assert [call.kind for call in target_verifier.calls] == [
+        IndependentVerificationKind.CONFIGURATION,
+        IndependentVerificationKind.PROBE,
+        IndependentVerificationKind.CONFIGURATION,
+        IndependentVerificationKind.PROBE,
+    ]
     assert authority_verifier.calls == [epoch_three_evidence, epoch_three_evidence]
 
 
@@ -872,4 +919,4 @@ def test_stale_denial_workflow_classifies_missing_authority_proof_as_ambiguous()
 
     assert result.status is CompletionStatus.AMBIGUOUS
     assert result.reason is CompletionReason.AUTHORITY_PROOF_ABSENT
-    assert timeline.stale_denial_groups == [(receipt, None, result)]
+    assert timeline.stale_denial_groups == [(receipt, None, result, ())]

@@ -169,6 +169,7 @@ class CompletionWorkflowTimelineRecorder(Protocol):
         receipt: ExecutionReceipt,
         signed_authority: SignedEvidenceEventV1 | None,
         classification: CompletionClassificationV1,
+        *verified: VerifiedIndependentVerificationEvidenceV1,
     ) -> None: ...
 
 
@@ -527,7 +528,7 @@ class CoordinatorCompletionWorkflow:
             )
         )
         try:
-            verification = create_verification_request(
+            verification = create_stale_denial_verification_request(
                 root=trusted.root,
                 service_claim=trusted.service_claim,
                 receipt=receipt,
@@ -537,6 +538,20 @@ class CoordinatorCompletionWorkflow:
             raise
         except Exception:
             raise CompletionWorkflowError(CompletionWorkflowErrorCode.INPUT_INVALID) from None
+
+        configuration = await self._attest(
+            IndependentVerificationKind.CONFIGURATION,
+            verification,
+        )
+        probe = await self._attest(
+            IndependentVerificationKind.PROBE,
+            verification,
+        )
+        observation = VerifiedTargetObservation(
+            request=verification,
+            configuration=_post_denial_evidence(configuration, receipt),
+            probe=_post_denial_evidence(probe, receipt),
+        )
 
         authority = (
             AuthorityCompletionEvidenceV1(
@@ -561,11 +576,19 @@ class CoordinatorCompletionWorkflow:
             else None
         )
         try:
+            assessed_at = max(
+                (
+                    self._timestamp(),
+                    receipt.updated_at,
+                    *(item.verified_at for item in observation.evidence),
+                ),
+                key=_parse_utc,
+            )
             assessment = CompletionAssessmentRequestV1(
                 schema_version=COMPLETION_ASSESSMENT_REQUEST_V1,
                 kind=CompletionKind.STALE_CAPABILITY_DENIAL,
                 verification=verification,
-                assessed_at=receipt.updated_at,
+                assessed_at=assessed_at,
             )
             bundle = CompletionEvidenceBundleV1(
                 schema_version=COMPLETION_EVIDENCE_BUNDLE_V1,
@@ -578,6 +601,8 @@ class CoordinatorCompletionWorkflow:
                     )
                     else None
                 ),
+                configuration=observation.configuration,
+                probe=observation.probe,
                 authority=authority,
             )
         except Exception:
@@ -597,6 +622,7 @@ class CoordinatorCompletionWorkflow:
                     receipt,
                     signed_evidence,
                     classification,
+                    *observation.evidence,
                 )
             except asyncio.CancelledError:
                 raise
@@ -843,6 +869,93 @@ def create_authority_verification_request(
     )
 
 
+def create_stale_denial_verification_request(
+    *,
+    root: RolloutRootV2 | RolloutRootV3,
+    service_claim: ServiceClaimRecordValue,
+    receipt: ExecutionReceipt,
+    started_at: str,
+) -> VerificationRequestV1:
+    """Bind a fresh unchanged-canary observation to one durable stale denial."""
+
+    if (
+        type(root) not in {RolloutRootV2, RolloutRootV3}
+        or type(service_claim) not in {ServiceClaimRecord, ServiceClaimRecordV3}
+        or type(receipt) is not ExecutionReceipt
+        or not service_claim_matches_content_addressed_root(service_claim, root)
+        or receipt.target != root.content.target
+        or receipt.root_id != root.root_id
+        or receipt.root_sha256 != root.root_sha256
+        or receipt.plan_sha256 != canonical_sha256(root.content.rollout_plan)
+        or receipt.receipt_id
+        != execution_receipt_logical_id(receipt.target, receipt.idempotency_key)
+        or receipt.outcome is not ReceiptOutcome.DENIED
+        or receipt.reason_code is not ReasonCode.EPOCH_MISMATCH
+        or receipt.observed_authority_epoch is None
+        or receipt.observed_authority_epoch <= receipt.epoch
+    ):
+        raise CompletionWorkflowError(CompletionWorkflowErrorCode.INPUT_INVALID)
+    traffic = (90, 10)
+    plan = root.content.rollout_plan
+    target_sha256 = (
+        rollout_root_v2_target_configuration_sha256(
+            root,
+            stable_percent=traffic[0],
+            candidate_percent=traffic[1],
+        )
+        if type(root) is RolloutRootV2
+        else rollout_root_v3_target_configuration_sha256(
+            cast(RolloutRootV3, root),
+            stable_percent=traffic[0],
+            candidate_percent=traffic[1],
+        )
+    )
+    start = _parse_utc(started_at)
+    receipt_sha256 = canonical_sha256(receipt)
+    return VerificationRequestV1(
+        schema_version=VERIFICATION_REQUEST_V1,
+        root_id=root.root_id,
+        root_sha256=root.root_sha256,
+        epoch=receipt.epoch,
+        target=root.content.target,
+        plan_sha256=canonical_sha256(plan),
+        service_claim_sha256=canonical_sha256(service_claim),
+        probe_policy_sha256=canonical_sha256(fixed_probe_policy(*traffic)),
+        signed_intent_sha256=receipt.capability_sha256,
+        action=CapabilityAction.APPLY_CANARY,
+        stable_revision=plan.stable_revision,
+        candidate_revision=plan.candidate_revision,
+        stable_percent=traffic[0],
+        candidate_percent=traffic[1],
+        concurrency=plan.concurrency,
+        expected_stable_revision_configuration_sha256=(
+            plan.stable_revision_configuration_sha256
+        ),
+        expected_candidate_revision_configuration_sha256=(
+            plan.candidate_revision_configuration_sha256
+        ),
+        expected_target_configuration_sha256=target_sha256,
+        observation_window_started_at=started_at,
+        observation_window_ends_at=_utc_second(
+            start + timedelta(seconds=_OBSERVATION_WINDOW_SECONDS)
+        ),
+        request_id=receipt.request_id,
+        correlation_id=f"stale-denial:{receipt_sha256[:32]}",
+    )
+
+
+def _post_denial_evidence(
+    evidence: VerifiedIndependentVerificationEvidenceV1 | None,
+    receipt: ExecutionReceipt,
+) -> VerifiedIndependentVerificationEvidenceV1 | None:
+    if evidence is None:
+        return None
+    occurred_at = evidence.signed_evidence.evidence.occurred_at
+    if _parse_utc(occurred_at) < _parse_utc(receipt.updated_at):
+        return None
+    return evidence
+
+
 def _execution_evidence(
     request: VerificationRequestV1,
     receipt: ExecutionReceipt,
@@ -928,5 +1041,6 @@ __all__ = [
     "CoordinatorCompletionWorkflow",
     "VerifiedTargetObservation",
     "create_authority_verification_request",
+    "create_stale_denial_verification_request",
     "create_verification_request",
 ]

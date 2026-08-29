@@ -65,6 +65,41 @@ variable "console_image" {
   }
 }
 
+variable "public_replay_gzip_base64" {
+  description = "Optional bounded gzip/base64 public replay embedded in the existing console revision."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.public_replay_gzip_base64 == "" ||
+      (
+        length(var.public_replay_gzip_base64) <= 24576 &&
+        length(var.public_replay_gzip_base64) % 4 == 0 &&
+        can(regex("^[A-Za-z0-9+/]*={0,2}$", var.public_replay_gzip_base64))
+      )
+    )
+    error_message = "public_replay_gzip_base64 must be empty or bounded canonical base64 text."
+  }
+}
+
+variable "public_replay_sha256" {
+  description = "Optional lowercase SHA-256 of the decompressed canonical public replay."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      (var.public_replay_gzip_base64 == "") == (var.public_replay_sha256 == "") &&
+      (
+        var.public_replay_sha256 == "" ||
+        can(regex("^[0-9a-f]{64}$", var.public_replay_sha256))
+      )
+    )
+    error_message = "public replay gzip/base64 and SHA-256 values must be paired, and the digest must be lowercase SHA-256."
+  }
+}
+
 variable "advisor_image" {
   description = "Reviewed advisor image in the dedicated registry, pinned by digest."
   type        = string

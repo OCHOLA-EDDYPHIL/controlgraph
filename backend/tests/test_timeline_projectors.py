@@ -233,6 +233,12 @@ def test_independent_verification_projection_preserves_verified_signature_and_bi
         TimelineCorrelationKind.REQUEST: _request().request_id,
         TimelineCorrelationKind.VERIFICATION: _request().correlation_id,
     }
+    fields = _fields(projection)
+    assert fields[TimelineDisplayFieldName.ACTION] == "APPLY_CANARY_V1"
+    assert fields[TimelineDisplayFieldName.STATE] == (
+        "stable_percent=90;candidate_percent=10;"
+        f"target_configuration_sha256={_request().expected_target_configuration_sha256}"
+    )
 
 
 @pytest.mark.parametrize(

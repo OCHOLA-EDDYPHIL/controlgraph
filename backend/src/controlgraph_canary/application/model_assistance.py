@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ from controlgraph_canary.contracts.model_assistance import (
     DIAGNOSTIC_TOOL_RESULT_V1,
     MAX_TOOL_CALLS,
     MODEL_ASSISTANCE_TIMELINE_AUDIT_V1,
+    PROMPT_VERSION,
     AdvisorDispositionCommandV1,
     AdvisorDispositionInvocationV1,
     AdvisorDispositionResultV1,
@@ -55,6 +57,7 @@ from controlgraph_canary.contracts.model_assistance import (
     AdvisorToolCallAuditV1,
     AdvisorValidationV1,
     AdvisoryHealth,
+    DiagnosticEvidenceFactName,
     DiagnosticEvidenceKind,
     DiagnosticEvidenceSummaryV1,
     DiagnosticRegistryV1,
@@ -73,6 +76,7 @@ from controlgraph_canary.contracts.model_assistance import (
     diagnostic_model_context,
     diagnostic_registry_v1,
 )
+from controlgraph_canary.contracts.models import ReasonCode
 
 
 class AdvisorModelFailureCode(StrEnum):
@@ -119,10 +123,9 @@ class SnapshotDiagnosticEvidenceReader:
     ) -> DiagnosticEvidenceSummaryV1:
         if type(request) is not AdvisorInvocationRequestV1:
             raise DiagnosticToolError("diagnostic request is invalid")
-        return {
-            summary.evidence_kind: summary
-            for summary in request.snapshot.evidence_summaries
-        }[evidence_kind]
+        return {summary.evidence_kind: summary for summary in request.snapshot.evidence_summaries}[
+            evidence_kind
+        ]
 
 
 @runtime_checkable
@@ -136,7 +139,7 @@ class AdvisorModel(Protocol):
     def model_location(self) -> Literal["global"]: ...
 
     @property
-    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v1"]: ...
+    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v2"]: ...
 
     async def recommend(
         self,
@@ -149,6 +152,37 @@ class AdvisorModel(Protocol):
 class _EvidenceIndexEntry:
     kind: DiagnosticEvidenceKind
     source_sha256: str
+
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def stale_denial_causal_path_clause(
+    *,
+    work_epoch: int,
+    current_authority_epoch: int,
+    target_configuration_sha256: str,
+) -> str:
+    """Render the only accepted stale-denial causal-path statement."""
+
+    if (
+        type(work_epoch) is not int
+        or type(current_authority_epoch) is not int
+        or type(target_configuration_sha256) is not str
+        or work_epoch < 1
+        or current_authority_epoch <= work_epoch
+        or _SHA256_PATTERN.fullmatch(target_configuration_sha256) is None
+    ):
+        raise ValueError("stale-denial causal-path facts are invalid")
+    return (
+        "causal_path("
+        f"work_epoch={work_epoch},"
+        f"current_authority_epoch={current_authority_epoch},"
+        f"reason={ReasonCode.EPOCH_MISMATCH.value},"
+        "target=90/10,"
+        f"target_configuration_sha256={target_configuration_sha256},"
+        "relation=AT_OR_AFTER_DENIAL)"
+    )
 
 
 class InvocationDiagnosticRegistry:
@@ -164,9 +198,8 @@ class InvocationDiagnosticRegistry:
         if type(request) is not AdvisorInvocationRequestV1:
             raise TypeError("an exact advisor request is required")
         selected_registry = registry or diagnostic_registry_v1()
-        if (
-            selected_registry != diagnostic_registry_v1()
-            or not isinstance(evidence_reader, VerifiedDiagnosticEvidenceReader)
+        if selected_registry != diagnostic_registry_v1() or not isinstance(
+            evidence_reader, VerifiedDiagnosticEvidenceReader
         ):
             raise ValueError("diagnostic registry must match the fixed allowlist")
         self._request = request
@@ -213,9 +246,8 @@ class InvocationDiagnosticRegistry:
                 self._request,
                 definition.evidence_source,
             )
-            if (
-                type(summary) is not DiagnosticEvidenceSummaryV1
-                or summary != _summary_for_tool(self._request, tool_id)
+            if type(summary) is not DiagnosticEvidenceSummaryV1 or summary != _summary_for_tool(
+                self._request, tool_id
             ):
                 raise DiagnosticToolError("diagnostic evidence binding is invalid")
             result = DiagnosticToolResultV1(
@@ -325,6 +357,7 @@ class ReadOnlyAdvisorService:
             or authentication_policy.caller.role is not CallerRole.COORDINATOR
             or authentication_policy.path != protected_path(ServiceRole.ADVISOR)
             or not isinstance(model, AdvisorModel)
+            or model.prompt_version != PROMPT_VERSION
             or (
                 evidence_reader is not None
                 and not isinstance(evidence_reader, VerifiedDiagnosticEvidenceReader)
@@ -369,9 +402,7 @@ class ReadOnlyAdvisorService:
             try:
                 candidate = AdvisorRecommendationV1.model_validate(candidate)
             except (TypeError, ValueError, ValidationError):
-                raise AdvisorModelFailure(
-                    AdvisorModelFailureCode.MALFORMED_OUTPUT
-                ) from None
+                raise AdvisorModelFailure(AdvisorModelFailureCode.MALFORMED_OUTPUT) from None
             recommendation = candidate
             validation = validate_recommendation(
                 request,
@@ -386,9 +417,7 @@ class ReadOnlyAdvisorService:
             raise
         except TimeoutError:
             fallback = AdvisorFallbackCode.TIMEOUT
-            validation = _failed_validation(
-                RecommendationValidationCode.MODEL_RESPONSE_INVALID
-            )
+            validation = _failed_validation(RecommendationValidationCode.MODEL_RESPONSE_INVALID)
         except AdvisorModelFailure as error:
             fallback = AdvisorFallbackCode(error.code.value)
             validation = _failed_validation(
@@ -398,15 +427,11 @@ class ReadOnlyAdvisorService:
             )
         except Exception:
             fallback = AdvisorFallbackCode.MODEL_UNAVAILABLE
-            validation = _failed_validation(
-                RecommendationValidationCode.MODEL_RESPONSE_INVALID
-            )
+            validation = _failed_validation(RecommendationValidationCode.MODEL_RESPONSE_INVALID)
 
         candidate_digest = _valid_candidate_digest(candidate)
         citations = (
-            _cited_evidence_ids(candidate)
-            if type(candidate) is AdvisorRecommendationV1
-            else ()
+            _cited_evidence_ids(candidate) if type(candidate) is AdvisorRecommendationV1 else ()
         )
         request_sha256 = canonical_sha256(request)
         audit = AdvisorInteractionAuditV1(
@@ -430,9 +455,7 @@ class ReadOnlyAdvisorService:
             request_sha256=request_sha256,
             recommendation=recommendation,
             audit=audit,
-            manual_next_step=(
-                "review_named_evidence_and_use_deterministic_operator_commands_only"
-            ),
+            manual_next_step=("review_named_evidence_and_use_deterministic_operator_commands_only"),
         )
 
 
@@ -685,6 +708,7 @@ class ApiAdvisorClient:
         if not _caller_matches_policy(principal, self._policy):
             raise AdvisorWorkflowError(AdvisorWorkflowErrorCode.OPERATOR_DENIED)
 
+
 class CoordinatorAdvisorWorkflow:
     """Load M6 evidence, invoke the read-only advisor, and persist its audit lifecycle."""
 
@@ -926,27 +950,23 @@ def validate_recommendation(
         recommendation.requested_operator_action is RequestedOperatorAction.MANUAL_REVIEW
     )
     current = _naive_utc_second(now)
-    if (
-        current < _utc(request.snapshot.assembled_at)
-        or current >= _utc(request.snapshot.expires_at)
-    ) and not manual_review:
+    evidence_is_fresh = current >= _utc(request.snapshot.assembled_at) and current < _utc(
+        request.snapshot.expires_at
+    )
+    if not evidence_is_fresh and not manual_review:
         codes.append(RecommendationValidationCode.EVIDENCE_STALE)
-    if (
-        snapshot.evidence_consistency is EvidenceConsistency.INCOMPLETE
-        and not manual_review
-    ):
+    if snapshot.evidence_consistency is EvidenceConsistency.INCOMPLETE and not manual_review:
         codes.append(RecommendationValidationCode.EVIDENCE_INCOMPLETE)
-    if (
-        snapshot.evidence_consistency is EvidenceConsistency.CONFLICTING
-        and not manual_review
-    ):
+    if snapshot.evidence_consistency is EvidenceConsistency.CONFLICTING and not manual_review:
         codes.append(RecommendationValidationCode.EVIDENCE_CONFLICT)
-    if (
-        recommendation.confidence_basis_points < 7_000
-        and not manual_review
-    ):
+    if recommendation.confidence_basis_points < 7_000 and not manual_review:
         codes.append(RecommendationValidationCode.LOW_CONFIDENCE)
-    if not _citations_are_valid(request, recommendation, tool_calls):
+    if not _citations_are_valid(
+        request,
+        recommendation,
+        tool_calls,
+        require_stale_denial_citations=(evidence_is_fresh and _is_stale_epoch_mismatch(request)),
+    ):
         codes.append(RecommendationValidationCode.CITATION_INVALID)
     if not _action_is_allowed(request, recommendation.requested_operator_action):
         codes.append(RecommendationValidationCode.ACTION_NOT_ALLOWED)
@@ -994,10 +1014,7 @@ def _action_is_allowed(
             in {RolloutPhase.CANARY, RolloutPhase.REVOKED, RolloutPhase.RECOVERY_PENDING}
             and (
                 snapshot.authority_revoked
-                or (
-                    snapshot.terminal_health
-                    and snapshot.health is AdvisoryHealth.UNHEALTHY
-                )
+                or (snapshot.terminal_health and snapshot.health is AdvisoryHealth.UNHEALTHY)
             )
         )
     if action is RequestedOperatorAction.REQUEST_NEW_OPERATOR_APPROVED_ROLLOUT:
@@ -1012,6 +1029,8 @@ def _citations_are_valid(
     request: AdvisorInvocationRequestV1,
     recommendation: AdvisorRecommendationV1,
     tool_calls: tuple[AdvisorToolCallAuditV1, ...],
+    *,
+    require_stale_denial_citations: bool,
 ) -> bool:
     expected_tools = set(DiagnosticToolId)
     succeeded_tools = {
@@ -1039,7 +1058,149 @@ def _citations_are_valid(
                 or expected.source_sha256 != citation.source_sha256
             ):
                 return False
-    return True
+    if not require_stale_denial_citations:
+        return True
+    receipt_ids = _fact_bearing_evidence_ids(
+        request.snapshot.receipt_summary,
+        {
+            DiagnosticEvidenceFactName.RECEIPT_OUTCOME: "DENIED",
+            DiagnosticEvidenceFactName.RECEIPT_REASON: ReasonCode.EPOCH_MISMATCH.value,
+        },
+        required_names={
+            DiagnosticEvidenceFactName.WORK_EPOCH,
+            DiagnosticEvidenceFactName.DENIAL_OCCURRED_AT,
+        },
+    )
+    transition_ids = _fact_bearing_evidence_ids(
+        request.snapshot.timeline_summary,
+        {
+            DiagnosticEvidenceFactName.AUTHORITY_TRANSITION: ("AUTHORITY_EPOCH_ADVANCED"),
+            DiagnosticEvidenceFactName.CURRENT_AUTHORITY_EPOCH: str(request.snapshot.current_epoch),
+        },
+    )
+    target_ids: set[tuple[DiagnosticEvidenceKind, str]] = set()
+    for summary in (
+        request.snapshot.target_summary,
+        request.snapshot.verifier_summary,
+    ):
+        ids = _fact_bearing_evidence_ids(
+            summary,
+            {
+                DiagnosticEvidenceFactName.VERIFICATION_KIND: "CONFIGURATION",
+                DiagnosticEvidenceFactName.VERIFICATION_VERDICT: "MATCH",
+                DiagnosticEvidenceFactName.TARGET_STABLE_PERCENT: "90",
+                DiagnosticEvidenceFactName.TARGET_CANDIDATE_PERCENT: "10",
+                DiagnosticEvidenceFactName.TARGET_OBSERVATION_RELATION: ("AT_OR_AFTER_DENIAL"),
+            },
+            required_names={
+                DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256,
+                DiagnosticEvidenceFactName.TARGET_OBSERVED_AT,
+            },
+        )
+        target_ids.update((summary.evidence_kind, evidence_id) for evidence_id in ids)
+    causal_findings = 0
+    for finding in recommendation.findings:
+        cited_evidence = {
+            (citation.evidence_kind, citation.evidence_id) for citation in finding.citations
+        }
+        cited_receipt_ids = {
+            evidence_id
+            for evidence_id in receipt_ids
+            if (DiagnosticEvidenceKind.RECEIPT, evidence_id) in cited_evidence
+        }
+        cited_transition_ids = {
+            evidence_id
+            for evidence_id in transition_ids
+            if (DiagnosticEvidenceKind.TIMELINE, evidence_id) in cited_evidence
+        }
+        cited_target_ids = target_ids.intersection(cited_evidence)
+        if not cited_receipt_ids or not cited_transition_ids or not cited_target_ids:
+            continue
+        expected_clauses: set[str] = set()
+        for receipt_id in cited_receipt_ids:
+            work_epoch = _fact_value(
+                request.snapshot.receipt_summary,
+                receipt_id,
+                DiagnosticEvidenceFactName.WORK_EPOCH,
+            )
+            if work_epoch is None or work_epoch != str(int(work_epoch)):
+                continue
+            for target_kind, target_id in cited_target_ids:
+                target_summary = {
+                    DiagnosticEvidenceKind.TARGET: request.snapshot.target_summary,
+                    DiagnosticEvidenceKind.VERIFIER: request.snapshot.verifier_summary,
+                }[target_kind]
+                target_configuration_sha256 = _fact_value(
+                    target_summary,
+                    target_id,
+                    DiagnosticEvidenceFactName.TARGET_CONFIGURATION_SHA256,
+                )
+                if target_configuration_sha256 is None:
+                    continue
+                try:
+                    clause = stale_denial_causal_path_clause(
+                        work_epoch=int(work_epoch),
+                        current_authority_epoch=request.snapshot.current_epoch,
+                        target_configuration_sha256=target_configuration_sha256,
+                    )
+                except ValueError:
+                    continue
+                expected_clauses.add(clause)
+        if finding.statement in expected_clauses:
+            causal_findings += 1
+    return causal_findings == 1
+
+
+def _fact_bearing_evidence_ids(
+    summary: DiagnosticEvidenceSummaryV1,
+    required_values: dict[DiagnosticEvidenceFactName, str],
+    *,
+    required_names: set[DiagnosticEvidenceFactName] | None = None,
+) -> set[str]:
+    required_names = required_names or set()
+    qualifying: set[str] = set()
+    for evidence_id in summary.evidence_ids:
+        facts = {fact.name: fact.value for fact in summary.facts if fact.evidence_id == evidence_id}
+        if all(facts.get(name) == value for name, value in required_values.items()) and all(
+            name in facts for name in required_names
+        ):
+            qualifying.add(evidence_id)
+    return qualifying
+
+
+def _fact_value(
+    summary: DiagnosticEvidenceSummaryV1,
+    evidence_id: str,
+    name: DiagnosticEvidenceFactName,
+) -> str | None:
+    return next(
+        (
+            fact.value
+            for fact in summary.facts
+            if fact.evidence_id == evidence_id and fact.name is name
+        ),
+        None,
+    )
+
+
+def _is_stale_epoch_mismatch(request: AdvisorInvocationRequestV1) -> bool:
+    snapshot = request.snapshot
+    work_epochs = tuple(
+        int(fact.value)
+        for fact in snapshot.receipt_summary.facts
+        if fact.name is DiagnosticEvidenceFactName.WORK_EPOCH
+    )
+    return (
+        snapshot.authority_revoked
+        and snapshot.rollout_phase is RolloutPhase.REVOKED
+        and len(work_epochs) == 1
+        and work_epochs[0] < snapshot.current_epoch
+        and any(
+            fact.name is DiagnosticEvidenceFactName.RECEIPT_REASON
+            and fact.value == ReasonCode.EPOCH_MISMATCH.value
+            for fact in snapshot.receipt_summary.facts
+        )
+    )
 
 
 def _summary_for_tool(
@@ -1104,8 +1265,7 @@ def _timeline_audit_event(
     actor_identity: str,
 ) -> ModelAssistanceTimelineAuditV1:
     material = (
-        f"{lifecycle.value}\0{result.interaction_id}\0{command.request_id}\0"
-        f"{disposition.value}"
+        f"{lifecycle.value}\0{result.interaction_id}\0{command.request_id}\0{disposition.value}"
     ).encode()
     event_id = f"cgmodelaudit:{hashlib.sha256(material).hexdigest()}"
     return ModelAssistanceTimelineAuditV1(
@@ -1208,5 +1368,6 @@ __all__ = [
     "ReadOnlyAdvisorService",
     "SnapshotDiagnosticEvidenceReader",
     "VerifiedDiagnosticEvidenceReader",
+    "stale_denial_causal_path_clause",
     "validate_recommendation",
 ]

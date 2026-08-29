@@ -60,8 +60,8 @@ class _InjectedProposalModel:
         return "global"
 
     @property
-    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v1"]:
-        return "controlgraph.rollout-advisor-prompt/v1"
+    def prompt_version(self) -> Literal["controlgraph.rollout-advisor-prompt/v2"]:
+        return "controlgraph.rollout-advisor-prompt/v2"
 
     async def recommend(
         self,
