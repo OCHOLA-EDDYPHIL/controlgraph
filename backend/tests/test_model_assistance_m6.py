@@ -461,7 +461,44 @@ def test_assembler_projects_one_current_m6_root_and_timeline() -> None:
         )
 
 
-def test_assembler_projects_fresh_stale_denial_causal_facts() -> None:
+@pytest.mark.parametrize(
+    (
+        "configuration_outcome",
+        "probe_outcome",
+        "probe_reason_code",
+        "expected_consistency",
+    ),
+    (
+        pytest.param("MATCH", "MATCH", None, "consistent", id="all-match"),
+        pytest.param(
+            "MATCH",
+            "INCONCLUSIVE",
+            "PROBE_DISTRIBUTION_MISMATCH",
+            "incomplete",
+            id="bounded-probe-inconclusive",
+        ),
+        pytest.param(
+            "MATCH",
+            "INCONCLUSIVE",
+            "PROBE_FAILED",
+            None,
+            id="unbounded-probe-inconclusive",
+        ),
+        pytest.param(
+            "INCONCLUSIVE",
+            "MATCH",
+            None,
+            None,
+            id="configuration-inconclusive",
+        ),
+    ),
+)
+def test_assembler_projects_fresh_stale_denial_causal_facts(
+    configuration_outcome: str,
+    probe_outcome: str,
+    probe_reason_code: str | None,
+    expected_consistency: str | None,
+) -> None:
     records = make_root_v3_records()
     root = records.root
     target = root.content.target
@@ -599,7 +636,7 @@ def test_assembler_projects_fresh_stale_denial_causal_facts() -> None:
             (
                 _field(TimelineDisplayFieldName.ACTION, "APPLY_CANARY_V1"),
                 _field(TimelineDisplayFieldName.OBSERVATION, "CONFIGURATION"),
-                _field(TimelineDisplayFieldName.OUTCOME, "MATCH"),
+                _field(TimelineDisplayFieldName.OUTCOME, configuration_outcome),
                 _field(
                     TimelineDisplayFieldName.STATE,
                     (
@@ -618,7 +655,17 @@ def test_assembler_projects_fresh_stale_denial_causal_facts() -> None:
             (
                 _field(TimelineDisplayFieldName.ACTION, "APPLY_CANARY_V1"),
                 _field(TimelineDisplayFieldName.OBSERVATION, "PROBE"),
-                _field(TimelineDisplayFieldName.OUTCOME, "MATCH"),
+                _field(TimelineDisplayFieldName.OUTCOME, probe_outcome),
+                *(
+                    ()
+                    if probe_reason_code is None
+                    else (
+                        _field(
+                            TimelineDisplayFieldName.REASON_CODE,
+                            probe_reason_code,
+                        ),
+                    )
+                ),
             ),
             1,
             "2026-08-22T09:59:10Z",
@@ -720,14 +767,21 @@ def test_assembler_projects_fresh_stale_denial_causal_facts() -> None:
         requested_at="2026-08-22T09:59:10Z",
     )
 
-    request = asyncio.run(
-        M6DiagnosticSnapshotAssembler(
-            target=target,
-            authority=_Authority(bundle),
-            timeline=_Timeline(head, tuple(entries)),
-            clock=lambda: datetime(2026, 8, 22, 10, 0, tzinfo=UTC),
-        ).assemble(command)
+    assembler = M6DiagnosticSnapshotAssembler(
+        target=target,
+        authority=_Authority(bundle),
+        timeline=_Timeline(head, tuple(entries)),
+        clock=lambda: datetime(2026, 8, 22, 10, 0, tzinfo=UTC),
     )
+    if expected_consistency is None:
+        with pytest.raises(
+            ValueError,
+            match="post-denial target evidence is incomplete",
+        ):
+            asyncio.run(assembler.assemble(command))
+        return
+
+    request = asyncio.run(assembler.assemble(command))
 
     receipt_facts = {
         (fact.name, fact.value) for fact in request.snapshot.receipt_summary.facts
@@ -736,7 +790,7 @@ def test_assembler_projects_fresh_stale_denial_causal_facts() -> None:
         (fact.name, fact.value) for fact in request.snapshot.timeline_summary.facts
     }
     assert request.snapshot.rollout_phase is RolloutPhase.REVOKED
-    assert request.snapshot.evidence_consistency.value == "consistent"
+    assert request.snapshot.evidence_consistency.value == expected_consistency
     assert receipt_facts == {
         (
             DiagnosticEvidenceFactName.DENIAL_OCCURRED_AT,
