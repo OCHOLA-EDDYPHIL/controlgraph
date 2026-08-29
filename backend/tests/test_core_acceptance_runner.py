@@ -262,13 +262,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     target = {
-        "candidate_revision": "controlgraph-reference-target-candidate-v19",
+        "candidate_revision": "controlgraph-reference-target-candidate-v20",
         "environment": "nonprod",
         "project_id": "controlgraph-canary-abc123",
         "region": "us-central1",
         "schema_version": "controlgraph.acceptance-target/v1",
         "service_name": "controlgraph-reference-target",
-        "stable_revision": "controlgraph-reference-target-stable-v19",
+        "stable_revision": "controlgraph-reference-target-stable-v20",
     }
     plan_sha = _write(artifacts / "inputs" / "plan.json", {"resource_changes": []})
     policy_sha = _write(artifacts / "inputs" / "policy.json", {"minimum_requests": 10})
@@ -1192,6 +1192,94 @@ def test_hosted_root_creation_does_not_retry_other_status_four_payloads(
         raise AssertionError("a non-exact ambiguity payload was unexpectedly retried")
 
     assert calls["count"] == 1
+
+
+def test_hosted_recovery_retries_exact_unknown_with_same_command(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    run = SimpleNamespace(repo=tmp_path, project_number="123456789")
+    command_path = tmp_path / "recovery.json"
+    recovered = SimpleNamespace(enqueue_disposition="CREATED")
+    responses = [
+        (4, {"code": "RECOVERY_OUTCOME_UNKNOWN"}, None),
+        (0, {}, recovered),
+    ]
+    invocations: list[dict[str, Any]] = []
+    sleeps: list[int] = []
+
+    def run_cli(**kwargs: Any) -> tuple[int, dict[str, Any], Any]:
+        invocations.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    result = runner._submit_recovery(run, command_path)
+
+    assert result is recovered
+    assert len(invocations) == 2
+    assert invocations[0]["arguments"] == invocations[1]["arguments"]
+    assert invocations[0]["allowed_statuses"] == frozenset({0, 4})
+    assert invocations[1]["allowed_statuses"] == frozenset({0, 4})
+    assert sleeps == [20]
+
+
+def test_hosted_recovery_unknown_outcome_retry_is_bounded(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    calls = {"count": 0}
+    sleeps: list[int] = []
+
+    def run_cli(**_kwargs: Any) -> tuple[int, dict[str, str], None]:
+        calls["count"] += 1
+        return 4, {"code": "RECOVERY_OUTCOME_UNKNOWN"}, None
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    with pytest.raises(runner.AcceptanceError) as captured:
+        runner._submit_recovery(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "recovery.json",
+        )
+
+    assert captured.value.code == "ACCEPTANCE_HOSTED_RECOVERY_AMBIGUOUS"
+    assert calls["count"] == 3
+    assert sleeps == [20, 20]
+
+
+def test_hosted_recovery_does_not_retry_nonexact_unknown(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    calls = {"count": 0}
+
+    def run_cli(**_kwargs: Any) -> tuple[int, dict[str, str], None]:
+        calls["count"] += 1
+        return 4, {"code": "RECOVERY_OUTCOME_UNKNOWN", "detail": "extra"}, None
+
+    monkeypatch.setattr(runner, "_run_cli", run_cli)
+
+    with pytest.raises(runner.AcceptanceError) as captured:
+        runner._submit_recovery(
+            SimpleNamespace(repo=tmp_path, project_number="123456789"),
+            tmp_path / "recovery.json",
+        )
+
+    assert captured.value.code == "ACCEPTANCE_HOSTED_RECOVERY_INVALID"
+    assert calls["count"] == 1
+
+
+def test_hosted_revoked_recovery_uses_cold_start_margin() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    source = inspect.getsource(runner._recover_revoked)
+
+    assert "timedelta(seconds=120)" in source
 
 
 def test_hosted_health_evaluation_adopts_after_delayed_unknown(
@@ -2452,7 +2540,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
                     return json.dumps(
                         {
                             "marker": "controlgraph-candidate-v1",
-                            "revision": "controlgraph-reference-target-candidate-v19",
+                            "revision": "controlgraph-reference-target-candidate-v20",
                             "schema_version": "controlgraph.reference-probe/v1",
                         }
                     ).encode()
@@ -2473,7 +2561,7 @@ def test_hosted_load_script_retries_transport_failures() -> None:
         "https://candidate.example/v1/probe",
         "token",
         "healthy",
-        "controlgraph-reference-target-candidate-v19",
+        "controlgraph-reference-target-candidate-v20",
     )
 
     assert flaky.calls == 3

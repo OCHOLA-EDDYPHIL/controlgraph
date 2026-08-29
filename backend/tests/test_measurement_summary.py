@@ -108,11 +108,11 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, Any], dict[str, Any]
             "source_commit": "d" * 40,
             "target": {
                 "environment": "nonprod",
-                "candidate_revision": "controlgraph-reference-target-candidate-v19",
+                "candidate_revision": "controlgraph-reference-target-candidate-v20",
                 "project_id": "controlgraph-canary-abc123",
                 "region": "us-central1",
                 "service_name": "controlgraph-reference-target",
-                "stable_revision": "controlgraph-reference-target-stable-v19",
+                "stable_revision": "controlgraph-reference-target-stable-v20",
             },
             "terraform_plan": _artifact("terraform-plan", "e" * 64),
         },

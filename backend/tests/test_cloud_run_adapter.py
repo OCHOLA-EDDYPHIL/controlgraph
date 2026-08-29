@@ -101,8 +101,8 @@ PROJECT_ID = "controlgraph-canary-a1b2c3"
 PROJECT_NUMBER = "123456789012"
 SUBJECT = "123456789012345678901"
 SERVICE = "controlgraph-reference-target"
-STABLE = f"{SERVICE}-stable-v19"
-CANDIDATE = f"{SERVICE}-candidate-v19"
+STABLE = f"{SERVICE}-stable-v20"
+CANDIDATE = f"{SERVICE}-candidate-v20"
 SERVICE_RESOURCE = f"projects/{PROJECT_ID}/locations/us-central1/services/{SERVICE}"
 ZERO_DIGEST = "0" * 64
 ONE_DIGEST = "1" * 64
@@ -1172,6 +1172,47 @@ async def test_recovery_receipt_readback_waits_for_provider_state_to_settle(
 
 
 @_async_test
+async def test_receipt_readback_allows_delayed_provider_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsettled = _service(
+        90,
+        10,
+        status_stable_percent=100,
+        status_candidate_percent=0,
+        etag="etag-readback-unsettled",
+    )
+    settled = _service(90, 10, etag="etag-readback-settled")
+    services = _GetOnlyServicesClient(
+        unsettled,
+        unsettled,
+        unsettled,
+        unsettled,
+        unsettled,
+        settled,
+    )
+    delays: list[float] = []
+
+    async def no_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+    expected = target_configuration_projection(
+        _verified().request.intent,
+        expected_concurrency=8,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-readback-settled",
+    )
+    assert delays == [1.0] * 5
+    assert len(services.get_calls) == 6
+
+
+@_async_test
 async def test_receipt_readback_uses_one_total_provider_settle_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1192,7 +1233,7 @@ async def test_receipt_readback_uses_one_total_provider_settle_budget(
     observation = await _receipt_readback(services).readback(expected)
 
     assert observation.state == expected
-    assert budgets == [5.0]
+    assert budgets == [10.0]
 
 
 @pytest.mark.parametrize(
@@ -1210,14 +1251,14 @@ async def test_receipt_readback_uses_one_total_provider_settle_budget(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            stable_revision=f"{SERVICE}-stable-v20",
+            stable_revision=f"{SERVICE}-stable-v21",
         ),
         replace(
             target_configuration_projection(
                 _verified().request.intent,
                 expected_concurrency=8,
             ),
-            candidate_revision=f"{SERVICE}-candidate-v20",
+            candidate_revision=f"{SERVICE}-candidate-v21",
         ),
         replace(
             target_configuration_projection(
@@ -1253,7 +1294,7 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
                 )
             ),
             "etag-after-8",
-            4,
+            9,
         ),
         (
             _service(
@@ -1273,7 +1314,7 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
         (
             _service(status_stable_percent=100, status_candidate_percent=0),
             "etag-after-8",
-            4,
+            9,
         ),
         (
             _service(template_revision=f"{SERVICE}-unapproved-v2"),
@@ -1887,7 +1928,7 @@ def test_target_configuration_projection_and_digest_are_stable() -> None:
     assert TARGET_CONFIGURATION_V1 == "controlgraph.target-configuration/v1"
     assert TARGET_CONFIGURATION_DOMAIN == b"controlgraph.target-configuration-sha256/v1\0"
     assert target_configuration_sha256(intent, expected_concurrency=8) == (
-            "02ed9e67eb32657e6f561d4192411196bf747d0b01c20ec6cfabd42d0d079d47"
+        "4c9b591f3b4f61573fbc151444e2057c29d9364624d738d677646033a9304a95"
     )
 
 
@@ -1915,8 +1956,8 @@ def test_target_configuration_digest_excludes_non_poststate_fields() -> None:
     ("changes", "expected_concurrency"),
     [
         ({"target": _target(project_id="controlgraph-canary-d4e5f6")}, 8),
-        ({"stable_revision": f"{SERVICE}-stable-v20"}, 8),
-        ({"candidate_revision": f"{SERVICE}-candidate-v20"}, 8),
+        ({"stable_revision": f"{SERVICE}-stable-v21"}, 8),
+        ({"candidate_revision": f"{SERVICE}-candidate-v21"}, 8),
         ({"stable_percent": 80, "candidate_percent": 20}, 8),
         ({}, 9),
     ],
@@ -2018,12 +2059,12 @@ async def test_reference_target_reset_migrates_the_exact_v18_baseline_to_v19() -
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v18",
-        candidate_revision="controlgraph-reference-target-candidate-v18",
+        stable_revision="controlgraph-reference-target-stable-v19",
+        candidate_revision="controlgraph-reference-target-candidate-v19",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v18"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v19"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
@@ -2149,12 +2190,12 @@ async def test_reference_target_reset_rejects_any_other_v18_traffic_shape(
     before = _service(
         100,
         0,
-        stable_revision="controlgraph-reference-target-stable-v18",
-        candidate_revision="controlgraph-reference-target-candidate-v18",
+        stable_revision="controlgraph-reference-target-stable-v19",
+        candidate_revision="controlgraph-reference-target-candidate-v19",
         etag="etag-before-migration",
         generation=8,
         latest_ready_revision=(
-            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v18"
+            f"{SERVICE_RESOURCE}/revisions/controlgraph-reference-target-candidate-v19"
         ),
         latest_created_revision=f"{SERVICE_RESOURCE}/revisions/{CANDIDATE}",
     )
