@@ -24,14 +24,6 @@ from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Final, Literal, Self, cast
 
-from pydantic import (
-    AfterValidator,
-    Field,
-    StringConstraints,
-    ValidationError,
-    model_validator,
-)
-
 import controlgraph_canary
 import controlgraph_canary.contracts.base as contract_base_module
 import controlgraph_canary.contracts.codec as contract_codec_module
@@ -52,6 +44,13 @@ from controlgraph_canary.contracts.codec import (
     RestrictedJson,
     canonical_json_value_bytes,
     decode_contract,
+)
+from pydantic import (
+    AfterValidator,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
 )
 
 MANIFEST_SCHEMA: Final = "controlgraph.core-acceptance-manifest/v1"
@@ -3682,6 +3681,15 @@ def _available_raw_records(items: Sequence[Any]) -> tuple[dict[str, Any], ...]:
     return tuple(records)
 
 
+def _model_from_raw_record[ModelT: StrictContractModel](
+    record: Mapping[str, Any],
+    model_type: type[ModelT],
+) -> ModelT:
+    """Decode one JSON-shaped raw record through the contract JSON boundary."""
+
+    return model_type.model_validate_json(_canonical_object(record))
+
+
 def _read_timeline_evidence(
     run: _HostedExecution,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -3872,7 +3880,10 @@ def _run_verifier_case(
         ):
             continue
         try:
-            item = VerifiedIndependentVerificationEvidenceV1.model_validate(record)
+            item = _model_from_raw_record(
+                record,
+                VerifiedIndependentVerificationEvidenceV1,
+            )
         except (TypeError, ValueError, ValidationError) as error:
             raise AcceptanceError("ACCEPTANCE_HOSTED_VERIFICATION_INVALID") from error
         evidence = item.signing_request.evidence
@@ -3932,7 +3943,7 @@ def _run_ambiguity_case(
         if record.get("schema_version") != "controlgraph.completion-classification/v1":
             continue
         try:
-            candidate = CompletionClassificationV1.model_validate(record)
+            candidate = _model_from_raw_record(record, CompletionClassificationV1)
         except (TypeError, ValueError, ValidationError) as error:
             raise AcceptanceError("ACCEPTANCE_HOSTED_CLASSIFICATION_INVALID") from error
         if candidate.request.verification.root_id in run.root_ids:
@@ -3945,7 +3956,7 @@ def _run_ambiguity_case(
         if record.get("schema_version") != "controlgraph.execution-receipt/v1":
             continue
         try:
-            candidate_receipt = ExecutionReceipt.model_validate(record)
+            candidate_receipt = _model_from_raw_record(record, ExecutionReceipt)
         except (TypeError, ValueError, ValidationError) as error:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RECEIPT_INVALID") from error
         verification = source.request.verification
