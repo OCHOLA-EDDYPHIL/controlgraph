@@ -1087,7 +1087,7 @@ def test_issuer_derives_root_scoped_promotion_from_verified_canary_receipt() -> 
         assert claims.request_id == command.request_id
         assert claims.idempotency_key == command.idempotency_key
         assert claims.not_before == command.scheduled_at
-        assert claims.expires_at == "2026-08-19T12:11:00Z"
+        assert claims.expires_at == "2026-08-19T12:12:00Z"
         assert claims.parent_capability_sha256 is None
         assert claims.plan_sha256 == canonical_sha256(records.root.content.rollout_plan)
         assert claims.stable_revision == records.root.content.rollout_plan.stable_revision
@@ -1105,7 +1105,7 @@ def test_promotion_schedule_binds_capability_identity_and_exact_margin_boundary(
         first_command = _promotion_command(records, source.value)
         boundary_schedule = (
             ISSUE_TIME
-            + timedelta(seconds=120 - MIN_PROMOTION_EXECUTION_MARGIN_SECONDS)
+            + timedelta(seconds=180 - MIN_PROMOTION_EXECUTION_MARGIN_SECONDS)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         boundary_command = first_command.model_copy(
             update={"scheduled_at": boundary_schedule}
@@ -1128,7 +1128,7 @@ def test_promotion_schedule_binds_capability_identity_and_exact_margin_boundary(
         assert MIN_PROMOTION_EXECUTION_MARGIN_SECONDS == 30
         assert first.claims.not_before == first_command.scheduled_at
         assert boundary.claims.not_before == boundary_schedule
-        assert boundary.claims.expires_at == "2026-08-19T12:11:00Z"
+        assert boundary.claims.expires_at == "2026-08-19T12:12:00Z"
         assert first.claims.capability_id != boundary.claims.capability_id
 
     asyncio.run(scenario())
@@ -1138,7 +1138,7 @@ def test_promotion_schedule_binds_capability_identity_and_exact_margin_boundary(
     ("scheduled_at", "issue_time"),
     [
         ("2026-08-19T12:09:00Z", ISSUE_TIME + timedelta(seconds=1)),
-        ("2026-08-19T12:10:31Z", ISSUE_TIME),
+        ("2026-08-19T12:11:31Z", ISSUE_TIME),
     ],
 )
 def test_issuer_rejects_past_or_insufficient_margin_promotion_schedule(

@@ -2611,8 +2611,8 @@ def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
     assert source.index("before_terminal()") < source.index(
         "while datetime.now(UTC) < next_evaluation:"
     )
-    assert proof_margin_seconds == 115
-    assert proof_margin_seconds - RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS >= 45
+    assert proof_margin_seconds == 175
+    assert proof_margin_seconds - RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS >= 105
 
     tasks_source = (SOURCE_ROOT / "infra" / "runtime" / "tasks.tf").read_text()
     attempts = [
