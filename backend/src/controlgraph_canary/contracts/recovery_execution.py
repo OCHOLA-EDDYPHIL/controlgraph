@@ -224,6 +224,15 @@ def _content_id(
     return f"{prefix}{hashlib.sha256(domain + canonical_json_value_bytes(projection)).hexdigest()}"
 
 
+def _validated_contract_json_bytes(value: StrictContractModel) -> bytes:
+    """Encode a nested model already revalidated by its containing contract."""
+
+    projection = cast(RestrictedJson, value.model_dump(mode="json"))
+    if type(projection) is not dict:
+        raise TypeError("contract projection must be an object")
+    return canonical_json_value_bytes(projection)
+
+
 def _validated_contract_sha256(value: StrictContractModel) -> str:
     """Hash a nested model already revalidated by its containing contract."""
 
@@ -233,11 +242,12 @@ def _validated_contract_sha256(value: StrictContractModel) -> str:
     schema_version = projection.get("schema_version")
     if type(schema_version) is not str:
         raise ValueError("contract projection lacks a schema version")
+    encoded = canonical_json_value_bytes(projection)
     return hashlib.sha256(
         DIGEST_DOMAIN
         + schema_version.encode("ascii")
         + b"\0"
-        + canonical_json_value_bytes(projection)
+        + encoded
     ).hexdigest()
 
 
@@ -425,7 +435,7 @@ class RevokedV2RecoverySourceV1(StrictContractModel):
             or result.new_epoch != self.epoch
             or proof.authority.current_epoch != self.epoch
             or proof.authority.previous_epoch != result.previous_epoch
-            or self.revocation_proof_sha256 != canonical_sha256(proof)
+            or self.revocation_proof_sha256 != _validated_contract_sha256(proof)
             or self.triggered_at != result.committed_at
         ):
             raise ValueError("revoked V2 recovery source proof is invalid")
@@ -460,7 +470,7 @@ class RevokedV3RecoverySourceV1(StrictContractModel):
             or result.new_epoch != self.epoch
             or proof.authority.current_epoch != self.epoch
             or proof.authority.previous_epoch != result.previous_epoch
-            or self.revocation_proof_sha256 != canonical_sha256(proof)
+            or self.revocation_proof_sha256 != _validated_contract_sha256(proof)
             or self.triggered_at != result.committed_at
         ):
             raise ValueError("revoked V3 recovery source proof is invalid")
@@ -547,7 +557,7 @@ class RecoveryIntentV1(StrictContractModel):
         command = self.command
         if (
             self.intent_id != recovery_intent_id(self.root_sha256)
-            or self.command_sha256 != recovery_command_sha256(command)
+            or self.command_sha256 != _validated_recovery_command_sha256(command)
             or self.root_id != command.root_id
             or self.root_sha256 != command.expected_root_sha256
             or self.epoch != command.expected_epoch
@@ -555,7 +565,8 @@ class RecoveryIntentV1(StrictContractModel):
             or self.idempotency_key != command.idempotency_key
             or self.source_receipt_sha256 != command.verified_apply_receipt.receipt_sha256
             or self.trigger_basis is not command.source.basis
-            or self.trigger_proof_sha256 != recovery_trigger_proof_sha256(command.source)
+            or self.trigger_proof_sha256
+            != _validated_recovery_trigger_proof_sha256(command.source)
             or self.created_at < command.source.triggered_at
             or self.created_at > command.scheduled_at
         ):
@@ -643,7 +654,7 @@ class RecoveryPrestateRequestV1(StrictContractModel):
         )
         duration = (_seconds(self.valid_until) - _seconds(self.requested_at)).total_seconds()
         if (
-            self.command_sha256 != recovery_command_sha256(self.command)
+            self.command_sha256 != _validated_recovery_command_sha256(self.command)
             or self.root_schema_version != bindings.schema_version
             or self.root_id != bindings.root_id
             or self.root_sha256 != bindings.root_sha256
@@ -663,7 +674,8 @@ class RecoveryPrestateRequestV1(StrictContractModel):
             or self.source_receipt_sha256 != self.verified_apply_receipt.receipt_sha256
             or self.source_receipt_storage_revision != self.verified_apply_receipt.storage_revision
             or self.source != self.command.source
-            or self.trigger_proof_sha256 != recovery_trigger_proof_sha256(self.source)
+            or self.trigger_proof_sha256
+            != _validated_recovery_trigger_proof_sha256(self.source)
             or self.verifier_identity
             != f"controlgraph-verifier@{self.target.project_id}.iam.gserviceaccount.com"
             or self.evidence_signing_key_version != bindings.evidence_signing_key_version
@@ -719,7 +731,7 @@ class RecoveryPrestateResultV1(StrictContractModel):
         request = self.request
         if (
             self.prestate_request_id != request.prestate_request_id
-            or self.request_sha256 != canonical_sha256(request)
+            or self.request_sha256 != _validated_contract_sha256(request)
             or self.target != request.target
             or self.root_schema_version != request.root_schema_version
             or self.root_id != request.root_id
@@ -759,7 +771,7 @@ class RecoveryPrestateSigningRequestV1(StrictContractModel):
     @model_validator(mode="after")
     def validate_request(self) -> Self:
         if (
-            self.result_sha256 != canonical_sha256(self.result)
+            self.result_sha256 != _validated_contract_sha256(self.result)
             or self.signing_key_version != self.result.request.evidence_signing_key_version
             or self.signing_request_id != recovery_prestate_signing_request_id(self)
         ):
@@ -793,12 +805,13 @@ class RecoveryPrestateAttestationV1(StrictContractModel):
         if (
             matched is None
             or matched.group("project") != self.result.target.project_id
-            or self.result_sha256 != canonical_sha256(self.result)
+            or self.result_sha256 != _validated_contract_sha256(self.result)
             or self.payload_sha256 != self.result_sha256
-            or self.signing_request_sha256 != canonical_sha256(expected_request)
+            or self.signing_request_sha256
+            != _validated_contract_sha256(expected_request)
             or self.signing_key_version != expected_request.signing_key_version
             or self.signing_input_sha256
-            != recovery_prestate_signing_input_sha256(
+            != _validated_recovery_prestate_signing_input_sha256(
                 self.result,
                 self.signing_key_version,
             )
@@ -908,7 +921,8 @@ class RecoveryAuthorizationV1(StrictContractModel):
             or self.source_receipt_storage_revision != request.source_receipt_storage_revision
             or self.source != request.source
             or self.trigger_proof_sha256 != request.trigger_proof_sha256
-            or self.prestate_attestation_sha256 != canonical_sha256(attestation)
+            or self.prestate_attestation_sha256
+            != _validated_contract_sha256(attestation)
             or self.evidence_signing_key_version != attestation.signing_key_version
             or self.expected_prestate_sha256 != request.expected_prestate_sha256
             or self.expected_prestate_sha256 != result.observed_prestate_sha256
@@ -952,7 +966,8 @@ class RecoveryCapabilityIssuanceCommandV2(StrictContractModel):
             or self.request_id != authorization.request_id
             or self.idempotency_key != authorization.idempotency_key
             or self.scheduled_at != authorization.scheduled_at
-            or self.authorization_sha256 != canonical_sha256(authorization)
+            or self.authorization_sha256
+            != _validated_contract_sha256(authorization)
         ):
             raise ValueError("recovery issuance command bindings are invalid")
         return self
@@ -977,10 +992,14 @@ class RecoveryCapabilityIssuanceResultV2(StrictContractModel):
         claims = self.capability.claims
         if (
             self.issuance_command_sha256
-            != recovery_capability_issuance_command_sha256(self.issuance_command)
-            or self.authorization_sha256 != canonical_sha256(authorization)
+            != _validated_recovery_capability_issuance_command_sha256(
+                self.issuance_command
+            )
+            or self.authorization_sha256
+            != _validated_contract_sha256(authorization)
             or self.capability_id != recovery_capability_id(authorization)
-            or self.capability_sha256 != canonical_sha256(self.capability)
+            or self.capability_sha256
+            != _validated_contract_sha256(self.capability)
             or claims.capability_id != self.capability_id
             or claims.issuer != authorization.issuer_identity
             or claims.subject != authorization.recovery_identity
@@ -1070,7 +1089,8 @@ class RecoveryMutationIntentV2(StrictContractModel):
             or self.stable_snapshot_sha256 != authorization.stable_snapshot_sha256
             or self.provider_etag != authorization.current_provider_etag
             or self.capability_id != authorization.capability_id
-            or self.recovery_authorization_sha256 != canonical_sha256(authorization)
+            or self.recovery_authorization_sha256
+            != _validated_contract_sha256(authorization)
             or self.verified_apply_receipt != authorization.verified_apply_receipt
             or self.source_receipt_sha256 != authorization.source_receipt_sha256
             or self.source_receipt_storage_revision != authorization.source_receipt_storage_revision
@@ -1425,6 +1445,14 @@ class RecoveryReceiptLocatorV1(StrictContractModel):
         return self
 
 
+def _validated_recovery_trigger_proof_sha256(source: RecoverySourceV1) -> str:
+    """Hash a recovery source already revalidated by its containing contract."""
+
+    return hashlib.sha256(
+        _TRIGGER_DIGEST_DOMAIN + _validated_contract_json_bytes(source)
+    ).hexdigest()
+
+
 def recovery_trigger_proof_sha256(source: RecoverySourceV1) -> str:
     """Hash one mode-separated recovery source under a fixed domain."""
 
@@ -1435,6 +1463,14 @@ def recovery_trigger_proof_sha256(source: RecoverySourceV1) -> str:
     ):
         raise TypeError("recovery trigger hashing requires an exact recovery source")
     return hashlib.sha256(_TRIGGER_DIGEST_DOMAIN + canonical_json_bytes(source)).hexdigest()
+
+
+def _validated_recovery_command_sha256(command: RecoveryCommandV2) -> str:
+    """Hash a recovery command already revalidated by its containing contract."""
+
+    return hashlib.sha256(
+        _COMMAND_DIGEST_DOMAIN + _validated_contract_json_bytes(command)
+    ).hexdigest()
 
 
 def recovery_command_sha256(command: RecoveryCommandV2) -> str:
@@ -1495,6 +1531,29 @@ def recovery_prestate_signing_request_id(
     )
 
 
+def _validated_recovery_prestate_signing_input_sha256(
+    result: RecoveryPrestateResultV1,
+    signing_key_version: str,
+) -> str:
+    """Hash a prestate result already revalidated by its containing contract."""
+
+    if type(signing_key_version) is not str or _EVIDENCE_KEY.fullmatch(signing_key_version) is None:
+        raise ValueError("recovery prestate signing key is invalid")
+    header: RestrictedJson = {
+        "algorithm": P256_SIGNING_ALGORITHM,
+        "key_version": signing_key_version,
+        "payload_version": result.schema_version,
+        "purpose": RECOVERY_PRESTATE_ATTESTATION_PURPOSE,
+        "schema_version": "controlgraph.recovery-prestate-signature-input/v1",
+    }
+    return hashlib.sha256(
+        _PRESTATE_SIGNING_INPUT_DOMAIN
+        + canonical_json_value_bytes(header)
+        + b"\0"
+        + _validated_contract_json_bytes(result)
+    ).hexdigest()
+
+
 def recovery_prestate_signing_input_sha256(
     result: RecoveryPrestateResultV1,
     signing_key_version: str,
@@ -1533,6 +1592,17 @@ def recovery_capability_id(authorization: RecoveryAuthorizationV1) -> str:
         _CAPABILITY_ID_DOMAIN + canonical_json_value_bytes(projection)
     ).hexdigest()
     return f"cgcap-{digest}"
+
+
+def _validated_recovery_capability_issuance_command_sha256(
+    command: RecoveryCapabilityIssuanceCommandV2,
+) -> str:
+    """Hash an issuance command already revalidated by its containing contract."""
+
+    return hashlib.sha256(
+        _ISSUANCE_COMMAND_DIGEST_DOMAIN
+        + _validated_contract_json_bytes(command)
+    ).hexdigest()
 
 
 def recovery_capability_issuance_command_sha256(
