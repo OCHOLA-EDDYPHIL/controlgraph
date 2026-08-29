@@ -74,9 +74,12 @@ from controlgraph_canary.contracts.root_creation import RolloutRootV2, RolloutRo
 from controlgraph_canary.contracts.storage import execution_receipt_logical_id
 
 RECEIPT_ORPHAN_GRACE_SECONDS: Final = 60
-# A new claim needs the orphan grace plus the queue's 30-second maximum
+# A new claim needs the orphan grace plus the queue's 10-second maximum
 # backoff so a later delivery can reach readback before task expiry.
-RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS: Final = 90
+RECEIPT_QUEUE_MAX_BACKOFF_SECONDS: Final = 10
+RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS: Final = (
+    RECEIPT_ORPHAN_GRACE_SECONDS + RECEIPT_QUEUE_MAX_BACKOFF_SECONDS
+)
 
 
 class ReceiptMutationStatus(StrEnum):
@@ -1183,6 +1186,7 @@ def _now_utc_second() -> datetime:
 __all__ = [
     "RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS",
     "RECEIPT_ORPHAN_GRACE_SECONDS",
+    "RECEIPT_QUEUE_MAX_BACKOFF_SECONDS",
     "OneShotRecoveryExecutorClient",
     "ReceiptClassifyingMutationAdapter",
     "ReceiptExecutionCoordinator",

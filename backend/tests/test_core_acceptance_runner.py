@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2406,6 +2407,8 @@ def test_hosted_health_append_disposition_validation(
 def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
     from controlgraph_canary.application.receipt_execution import (
         RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS,
+        RECEIPT_ORPHAN_GRACE_SECONDS,
+        RECEIPT_QUEUE_MAX_BACKOFF_SECONDS,
     )
     from controlgraph_canary.contracts.health import create_rollout_health_policy_v2
 
@@ -2425,7 +2428,30 @@ def test_hosted_health_load_retries_at_the_declared_boundary() -> None:
         "while datetime.now(UTC) < next_evaluation:"
     )
     assert proof_margin_seconds == 115
-    assert proof_margin_seconds > RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS
+    assert proof_margin_seconds - RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS >= 45
+
+    tasks_source = (SOURCE_ROOT / "infra" / "runtime" / "tasks.tf").read_text()
+    attempts = [
+        int(value)
+        for value in re.findall(r"max_attempts\s*=\s*(\d+)", tasks_source)
+    ]
+    minimum_backoffs = [
+        int(value)
+        for value in re.findall(r'min_backoff\s*=\s*"(\d+)s"', tasks_source)
+    ]
+    maximum_backoffs = [
+        int(value)
+        for value in re.findall(r'max_backoff\s*=\s*"(\d+)s"', tasks_source)
+    ]
+    assert attempts == [8, 8]
+    assert minimum_backoffs == [5, 5]
+    assert maximum_backoffs == [RECEIPT_QUEUE_MAX_BACKOFF_SECONDS] * 2
+    assert RECEIPT_NEW_CLAIM_RECOVERY_WINDOW_SECONDS == (
+        RECEIPT_ORPHAN_GRACE_SECONDS + RECEIPT_QUEUE_MAX_BACKOFF_SECONDS
+    )
+    assert minimum_backoffs[0] + (attempts[0] - 2) * maximum_backoffs[0] >= (
+        RECEIPT_ORPHAN_GRACE_SECONDS
+    )
 
 
 def test_hosted_health_load_preserves_cold_start_token_margin() -> None:

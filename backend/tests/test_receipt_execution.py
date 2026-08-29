@@ -1346,7 +1346,7 @@ def test_delayed_first_delivery_refuses_a_claim_without_recovery_time() -> None:
             _Reader(_snapshot(), events),
             adapter,
             readback,
-            _Clock(datetime(2026, 8, 19, 12, 3, 30, tzinfo=UTC)),
+            _Clock(datetime(2026, 8, 19, 12, 3, 50, tzinfo=UTC)),
         )
 
         result = await coordinator.execute(_verified())
