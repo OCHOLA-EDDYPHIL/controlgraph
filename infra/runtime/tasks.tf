@@ -9,10 +9,12 @@ resource "google_cloud_tasks_queue" "execution" {
   }
 
   retry_config {
-    max_attempts       = 6
+    # Eight bounded deliveries span the executor's 60-second orphan grace while
+    # preserving a 45-second acceptance reserve before permit expiry.
+    max_attempts       = 8
     max_retry_duration = "900s"
     min_backoff        = "5s"
-    max_backoff        = "30s"
+    max_backoff        = "10s"
     max_doublings      = 3
   }
 
@@ -71,10 +73,11 @@ resource "google_cloud_tasks_queue" "recovery" {
   }
 
   retry_config {
-    max_attempts       = 6
+    # Keep recovery delivery geometry identical to execution delivery geometry.
+    max_attempts       = 8
     max_retry_duration = "900s"
     min_backoff        = "5s"
-    max_backoff        = "30s"
+    max_backoff        = "10s"
     max_doublings      = 3
   }
 

@@ -32,7 +32,8 @@ output "task_queues" {
       caller                = local.service_accounts.execution_task_caller
       max_dispatches_second = 1
       max_concurrency       = 1
-      max_attempts          = 6
+      max_attempts          = 8
+      max_backoff           = "10s"
       max_retry_duration    = "900s"
     }
     recovery = {
@@ -42,7 +43,8 @@ output "task_queues" {
       caller                = local.service_accounts.recovery_task_caller
       max_dispatches_second = 1
       max_concurrency       = 1
-      max_attempts          = 6
+      max_attempts          = 8
+      max_backoff           = "10s"
       max_retry_duration    = "900s"
     }
   }
