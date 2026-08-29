@@ -38,6 +38,7 @@ jobs:
           ../scripts/fault_acceptance.py
           ../scripts/frozen_bundle.py
           ../scripts/measurement_summary.py
+          ../scripts/public_replay.py
           ../scripts/release_evidence.py
           ../scripts/security_abuse.py
       - name: Type check
@@ -47,6 +48,7 @@ jobs:
           ../scripts/fault_acceptance.py
           ../scripts/frozen_bundle.py
           ../scripts/measurement_summary.py
+          ../scripts/public_replay.py
           ../scripts/release_evidence.py
           ../scripts/security_abuse.py
       - name: Test

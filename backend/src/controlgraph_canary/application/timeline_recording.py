@@ -331,17 +331,26 @@ class TimelineRecorder:
         receipt: ExecutionReceipt,
         signed_authority: SignedEvidenceEventV1 | None,
         classification: CompletionClassificationV1,
+        *verified: VerifiedIndependentVerificationEvidenceV1,
     ) -> None:
-        if signed_authority is not None:
-            await self.record(
+        authority = (
+            (
                 project_signed_evidence_event(
                     signed_authority,
                     policy_set=self._policy_set,
                     signature_verified=True,
-                )
+                ),
             )
+            if signed_authority is not None
+            else ()
+        )
         await self.record(
+            *authority,
             project_execution_receipt(receipt, policy_set=self._policy_set),
+            *(
+                project_independent_verification(item, policy_set=self._policy_set)
+                for item in verified
+            ),
             project_completion_classification(
                 classification,
                 policy_set=self._policy_set,

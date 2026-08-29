@@ -3,7 +3,7 @@ FROM node:22-bookworm@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d43
 WORKDIR /web
 COPY package.json package-lock.json ./
 RUN npm ci
-COPY index.html tsconfig.json tsconfig.build.json tsconfig.node.json vite.config.ts ./
+COPY index.html replay.html tsconfig.json tsconfig.build.json tsconfig.node.json vite.config.ts ./
 COPY src ./src
 RUN npm run build:image
 

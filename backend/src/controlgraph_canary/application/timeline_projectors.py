@@ -125,7 +125,11 @@ _EVENT_CLASS: dict[TimelineEventType, TimelineEvidenceClass] = {
 }
 
 
-def _actor_id(value: str) -> str:
+def timeline_actor_id(value: str) -> str:
+    """Return the stable pseudonymous actor identifier used by timeline events."""
+
+    if type(value) is not str or not value:
+        raise TypeError("timeline actor source must be nonempty text")
     return f"actor:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
@@ -255,7 +259,7 @@ def _projection(
         evidence_class=evidence_class,
         target=target,
         actor_role=actor_role,
-        actor_id=actor_id or _actor_id(actor),
+        actor_id=actor_id or timeline_actor_id(actor),
         actor_data_class=TimelineAudience.SECURITY_AUDIT,
         root_id=root_id,
         root_sha256=root_sha256,
@@ -886,6 +890,49 @@ def project_independent_verification(
     signed = verified.signed_evidence
     evidence = signed.evidence
     source_sha256 = canonical_sha256(verified)
+    fields = [
+        (
+            TimelineDisplayFieldName.ACTION,
+            evidence.action.value,
+            TimelineAudience.OPERATOR,
+        ),
+        (
+            TimelineDisplayFieldName.OBSERVATION,
+            evidence.kind.value,
+            TimelineAudience.PUBLIC_DEMO,
+        ),
+        (
+            TimelineDisplayFieldName.OUTCOME,
+            evidence.verdict.value,
+            TimelineAudience.PUBLIC_DEMO,
+        ),
+        (
+            TimelineDisplayFieldName.REASON_CODE,
+            evidence.reason_code,
+            TimelineAudience.OPERATOR,
+        ),
+        (
+            TimelineDisplayFieldName.SUMMARY,
+            "Independent verification recorded",
+            TimelineAudience.PUBLIC_DEMO,
+        ),
+    ]
+    configuration = verified.signing_request.configuration
+    if configuration is not None and configuration.observation is not None:
+        facts = configuration.observation.facts
+        traffic = {item.revision: item.percent for item in facts.traffic_statuses}
+        fields.append(
+            (
+                TimelineDisplayFieldName.STATE,
+                (
+                    f"stable_percent={traffic.get(facts.stable_revision, 0)};"
+                    f"candidate_percent={traffic.get(facts.candidate_revision, 0)};"
+                    "target_configuration_sha256="
+                    f"{facts.target_configuration_sha256}"
+                ),
+                TimelineAudience.OPERATOR,
+            )
+        )
     return _projection(
         source=verified,
         source_id=f"verification:{source_sha256}",
@@ -920,30 +967,7 @@ def project_independent_verification(
         signature=_signature_metadata(signed),
         verification_status=TimelineVerificationStatus.VERIFIED,
         terminal_classification=TimelineTerminalClassification.NONE,
-        display_fields=_display(
-            (
-                (
-                    TimelineDisplayFieldName.OBSERVATION,
-                    evidence.kind.value,
-                    TimelineAudience.PUBLIC_DEMO,
-                ),
-                (
-                    TimelineDisplayFieldName.OUTCOME,
-                    evidence.verdict.value,
-                    TimelineAudience.PUBLIC_DEMO,
-                ),
-                (
-                    TimelineDisplayFieldName.REASON_CODE,
-                    evidence.reason_code,
-                    TimelineAudience.OPERATOR,
-                ),
-                (
-                    TimelineDisplayFieldName.SUMMARY,
-                    "Independent verification recorded",
-                    TimelineAudience.PUBLIC_DEMO,
-                ),
-            )
-        ),
+        display_fields=_display(tuple(fields)),
         policy_set=policy_set,
     )
 
@@ -1474,4 +1498,5 @@ __all__ = [
     "project_signed_evidence_event",
     "project_signed_health_proof",
     "project_task_request",
+    "timeline_actor_id",
 ]

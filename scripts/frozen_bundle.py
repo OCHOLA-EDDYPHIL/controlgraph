@@ -87,6 +87,8 @@ CORE_REQUIRED_EVIDENCE: Final = {
             "EXECUTOR_EPOCH_CHECK",
             "STALE_DENIAL",
             "EXECUTION_RECEIPT",
+            "COORDINATOR",
+            "MODEL_AUDIT",
             "TIMELINE",
         }
     ),
@@ -110,7 +112,13 @@ CORE_REQUIRED_EVIDENCE: Final = {
         {"CLOUD_RUN_CONFIGURATION", "TIMELINE", "CONSOLE_READ"}
     ),
     "BOUNDED_ADVISOR": frozenset(
-        {"CLOUD_RUN_CONFIGURATION", "COORDINATOR", "MODEL_AUDIT", "TIMELINE"}
+        {
+            "CLOUD_RUN_CONFIGURATION",
+            "COORDINATOR",
+            "MODEL_AUDIT",
+            "PUBLIC_REPLAY_SEED",
+            "TIMELINE",
+        }
     ),
 }
 MAX_CORE_CASE_DURATION_MS: Final = 60 * 60 * 1_000

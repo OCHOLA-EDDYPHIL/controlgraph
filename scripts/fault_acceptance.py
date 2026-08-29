@@ -1433,6 +1433,7 @@ def _execute_delayed_task(
     )
     core._require_split(before, state.run.spec, stable=90, candidate=10)
     held = False
+    revocation: Any | None = None
     proof: EpochRevocationProofV1 | None = None
     try:
         queue_held = core._queue_control(state.run, "hold")
@@ -1444,7 +1445,7 @@ def _execute_delayed_task(
             apply_receipt=apply_receipt,
             terminal=health,
         )
-        _revocation, proof = core._revoke(state.run, case, root_result.root)
+        revocation = core._revoke(state.run, case, root_result.root)
         queue_released = core._queue_control(state.run, "release")
         held = False
         stale = core._poll_receipt(
@@ -1458,6 +1459,7 @@ def _execute_delayed_task(
             capability_sha256=promotion.capability_sha256,
             label="delayed-stale-promotion",
         )
+        proof = core._revocation_proof(state.run, revocation)
         denied = cast(
             TargetTrafficReadResultV1,
             core._read_traffic(state.run, case, "delayed-denied"),
@@ -1472,7 +1474,7 @@ def _execute_delayed_task(
         )
     finally:
         if held:
-            if proof is None:
+            if revocation is None:
                 state.cleanup_required.add("execution-queue")
             else:
                 try:
@@ -1607,7 +1609,8 @@ def _execute_monitoring_gap(
         core._read_traffic(state.run, case, "monitoring-gap-after"),
     )
     core._require_split(after, state.run.spec, stable=90, candidate=10)
-    _revocation, proof = core._revoke(state.run, case, root_result.root)
+    revocation = core._revoke(state.run, case, root_result.root)
+    proof = core._revocation_proof(state.run, revocation)
     _recover_and_release(
         state,
         case,
@@ -1856,7 +1859,8 @@ def _execute_configuration_drift(
             raise
     if not restored:
         raise FaultAcceptanceError("FAULT_CONFIGURATION_RESTORE_FAILED")
-    _revocation, proof = core._revoke(state.run, case, root_result.root)
+    revocation = core._revoke(state.run, case, root_result.root)
+    proof = core._revocation_proof(state.run, revocation)
     _recover_and_release(
         state,
         case,
@@ -1924,7 +1928,8 @@ def _execute_probe_failure(
     )
     if _state(before) != _state(after):
         raise FaultAcceptanceError("FAULT_PROBE_FAILURE_NOT_PROVEN")
-    _revocation, proof = core._revoke(state.run, case, root_result.root)
+    revocation = core._revoke(state.run, case, root_result.root)
+    proof = core._revocation_proof(state.run, revocation)
     _recover_and_release(
         state,
         case,
@@ -1985,7 +1990,7 @@ def _execute_revocation_race(
             race_barrier: threading.Barrier = barrier,
             race_case: core.CaseBindingV1 = case,
             race_root: Any = root_result.root,
-        ) -> tuple[Any, EpochRevocationProofV1]:
+        ) -> Any:
             race_barrier.wait(timeout=5)
             return core._revoke(state.run, race_case, race_root)
 
@@ -1994,7 +1999,7 @@ def _execute_revocation_race(
                 release_future = executor.submit(release_queue)
                 revoke_future = executor.submit(revoke_epoch)
                 queue_released = release_future.result(timeout=90)
-                _revocation, proof = revoke_future.result(timeout=90)
+                revocation = revoke_future.result(timeout=90)
             state.cleanup_required.discard("execution-queue")
         except Exception as error:
             state.cleanup_required.add("execution-queue")
@@ -2011,6 +2016,7 @@ def _execute_revocation_race(
             capability_sha256=promotion.capability_sha256,
             label=f"race-{attempt}-promotion",
         )
+        proof = core._revocation_proof(state.run, revocation)
         denied = cast(
             TargetTrafficReadResultV1,
             core._read_traffic(state.run, case, f"race-{attempt}-terminal"),

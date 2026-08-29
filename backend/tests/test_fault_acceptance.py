@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -470,6 +471,96 @@ def test_fault_promotion_uses_five_second_schedule_lead(monkeypatch: Any) -> Non
     )
 
     assert command.scheduled_at == "2026-08-27T12:00:05Z"
+
+
+def test_fault_revocation_paths_fetch_proofs_from_revocation_outcomes() -> None:
+    for execute in (
+        FAULTS._execute_monitoring_gap,
+        FAULTS._execute_configuration_drift,
+        FAULTS._execute_probe_failure,
+    ):
+        source = inspect.getsource(execute)
+        revoke = source.index("revocation = core._revoke(")
+        proof = source.index("proof = core._revocation_proof(")
+        recovery = source.index("_recover_and_release(")
+
+        assert revoke < proof < recovery
+
+
+def test_stale_faults_fetch_proofs_after_polling_receipts() -> None:
+    delayed = inspect.getsource(FAULTS._execute_delayed_task)
+    delayed_revoke = delayed.index("revocation = core._revoke(")
+    delayed_release = delayed.index('core._queue_control(state.run, "release")')
+    delayed_receipt = delayed.index("stale = core._poll_receipt(")
+    delayed_proof = delayed.index("proof = core._revocation_proof(")
+
+    assert delayed_revoke < delayed_release < delayed_receipt < delayed_proof
+
+    race = inspect.getsource(FAULTS._execute_revocation_race)
+    race_revoke = race.index("revocation = revoke_future.result(")
+    race_receipt = race.index("stale = core._poll_receipt(")
+    race_proof = race.index("proof = core._revocation_proof(")
+
+    assert race_revoke < race_receipt < race_proof
+
+
+def test_delayed_fault_retries_queue_release_after_confirmed_revocation(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    state = FAULTS._ExecutionState(
+        run=SimpleNamespace(spec=object()),
+        evidence_root=tmp_path,
+        cleanup_required=set(),
+    )
+    root = SimpleNamespace(root_id="cgroot:delayed")
+    queue_actions: list[str] = []
+
+    monkeypatch.setattr(FAULTS, "_fault_case", lambda *_args: object())
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_create_root",
+        lambda *_args: SimpleNamespace(root=root),
+    )
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_health_load",
+        lambda *_args, **_kwargs: (object(), object(), object(), object()),
+    )
+    monkeypatch.setattr(FAULTS.core, "_read_traffic", lambda *_args: object())
+    monkeypatch.setattr(FAULTS.core, "_require_split", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_promote",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(capability_sha256="a" * 64),
+            SimpleNamespace(request_id="request", idempotency_key="idempotency"),
+        ),
+    )
+    revocation = object()
+    monkeypatch.setattr(FAULTS.core, "_revoke", lambda *_args: revocation)
+    monkeypatch.setattr(
+        FAULTS.core,
+        "_revocation_proof",
+        lambda *_args: pytest.fail("proof fetch must follow a successful queue release"),
+    )
+
+    def queue_control(_run: Any, action: str) -> dict[str, str]:
+        queue_actions.append(action)
+        if queue_actions == ["hold", "release"]:
+            raise FAULTS.core.AcceptanceError("ACCEPTANCE_HOSTED_QUEUE_INVALID")
+        return {"action": action}
+
+    monkeypatch.setattr(FAULTS.core, "_queue_control", queue_control)
+
+    with pytest.raises(
+        FAULTS.core.AcceptanceError,
+        match="ACCEPTANCE_HOSTED_QUEUE_INVALID",
+    ):
+        FAULTS._execute_delayed_task(state, object(), 1)
+
+    assert queue_actions == ["hold", "release", "release"]
+    assert state.cleanup_required == set()
 
 
 def test_stale_cases_require_real_denial_and_safe_queue_release() -> None:

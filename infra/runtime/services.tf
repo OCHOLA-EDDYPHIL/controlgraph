@@ -172,7 +172,7 @@ module "advisor" {
     CONTROLGRAPH_ADVISOR_MODEL             = "gemini-3.5-flash"
     CONTROLGRAPH_ADVISOR_MODEL_LOCATION    = "global"
     CONTROLGRAPH_ADVISOR_API_VERSION       = "v1"
-    CONTROLGRAPH_ADVISOR_PROMPT_VERSION    = "controlgraph.rollout-advisor-prompt/v1"
+    CONTROLGRAPH_ADVISOR_PROMPT_VERSION    = "controlgraph.rollout-advisor-prompt/v2"
     CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS   = "20"
     CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS     = "4"
     CONTROLGRAPH_ADVISOR_MAX_OUTPUT_TOKENS = "2048"
@@ -290,9 +290,12 @@ module "console" {
   subnetwork  = data.terraform_remote_state.foundation.outputs.network.subnetwork_id
   vpc_egress  = "PRIVATE_RANGES_ONLY"
   labels      = merge(local.common_labels, { component = "console" })
-  environment = {
+  environment = merge({
     CONTROLGRAPH_CONSOLE_ORIGIN                 = local.console_origin
     CONTROLGRAPH_OPERATOR_API_ORIGIN            = local.service_audiences.api
     CONTROLGRAPH_OPERATOR_OAUTH_CLIENT_AUDIENCE = var.operator_oauth_client_audience
-  }
+    }, var.public_replay_sha256 == "" ? {} : {
+    CONTROLGRAPH_PUBLIC_REPLAY_GZIP_BASE64 = var.public_replay_gzip_base64
+    CONTROLGRAPH_PUBLIC_REPLAY_SHA256      = var.public_replay_sha256
+  })
 }

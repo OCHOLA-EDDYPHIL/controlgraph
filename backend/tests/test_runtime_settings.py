@@ -85,7 +85,7 @@ def _advisor_environment() -> dict[str, str]:
             "CONTROLGRAPH_ADVISOR_MODEL_LOCATION": "global",
             "CONTROLGRAPH_ADVISOR_API_VERSION": "v1",
             "CONTROLGRAPH_ADVISOR_PROMPT_VERSION": (
-                "controlgraph.rollout-advisor-prompt/v1"
+                "controlgraph.rollout-advisor-prompt/v2"
             ),
             "CONTROLGRAPH_ADVISOR_TIMEOUT_SECONDS": "20",
             "CONTROLGRAPH_ADVISOR_MAX_LLM_CALLS": "4",
