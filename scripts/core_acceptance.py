@@ -2685,7 +2685,6 @@ def _recover_revoked(
     revocation_proof: Any,
 ) -> tuple[Any, Any]:
     from controlgraph_canary.contracts.recovery_execution import (
-        RecoveryDispatchResultV2,
         create_recovery_apply_receipt_locator,
         create_revoked_v3_recovery_command,
     )
@@ -2701,24 +2700,12 @@ def _recover_revoked(
         verified_apply_receipt=apply_locator,
         request_id=_stable_id(run.run_inputs_sha256, case, "recovery-request"),
         idempotency_key=_stable_id(run.run_inputs_sha256, case, "recovery-idempotency"),
-        scheduled_at=_utc(datetime.now(UTC) + timedelta(seconds=10)),
+        scheduled_at=_utc(datetime.now(UTC) + timedelta(seconds=120)),
         confirmation="RECOVER_CAPTURED_STABLE",
     )
     path = run.command_path(case, "revoked-recovery")
     _write_command(path, command)
-    _, _, dispatch = _run_cli(
-        repo=run.repo,
-        entry_point="controlgraph-canary",
-        arguments=(
-            "recover-captured-stable",
-            "--project-number",
-            run.project_number,
-            "--command-file",
-            str(path),
-        ),
-        model_type=RecoveryDispatchResultV2,
-    )
-    assert dispatch is not None
+    dispatch = _submit_recovery(run, path)
     if (
         dispatch.root_id != root.root_id
         or dispatch.epoch != 2
@@ -2740,6 +2727,37 @@ def _recover_revoked(
     if receipt.receipt.outcome.value != "VERIFIED":
         raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
     return dispatch, receipt
+
+
+def _submit_recovery(run: _HostedExecution, command_path: Path) -> Any:
+    from controlgraph_canary.contracts.recovery_execution import (
+        RecoveryDispatchResultV2,
+    )
+
+    for attempt in range(3):
+        status, payload, result = _run_cli(
+            repo=run.repo,
+            entry_point="controlgraph-canary",
+            arguments=(
+                "recover-captured-stable",
+                "--project-number",
+                run.project_number,
+                "--command-file",
+                str(command_path),
+            ),
+            model_type=RecoveryDispatchResultV2,
+            allowed_statuses=frozenset({0, 4}),
+        )
+        if status == 0 and result is not None:
+            return result
+        if payload != {"code": "RECOVERY_OUTCOME_UNKNOWN"}:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_INVALID")
+        if attempt < 2:
+            # The operator edge returns before the coordinator's bounded request
+            # deadline. Give that exact command time to become adoptable before
+            # replaying it, avoiding concurrent capability issuance.
+            time.sleep(20)
+    raise AcceptanceError("ACCEPTANCE_HOSTED_RECOVERY_AMBIGUOUS")
 
 
 def _advisor_command(run: _HostedExecution, case: CaseBindingV1, root: Any, epoch: int) -> Any:

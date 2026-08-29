@@ -60,18 +60,19 @@ CLOUD_RUN_REFERENCE_SERVICE: Final = "controlgraph-reference-target"
 CLOUD_RUN_RPC_TIMEOUT_SECONDS: Final = 5.0
 _CLOUD_RUN_MUTATION_RPC_TIMEOUT_SECONDS: Final = 15.0
 CLOUD_RUN_OPERATION_TIMEOUT_SECONDS: Final = 30.0
-_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS: Final = 4
+_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS: Final = 9
 _CLOUD_RUN_READBACK_SETTLE_DELAY_SECONDS: Final = 1.0
+_CLOUD_RUN_READBACK_SETTLE_TIMEOUT_SECONDS: Final = 10.0
 
 _CONTROLGRAPH_PROJECT_ID: Final = re.compile(r"^controlgraph-canary-[a-z0-9]{6,10}$")
 _REVISION_ALLOCATION: Final = (
     run_v2.TrafficTargetAllocationType.TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION
 )
 _PREVIOUS_REFERENCE_TARGET_STABLE_REVISION: Final = (
-    "controlgraph-reference-target-stable-v18"
+    "controlgraph-reference-target-stable-v19"
 )
 _PREVIOUS_REFERENCE_TARGET_CANDIDATE_REVISION: Final = (
-    "controlgraph-reference-target-candidate-v18"
+    "controlgraph-reference-target-candidate-v19"
 )
 _KNOWN_PRECONDITION_FAILURES: Final = (
     api_exceptions.Aborted,
@@ -1370,7 +1371,7 @@ class CloudRunV2ReceiptReadback:
         observed_etag: str | None = None
         try:
             client = await self._services_client()
-            async with asyncio.timeout(CLOUD_RUN_RPC_TIMEOUT_SECONDS):
+            async with asyncio.timeout(_CLOUD_RUN_READBACK_SETTLE_TIMEOUT_SECONDS):
                 for attempt in range(_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS):
                     provider_service = await client.get_service(
                         request,
