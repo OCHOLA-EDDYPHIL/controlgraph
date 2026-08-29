@@ -52,7 +52,8 @@ from controlgraph_canary.contracts.timeline import (
 )
 
 _TIMELINE_PAGE_SIZE = 100
-_MAX_TIMELINE_ENTRIES = 1_000
+_MAX_TIMELINE_SCAN_ENTRIES = 10_000
+_MAX_ROOT_TIMELINE_ENTRIES = 1_000
 _SNAPSHOT_LIFETIME_SECONDS = 240
 _TARGET_STATE = re.compile(
     r"^stable_percent=(?P<stable>[0-9]{1,3});"
@@ -128,13 +129,10 @@ class M6DiagnosticSnapshotAssembler:
         timeline_head, timeline_entries = await _read_timeline(
             target=self._target,
             timeline=self._timeline,
+            root_id=root.root_id,
+            root_sha256=root.root_sha256,
         )
-        entries = tuple(
-            entry
-            for entry in timeline_entries
-            if entry.content.event.root_id == root.root_id
-            and entry.content.event.root_sha256 == root.root_sha256
-        )
+        entries = timeline_entries
         if not entries or any(
             entry.content.event.epoch > authority.current_epoch for entry in entries
         ):
@@ -364,6 +362,8 @@ async def _read_timeline(
     *,
     target: TargetBinding,
     timeline: M6TimelineReader,
+    root_id: str,
+    root_sha256: str,
 ) -> tuple[TimelineHeadV1, tuple[TimelineEntryV1, ...]]:
     entries: list[TimelineEntryV1] = []
     after_sequence = 0
@@ -388,14 +388,21 @@ async def _read_timeline(
         if expected_head is None:
             captured_head = page.head
             expected_head = observed_head
-            if page.head.sequence > _MAX_TIMELINE_ENTRIES:
+            if page.head.sequence > _MAX_TIMELINE_SCAN_ENTRIES:
                 raise ValueError("advisor timeline evidence is unavailable")
         elif observed_head != expected_head:
             raise ValueError("advisor timeline evidence is unavailable")
         if not page.entries:
             raise ValueError("advisor timeline evidence is unavailable")
 
-        entries.extend(page.entries)
+        entries.extend(
+            entry
+            for entry in page.entries
+            if entry.content.event.root_id == root_id
+            and entry.content.event.root_sha256 == root_sha256
+        )
+        if len(entries) > _MAX_ROOT_TIMELINE_ENTRIES:
+            raise ValueError("advisor timeline evidence is unavailable")
         final_entry = page.entries[-1]
         if final_entry.content.sequence <= after_sequence:
             raise ValueError("advisor timeline evidence is unavailable")
