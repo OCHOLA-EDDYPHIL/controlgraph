@@ -125,7 +125,15 @@ def test_timeline_read_paginates_with_exact_cursor_beyond_one_page() -> None:
     expected_head = _head(entries)
     timeline = _Timeline(expected_head, entries)
 
-    head, observed = asyncio.run(_read_timeline(target=target, timeline=timeline))
+    event = entries[0].content.event
+    head, observed = asyncio.run(
+        _read_timeline(
+            target=target,
+            timeline=timeline,
+            root_id=event.root_id,
+            root_sha256=event.root_sha256,
+        )
+    )
 
     assert head == expected_head
     assert observed == entries
@@ -144,23 +152,99 @@ def test_timeline_read_rejects_head_drift_between_pages() -> None:
         entries,
         later_heads=(_head(entries),),
     )
+    event = entries[0].content.event
 
     with pytest.raises(ValueError, match="timeline evidence is unavailable"):
-        asyncio.run(_read_timeline(target=target, timeline=timeline))
+        asyncio.run(
+            _read_timeline(
+                target=target,
+                timeline=timeline,
+                root_id=event.root_id,
+                root_sha256=event.root_sha256,
+            )
+        )
 
     assert len(timeline.commands) == 2
 
 
-def test_timeline_read_rejects_a_head_beyond_the_total_entry_cap() -> None:
+def test_timeline_read_retains_only_the_requested_root_beyond_legacy_cap() -> None:
+    target = make_root_v3_records().root.content.target
+    requested_root_id = f"cgroot:{'e' * 64}"
+    requested_root_sha256 = "e" * 64
+    entries: list[TimelineEntryV1] = []
+    predecessor = None
+    for sequence in range(1, 1_227):
+        event = timeline_event(sequence, target=target)
+        if sequence > 1_202:
+            event = event.model_copy(
+                update={
+                    "root_id": requested_root_id,
+                    "root_sha256": requested_root_sha256,
+                }
+            )
+        entry = timeline_entry(
+            event,
+            sequence=sequence,
+            previous_entry_sha256=predecessor,
+            recorded_at=event.occurred_at,
+        )
+        entries.append(entry)
+        predecessor = entry.entry_sha256
+    all_entries = tuple(entries)
+    expected = all_entries[-24:]
+    timeline = _Timeline(_head(all_entries), all_entries)
+
+    head, observed = asyncio.run(
+        _read_timeline(
+            target=target,
+            timeline=timeline,
+            root_id=requested_root_id,
+            root_sha256=requested_root_sha256,
+        )
+    )
+
+    assert head == _head(all_entries)
+    assert observed == expected
+    assert len(timeline.commands) == 13
+
+
+def test_timeline_read_rejects_requested_root_beyond_its_entry_cap() -> None:
+    target = make_root_v3_records().root.content.target
+    entries = _synthetic_entries(target, 1_001)
+    event = entries[0].content.event
+    timeline = _Timeline(_head(entries), entries)
+
+    with pytest.raises(ValueError, match="timeline evidence is unavailable"):
+        asyncio.run(
+            _read_timeline(
+                target=target,
+                timeline=timeline,
+                root_id=event.root_id,
+                root_sha256=event.root_sha256,
+            )
+        )
+
+    assert len(timeline.commands) == 11
+
+
+def test_timeline_read_rejects_a_head_beyond_the_global_scan_cap() -> None:
     target = make_root_v3_records().root.content.target
     entries = _synthetic_entries(target, 100)
+    event = entries[0].content.event
     timeline = _Timeline(
-        _head(entries, sequence=1_001, entry_sha256="f" * 64),
+        _head(entries, sequence=10_001, entry_sha256="f" * 64),
         entries,
     )
 
     with pytest.raises(ValueError, match="timeline evidence is unavailable"):
-        asyncio.run(_read_timeline(target=target, timeline=timeline))
+        asyncio.run(
+            _read_timeline(
+                target=target,
+                timeline=timeline,
+                root_id=event.root_id,
+                root_sha256=event.root_sha256,
+            )
+        )
 
     assert len(timeline.commands) == 1
 
