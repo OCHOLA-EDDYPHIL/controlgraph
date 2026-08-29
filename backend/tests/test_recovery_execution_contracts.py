@@ -14,6 +14,7 @@ from recovery_v2_test_data import (
 )
 from root_v2_test_data import make_root_v3_records
 
+import controlgraph_canary.contracts.recovery_execution as recovery_contracts
 from controlgraph_canary.contracts.base import MAX_CONTRACT_BYTES, StrictContractModel
 from controlgraph_canary.contracts.codec import (
     canonical_json_bytes,
@@ -244,6 +245,32 @@ def test_complete_recovery_contract_is_canonical_and_stable_only(
         assert len(encoded) <= MAX_CONTRACT_BYTES
         assert decode_contract(encoded, type(model)) == model
     assert len(canonical_json_bytes(first.task)) <= MAX_RECOVERY_TASK_CANONICAL_BYTES
+
+
+def test_revoked_v3_boundary_validation_has_bounded_nested_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = make_revoked_v3_recovery_bundle()
+    payload = canonical_json_bytes(bundle.issuance_result)
+    calls = {"json_bytes": 0, "sha256": 0}
+    original_json_bytes = recovery_contracts.canonical_json_bytes
+    original_sha256 = recovery_contracts.canonical_sha256
+
+    def counted_json_bytes(value: StrictContractModel) -> bytes:
+        calls["json_bytes"] += 1
+        return original_json_bytes(value)
+
+    def counted_sha256(value: StrictContractModel) -> str:
+        calls["sha256"] += 1
+        return original_sha256(value)
+
+    monkeypatch.setattr(recovery_contracts, "canonical_json_bytes", counted_json_bytes)
+    monkeypatch.setattr(recovery_contracts, "canonical_sha256", counted_sha256)
+
+    decoded = decode_contract(payload, RecoveryCapabilityIssuanceResultV2)
+
+    assert decoded == bundle.issuance_result
+    assert calls["json_bytes"] + calls["sha256"] < 100
 
 
 def test_public_command_has_no_mutation_coordinate_or_provider_prestate() -> None:
