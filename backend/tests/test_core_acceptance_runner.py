@@ -1600,7 +1600,12 @@ def test_core_advisor_validation_requires_exact_causal_path_clause(tmp_path: Pat
     assert raised.value.code == "ACCEPTANCE_HOSTED_ADVISOR_INVALID"
 
 
-def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, ...]:
+def _stale_completion_readiness_fixture(
+    *,
+    verification_id: str,
+    probe_outcome: str = "MATCH",
+    probe_reason_code: str | None = None,
+) -> tuple[Any, ...]:
     root_sha256 = "1" * 64
     receipt_sha256 = "2" * 64
     target_sha256 = "3" * 64
@@ -1726,7 +1731,12 @@ def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, .
             fields=(
                 field("ACTION", "APPLY_CANARY_V1"),
                 field("OBSERVATION", "PROBE"),
-                field("OUTCOME", "MATCH"),
+                field("OUTCOME", probe_outcome),
+                *(
+                    ()
+                    if probe_reason_code is None
+                    else (field("REASON_CODE", probe_reason_code),)
+                ),
             ),
             signature_purpose="INDEPENDENT_VERIFICATION",
             verification_status="VERIFIED",
@@ -1753,6 +1763,43 @@ def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, .
         receipt,
         target_sha256,
         (SimpleNamespace(entries=entries),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("probe_outcome", "probe_reason_code", "expected"),
+    (
+        ("MATCH", None, True),
+        ("INCONCLUSIVE", "PROBE_DISTRIBUTION_MISMATCH", True),
+        ("INCONCLUSIVE", None, False),
+        ("INCONCLUSIVE", "PROBE_FAILED", False),
+    ),
+)
+def test_stale_completion_readiness_accepts_only_bounded_probe_inconclusive(
+    tmp_path: Path,
+    probe_outcome: str,
+    probe_reason_code: str | None,
+    expected: bool,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    receipt_sha256 = "2" * 64
+    root, revocation, receipt, target_sha256, pages = (
+        _stale_completion_readiness_fixture(
+            verification_id=f"stale-denial:{receipt_sha256[:32]}",
+            probe_outcome=probe_outcome,
+            probe_reason_code=probe_reason_code,
+        )
+    )
+
+    assert (
+        runner._stale_denial_completion_is_ready(
+            pages,
+            root=root,
+            revocation=revocation,
+            stale_receipt=receipt,
+            target_configuration_sha256=target_sha256,
+        )
+        is expected
     )
 
 

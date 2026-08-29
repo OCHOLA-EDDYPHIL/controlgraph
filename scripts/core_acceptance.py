@@ -2883,6 +2883,12 @@ def _stale_denial_completion_is_ready(
     for entry in entries:
         display = _timeline_display_values(entry)
         observation = display.get("OBSERVATION")
+        observation_outcome = display.get("OUTCOME")
+        observation_is_sufficient = observation_outcome == "MATCH" or (
+            observation == "PROBE"
+            and observation_outcome == "INCONCLUSIVE"
+            and display.get("REASON_CODE") == "PROBE_DISTRIBUTION_MISMATCH"
+        )
         if (
             observation in {"CONFIGURATION", "PROBE"}
             and _timeline_enum_value(entry.event_type) == "VERIFICATION_RECORDED"
@@ -2893,7 +2899,7 @@ def _stale_denial_completion_is_ready(
             and entry.signature.purpose == "INDEPENDENT_VERIFICATION"
             and _timeline_enum_value(entry.verification_status) == "VERIFIED"
             and display.get("ACTION") == "APPLY_CANARY_V1"
-            and display.get("OUTCOME") == "MATCH"
+            and observation_is_sufficient
             and _timeline_has_correlation(entry, "REQUEST", receipt.request_id)
             and _timeline_has_correlation(
                 entry,
