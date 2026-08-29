@@ -3599,13 +3599,40 @@ def _timeline_pages(run: _HostedExecution, token: str) -> tuple[Any, ...]:
     raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_TOO_LARGE")
 
 
-def _raw_timeline(run: _HostedExecution, token: str) -> tuple[Any, ...]:
+def _raw_timeline_boundary(
+    pages: Sequence[Any],
+    root_ids: set[str],
+) -> tuple[int, str | None, tuple[int, str | None]]:
+    if not pages or not root_ids:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    entries = tuple(
+        entry
+        for page in pages
+        for entry in page.entries
+        if entry.root_id in root_ids
+    )
+    if not entries:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    earliest = min(entries, key=lambda entry: entry.sequence)
+    sequence = earliest.sequence - 1
+    cursor = earliest.previous_entry_sha256
+    if sequence < 0 or (sequence == 0) != (cursor is None):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    head = (pages[0].head_sequence, pages[0].head_entry_sha256)
+    if head[0] < earliest.sequence:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    return sequence, cursor, head
+
+
+def _raw_timeline(
+    run: _HostedExecution,
+    token: str,
+    pages: Sequence[Any],
+) -> tuple[Any, ...]:
     from controlgraph_canary.contracts.timeline import TimelineRawExportV1
 
-    sequence = 0
-    cursor: str | None = None
+    sequence, cursor, head = _raw_timeline_boundary(pages, run.root_ids)
     items: list[Any] = []
-    head: tuple[int, str | None] | None = None
     for _page in range(1_000):
         query: list[tuple[str, str]] = [
             ("after_sequence", str(sequence)),
@@ -3625,7 +3652,6 @@ def _raw_timeline(run: _HostedExecution, token: str) -> tuple[Any, ...]:
         except (TypeError, ValueError, ValidationError) as error:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RAW_EXPORT_INVALID") from error
         observed_head = (page.head_sequence, page.head_entry_sha256)
-        head = observed_head if head is None else head
         if observed_head != head:
             raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
         items.extend(page.entries)
@@ -3658,7 +3684,8 @@ def _read_timeline_evidence(
     exporter_token = _identity_token(run, run.restricted_exporter_service_account)
     try:
         pages = _timeline_pages(run, operator_token)
-        raw = _raw_timeline(run, exporter_token)
+        _timeline_page_summary(pages)
+        raw = _raw_timeline(run, exporter_token, pages)
     finally:
         operator_token = ""
         exporter_token = ""
