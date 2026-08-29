@@ -2831,16 +2831,15 @@ def _stale_denial_completion_is_ready(
         if entry.root_id == root.root_id and entry.root_sha256 == root.root_sha256
     )
     expected_verification = f"stale-denial:{stale_receipt.receipt_sha256[:32]}"
-    expected_actor = (
-        f"actor:{hashlib.sha256(revocation_result.operator_identity.encode('utf-8')).hexdigest()}"
-    )
     transitions = tuple(
         entry
         for entry in entries
         if _timeline_enum_value(entry.event_type) == "AUTHORITY_EPOCH_ADVANCED"
         and entry.epoch == revocation_result.new_epoch
         and entry.occurred_at == revocation_result.committed_at
-        and entry.actor_id == expected_actor
+        and _timeline_enum_value(entry.actor_role) == "OPERATOR"
+        and _timeline_enum_value(entry.actor_data_class) == "SECURITY_AUDIT"
+        and entry.actor_id is None
         and entry.signature is not None
         and entry.signature.purpose == "EVIDENCE"
         and _timeline_enum_value(entry.verification_status) == "VERIFIED"

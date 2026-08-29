@@ -1641,7 +1641,9 @@ def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, .
         signature_purpose: str | None,
         verification_status: str,
         terminal_classification: str = "NONE",
-        actor_id: str = "actor:test",
+        actor_id: str | None = None,
+        actor_role: str = "OPERATOR",
+        actor_data_class: str = "SECURITY_AUDIT",
         payload_sha256: str = "4" * 64,
     ) -> Any:
         return SimpleNamespace(
@@ -1652,6 +1654,8 @@ def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, .
             epoch=epoch,
             occurred_at=occurred_at,
             actor_id=actor_id,
+            actor_role=actor_role,
+            actor_data_class=actor_data_class,
             signature=(
                 None if signature_purpose is None else SimpleNamespace(purpose=signature_purpose)
             ),
@@ -1662,9 +1666,6 @@ def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, .
             display_fields=fields,
         )
 
-    actor_id = (
-        "actor:" + hashlib.sha256(revocation.result.operator_identity.encode("utf-8")).hexdigest()
-    )
     common_verification_correlations = (
         correlation("REQUEST", receipt.receipt.request_id),
         correlation("VERIFICATION", verification_id),
@@ -1682,7 +1683,6 @@ def _stale_completion_readiness_fixture(*, verification_id: str) -> tuple[Any, .
             fields=(field("SUMMARY", "Epoch Advanced"),),
             signature_purpose="EVIDENCE",
             verification_status="VERIFIED",
-            actor_id=actor_id,
         ),
         entry(
             2,
