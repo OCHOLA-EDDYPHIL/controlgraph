@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -2189,6 +2190,142 @@ def test_hosted_timeline_evidence_rejects_cursor_gaps() -> None:
             runner._timeline_evidence(pages)
 
         assert raised.value.code == "ACCEPTANCE_HOSTED_TIMELINE_INVALID"
+
+
+def test_hosted_raw_timeline_starts_at_the_current_run_boundary() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    predecessor = "a" * 64
+    head = "b" * 64
+    pages = (
+        SimpleNamespace(
+            entries=(
+                SimpleNamespace(
+                    root_id="cgroot:unrelated",
+                    sequence=997,
+                    previous_entry_sha256="c" * 64,
+                ),
+                SimpleNamespace(
+                    root_id="cgroot:first-current",
+                    sequence=999,
+                    previous_entry_sha256=predecessor,
+                ),
+                SimpleNamespace(
+                    root_id="cgroot:second-current",
+                    sequence=1004,
+                    previous_entry_sha256="d" * 64,
+                ),
+            ),
+            head_entry_sha256=head,
+            head_sequence=1004,
+        ),
+    )
+
+    assert runner._raw_timeline_boundary(
+        pages,
+        {"cgroot:first-current", "cgroot:second-current"},
+    ) == (
+        998,
+        predecessor,
+        (1004, head),
+    )
+
+
+def test_hosted_raw_timeline_requires_a_current_run_entry() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    pages = (
+        SimpleNamespace(
+            entries=(
+                SimpleNamespace(
+                    root_id="cgroot:unrelated",
+                    sequence=1,
+                    previous_entry_sha256=None,
+                ),
+            ),
+            head_entry_sha256="a" * 64,
+            head_sequence=1,
+        ),
+    )
+
+    with pytest.raises(runner.AcceptanceError) as raised:
+        runner._raw_timeline_boundary(pages, {"cgroot:current"})
+
+    assert raised.value.code == "ACCEPTANCE_HOSTED_TIMELINE_INVALID"
+
+
+def test_hosted_raw_timeline_uses_the_run_anchor_and_exact_operator_head(
+    monkeypatch: Any,
+) -> None:
+    import controlgraph_canary.contracts.timeline as timeline_contracts
+
+    runner = _hosted_module(Path(__file__).parent)
+    predecessor = "a" * 64
+    first_entry = "b" * 64
+    head = "c" * 64
+    pages = (
+        SimpleNamespace(
+            entries=(
+                SimpleNamespace(
+                    root_id="cgroot:current",
+                    sequence=1002,
+                    previous_entry_sha256=predecessor,
+                ),
+            ),
+            head_entry_sha256=head,
+            head_sequence=1003,
+        ),
+    )
+    responses = (
+        SimpleNamespace(
+            entries=("first",),
+            has_more=True,
+            head_entry_sha256=head,
+            head_sequence=1003,
+            next_after_entry_sha256=first_entry,
+            next_after_sequence=1002,
+        ),
+        SimpleNamespace(
+            entries=("last",),
+            has_more=False,
+            head_entry_sha256=head,
+            head_sequence=1003,
+            next_after_entry_sha256=head,
+            next_after_sequence=1003,
+        ),
+    )
+    queries: list[dict[str, list[str]]] = []
+
+    class RawExport:
+        @classmethod
+        def model_validate_json(cls, payload: bytes) -> Any:
+            return responses[int(payload.decode("ascii"))]
+
+    def request(**kwargs: Any) -> tuple[int, bytes, dict[str, str]]:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(kwargs["url"]).query)
+        queries.append(query)
+        return 200, str(len(queries) - 1).encode("ascii"), {"cache-control": "no-store"}
+
+    monkeypatch.setattr(timeline_contracts, "TimelineRawExportV1", RawExport)
+    monkeypatch.setattr(runner, "_http_request", request)
+
+    result = runner._raw_timeline(
+        SimpleNamespace(api_origin="https://api.example", root_ids={"cgroot:current"}),
+        "token",
+        pages,
+    )
+
+    assert result == ("first", "last")
+    assert queries == [
+        {
+            "after_entry_sha256": [predecessor],
+            "after_sequence": ["1001"],
+            "limit": ["1"],
+        },
+        {
+            "after_entry_sha256": [first_entry],
+            "after_sequence": ["1002"],
+            "limit": ["1"],
+        },
+    ]
 
 
 def test_hosted_policy_binding_compares_plain_artifact_digest() -> None:
