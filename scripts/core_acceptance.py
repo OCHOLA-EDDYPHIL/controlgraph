@@ -3173,18 +3173,22 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
     run.unreleased_root_ids.add(root_result.root.root_id)
     terminal_idempotency_key: str | None = None
     released = False
+    before_denial: Any | None = None
     try:
 
-        def hold_execution_queue() -> None:
+        def hold_execution_queue_and_capture_baseline() -> None:
+            nonlocal before_denial
             _queue_control(run, "hold")
             run.execution_queue_cleanup_required = True
+            before_denial = _read_traffic(run, case, "before-stale-denial")
+            _require_split(before_denial, run.spec, stable=90, candidate=10)
 
         load, apply_dispatch, apply_receipt, health = _health_load(
             run,
             case,
             mode="healthy",
             root_result=root_result,
-            before_terminal=hold_execution_queue,
+            before_terminal=hold_execution_queue_and_capture_baseline,
         )
         promotion_dispatch, promotion_command = _promote(
             run,
@@ -3194,8 +3198,8 @@ def _run_revocation_case(run: _HostedExecution, case: CaseBindingV1) -> _CaseOut
             terminal=health,
         )
         revocation = _revoke(run, case, root_result.root)
-        before_denial = _read_traffic(run, case, "before-stale-denial")
-        _require_split(before_denial, run.spec, stable=90, candidate=10)
+        if before_denial is None:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_STALE_DENIAL_INVALID")
         _queue_control(run, "release")
         run.execution_queue_cleanup_required = False
         stale_receipt = _poll_receipt(

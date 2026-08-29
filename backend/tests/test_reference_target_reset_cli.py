@@ -71,7 +71,7 @@ def test_reference_target_reset_command_emits_exact_readback(
         "action": "reset-reference-target-baseline",
         "candidate_image": CANDIDATE_IMAGE,
         "candidate_percent": 0,
-        "candidate_revision": "controlgraph-reference-target-candidate-v20",
+        "candidate_revision": "controlgraph-reference-target-candidate-v21",
         "observed_etag": "etag-after-reset",
         "observed_generation": 9,
         "operation_name": "operations/reference-target-reset-1",
@@ -83,7 +83,7 @@ def test_reference_target_reset_command_emits_exact_readback(
         "service_name": "controlgraph-reference-target",
         "stable_image": STABLE_IMAGE,
         "stable_percent": 100,
-        "stable_revision": "controlgraph-reference-target-stable-v20",
+        "stable_revision": "controlgraph-reference-target-stable-v21",
     }
 
 
