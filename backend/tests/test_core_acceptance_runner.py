@@ -889,6 +889,17 @@ def test_hosted_cli_decodes_json_arrays_for_strict_tuple_contracts(
     assert model is not None and model.values == ("one", "two")
 
 
+def test_raw_timeline_records_decode_through_strict_json_boundary(tmp_path: Path) -> None:
+    runner = _hosted_module(tmp_path)
+
+    model = runner._model_from_raw_record(
+        {"values": ["one", "two"]},
+        _StrictTupleResponse,
+    )
+
+    assert model.values == ("one", "two")
+
+
 def test_service_account_identity_token_uses_direct_iam_credentials_request(
     tmp_path: Path,
     monkeypatch: Any,
