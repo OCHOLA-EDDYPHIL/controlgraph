@@ -744,12 +744,19 @@ def _post_denial_verification_entries(
     for entry in entries:
         event = entry.content.event
         kind = _display_value(entry, "OBSERVATION")
+        outcome = _display_value(entry, "OUTCOME")
+        outcome_is_admissible = outcome == "MATCH" or (
+            kind == "PROBE"
+            and outcome == "INCONCLUSIVE"
+            and _display_value(entry, "REASON_CODE")
+            == "PROBE_DISTRIBUTION_MISMATCH"
+        )
         if (
             kind in {"CONFIGURATION", "PROBE"}
             and event.epoch == receipt_event.epoch
             and event.occurred_at >= receipt_event.occurred_at
             and entry.content.sequence > receipt_entry.content.sequence
-            and _display_value(entry, "OUTCOME") == "MATCH"
+            and outcome_is_admissible
             and _display_value(entry, "ACTION") == "APPLY_CANARY_V1"
             and _correlation_value(entry, TimelineCorrelationKind.REQUEST)
             == receipt_request
