@@ -1262,7 +1262,7 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
               <SummaryCard
                 label="Traffic"
                 value={trafficSummary(view.entries)}
-                detail="Derived from admitted mutation evidence"
+                detail="Latest verified rollout evidence"
               />
               <SummaryCard
                 label="Health"

@@ -264,10 +264,10 @@ export function eventPresentation(
       return {
         title:
           entry.verificationStatus === "FAILED"
-            ? "Independent verification record failed checks"
+            ? "Verification record failed checks"
             : entry.verificationStatus === "AMBIGUOUS"
-              ? "Independent verification record ambiguous"
-              : "Independent verification recorded",
+              ? "Verification record ambiguous"
+              : "Verification recorded",
         category: "Verification",
         tone:
           entry.verificationStatus === "FAILED"
@@ -332,25 +332,22 @@ export function trafficSummary(entries: readonly TimelineEntry[]): string {
       return "100% captured stable";
     }
     if (entry.eventType === "MUTATION_APPLIED") {
-      const verificationPending =
-        displayField(entry, "OUTCOME")?.toUpperCase() !== "VERIFIED";
+      if (displayField(entry, "OUTCOME")?.toUpperCase() !== "VERIFIED") {
+        continue;
+      }
       if (values.includes("PROMOT") || values.includes("100% CANDIDATE")) {
-        return verificationPending
-          ? "100% candidate · verification pending"
-          : "100% candidate";
+        return "100% candidate";
       }
       if (
         values.includes("APPLY") ||
         values.includes("90/10") ||
         values.includes("90% STABLE")
       ) {
-        return verificationPending
-          ? "90% stable · 10% candidate · verification pending"
-          : "90% stable · 10% candidate";
+        return "90% stable · 10% candidate";
       }
     }
   }
-  return "Awaiting traffic evidence";
+  return "Awaiting verified traffic";
 }
 
 export function healthSummary(entries: readonly TimelineEntry[]): string {

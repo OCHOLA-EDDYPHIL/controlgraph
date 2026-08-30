@@ -21,8 +21,14 @@ describe("timeline presentation", () => {
     };
     const page = decodeTimelinePage(operatorTimelinePageV1.trim(), query);
     const health = page.entries.find((entry) => entry.eventType === "HEALTH_DECIDED")!;
+    const verification = page.entries.find(
+      (entry) => entry.eventType === "VERIFICATION_RECORDED",
+    )!;
 
     expect(eventPresentation(health, page.entries).title).toBe("Health policy: healthy");
+    expect(eventPresentation(verification, page.entries).title).toBe(
+      "Verification recorded",
+    );
     expect(healthSummary(page.entries)).toBe("healthy");
     expect(trafficSummary(page.entries)).toBe("100% candidate");
   });
@@ -62,7 +68,22 @@ describe("timeline presentation", () => {
       title: "Candidate promotion accepted; verification pending",
       tone: "ACTIVE",
     });
-    expect(trafficSummary(entries)).toBe("100% candidate · verification pending");
+    expect(trafficSummary(entries)).toBe("Awaiting verified traffic");
+  });
+
+  it("retains the latest verified traffic while a newer change awaits verification", () => {
+    const entries = [
+      timelineEntry(1, "MUTATION_APPLIED", {
+        fields: [field("ACTION", "APPLY_CANARY"), field("OUTCOME", "VERIFIED")],
+        verificationStatus: "VERIFIED",
+      }),
+      timelineEntry(2, "MUTATION_APPLIED", {
+        fields: [field("ACTION", "PROMOTE_CANDIDATE"), field("OUTCOME", "APPLIED")],
+        verificationStatus: "NOT_APPLICABLE",
+      }),
+    ];
+
+    expect(trafficSummary(entries)).toBe("90% stable · 10% candidate");
   });
 
   it("presents the independent verdict instead of the signature status", () => {
