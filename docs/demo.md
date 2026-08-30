@@ -1,13 +1,25 @@
 # Evidence-backed demo
 
-This is the narration for one hosted acceptance run of the disposable reference target. It is a
-proof script, not a claim that the current revision has passed: present a claim only when all four
-evidence columns below are bound to the same source commit, target, root, epoch, request, and run.
-Examples and fixture identifiers are synthetic; published evidence must be redacted.
+This is the evidence order for one hosted acceptance run of the disposable reference target.
+Present a claim only when all four evidence columns below are bound to the same source commit,
+target, root, epoch, request, and run. Examples and fixture identifiers are synthetic; published
+evidence is redacted.
 
 Use the [reproducible quickstart](quickstart.md) to provision and run the sequence. The
 [product contract](product-contract.md) defines the allowed outcomes, and the
 [threat model](threat-model.md) defines what the demonstration does not prove.
+
+## Shortest complete proof
+
+The clearest single path starts from verified 90/10 traffic. Enqueue signed promotion work at
+epoch N, pause delivery, revoke to N+1, and release the queue. The executor returns
+`DENIED / EPOCH_MISMATCH`; configuration readback before and after denial proves the target stayed
+90/10. Gemini 3.5 Flash then uses the Google ADK runner's six read-only tools to derive one
+receipt/timeline/target-cited causal path with no authority effect. Fresh current-epoch,
+stable-only recovery finishes at verified 100/0.
+
+The immutable, credential-free version of that path is available at the
+[public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay).
 
 ## Demo sequence
 
@@ -46,17 +58,22 @@ promotion or recovery, and the recovery identity cannot mutate Cloud Run itself.
 Reset, create a fresh root, establish its verified 90/10 prestate, hold the execution queue, and
 enqueue otherwise-valid work at epoch N. Revoke to N+1, release the queue, and show that the delayed
 work receives `EPOCH_MISMATCH` without a protected target change. Then use the separately confirmed,
-current-epoch recovery path and verify the captured stable state.
+current-epoch recovery path and verify the captured stable state. Before recovery, invoke the
+bounded advisor against that exact stale-denial snapshot. Show all six successful read-only tool
+calls, the receipt/timeline/target citations, `authority_effect=none`, and the identical replayed
+result that causes no second model call.
 
 Narrate: "Authentication, signature validity, and queue admission are insufficient. Stale authority
-is denied at execution time; recovery is new, stable-only authority rather than revival of epoch N."
+is denied at execution time. Gemini explains the evidence-backed causal path but cannot change the
+decision; recovery is new, stable-only authority rather than revival of epoch N."
 
 ### 5. Review the operator surfaces and clean up
 
-In the console, page through the ordered timeline and correlate root, epoch, request, receipt,
-health, recovery, and terminal events. If the advisor is shown, use only the bounded diagnostic
-request and show the `ADVISORY_ONLY` audit event. Do not present advisor prose as evidence or an
-authorization decision.
+In the authenticated console, page through the ordered timeline and correlate root, epoch,
+request, receipt, health, recovery, and terminal events. The deterministic denial must appear
+before the `ADVISORY_ONLY` analysis, and the advisor has no apply action. Then open `/replay`
+without credentials and show its artifact-hash, schema, payload-digest, and event-chain checks.
+The browser does not independently verify KMS signatures.
 
 Finish by resetting to 100/0, verifying configuration and the stable data-path marker, releasing
 the terminal service claim, and ensuring the execution queue is running. Infrastructure teardown
@@ -73,6 +90,7 @@ or outside the run interval, say that the result is unverified and do not make t
 | Healthy candidate promoted to 100 percent | Final target readback: stable 0, candidate 100, expected candidate configuration digest | Signed independent-verification evidence cites a matching candidate probe attestation | `HEALTH_DECIDED` followed by `TERMINAL_CLASSIFIED=PROMOTED` on one verified chain | `HEALTHY_PROMOTION` is `PASSED` with observed result `PROMOTED` |
 | Unhealthy candidate recovered to captured stable | Final target readback: stable 100, candidate 0, captured configuration and concurrency | Signed independent-verification evidence cites a matching stable probe attestation | `HEALTH_DECIDED`, `RECOVERY_INTENT_CREATED`, `RECOVERY_APPLIED`, then `TERMINAL_CLASSIFIED=RECOVERED` | `UNHEALTHY_STABLE_RECOVERY` is `PASSED` with observed result `RECOVERED` and recovery-identity evidence |
 | Revocation denied delayed epoch-N work and recovery used N+1 | Readbacks before and after delayed delivery show no stale mutation; final readback shows captured stable | Root-bound probe attestations agree with both observed configurations | `AUTHORITY_EPOCH_ADVANCED`, `MUTATION_DENIED` with `EPOCH_MISMATCH`, and the distinct current-epoch recovery sequence | `REVOCATION_STALE_DENIAL` is `PASSED` with authority-transition, executor-check, stale-denial, receipt, timeline, readback, and probe artifacts |
+| Gemini explained the stale denial without authority effect | The cited target summary records the same 90/10 configuration at or after denial | The cited target or verifier record binds the observed configuration | `MODEL_ASSISTANCE_RECORDED` follows the deterministic denial; the structured finding cites receipt, timeline, and target or verifier evidence | `BOUNDED_ADVISOR` is `PASSED` with `ADVISORY_ONLY`, six successful read-only tool calls, accepted non-fallback output, and idempotent replay |
 
 The source contracts behind those evidence types are:
 
@@ -88,13 +106,23 @@ read-only diagnostic tools through
 [`application/model_assistance_m6.py`](../backend/src/controlgraph_canary/application/model_assistance_m6.py);
 it has no mutation facade, and its result is always non-authoritative.
 
-## Final manifest binding
+## Accepted manifest and replay binding
 
-Read the run ID and manifest SHA-256 directly from the verified frozen bundle; do not copy a
-mutable example into this document. The manifest must report all eight fixed cases as passed, bind
-the exact clean source SHA and five distinct image digests, and remain within its declared cost and
-duration ceilings. This document is the reproducible narration; the immutable bundle is the run's
-acceptance evidence.
+The published replay records one accepted hosted run:
+
+- source: `dcc2192dade08d3fdfd27daded0ccfdd13193fd1`;
+- run: `cgacceptance:380d6733e6caa85a17df5da6c193680bfa7e03b00009ac30a40fa068849b14b9`;
+- manifest SHA-256:
+  `7b5c2e362b702bd675acc8b1fff18a4ece232cd530013967d6ed11122fcea700`;
+- public replay SHA-256:
+  `13782bc3b1d6f711c39494118a3df783de61b9ac20f0defeca108ec473fcf8cc`; and
+- result: all eight fixed cases passed with complete evidence binding and five immutable image
+  references.
+
+The replay's six-event chain records the epoch advance, stale denial, unchanged 90/10 target,
+validated cited advisor result, verified 100/0 recovery, and committed timeline. The acceptance
+manifest remains the run's authoritative full evidence; the replay is its bounded redacted
+projection.
 
 ## Publication boundary
 

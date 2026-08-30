@@ -11,6 +11,28 @@ disposable reference target and incur bounded Google Cloud cost. They do not cre
 service-account key; `gcloud` uses the active human identity and the runtime uses workload
 identities.
 
+## Choose the shortest verification path
+
+- To inspect the accepted stale-authority story without credentials or cloud mutation, open the
+  [public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay).
+- To run the backend and console locally, use the root [README](../README.md#quick-start).
+- To reproduce all eight hosted cases against a disposable target, continue with this runbook.
+
+The published canonical replay can also be fetched and checked directly:
+
+```bash
+CG_REPLAY_SHA256=13782bc3b1d6f711c39494118a3df783de61b9ac20f0defeca108ec473fcf8cc
+CG_REPLAY_FILE="$(mktemp)"
+curl -fsS \
+  "https://controlgraph-console-936681471311.us-central1.run.app/replays/${CG_REPLAY_SHA256}.json" \
+  -o "$CG_REPLAY_FILE"
+printf '%s  %s\n' "$CG_REPLAY_SHA256" "$CG_REPLAY_FILE" | sha256sum -c -
+```
+
+The replay page performs the closed-schema, payload-digest, case-binding, and six-event hash-chain
+checks in the browser before rendering. It is recorded redacted evidence, not a live control-plane
+view, and browser validation does not independently verify Cloud KMS signatures.
+
 ## Pinned prerequisites
 
 | Tool or boundary | Required value |
@@ -237,7 +259,12 @@ recovery; it does not turn stale authority back on.
 Open the console URI from `operator-console.json` while authenticated as the configured operator.
 The console reads `/v1/operator/timeline` through the API; it does not call Firestore or a cloud
 control plane. Check ordered root and epoch bindings, signature metadata, terminal classification,
-and the `ADVISORY_ONLY` model-assistance event. Advisor text is explanatory only.
+and the `ADVISORY_ONLY` model-assistance event. For the stale-denial investigation, require the
+deterministic `DENIED / EPOCH_MISMATCH` receipt and unchanged 90/10 readback to precede the
+Gemini 3.5 Flash result. The Google ADK audit must show exactly six successful read-only tool calls,
+receipt/timeline/target-or-verifier citations, no fallback, and `authority_effect=none`. Repeating
+the exact request must return the stored result without another model call. Advisor text is
+explanatory only.
 
 Independently verify the final traffic state:
 

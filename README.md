@@ -1,16 +1,54 @@
 # ControlGraph Canary
 
-ControlGraph Canary is a narrow authority and execution control plane for Cloud Run
-canaries. It addresses work that was valid when queued but no longer has authority when it
-reaches the mutation boundary. Every mutating executor must re-read the rollout root's
-current epoch immediately before invoking its target-bound adapter. A capability from any
-other epoch fails closed even when its caller and signature are valid.
+**A valid signature proves what was approved. It does not prove that approval still exists when
+queued work finally executes.**
+
+ControlGraph Canary is last-mile authority for agentic Cloud Run changes. It turns real provider
+observations into deterministic execution decisions, narrow KMS-signed capabilities, durable
+one-use receipt claims, and an evidence-backed causal path that an operator can inspect. Every
+mutating executor rereads the rollout root's current Firestore epoch immediately before invoking
+its target-bound adapter. A capability from any other epoch fails closed even when its caller and
+signature are valid.
 
 The repository contains a Python 3.12 backend and CLI, a static React and TypeScript operator
 console, Terraform, shared contract fixtures, and CI checks. The implemented rollout vertical
 captures a stable Cloud Run revision, applies a 90/10 canary, deterministically evaluates its
 Cloud Monitoring signals, then either promotes the approved candidate or restores the captured
 stable revision. Manual epoch revocation makes delayed otherwise-valid work fail closed.
+
+## The proof protocol
+
+The strongest end-to-end path is deliberately small and visible:
+
+1. Establish a verified 90/10 canary and enqueue signed promotion work at epoch N.
+2. Hold delivery, revoke authority to N+1, and release the delayed work.
+3. Classify it as `DENIED / EPOCH_MISMATCH` while independent readback proves the target stayed
+   exactly 90/10.
+4. Invoke Gemini 3.5 Flash through Google ADK with six read-only tools. The accepted structured
+   finding cites the receipt, timeline, and target evidence that form the stale-authority causal
+   path; it has `authority_effect=none` and offers no apply action.
+5. Issue fresh, stable-only recovery authority at the current epoch and verify 100/0.
+
+If a provider mutation might have happened but readback cannot distinguish the outcome,
+ControlGraph records `AMBIGUOUS`; it does not wrap uncertainty in a success-shaped certificate or
+blindly retry. Selected authority, health, and independent-verification evidence and capabilities
+are signed with purpose-separated Cloud KMS keys. The ordered timeline is hash-linked.
+
+## Verify the published run
+
+The credential-free [public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
+is bound to:
+
+- source `dcc2192dade08d3fdfd27daded0ccfdd13193fd1`;
+- accepted run `cgacceptance:380d6733e6caa85a17df5da6c193680bfa7e03b00009ac30a40fa068849b14b9`;
+- acceptance manifest SHA-256
+  `7b5c2e362b702bd675acc8b1fff18a4ece232cd530013967d6ed11122fcea700`; and
+- replay SHA-256 `13782bc3b1d6f711c39494118a3df783de61b9ac20f0defeca108ec473fcf8cc`.
+
+The browser fails closed unless the artifact hash, closed schema, payload digest, eight-case
+binding, and six-event hash chain validate. It renders recorded, redacted evidence and makes no
+protected API call. It does not independently verify Cloud KMS signatures; those are checked in
+the authenticated verifier path and represented by bounded metadata in the replay.
 
 ## Repository layout
 
