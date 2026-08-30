@@ -824,23 +824,7 @@ class CloudRunV2ReferenceTargetResetter:
             )
 
         acknowledged, operation_name = await self._update_baseline(before.service.etag)
-        try:
-            observed = await self._read_target()
-            observed_traffic = self._admit_target(observed)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise ReferenceTargetResetError(
-                ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
-            ) from None
-        if (
-            observed_traffic != (100, 0)
-            or observed.service.generation <= before.service.generation
-            or observed.service.etag == before.service.etag
-        ):
-            raise ReferenceTargetResetError(
-                ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
-            )
+        observed = await self._read_settled_baseline(before.service)
         outcome = (
             ReferenceTargetResetOutcome.RESET_APPLIED
             if acknowledged
@@ -854,6 +838,33 @@ class CloudRunV2ReferenceTargetResetter:
             observed_generation=observed.service.generation,
             observed_etag=observed.service.etag,
             operation_name=operation_name,
+        )
+
+    async def _read_settled_baseline(
+        self,
+        before: CloudRunServiceState,
+    ) -> CloudRunTargetState:
+        try:
+            async with asyncio.timeout(_CLOUD_RUN_READBACK_SETTLE_TIMEOUT_SECONDS):
+                for attempt in range(_CLOUD_RUN_READBACK_SETTLE_ATTEMPTS):
+                    try:
+                        observed = await self._read_target()
+                        if (
+                            self._admit_target(observed) == (100, 0)
+                            and observed.service.generation > before.generation
+                            and observed.service.etag != before.etag
+                        ):
+                            return observed
+                    except ReferenceTargetResetError:
+                        pass
+                    if attempt + 1 < _CLOUD_RUN_READBACK_SETTLE_ATTEMPTS:
+                        await asyncio.sleep(_CLOUD_RUN_READBACK_SETTLE_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        raise ReferenceTargetResetError(
+            ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
         )
 
     async def _read_target(self) -> CloudRunTargetState:
