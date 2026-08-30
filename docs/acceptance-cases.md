@@ -1,10 +1,10 @@
-# Build acceptance cases
+# Acceptance cases
 
 ## Status and evidence rule
 
-These cases define the reproducible outcomes against which the built product is evaluated. They
-are specifications, not records of completed hosted runs. Implementing an execution path does not
-prove its hosted result.
+These cases define the reproducible outcomes used to evaluate ControlGraph. They are
+specifications. Accepted-run records are separate, and implementation alone does not prove a
+hosted result.
 
 Local fakes and contract tests are required development evidence, but they do not replace a case
 that explicitly calls for Cloud Run, Cloud KMS, Firestore, Cloud Tasks, or Google-issued identity.
@@ -236,7 +236,7 @@ Cloud Tasks and OIDC prove addressed delivery by the configured caller, KMS prov
 integrity, and Cloud Run provides target readback. ControlGraph adds the separate current-authority
 decision that makes otherwise valid delayed work harmless.
 
-## Negative-authority conformance
+## Authority-boundary conformance
 
 The built enforcement path also exercises at least these single-variable failures:
 

@@ -21,8 +21,14 @@ describe("timeline presentation", () => {
     };
     const page = decodeTimelinePage(operatorTimelinePageV1.trim(), query);
     const health = page.entries.find((entry) => entry.eventType === "HEALTH_DECIDED")!;
+    const verification = page.entries.find(
+      (entry) => entry.eventType === "VERIFICATION_RECORDED",
+    )!;
 
     expect(eventPresentation(health, page.entries).title).toBe("Health policy: healthy");
+    expect(eventPresentation(verification, page.entries).title).toBe(
+      "Verification recorded",
+    );
     expect(healthSummary(page.entries)).toBe("healthy");
     expect(trafficSummary(page.entries)).toBe("100% candidate");
   });
@@ -40,8 +46,70 @@ describe("timeline presentation", () => {
       }),
     ];
 
-    expect(eventPresentation(entries[1]!, entries).title).toBe("90/10 canary applied");
+    expect(eventPresentation(entries[1]!, entries).title).toBe("90/10 canary verified");
     expect(trafficSummary(entries)).toBe("90% stable · 10% candidate");
+  });
+
+  it("does not present provider acceptance as verified completion", () => {
+    const request = "request:shared-promotion";
+    const entries = [
+      timelineEntry(1, "TASK_CREATED", {
+        fields: [field("ACTION", "PROMOTE_CANDIDATE")],
+        correlations: [{ kind: "REQUEST", correlationId: request }],
+      }),
+      timelineEntry(2, "MUTATION_APPLIED", {
+        fields: [field("OUTCOME", "APPLIED")],
+        correlations: [{ kind: "REQUEST", correlationId: request }],
+        verificationStatus: "NOT_APPLICABLE",
+      }),
+    ];
+
+    expect(eventPresentation(entries[1]!, entries)).toMatchObject({
+      title: "Candidate promotion accepted; verification pending",
+      tone: "ACTIVE",
+    });
+    expect(trafficSummary(entries)).toBe("Awaiting verified traffic");
+  });
+
+  it("retains the latest verified traffic while a newer change awaits verification", () => {
+    const entries = [
+      timelineEntry(1, "MUTATION_APPLIED", {
+        fields: [field("ACTION", "APPLY_CANARY"), field("OUTCOME", "VERIFIED")],
+        verificationStatus: "VERIFIED",
+      }),
+      timelineEntry(2, "MUTATION_APPLIED", {
+        fields: [field("ACTION", "PROMOTE_CANDIDATE"), field("OUTCOME", "APPLIED")],
+        verificationStatus: "NOT_APPLICABLE",
+      }),
+    ];
+
+    expect(trafficSummary(entries)).toBe("90% stable · 10% candidate");
+  });
+
+  it("presents the independent verdict instead of the signature status", () => {
+    const mismatch = timelineEntry(1, "VERIFICATION_RECORDED", {
+      fields: [
+        field("OUTCOME", "MISMATCH"),
+        field("REASON_CODE", "CONFIGURATION_MISMATCH"),
+        field("SUMMARY", "Independent verification recorded"),
+      ],
+      verificationStatus: "VERIFIED",
+    });
+    const unavailable = timelineEntry(2, "VERIFICATION_RECORDED", {
+      fields: [field("OUTCOME", "UNAVAILABLE")],
+      verificationStatus: "VERIFIED",
+    });
+
+    expect(eventPresentation(mismatch)).toMatchObject({
+      title: "Independent verification found a mismatch",
+      tone: "DANGER",
+    });
+    expect(eventPresentation(unavailable)).toMatchObject({
+      title: "Independent verification unavailable",
+      tone: "WARNING",
+    });
+    expect(hasPartialEvidence([mismatch])).toBe(true);
+    expect(hasPartialEvidence([unavailable])).toBe(true);
   });
 
   it("derives authority only from authority transitions and never from stale work", () => {
@@ -65,7 +133,8 @@ describe("timeline presentation", () => {
     const entries = [
       timelineEntry(1, "AUTHORITY_ROOT_CREATED"),
       timelineEntry(2, "MUTATION_APPLIED", {
-        fields: [field("ACTION", "APPLY_CANARY")],
+        fields: [field("ACTION", "APPLY_CANARY"), field("OUTCOME", "VERIFIED")],
+        verificationStatus: "VERIFIED",
       }),
       timelineEntry(3, "MODEL_ASSISTANCE_RECORDED", {
         fields: [field("SUMMARY", "PROMOTE to 100% candidate")],

@@ -2,11 +2,10 @@
 
 ## Status
 
-This threat model defines the implemented security boundary for ControlGraph Canary through
-deterministic health, promotion, and captured-stable recovery. The repository contains the
-authority, signing, task-delivery, target-bound mutation, receipt/readback, Monitoring, and
-recovery composition described below. The public replay records one accepted hosted run, but that
-closed reference-target evidence is not a claim of production readiness or general security.
+This threat model defines the implemented ControlGraph Canary boundary: authority, signing,
+delivery, target-bound mutation, independent readback, deterministic health, and captured-stable
+recovery. The public replay records one accepted run inside that boundary. It does not establish
+general production suitability.
 
 ## Protected assets and safety outcomes
 
@@ -30,44 +29,11 @@ Cloud Run update one atomic transaction.
 
 ## Trust boundaries and data flow
 
-```text
-Operator identity
-      |
-      | authenticated, versioned API request
-      v
-API boundary -----> deterministic application facade and reducer
-                          |
-                          | bounded issuance request
-                          v
-                    Issuer identity -----> Cloud KMS boundary
-                          |
-                          | canonical signed capability
-                          v
-                    Coordinator boundary
-                          |
-                          | addressed task + dedicated OIDC caller
-                          v
-Cloud Tasks boundary ---> Executor normal ingress
-             |
-             +----------> Recovery ingress -- one unchanged task --> Executor recovery facade
-                                      |                                |
-                                      | caller, signature, root,       | independent revalidation,
-                                      | epoch, prestate, source        | separate recovery receipt,
-                                      | receipt, binding, time         | fresh epoch check
-                                      v                                v
-                               Firestore authority              Narrow Cloud Run adapter
-                                                                    |
-                                                                    | conditional update
-                                                                    v
-                                                            Bound Cloud Run target
+![Trust boundaries separate operator approval, current authority, target-bound execution, independent verification, recorded evidence, and read-only explanation.](assets/architecture.svg)
 
-Verifier identity ------ independent read ------> Bound Cloud Run target
-Cloud Monitoring ------- bounded observations --> Deterministic policy input
-Evidence writer -------- sign facts ------------> Evidence boundary
-Console ---------------- read-only API ----------> Operator information
-Public replay ----------- embedded redacted artifact; no protected API or mutation action
-Optional Gemini/ADK advisor -- six read-only tools; never enters the authority path
-```
+[Open the editable Draw.io source](assets/architecture.drawio). The diagram shows the control
+relationships. The sections below define the exact identity, network, storage, signing, delivery,
+mutation, and evidence boundaries.
 
 ### Identity boundary
 

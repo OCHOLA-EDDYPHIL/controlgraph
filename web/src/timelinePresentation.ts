@@ -51,34 +51,61 @@ function mutationTitle(
   entries: readonly TimelineEntry[],
 ): EventPresentation {
   const action = correlatedAction(entry, entries);
+  const outcome = displayField(entry, "OUTCOME")?.toUpperCase();
+  const status =
+    outcome === "VERIFIED"
+      ? "VERIFIED"
+      : outcome === "APPLIED"
+        ? "AWAITING_VERIFICATION"
+        : "RECORDED";
   if (action.includes("APPLY") || action.includes("CANARY")) {
     return {
-      title: "90/10 canary applied",
+      title:
+        status === "VERIFIED"
+          ? "90/10 canary verified"
+          : status === "AWAITING_VERIFICATION"
+            ? "90/10 canary accepted; verification pending"
+            : "90/10 canary update recorded",
       category: "Traffic",
-      tone: "ACTIVE",
+      tone: status === "VERIFIED" ? "GOOD" : "ACTIVE",
       advisory: false,
     };
   }
   if (action.includes("PROMOT")) {
     return {
-      title: "Candidate promoted",
+      title:
+        status === "VERIFIED"
+          ? "Candidate promotion verified"
+          : status === "AWAITING_VERIFICATION"
+            ? "Candidate promotion accepted; verification pending"
+            : "Candidate promotion recorded",
       category: "Promotion",
-      tone: "GOOD",
+      tone: status === "VERIFIED" ? "GOOD" : "ACTIVE",
       advisory: false,
     };
   }
   if (action.includes("RECOVER") || action.includes("RESTORE")) {
     return {
-      title: "Captured stable revision restored",
+      title:
+        status === "VERIFIED"
+          ? "Captured stable revision restored"
+          : status === "AWAITING_VERIFICATION"
+            ? "Stable recovery accepted; verification pending"
+            : "Stable recovery recorded",
       category: "Recovery",
-      tone: "GOOD",
+      tone: status === "VERIFIED" ? "GOOD" : "ACTIVE",
       advisory: false,
     };
   }
   return {
-    title: "Target mutation applied",
+    title:
+      status === "VERIFIED"
+        ? "Target mutation verified"
+        : status === "AWAITING_VERIFICATION"
+          ? "Target mutation accepted; verification pending"
+          : "Target mutation recorded",
     category: "Mutation",
-    tone: "GOOD",
+    tone: status === "VERIFIED" ? "GOOD" : "ACTIVE",
     advisory: false,
   };
 }
@@ -200,25 +227,58 @@ export function eventPresentation(
         tone: "GOOD",
         advisory: false,
       };
-    case "VERIFICATION_RECORDED":
+    case "VERIFICATION_RECORDED": {
+      const verdict = displayField(entry, "OUTCOME")?.toUpperCase();
+      if (verdict === "MATCH") {
+        return {
+          title: "Independent verification matched",
+          category: "Verification",
+          tone: "GOOD",
+          advisory: false,
+        };
+      }
+      if (verdict === "MISMATCH") {
+        return {
+          title: "Independent verification found a mismatch",
+          category: "Verification",
+          tone: "DANGER",
+          advisory: false,
+        };
+      }
+      if (verdict === "UNAVAILABLE") {
+        return {
+          title: "Independent verification unavailable",
+          category: "Verification",
+          tone: "WARNING",
+          advisory: false,
+        };
+      }
+      if (verdict === "INCONCLUSIVE") {
+        return {
+          title: "Independent verification inconclusive",
+          category: "Verification",
+          tone: "WARNING",
+          advisory: false,
+        };
+      }
       return {
         title:
-          entry.verificationStatus === "VERIFIED"
-            ? "Independent verification matched"
+          entry.verificationStatus === "FAILED"
+            ? "Verification record failed checks"
             : entry.verificationStatus === "AMBIGUOUS"
-              ? "Independent verification ambiguous"
-              : entry.verificationStatus === "FAILED"
-                ? "Independent verification contradicted intent"
-                : "Independent verification pending",
+              ? "Verification record ambiguous"
+              : "Verification recorded",
         category: "Verification",
         tone:
-          entry.verificationStatus === "VERIFIED"
-            ? "GOOD"
-            : entry.verificationStatus === "UNVERIFIED"
+          entry.verificationStatus === "FAILED"
+            ? "DANGER"
+            : entry.verificationStatus === "AMBIGUOUS" ||
+                entry.verificationStatus === "UNVERIFIED"
               ? "WARNING"
-              : "DANGER",
+              : "NEUTRAL",
         advisory: false,
       };
+    }
     case "TERMINAL_CLASSIFIED":
       return {
         title: `Outcome classified: ${entry.terminalClassification
@@ -272,6 +332,9 @@ export function trafficSummary(entries: readonly TimelineEntry[]): string {
       return "100% captured stable";
     }
     if (entry.eventType === "MUTATION_APPLIED") {
+      if (displayField(entry, "OUTCOME")?.toUpperCase() !== "VERIFIED") {
+        continue;
+      }
       if (values.includes("PROMOT") || values.includes("100% CANDIDATE")) {
         return "100% candidate";
       }
@@ -284,7 +347,7 @@ export function trafficSummary(entries: readonly TimelineEntry[]): string {
       }
     }
   }
-  return "Awaiting traffic evidence";
+  return "Awaiting verified traffic";
 }
 
 export function healthSummary(entries: readonly TimelineEntry[]): string {
@@ -316,12 +379,22 @@ export function outcomeSummary(entries: readonly TimelineEntry[]): string {
 
 export function hasPartialEvidence(entries: readonly TimelineEntry[]): boolean {
   return entries.some(
-    (entry) =>
-      entry.eventType === "MUTATION_AMBIGUOUS" ||
-      entry.verificationStatus === "UNVERIFIED" ||
-      entry.verificationStatus === "FAILED" ||
-      entry.verificationStatus === "AMBIGUOUS" ||
-      entry.terminalClassification === "AMBIGUOUS",
+    (entry) => {
+      const independentVerdict =
+        entry.eventType === "VERIFICATION_RECORDED"
+          ? displayField(entry, "OUTCOME")?.toUpperCase()
+          : null;
+      return (
+        entry.eventType === "MUTATION_AMBIGUOUS" ||
+        independentVerdict === "MISMATCH" ||
+        independentVerdict === "UNAVAILABLE" ||
+        independentVerdict === "INCONCLUSIVE" ||
+        entry.verificationStatus === "UNVERIFIED" ||
+        entry.verificationStatus === "FAILED" ||
+        entry.verificationStatus === "AMBIGUOUS" ||
+        entry.terminalClassification === "AMBIGUOUS"
+      );
+    },
   );
 }
 

@@ -23,8 +23,9 @@ state, local paths, transient evidence, and development-machine details do not b
 
 ## Accepted owner-authored source
 
-The initial accepted adaptation source is the owner-authored RECONCILE repository at immutable
-commit `ea1607a7782bc73c729407618d8c8a4ccfb4778b`, accepted for review on 2026-08-19.
+The initial accepted adaptation source, referred to below as **R1**, is the owner-authored
+RECONCILE repository at immutable commit `ea1607a7782bc73c729407618d8c8a4ccfb4778b`, accepted for
+review on 2026-08-19.
 
 | Source path | Rights holder | Intended ControlGraph use | Material adaptation required |
 |---|---|---|---|
@@ -53,13 +54,13 @@ changes before a release claim is made.
 
 | Local artifact | Accepted source | Material changes | Verification |
 |---|---|---|---|
-| `backend/src/controlgraph_canary/contracts/base.py` | `reconcile/contracts/base.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Retains strict frozen models and bounded primitive validation; replaces RECONCILE security dependencies with ControlGraph NFC, safe-integer, UTC-second, audience, and domain limits. | Contract model, Unicode, timestamp, bound, and import-boundary tests. |
-| `backend/src/controlgraph_canary/contracts/codec.py` | `reconcile/contracts/codec.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Retains duplicate-key rejection, version-aware decoding, canonical bytes, and stable errors; adds a no-float cross-language subset, canonical-input enforcement, domain-separated hashes, byte/depth bounds, and canonical base64url. | Python malformed/canonical tests and byte-identical TypeScript golden vectors. |
-| `backend/src/controlgraph_canary/contracts/models.py` | Selected bounded-value and ambiguity patterns from `reconcile/contracts/common.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Replaces provider-neutral RECONCILE records with closed ControlGraph target, root, authority, capability, task, receipt, health, recovery, and evidence schemas. | ControlGraph cross-field, round-trip, fixture, and rejection tests. |
-| `backend/src/controlgraph_canary/authority/replay.py` | Mutation-identity, exact-readback, and explicit unknown-outcome patterns from `reconcile/hosted/firestore_cas.py`, plus one-shot transport behavior from `reconcile/hosted/transport.py`, at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Recasts the selected patterns as a dependency-free canary mutation binding and receipt-state kernel. It binds request, capability, payload, plan, root, provider precondition, target, epoch, and expected post-state digests; removes durable pre-dispatch retry authority; and requires exact readback after any possible provider attempt. | Canonical fixture identity, altered-binding replay, provider ambiguity, readback-only recovery, and generated invariant tests. |
-| `backend/src/controlgraph_canary/contracts/storage.py`, `backend/src/controlgraph_canary/application/authority_store.py`, `backend/src/controlgraph_canary/application/receipt_execution.py`, and `backend/src/controlgraph_canary/integrations/google/firestore.py` | Fixed logical identity, transaction, compare-and-swap, exact-readback, and ambiguous-write patterns from `reconcile/hosted/firestore_cas.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Replaces every RECONCILE collection, record, and path with fixed ControlGraph authority record families in the named `controlgraph-authority` database. Adds target-sealed document identities, atomic root/claim/authority creation, direct-confirmed one-use receipt dispatch, monotonic authority and receipt revisions, explicit service-claim release, bounded transactions, sanitized provider errors, and exact wrapper-plus-payload readback after an uncertain commit. | Contract tests, fake-provider contention and ambiguity tests, and real Firestore-emulator races for root creation, epoch revocation, execution claims, and recovery claims. |
-| `backend/src/controlgraph_canary/application/tasks.py` and `backend/src/controlgraph_canary/integrations/google/tasks.py` | Destination sealing and one-shot delivery behavior from `reconcile/hosted/transport.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Recasts transport as two addressed Cloud Tasks routes derived only from startup configuration. Adds canonical task identities, exact regional queues, handler origins and paths, distinct OIDC callers, schedule and age bounds, one create attempt, and exact duplicate adoption without treating delivery identity as mutation authority. | Route substitution, time-bound, duplicate, provider-request, and no-application-retry tests. |
-| `backend/src/controlgraph_canary/application/identity.py` and `backend/src/controlgraph_canary/integrations/google/identity.py` | Bounded Google OIDC verification against exact audience and caller sets from `reconcile/hosted/identity.py` at `ea1607a7782bc73c729407618d8c8a4ccfb4778b` | Replaces RECONCILE identity configuration with a closed ControlGraph service, route, caller-role, email, subject, and audience map. Adds stable credential-free denial codes, exact token time bounds, startup coordinate cross-checks, task-caller separation, and authentication context that retains no bearer token or mutation authority. | Caller-map, route-replay, claim substitution, bounded-token, credential-nondisclosure, startup-composition, and protected-route tests. |
+| `backend/src/controlgraph_canary/contracts/base.py` | R1 `reconcile/contracts/base.py` | Retains strict frozen models and bounded primitive validation; replaces RECONCILE security dependencies with ControlGraph NFC, safe-integer, UTC-second, audience, and domain limits. | Contract model, Unicode, timestamp, bound, and import-boundary tests. |
+| `backend/src/controlgraph_canary/contracts/codec.py` | R1 `reconcile/contracts/codec.py` | Retains duplicate-key rejection, version-aware decoding, canonical bytes, and stable errors; adds a no-float cross-language subset, canonical-input enforcement, domain-separated hashes, byte/depth bounds, and canonical base64url. | Python malformed/canonical tests and byte-identical TypeScript golden vectors. |
+| `backend/src/controlgraph_canary/contracts/models.py` | Selected bounded-value and ambiguity patterns from R1 `reconcile/contracts/common.py` | Replaces provider-neutral RECONCILE records with closed ControlGraph target, root, authority, capability, task, receipt, health, recovery, and evidence schemas. | ControlGraph cross-field, round-trip, fixture, and rejection tests. |
+| `backend/src/controlgraph_canary/authority/replay.py` | Mutation-identity, exact-readback, and explicit unknown-outcome patterns from R1 `reconcile/hosted/firestore_cas.py`, plus one-shot transport behavior from R1 `reconcile/hosted/transport.py` | Recasts the selected patterns as a dependency-free canary mutation binding and receipt-state kernel. It binds request, capability, payload, plan, root, provider precondition, target, epoch, and expected post-state digests; removes durable pre-dispatch retry authority; and requires exact readback after any possible provider attempt. | Canonical fixture identity, altered-binding replay, provider ambiguity, readback-only recovery, and generated invariant tests. |
+| `backend/src/controlgraph_canary/contracts/storage.py`, `backend/src/controlgraph_canary/application/authority_store.py`, `backend/src/controlgraph_canary/application/receipt_execution.py`, and `backend/src/controlgraph_canary/integrations/google/firestore.py` | Fixed logical identity, transaction, compare-and-swap, exact-readback, and ambiguous-write patterns from R1 `reconcile/hosted/firestore_cas.py` | Replaces every RECONCILE collection, record, and path with fixed ControlGraph authority record families in the named `controlgraph-authority` database. Adds target-sealed document identities, atomic root/claim/authority creation, direct-confirmed one-use receipt dispatch, monotonic authority and receipt revisions, explicit service-claim release, bounded transactions, sanitized provider errors, and exact wrapper-plus-payload readback after an uncertain commit. | Contract tests, fake-provider contention and ambiguity tests, and real Firestore-emulator races for root creation, epoch revocation, execution claims, and recovery claims. |
+| `backend/src/controlgraph_canary/application/tasks.py` and `backend/src/controlgraph_canary/integrations/google/tasks.py` | Destination sealing and one-shot delivery behavior from R1 `reconcile/hosted/transport.py` | Recasts transport as two addressed Cloud Tasks routes derived only from startup configuration. Adds canonical task identities, exact regional queues, handler origins and paths, distinct OIDC callers, schedule and age bounds, one create attempt, and exact duplicate adoption without treating delivery identity as mutation authority. | Route substitution, time-bound, duplicate, provider-request, and no-application-retry tests. |
+| `backend/src/controlgraph_canary/application/identity.py` and `backend/src/controlgraph_canary/integrations/google/identity.py` | Bounded Google OIDC verification against exact audience and caller sets from R1 `reconcile/hosted/identity.py` | Replaces RECONCILE identity configuration with a closed ControlGraph service, route, caller-role, email, subject, and audience map. Adds stable credential-free denial codes, exact token time bounds, startup-coordinate cross-checks, task-caller separation, and authentication context that retains no bearer token or mutation authority. | Caller-map, route-replay, claim substitution, bounded-token, credential-nondisclosure, startup-composition, and protected-route tests. |
 
 A broad entry such as "backend" is insufficient: each coherent adapted module or tightly related
 module group must remain traceable as later work is added.
@@ -76,8 +77,8 @@ Direct dependencies and development tools are disclosed in `THIRD_PARTY_NOTICES.
 license texts and distributions remain authoritative. Package and action references do not imply
 that their source is vendored.
 
-The current UI uses system fonts and CSS-drawn presentation. No external image, font, icon, or
-generated media is recorded in the scaffold.
+The UI uses system fonts and CSS-drawn presentation. The documentation diagrams use native Draw.io
+vector shapes and system fonts. They contain no external image, icon, or runtime asset.
 
 ## Native cloud services
 
@@ -116,6 +117,21 @@ pinned Cosign binary using `cosign signing-config create --with-default-services
 --no-default-rekor`, respectively. Do not hand-edit them; review regenerated trust changes and
 update their SHA-256 digests in `.github/release-evidence-policy.json`. Cosign and the Sigstore
 root-signing material are Apache-2.0 licensed.
+
+The tracked `docs/assets/architecture.svg` and `docs/assets/stale-authority-flow.svg` files are
+exported from the matching uncompressed `.drawio` sources with Draw.io Desktop 31.3.2. The SVGs
+use a fixed light theme, native vector shapes, plain-text labels, and no embedded font or external
+image. After export, the second command removes Draw.io's generic unsupported-text footer. Each
+label retains its native SVG text fallback. Edit the `.drawio` source, then run both commands; do
+not make other changes to the rendered file. Draw.io Desktop is Apache-2.0 licensed.
+
+```bash
+drawio --export --format svg --output docs/assets --size page --theme light \
+  --embed-svg-fonts false --uncompressed \
+  docs/assets/architecture.drawio docs/assets/stale-authority-flow.drawio
+perl -0pi -e 's#<switch><g requiredFeatures="[^"]*"/><a[^>]*><text[^>]*>Text is not SVG - cannot display</text></a></switch>##g' \
+  docs/assets/architecture.svg docs/assets/stale-authority-flow.svg
+```
 
 If a generated schema, software bill of materials, trust bundle, or other release artifact is
 tracked later, its entry must record:

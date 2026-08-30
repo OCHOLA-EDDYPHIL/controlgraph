@@ -23,6 +23,7 @@ export type ConsolePhase =
   | "AUTHENTICATING"
   | "LOADING"
   | "LIVE"
+  | "EMPTY"
   | "RECONNECTING"
   | "STALE"
   | "PARTIAL"
@@ -227,7 +228,7 @@ export function useOperatorConsole(
       }
       const authority = deriveAuthority(entries);
       const next: OperatorConsoleView = {
-        phase: entries.length === 0 ? "PARTIAL" : "LIVE",
+        phase: entries.length === 0 ? "EMPTY" : "LIVE",
         identity,
         target: batch.target,
         entries,
@@ -488,7 +489,7 @@ export function useOperatorConsole(
   }, [api, commitBatch, commitView, handleError]);
 
   useEffect(() => {
-    if (view.phase !== "LIVE" || pollIntervalMs <= 0) {
+    if ((view.phase !== "LIVE" && view.phase !== "EMPTY") || pollIntervalMs <= 0) {
       return undefined;
     }
     const timer = window.setTimeout(() => {
