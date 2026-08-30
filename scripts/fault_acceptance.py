@@ -21,8 +21,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, cast
 
-import controlgraph_canary
 import core_acceptance as core
+from pydantic import ValidationError
+
+import controlgraph_canary
 from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.contracts.base import (
     MAX_CONTRACT_BYTES,
@@ -84,7 +86,6 @@ from controlgraph_canary.contracts.revocation import EpochRevocationProofV1
 from controlgraph_canary.integrations.google.kms import (
     GoogleKmsIndependentVerificationEvidenceVerifier,
 )
-from pydantic import ValidationError
 
 MANIFEST_SCHEMA: Final = "controlgraph.fault-acceptance-manifest/v1"
 CONFIRMATION: Final = "RUN_CONTROLGRAPH_FAULT_ACCEPTANCE"

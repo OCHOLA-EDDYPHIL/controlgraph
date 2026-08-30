@@ -24,6 +24,14 @@ from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Final, Literal, Self, cast
 
+from pydantic import (
+    AfterValidator,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
+
 import controlgraph_canary
 import controlgraph_canary.contracts.base as contract_base_module
 import controlgraph_canary.contracts.codec as contract_codec_module
@@ -44,13 +52,6 @@ from controlgraph_canary.contracts.codec import (
     RestrictedJson,
     canonical_json_value_bytes,
     decode_contract,
-)
-from pydantic import (
-    AfterValidator,
-    Field,
-    StringConstraints,
-    ValidationError,
-    model_validator,
 )
 
 MANIFEST_SCHEMA: Final = "controlgraph.core-acceptance-manifest/v1"
