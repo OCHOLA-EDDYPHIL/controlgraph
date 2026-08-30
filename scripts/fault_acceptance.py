@@ -21,10 +21,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, cast
 
-import core_acceptance as core
-from pydantic import ValidationError
-
 import controlgraph_canary
+import core_acceptance as core
 from controlgraph_canary.application.identity import ServiceRole
 from controlgraph_canary.contracts.base import (
     MAX_CONTRACT_BYTES,
@@ -86,6 +84,7 @@ from controlgraph_canary.contracts.revocation import EpochRevocationProofV1
 from controlgraph_canary.integrations.google.kms import (
     GoogleKmsIndependentVerificationEvidenceVerifier,
 )
+from pydantic import ValidationError
 
 MANIFEST_SCHEMA: Final = "controlgraph.fault-acceptance-manifest/v1"
 CONFIRMATION: Final = "RUN_CONTROLGRAPH_FAULT_ACCEPTANCE"
@@ -2251,6 +2250,7 @@ def execute_fault_suite(
         acceptance_identity=acceptance_identity,
     )
     core._verify_hosted_bindings(run)
+    core._capture_timeline_anchor(run)
     state = _ExecutionState(run=run, evidence_root=root, cleanup_required=set())
     for sequence, kind in enumerate(FaultKind, start=1):
         scenario = _scenario(bridge.spec.random_seed, kind, fault_inputs_sha256)

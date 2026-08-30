@@ -69,6 +69,7 @@ _LOAD_JOB_LABEL = "m8-core-acceptance"
 _LOAD_RESULT_SCHEMA = "controlgraph.core-acceptance-load-result/v1"
 _LOAD_READY_SCHEMA = "controlgraph.core-acceptance-load-ready/v1"
 _TIMELINE_PAGE_SET_DOMAIN = b"controlgraph.timeline-acceptance-page-set/v1\0"
+_TIMELINE_PAGE_LIMIT: Final = 16
 _STALE_COMPLETION_READINESS_ATTEMPTS: Final = 30
 _STALE_COMPLETION_READINESS_DELAY_SECONDS: Final = 1.0
 _LOAD_JOB_PERMISSIONS = (
@@ -1161,6 +1162,8 @@ class _HostedExecution:
     advisor_result: Any | None = None
     public_replay_seed_values: _PublicReplaySeedState | None = None
     execution_queue_cleanup_required: bool = False
+    timeline_anchor_sequence: int | None = None
+    timeline_anchor_entry_sha256: str | None = None
 
     @property
     def api_origin(self) -> str:
@@ -3565,40 +3568,101 @@ def _http_request(
     return status, payload, response_headers
 
 
-def _timeline_pages(run: _HostedExecution, token: str) -> tuple[Any, ...]:
+def _timeline_page(
+    run: _HostedExecution,
+    token: str,
+    *,
+    sequence: int,
+    cursor: str | None,
+    limit: int,
+) -> Any:
     from controlgraph_canary.contracts.timeline import TimelinePageV1
 
-    sequence = 0
-    cursor: str | None = None
+    query: list[tuple[str, str]] = [
+        ("after_sequence", str(sequence)),
+        ("limit", str(limit)),
+        ("audience", "OPERATOR"),
+    ]
+    if cursor is not None:
+        query.insert(1, ("after_entry_sha256", cursor))
+    status, payload, headers = _http_request(
+        url=f"{run.api_origin}/v1/operator/timeline?{urllib.parse.urlencode(query)}",
+        token=token,
+        operator=True,
+    )
+    if status != 200 or headers.get("cache-control") != "no-store":
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    try:
+        return TimelinePageV1.model_validate_json(payload)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID") from error
+
+
+def _capture_timeline_anchor(run: _HostedExecution) -> None:
+    token = _identity_token(run)
+    try:
+        page = _timeline_page(run, token, sequence=0, cursor=None, limit=1)
+    finally:
+        token = ""
+    run.timeline_anchor_sequence = page.head_sequence
+    run.timeline_anchor_entry_sha256 = page.head_entry_sha256
+
+
+def _require_timeline_head_extension(
+    *,
+    frozen: tuple[int, str | None],
+    previous: tuple[int, str | None] | None,
+    current: tuple[int, str | None],
+) -> None:
+    if (
+        current[0] < frozen[0]
+        or (current[0] == frozen[0] and current[1] != frozen[1])
+        or (
+            previous is not None
+            and (
+                current[0] < previous[0]
+                or (current[0] == previous[0] and current[1] != previous[1])
+            )
+        )
+    ):
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
+
+
+def _timeline_pages(run: _HostedExecution, token: str) -> tuple[Any, ...]:
+    if run.timeline_anchor_sequence is None:
+        raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    sequence = run.timeline_anchor_sequence
+    cursor = run.timeline_anchor_entry_sha256
     pages: list[Any] = []
     head: tuple[int, str | None] | None = None
+    observed_head: tuple[int, str | None] | None = None
     for _page in range(100):
-        query: list[tuple[str, str]] = [
-            ("after_sequence", str(sequence)),
-            ("limit", "25"),
-            ("audience", "OPERATOR"),
-        ]
-        if cursor is not None:
-            query.insert(1, ("after_entry_sha256", cursor))
-        status, payload, headers = _http_request(
-            url=f"{run.api_origin}/v1/operator/timeline?{urllib.parse.urlencode(query)}",
-            token=token,
-            operator=True,
-        )
-        if status != 200 or headers.get("cache-control") != "no-store":
-            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
-        try:
-            page = TimelinePageV1.model_validate_json(payload)
-        except (TypeError, ValueError, ValidationError) as error:
-            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID") from error
-        observed_head = (page.head_sequence, page.head_entry_sha256)
-        head = observed_head if head is None else head
-        if observed_head != head:
+        remaining = _TIMELINE_PAGE_LIMIT if head is None else head[0] - sequence
+        if remaining < 0:
             raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
+        page = _timeline_page(
+            run,
+            token,
+            sequence=sequence,
+            cursor=cursor,
+            limit=min(_TIMELINE_PAGE_LIMIT, max(1, remaining)),
+        )
+        current_head = (page.head_sequence, page.head_entry_sha256)
+        head = current_head if head is None else head
+        _require_timeline_head_extension(
+            frozen=head,
+            previous=observed_head,
+            current=current_head,
+        )
+        observed_head = current_head
         pages.append(page)
         sequence = page.next_after_sequence
         cursor = page.next_after_entry_sha256
-        if not page.has_more:
+        if sequence > head[0]:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
+        if sequence == head[0]:
+            if cursor != head[1]:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
             return tuple(pages)
     raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_TOO_LARGE")
 
@@ -3637,6 +3701,7 @@ def _raw_timeline(
 
     sequence, cursor, head = _raw_timeline_boundary(pages, run.root_ids)
     items: list[Any] = []
+    observed_head: tuple[int, str | None] | None = None
     for _page in range(1_000):
         query: list[tuple[str, str]] = [
             ("after_sequence", str(sequence)),
@@ -3655,13 +3720,21 @@ def _raw_timeline(
             page = TimelineRawExportV1.model_validate_json(payload)
         except (TypeError, ValueError, ValidationError) as error:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RAW_EXPORT_INVALID") from error
-        observed_head = (page.head_sequence, page.head_entry_sha256)
-        if observed_head != head:
-            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
+        current_head = (page.head_sequence, page.head_entry_sha256)
+        _require_timeline_head_extension(
+            frozen=head,
+            previous=observed_head,
+            current=current_head,
+        )
+        observed_head = current_head
         items.extend(page.entries)
         sequence = page.next_after_sequence
         cursor = page.next_after_entry_sha256
-        if not page.has_more:
+        if sequence > head[0]:
+            raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
+        if sequence == head[0]:
+            if cursor != head[1]:
+                raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_CHANGED")
             return tuple(items)
     raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_TOO_LARGE")
 
@@ -3726,19 +3799,25 @@ def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
     expected_sequence = first.command.after_sequence
     expected_entry_sha256 = first.command.after_entry_sha256
     head = (first.head_sequence, first.head_entry_sha256)
-    if expected_sequence != 0 or expected_entry_sha256 is not None:
+    if (expected_sequence == 0) != (expected_entry_sha256 is None):
         raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+    observed_head = head
     summaries: list[dict[str, object]] = []
     page_sha256s: list[str] = []
     entry_count = 0
     for page in pages:
+        current_head = (page.head_sequence, page.head_entry_sha256)
         if (
-            (page.head_sequence, page.head_entry_sha256) != head
+            current_head[0] < head[0]
+            or (current_head[0] == head[0] and current_head[1] != head[1])
+            or current_head[0] < observed_head[0]
+            or (current_head[0] == observed_head[0] and current_head[1] != observed_head[1])
             or page.command.audience != audience
             or page.command.after_sequence != expected_sequence
             or page.command.after_entry_sha256 != expected_entry_sha256
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
+        observed_head = current_head
         page_sequence = page.command.after_sequence
         page_entry_sha256 = page.command.after_entry_sha256
         for entry in page.entries:
@@ -3749,7 +3828,8 @@ def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
         if (
             page.next_after_sequence != page_sequence
             or page.next_after_entry_sha256 != page_entry_sha256
-            or page.has_more != (page.next_after_sequence < head[0])
+            or page.next_after_sequence > head[0]
+            or page.has_more != (page.next_after_sequence < current_head[0])
         ):
             raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
         page_sha256 = hashlib.sha256(_canonical_object(_model_dict(page))).hexdigest()
@@ -3767,7 +3847,7 @@ def _timeline_page_summary(pages: Sequence[Any]) -> dict[str, object]:
         entry_count += len(page.entries)
         expected_sequence = page.next_after_sequence
         expected_entry_sha256 = page.next_after_entry_sha256
-    if pages[-1].has_more or expected_sequence != head[0] or expected_entry_sha256 != head[1]:
+    if expected_sequence != head[0] or expected_entry_sha256 != head[1]:
         raise AcceptanceError("ACCEPTANCE_HOSTED_TIMELINE_INVALID")
     return {
         "audience": audience.value,
@@ -4605,6 +4685,7 @@ def execute_hosted(
         acceptance_identity=acceptance_identity,
     )
     _verify_hosted_bindings(run)
+    _capture_timeline_anchor(run)
     updated_cases: list[CaseBindingV1] = []
     for case_index, case in enumerate(spec.cases):
         started = datetime.now(UTC)

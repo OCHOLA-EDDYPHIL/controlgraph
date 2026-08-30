@@ -797,6 +797,7 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
     sys.modules[module_spec.name] = runner
     module_spec.loader.exec_module(runner)
     reset_cases: list[str] = []
+    lifecycle: list[str] = []
 
     monkeypatch.setenv(
         "CONTROLGRAPH_CORE_ACCEPTANCE_CONFIRM",
@@ -806,7 +807,13 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
     monkeypatch.setattr(runner, "_verify_exact_remote_main", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "_verify_hosted_bindings", lambda *_args, **_kwargs: None)
 
+    def capture_timeline_anchor(_run: Any) -> None:
+        lifecycle.append("anchor")
+
+    monkeypatch.setattr(runner, "_capture_timeline_anchor", capture_timeline_anchor)
+
     def reset(_run: Any, case: Any) -> dict[str, str]:
+        assert lifecycle == ["anchor"]
         reset_cases.append(case.kind.value)
         return {"schema_version": "test.reset/v1"}
 
@@ -856,6 +863,7 @@ def test_hosted_execute_resets_before_all_eight_fixed_cases(
     )
 
     assert reset_cases == [kind for kind, _evidence in CASES]
+    assert lifecycle == ["anchor"]
     assert status.value == "PASSED"
     assert output_spec.is_file()
     assert output_manifest.is_file()
@@ -2226,14 +2234,145 @@ def test_hosted_timeline_evidence_compacts_large_pages_with_complete_bindings() 
     assert b'"payload"' not in encoded
 
 
-def test_hosted_timeline_evidence_rejects_cursor_gaps() -> None:
+def test_hosted_timeline_pages_use_run_anchor_and_freeze_first_head(
+    monkeypatch: Any,
+) -> None:
+    import controlgraph_canary.contracts.timeline as timeline_contracts
+
+    runner = _hosted_module(Path(__file__).parent)
+    anchor = "a" * 64
+    first_page_digests = tuple(f"{index:064x}" for index in range(1, 17))
+    frozen_head = "c" * 64
+    extended_head = "d" * 64
+    audience = SimpleNamespace(value="OPERATOR")
+
+    def page(
+        *,
+        after_sequence: int,
+        after_entry_sha256: str,
+        entries: tuple[tuple[int, str], ...],
+        head_sequence: int,
+        head_entry_sha256: str,
+    ) -> Any:
+        command = SimpleNamespace(
+            audience=audience,
+            after_sequence=after_sequence,
+            after_entry_sha256=after_entry_sha256,
+        )
+        entry_documents: list[dict[str, object]] = []
+        previous = after_entry_sha256
+        for sequence, entry_sha256 in entries:
+            entry_documents.append(
+                {
+                    "entry_sha256": entry_sha256,
+                    "previous_entry_sha256": previous,
+                    "sequence": sequence,
+                }
+            )
+            previous = entry_sha256
+        last_sequence, last_digest = entries[-1]
+        document = {
+            "command": {
+                "audience": audience.value,
+                "after_entry_sha256": after_entry_sha256,
+                "after_sequence": after_sequence,
+            },
+            "entries": entry_documents,
+            "has_more": last_sequence < head_sequence,
+            "head_entry_sha256": head_entry_sha256,
+            "head_sequence": head_sequence,
+            "next_after_entry_sha256": last_digest,
+            "next_after_sequence": last_sequence,
+            "schema_version": "controlgraph.timeline-page/v1",
+        }
+
+        def model_dump(*, mode: str) -> dict[str, Any]:
+            assert mode == "json"
+            return document
+
+        return SimpleNamespace(
+            command=command,
+            entries=tuple(SimpleNamespace(**entry) for entry in entry_documents),
+            has_more=last_sequence < head_sequence,
+            head_entry_sha256=head_entry_sha256,
+            head_sequence=head_sequence,
+            model_dump=model_dump,
+            next_after_entry_sha256=last_digest,
+            next_after_sequence=last_sequence,
+        )
+
+    responses = (
+        page(
+            after_sequence=1000,
+            after_entry_sha256=anchor,
+            entries=tuple(
+                (1000 + index, digest)
+                for index, digest in enumerate(first_page_digests, start=1)
+            ),
+            head_sequence=1017,
+            head_entry_sha256=frozen_head,
+        ),
+        page(
+            after_sequence=1016,
+            after_entry_sha256=first_page_digests[-1],
+            entries=((1017, frozen_head),),
+            head_sequence=1018,
+            head_entry_sha256=extended_head,
+        ),
+    )
+    queries: list[dict[str, list[str]]] = []
+
+    class TimelinePage:
+        @classmethod
+        def model_validate_json(cls, payload: bytes) -> Any:
+            return responses[int(payload.decode("ascii"))]
+
+    def request(**kwargs: Any) -> tuple[int, bytes, dict[str, str]]:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(kwargs["url"]).query)
+        queries.append(query)
+        return 200, str(len(queries) - 1).encode("ascii"), {"cache-control": "no-store"}
+
+    monkeypatch.setattr(timeline_contracts, "TimelinePageV1", TimelinePage)
+    monkeypatch.setattr(runner, "_http_request", request)
+    assert runner._TIMELINE_PAGE_LIMIT == 16
+    run = SimpleNamespace(
+        api_origin="https://api.example",
+        timeline_anchor_sequence=1000,
+        timeline_anchor_entry_sha256=anchor,
+    )
+
+    pages = runner._timeline_pages(run, "token")
+    summary = runner._timeline_page_summary(pages)
+
+    assert pages == responses
+    assert summary["page_bindings"][0]["after_sequence"] == 1000
+    assert summary["page_bindings"][0]["after_entry_sha256"] == anchor
+    assert summary["head_sequence"] == 1017
+    assert summary["head_entry_sha256"] == frozen_head
+    assert queries == [
+        {
+            "after_entry_sha256": [anchor],
+            "after_sequence": ["1000"],
+            "audience": ["OPERATOR"],
+            "limit": ["16"],
+        },
+        {
+            "after_entry_sha256": [first_page_digests[-1]],
+            "after_sequence": ["1016"],
+            "audience": ["OPERATOR"],
+            "limit": ["1"],
+        },
+    ]
+
+
+def test_hosted_timeline_evidence_rejects_invalid_anchor() -> None:
     runner = _hosted_module(Path(__file__).parent)
     digest = "a" * 64
     page = SimpleNamespace(
         command=SimpleNamespace(
             audience=SimpleNamespace(value="OPERATOR"),
             after_sequence=1,
-            after_entry_sha256=digest,
+            after_entry_sha256=None,
         ),
         entries=(),
         has_more=False,
@@ -2248,6 +2387,102 @@ def test_hosted_timeline_evidence_rejects_cursor_gaps() -> None:
             runner._timeline_evidence(pages)
 
         assert raised.value.code == "ACCEPTANCE_HOSTED_TIMELINE_INVALID"
+
+
+def test_hosted_timeline_evidence_rejects_inter_page_cursor_gap() -> None:
+    runner = _hosted_module(Path(__file__).parent)
+    first_digest = "a" * 64
+    head_digest = "b" * 64
+    audience = SimpleNamespace(value="OPERATOR")
+    first_document = {
+        "command": {
+            "audience": "OPERATOR",
+            "after_entry_sha256": None,
+            "after_sequence": 0,
+        },
+        "entries": [
+            {
+                "entry_sha256": first_digest,
+                "previous_entry_sha256": None,
+                "sequence": 1,
+            }
+        ],
+        "has_more": True,
+        "head_entry_sha256": head_digest,
+        "head_sequence": 2,
+        "next_after_entry_sha256": first_digest,
+        "next_after_sequence": 1,
+    }
+
+    def model_dump(*, mode: str) -> dict[str, Any]:
+        assert mode == "json"
+        return first_document
+
+    pages = (
+        SimpleNamespace(
+            command=SimpleNamespace(
+                audience=audience,
+                after_sequence=0,
+                after_entry_sha256=None,
+            ),
+            entries=(
+                SimpleNamespace(
+                    sequence=1,
+                    previous_entry_sha256=None,
+                    entry_sha256=first_digest,
+                ),
+            ),
+            has_more=True,
+            head_sequence=2,
+            head_entry_sha256=head_digest,
+            next_after_sequence=1,
+            next_after_entry_sha256=first_digest,
+            model_dump=model_dump,
+        ),
+        SimpleNamespace(
+            command=SimpleNamespace(
+                audience=audience,
+                after_sequence=0,
+                after_entry_sha256=None,
+            ),
+            entries=(),
+            has_more=False,
+            head_sequence=2,
+            head_entry_sha256=head_digest,
+            next_after_sequence=2,
+            next_after_entry_sha256=head_digest,
+        ),
+    )
+
+    with pytest.raises(runner.AcceptanceError) as raised:
+        runner._timeline_page_summary(pages)
+
+    assert raised.value.code == "ACCEPTANCE_HOSTED_TIMELINE_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"),
+    (
+        (None, (9, "b" * 64)),
+        (None, (10, "b" * 64)),
+        ((12, "c" * 64), (11, "d" * 64)),
+        ((11, "c" * 64), (11, "d" * 64)),
+    ),
+)
+def test_hosted_timeline_rejects_receding_or_rewritten_heads(
+    previous: tuple[int, str] | None,
+    current: tuple[int, str],
+) -> None:
+    runner = _hosted_module(Path(__file__).parent)
+
+    with pytest.raises(runner.AcceptanceError) as raised:
+        runner._require_timeline_head_extension(
+            frozen=(10, "a" * 64),
+            previous=previous,
+            current=current,
+        )
+
+    assert raised.value.code == "ACCEPTANCE_HOSTED_TIMELINE_CHANGED"
 
 
 def test_hosted_raw_timeline_starts_at_the_current_run_boundary() -> None:
@@ -2319,6 +2554,7 @@ def test_hosted_raw_timeline_uses_the_run_anchor_and_exact_operator_head(
     predecessor = "a" * 64
     first_entry = "b" * 64
     head = "c" * 64
+    extended_head = "d" * 64
     pages = (
         SimpleNamespace(
             entries=(
@@ -2343,9 +2579,9 @@ def test_hosted_raw_timeline_uses_the_run_anchor_and_exact_operator_head(
         ),
         SimpleNamespace(
             entries=("last",),
-            has_more=False,
-            head_entry_sha256=head,
-            head_sequence=1003,
+            has_more=True,
+            head_entry_sha256=extended_head,
+            head_sequence=1004,
             next_after_entry_sha256=head,
             next_after_sequence=1003,
         ),
