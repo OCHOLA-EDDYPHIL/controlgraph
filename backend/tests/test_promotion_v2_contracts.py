@@ -434,7 +434,7 @@ def test_retry_chains_use_compact_authorizations_within_the_task_budget() -> Non
     )
     task = _task(
         authorization,
-        expires_at="2026-08-21T12:10:30Z",
+        expires_at="2026-08-21T12:11:30Z",
     )
     assert len(retry_chain.signed_proofs) == 3
     assert len(canonical_json_bytes(task)) <= MAX_PROMOTION_TASK_CANONICAL_BYTES
@@ -467,7 +467,7 @@ def test_maximum_promotable_chain_is_compact_and_twentieth_proof_has_no_authorit
     )
     task = _task(
         authorization,
-        expires_at="2026-08-21T12:18:30Z",
+        expires_at="2026-08-21T12:19:30Z",
     )
     assert authorization.health_chain_locator.terminal_sequence == 19
     assert authorization.health_chain_locator.health_chain_sha256 == (
@@ -679,7 +679,7 @@ def test_v2_task_denies_capability_or_health_expiry_substitution() -> None:
     with pytest.raises(ValidationError):
         _task(
             authorization,
-            capability_expires_at="2026-08-21T12:11:01Z",
+            capability_expires_at="2026-08-21T12:12:01Z",
         )
 
 
