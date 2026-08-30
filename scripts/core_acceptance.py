@@ -1440,6 +1440,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 OPENER = urllib.request.build_opener(NoRedirect)
+FUTURE_TIMEOUT_SECONDS = 20
 
 def utc(value):
     return (
@@ -1573,7 +1574,9 @@ def main():
                 if time.time() >= window_start + 55:
                     break
                 futures.append(pool.submit(one, destination, credential, mode, expected_revision))
-            results = [future.result(timeout=8) for future in futures]
+            results = [
+                future.result(timeout=FUTURE_TIMEOUT_SECONDS) for future in futures
+            ]
         codes = {}
         accepted = 0
         for code, good in results:

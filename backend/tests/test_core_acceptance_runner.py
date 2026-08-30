@@ -3114,6 +3114,8 @@ def test_hosted_load_script_retries_transport_failures() -> None:
     with contextlib.suppress(SystemExit):
         exec(compile(source, "<load-script>", "exec"), namespace)
 
+    assert namespace["FUTURE_TIMEOUT_SECONDS"] > 3 * 5 + 2 * 0.75
+
     class _FlakyOpener:
         def __init__(self) -> None:
             self.calls = 0
