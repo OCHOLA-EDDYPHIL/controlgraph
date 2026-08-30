@@ -5,8 +5,8 @@
 This threat model defines the implemented security boundary for ControlGraph Canary through
 deterministic health, promotion, and captured-stable recovery. The repository contains the
 authority, signing, task-delivery, target-bound mutation, receipt/readback, Monitoring, and
-recovery composition described below. Source implementation and local verification do not claim
-that a particular revision has passed hosted acceptance.
+recovery composition described below. The public replay records one accepted hosted run, but that
+closed reference-target evidence is not a claim of production readiness or general security.
 
 ## Protected assets and safety outcomes
 
@@ -65,7 +65,8 @@ Verifier identity ------ independent read ------> Bound Cloud Run target
 Cloud Monitoring ------- bounded observations --> Deterministic policy input
 Evidence writer -------- sign facts ------------> Evidence boundary
 Console ---------------- read-only API ----------> Operator information
-Optional Gemini/ADK advisor -- bounded read-only facade; never enters the authority path
+Public replay ----------- embedded redacted artifact; no protected API or mutation action
+Optional Gemini/ADK advisor -- six read-only tools; never enters the authority path
 ```
 
 ### Identity boundary
@@ -124,6 +125,15 @@ captured stable revision at 100 percent traffic.
 Receipts and evidence identify canonical requests and authority transitions without storing
 credentials or raw tokens. Evidence integrity does not itself grant authority. Independent
 readback, immutable request bindings, and signed evidence make omission or alteration detectable.
+Selected authority, health, and independent-verification evidence and capabilities receive
+purpose-separated KMS signatures. Other effects are bound by canonical digests, receipts,
+provider readback, and the hash-linked timeline; the system does not claim that every effect is
+individually signed.
+
+The credential-free replay is a bounded, redacted projection embedded in the console revision.
+The browser validates its artifact hash, closed schema, payload digest, case bindings, and event
+chain before rendering and never calls a protected API. It does not independently verify KMS
+signatures or replace the authenticated evidence-verification path.
 
 ## Authority by actor
 
@@ -138,7 +148,7 @@ readback, immutable request bindings, and signed evidence make omission or alter
 | Verifier | Read exact target and Monitoring state and produce bounded health or prestate evidence. | No mutation or authority write. |
 | Evidence writer | Sign append-only evidence facts with the evidence key. | No authority-store write, capability signing, or target mutation. |
 | Task caller | Invoke one protected handler with the configured audience. | No mutation authority by identity alone. |
-| Optional Gemini/ADK advisor | Summarize bounded, already recorded facts. | No health, authority, safety, rollout, recovery, or execution decision. |
+| Optional Gemini/ADK advisor | Use six bounded read-only tools to derive a cited causal path over already recorded facts. | No health, authority, safety, rollout, recovery, or execution decision. |
 
 ## Threats, controls, and decisive tests
 
@@ -161,6 +171,7 @@ readback, immutable request bindings, and signed evidence make omission or alter
 | Recovery abuse | Separate task caller, recovery identity, executor facade, receipt route, signed verifier prestate, and restore-only adapter purpose; no direct recovery target permissions. | Substitute a prior APPLY receipt, candidate or arbitrary revision, prestate, root, epoch, or facade response and observe a fail-closed denial before mutation. |
 | Revoked-root recovery replay | Distinct revoked-V3 trigger; explicit operator confirmation; current signed N-to-N+1 revocation proof; direct-predecessor verified APPLY receipt; fresh exact-90/10 prestate; root-derived stable target. | Substitute stale or later authority, a non-predecessor or post-revocation receipt, a different evidence key or signature, an unhealthy source on the operator route, or an operator-selected revision and observe denial before mutation. |
 | Evidence tampering or omission | Canonical event identity, append-only records, signed evidence where required, and independent target readback. | Alter or remove a record and detect a digest, signature, or sequence discontinuity. |
+| Public replay substitution | Digest-addressed artifact, exact closed schema, fixed case and image sets, payload digest, and event hash chain. | Alter, truncate, reorder, or substitute replay content and require the browser verifier to fail closed before rendering. |
 | Prompt injection or unsafe model output | Models remain outside authority packages and call only a read-only application facade. | Adversarial text cannot produce a capability, authority transition, task enqueue, or adapter call. |
 | Credential disclosure | Never log or persist authorization headers, tokens, signatures as secrets, private keys, or raw provider errors. | Secret-shaped fixtures are rejected or redacted and error chains expose no credential material. |
 | Dependency or source confusion | Immutable dependency locks, pinned actions and images, disclosed adaptation source, and no sibling-repository runtime path. | Clean checkout and provenance checks detect symlinks, forbidden source paths, generated output, and credential material. |

@@ -13,8 +13,8 @@ target-bound Cloud Run mutation and readback, deterministic Monitoring health ev
 healthy promotion, and captured-stable recovery. Terraform defines the isolated cloud substrate,
 and the static React console renders the operator timeline and submits only the explicitly
 confirmed epoch-revocation command through the API. A bounded ADK/Gemini advisor reads recorded
-facts but has no mutation authority. These implementation facts do not establish that a particular
-revision has passed hosted acceptance.
+facts but has no mutation authority. The published credential-free replay binds one accepted
+hosted run to its exact source, immutable images, manifest, cases, and redacted event chain.
 
 ## Trust boundaries and control path
 
@@ -89,6 +89,30 @@ drives the separately addressed recovery path.
 No model appears in the authority or mutation path. The optional Gemini/ADK integration consumes
 six narrow, read-only diagnostic tools. Its bounded output cannot approve authority, classify
 health, select a rollout or recovery action, enqueue protected work, or call a mutation adapter.
+
+## Proof protocol and causal boundary
+
+The implemented proof protocol connects five independently reviewable layers:
+
+1. Cloud Run configuration and probe observations, Firestore authority and receipt records, and
+   Cloud Monitoring samples are captured under closed versioned contracts.
+2. Pure reducers classify authority, health, execution, recovery, and uncertain provider outcomes.
+   An outcome that cannot be distinguished by exact readback remains `AMBIGUOUS`.
+3. One canonical request can acquire one directly confirmed, process-local dispatch lease. Its
+   durable receipt rejects conflicting reuse and prevents replay from reconstructing mutation
+   authority.
+4. Selected authority, health, and independent-verification evidence and capabilities are signed
+   through purpose-separated Cloud KMS keys. Other effects remain bound by canonical digests,
+   receipts, provider readback, and the hash-linked timeline rather than being described as
+   individually signed.
+5. Gemini 3.5 Flash, invoked by Google ADK, uses six read-only tools to derive a structured,
+   evidence-backed causal path. Required receipt, timeline, and target or verifier citations are
+   validated before the result is recorded as `ADVISORY_ONLY`; the result never enters a
+   deterministic decision path.
+
+This is a causal path over named observations, not a general-purpose causal graph. The protocol
+does not invent competing histories when evidence is incomplete: it preserves the explicit
+deterministic outcome and the evidence needed for an operator to investigate it.
 
 ## Layering and dependency direction
 
@@ -317,8 +341,14 @@ promote, recover, issue a capability, or reinterpret advisor output as authority
 
 The optional advisor is a separate service and identity. It can query only bounded application
 facts, is capped by request, token, and timeout limits, records model assistance as
-`ADVISORY_ONLY`, and has no mutation-capable facade. Hosted behavior still requires evidence from
-the exact deployed revision; source and Terraform definitions alone do not prove it.
+`ADVISORY_ONLY`, and has no mutation-capable facade. Its Google ADK runner fixes the model to
+`gemini-3.5-flash` and supplies exactly six read-only tools.
+
+The same console service exposes `/replay` without credentials. That route serves one bounded,
+redacted artifact embedded in the deployed revision and makes no protected API call. The browser
+validates the artifact hash, exact schemas and bounds, payload digest, case bindings, and event
+hash chain before rendering it. Browser validation does not independently verify Cloud KMS
+signatures; authenticated server-side verifier and evidence paths own that check.
 
 ## Selective reuse and provenance
 
