@@ -3151,7 +3151,7 @@ def _public_timeline(pages: Sequence[Any], *, root_id: str) -> Any:
             schema_version=PUBLIC_REPLAY_TIMELINE_ENTRY_V1,
             sequence=entry.sequence,
             entry_sha256=entry.entry_sha256,
-            event_type=entry.event_type.value,
+            event_type=PublicReplayTimelineEventType(entry.event_type.value),
             occurred_at=entry.occurred_at,
             verification_status=entry.verification_status.value,
         )

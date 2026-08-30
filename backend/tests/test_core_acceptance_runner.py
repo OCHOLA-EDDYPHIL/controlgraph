@@ -2648,6 +2648,49 @@ def test_hosted_policy_binding_compares_plain_artifact_digest() -> None:
     assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == artifact_sha256
 
 
+def test_hosted_public_timeline_uses_strict_replay_event_enum(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    root_id = "cgroot:" + "a" * 64
+    event_types = (
+        "AUTHORITY_EPOCH_ADVANCED",
+        "MUTATION_APPLIED",
+        "MUTATION_DENIED",
+        "MODEL_ASSISTANCE_RECORDED",
+    )
+    entries = tuple(
+        SimpleNamespace(
+            sequence=sequence,
+            entry_sha256=f"{sequence:064x}",
+            root_id=root_id,
+            event_type=SimpleNamespace(value=event_type),
+            occurred_at="2026-08-30T00:00:00Z",
+            verification_status=SimpleNamespace(value="VERIFIED"),
+        )
+        for sequence, event_type in enumerate(event_types, start=1)
+    )
+    monkeypatch.setattr(
+        runner,
+        "_timeline_page_summary",
+        lambda _pages: {
+            "entry_count": 4,
+            "head_entry_sha256": entries[-1].entry_sha256,
+            "head_sequence": 4,
+            "page_count": 1,
+            "page_set_sha256": "f" * 64,
+        },
+    )
+
+    timeline = runner._public_timeline(
+        (SimpleNamespace(entries=entries),),
+        root_id=root_id,
+    )
+
+    assert tuple(item.event_type.value for item in timeline.entries) == event_types
+
+
 def test_hosted_receipt_poll_tolerates_transient_read_codes(
     tmp_path: Path,
     monkeypatch: Any,
