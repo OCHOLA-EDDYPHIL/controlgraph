@@ -2763,6 +2763,38 @@ def test_hosted_receipt_poll_allows_delayed_terminal_receipt(
     assert delays == [2.0] * 100
 
 
+def test_hosted_receipt_poll_waits_for_ambiguous_resolution(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    root = SimpleNamespace(root_id="cgroot:" + "b" * 64, root_sha256="b" * 64)
+    outcomes = iter(("AMBIGUOUS", "VERIFIED"))
+    delays: list[float] = []
+
+    def fake_run_cli(*_args: Any, **_kwargs: Any) -> tuple[int, Any, Any]:
+        outcome = SimpleNamespace(value=next(outcomes))
+        return 0, {}, SimpleNamespace(receipt=SimpleNamespace(outcome=outcome))
+
+    monkeypatch.setattr(runner, "_run_cli", fake_run_cli)
+    monkeypatch.setattr(runner.time, "sleep", delays.append)
+
+    result = runner._poll_receipt(
+        run=SimpleNamespace(repo=SOURCE_ROOT, project_number="123456789"),
+        case=SimpleNamespace(case_id="core-case-1"),
+        root=root,
+        epoch=2,
+        request_id="req",
+        idempotency_key="idem",
+        action="RECOVER_STABLE_V1",
+        capability_sha256="c" * 64,
+        label="recovery",
+    )
+
+    assert result.receipt.outcome.value == "VERIFIED"
+    assert delays == [2.0]
+
+
 def test_hosted_candidate_prewarm_returns_on_first_answer(
     monkeypatch: Any,
 ) -> None:
