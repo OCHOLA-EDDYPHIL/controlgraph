@@ -1407,6 +1407,7 @@ def _poll_receipt(
             not in {
                 "CLAIMED",
                 "APPLIED",
+                "AMBIGUOUS",
             }
         ):
             return model
