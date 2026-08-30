@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 
 import {
   OperatorApiError,
@@ -210,6 +210,25 @@ function actionLabel(value: string): string {
   return value.replaceAll("_", " ");
 }
 
+function advisorActionLabel(value: string): string {
+  switch (value) {
+    case "wait":
+      return "Wait for more evidence";
+    case "collect_approved_diagnostics":
+      return "Collect approved diagnostics";
+    case "request_revocation":
+      return "Review epoch revocation";
+    case "request_captured_stable_recovery":
+      return "Review recovery to the captured stable revision";
+    case "request_new_operator_approved_rollout":
+      return "Review a new operator-approved rollout";
+    case "manual_review":
+      return "Continue with manual review";
+    default:
+      return actionLabel(value);
+  }
+}
+
 function AdvisorInvestigation({
   eligible,
   status,
@@ -229,30 +248,34 @@ function AdvisorInvestigation({
     <section className="advisor-investigation" aria-labelledby="advisor-title">
       <div className="section-heading">
         <div>
-          <p className="eyebrow">Deterministic denial · advisory investigation</p>
-          <h2 id="advisor-title">Why the stale action could not proceed</h2>
+          <p className="eyebrow">Denied work · optional explanation</p>
+          <h2 id="advisor-title">Why the queued action was denied</h2>
         </div>
-        <p>Gemini may explain cited evidence. It cannot authorize or mutate a rollout.</p>
+        <p>
+          The denial comes from deterministic checks. The advisor cannot approve work or change
+          traffic.
+        </p>
       </div>
 
       {eligible !== null && (
         <article className="denial-proof">
           <div>
-            <span className="proof-kicker">Enforced before model analysis</span>
-            <strong>DENIED · EPOCH_MISMATCH</strong>
+            <span className="proof-kicker">Decision made before advisor analysis</span>
+            <strong>Queued work was denied</strong>
             <p>
-              Work bound to epoch {eligible.entry.epoch} reached authority at epoch{" "}
-              {eligible.currentEpoch}. No provider mutation was authorized.
+              This work was approved for epoch {eligible.entry.epoch}, but the root is now at epoch{" "}
+              {eligible.currentEpoch}. The authority check blocked it before any provider change.
             </p>
+            <code className="decision-code">DENIED · EPOCH_MISMATCH</code>
           </div>
           <dl>
             <div>
-              <dt>Receipt evidence</dt>
-              <dd><code>{shortDigest(eligible.entry.entrySha256)}</code></dd>
+              <dt>Issued authority</dt>
+              <dd>Epoch {eligible.entry.epoch}</dd>
             </div>
             <div>
-              <dt>Root</dt>
-              <dd><code>{shortDigest(eligible.entry.rootSha256)}</code></dd>
+              <dt>Current authority</dt>
+              <dd>Epoch {eligible.currentEpoch}</dd>
             </div>
           </dl>
         </article>
@@ -272,10 +295,10 @@ function AdvisorInvestigation({
       {eligible !== null && result === null && status !== "STALE" && (
         <div className="advisor-launch">
           <div>
-            <strong>Analyze current rollout evidence</strong>
+            <strong>Ask the read-only advisor for an explanation</strong>
             <p>
-              Runs the six read-only diagnostic tools through Google ADK and
-              gemini-3.5-flash, then validates every returned citation.
+              It summarizes named evidence and validates every citation. Its answer cannot
+              change this decision.
             </p>
           </div>
           <button
@@ -284,7 +307,7 @@ function AdvisorInvestigation({
             disabled={status === "RUNNING"}
             onClick={asyncAction(run)}
           >
-            {status === "RUNNING" ? "Analyzing evidence…" : "Analyze current rollout evidence"}
+            {status === "RUNNING" ? "Analyzing evidence…" : "Analyze evidence"}
           </button>
         </div>
       )}
@@ -304,14 +327,19 @@ function AdvisorInvestigation({
           <header>
             <div>
               <span className="proof-kicker">Validated advisory · operator review required</span>
-              <h3>{actionLabel(recommendation.requested_operator_action)}</h3>
+              <h3>{advisorActionLabel(recommendation.requested_operator_action)}</h3>
             </div>
             <strong>{(recommendation.confidence_basis_points / 100).toFixed(2)}% confidence</strong>
           </header>
 
           <div className="advisor-boundary">
-            Authority effect: <strong>none</strong> · deterministic health override:{" "}
-            <strong>false</strong>
+            Advice only. It cannot approve work, override deterministic health decisions, or
+            change the target.
+            <span>
+              Authority effect: <strong>{recommendation.authority_effect}</strong> · deterministic
+              health override:{" "}
+              <strong>{String(recommendation.deterministic_health_override)}</strong>
+            </span>
           </div>
 
           <div className="advisor-columns">
@@ -325,8 +353,7 @@ function AdvisorInvestigation({
                       {finding.citations.map((citation) => (
                         <li key={`${citation.evidence_kind}:${citation.evidence_id}`}>
                           <span>{citation.evidence_kind}</span>{" "}
-                          <code>{citation.evidence_id}</code>{" "}
-                          <code>{shortDigest(citation.source_sha256)}</code>
+                          <code>{citation.evidence_id}</code>
                         </li>
                       ))}
                     </ul>
@@ -348,12 +375,25 @@ function AdvisorInvestigation({
           </div>
 
           <details className="advisor-audit">
-            <summary>Model and tool audit</summary>
+            <summary>Technical model and tool details</summary>
             <dl>
               <div><dt>Model</dt><dd>{result.response.audit.model_id}</dd></div>
               <div><dt>Prompt</dt><dd>{result.response.audit.prompt_version}</dd></div>
               <div><dt>Interaction</dt><dd><code>{result.interaction_id}</code></dd></div>
               <div><dt>Replay</dt><dd>{result.replayed ? "exact idempotent replay" : "fresh invocation"}</dd></div>
+              <div><dt>Authority effect</dt><dd>{recommendation.authority_effect}</dd></div>
+              <div><dt>Health override</dt><dd>{String(recommendation.deterministic_health_override)}</dd></div>
+              {recommendation.findings.flatMap((finding, findingIndex) =>
+                finding.citations.map((citation, citationIndex) => (
+                  <div key={`${findingIndex}:${citationIndex}:${citation.evidence_id}`}>
+                    <dt>{citation.evidence_kind} citation</dt>
+                    <dd>
+                      <code>{citation.evidence_id}</code>{" "}
+                      <code>{shortDigest(citation.source_sha256)}</code>
+                    </dd>
+                  </div>
+                )),
+              )}
             </dl>
             <ol>
               {result.response.audit.tool_calls.map((tool) => (
@@ -380,22 +420,51 @@ function asyncAction(action: () => Promise<unknown>): () => void {
   };
 }
 
-function phaseMessage(phase: ConsolePhase): string | null {
+function phaseNotice(phase: ConsolePhase): {
+  readonly heading: string;
+  readonly message: string;
+} | null {
   switch (phase) {
     case "AUTHENTICATING":
-      return "Authenticating operator identity…";
+      return {
+        heading: "Checking operator identity",
+        message: "Verifying access before requesting target evidence.",
+      };
     case "LOADING":
-      return "Loading the signed operator timeline…";
+      return {
+        heading: "Loading verified evidence",
+        message: "Reading and validating the signed operator timeline.",
+      };
     case "RECONNECTING":
-      return "Connection interrupted. The next read will continue from the last verified cursor.";
+      return {
+        heading: "Connection interrupted",
+        message: "The next read will continue from the last verified timeline position.",
+      };
+    case "EMPTY":
+      return {
+        heading: "No rollout evidence yet",
+        message: "The verified timeline is empty. Authority actions become available after a rollout root is recorded.",
+      };
     case "STALE":
-      return "This view is stale. Authority actions are blocked until the timeline is reloaded from its first entry.";
+      return {
+        heading: "Timeline reload required",
+        message: "This view is stale. Authority actions are blocked until the timeline is reloaded from its first entry.",
+      };
     case "PARTIAL":
-      return "Timeline evidence is partial or failed validation. No authority action is available from this view.";
+      return {
+        heading: "Evidence could not be fully verified",
+        message: "Timeline evidence is partial or failed validation. No authority action is available from this view.",
+      };
     case "DENIED":
-      return "Access denied. An authenticated operator identity is required for this target.";
+      return {
+        heading: "Access denied",
+        message: "An authenticated operator identity is required for this target.",
+      };
     case "FAILED":
-      return "The operator API is unavailable. Existing evidence has not been replaced or inferred.";
+      return {
+        heading: "Console unavailable",
+        message: "The operator API is unavailable. Existing evidence has not been replaced or inferred.",
+      };
     case "LIVE":
       return null;
   }
@@ -412,8 +481,8 @@ function ConnectionNotice({
   readonly reconnect: () => Promise<void>;
   readonly reload: () => Promise<void>;
 }) {
-  const message = phaseMessage(phase);
-  if (message === null) {
+  const notice = phaseNotice(phase);
+  if (notice === null) {
     return null;
   }
   const isBusy = phase === "AUTHENTICATING" || phase === "LOADING";
@@ -426,8 +495,8 @@ function ConnectionNotice({
     >
       <span className="connection-notice__signal" aria-hidden="true" />
       <div>
-        <strong>{isBusy ? "Establishing trusted view" : "Operator attention required"}</strong>
-        <p>{message}</p>
+        <h2>{notice.heading}</h2>
+        <p>{notice.message}</p>
         {stableCode !== null && <code>{stableCode}</code>}
       </div>
       {!isBusy && phase === "RECONNECTING" && (
@@ -437,7 +506,11 @@ function ConnectionNotice({
       )}
       {!isBusy && phase !== "RECONNECTING" && (
         <button className="button button--quiet" type="button" onClick={asyncAction(reload)}>
-          {phase === "DENIED" ? "Retry authentication" : "Reload timeline"}
+          {phase === "DENIED"
+            ? "Retry authentication"
+            : phase === "EMPTY"
+              ? "Check again"
+              : "Reload timeline"}
         </button>
       )}
     </section>
@@ -461,8 +534,28 @@ function SummaryCard({ label, value, detail }: {
 function EventBindings({ entry }: { readonly entry: TimelineEntry }) {
   return (
     <details className="event-bindings">
-      <summary>Evidence bindings</summary>
+      <summary>Technical details</summary>
       <dl>
+        <div>
+          <dt>Epoch</dt>
+          <dd>{entry.epoch}</dd>
+        </div>
+        <div>
+          <dt>Verification</dt>
+          <dd>{entry.verificationStatus.toLowerCase().replaceAll("_", " ")}</dd>
+        </div>
+        <div>
+          <dt>Signature metadata</dt>
+          <dd>
+            {entry.signature === null
+              ? "Not present"
+              : `Signed ${entry.signature.purpose.toLowerCase().replaceAll("_", " ")}`}
+          </dd>
+        </div>
+        <div>
+          <dt>Terminal classification</dt>
+          <dd>{entry.terminalClassification.toLowerCase().replaceAll("_", " ")}</dd>
+        </div>
         <div>
           <dt>Entry</dt>
           <dd><code>{shortDigest(entry.entrySha256)}</code></dd>
@@ -480,6 +573,16 @@ function EventBindings({ entry }: { readonly entry: TimelineEntry }) {
           <dd>{entry.sourceSchemaVersion}</dd>
         </div>
       </dl>
+      {entry.displayFields.length > 0 && (
+        <dl className="display-fields" aria-label="Server-provided evidence fields">
+          {entry.displayFields.map((field) => (
+            <div key={field.name}>
+              <dt>{field.name.toLowerCase().replaceAll("_", " ")}</dt>
+              <dd>{field.value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
       {entry.correlations.length > 0 && (
         <div className="correlations" aria-label="Event correlations">
           {entry.correlations.map((correlation) => (
@@ -501,10 +604,14 @@ function TimelineEvent({
   readonly entries: readonly TimelineEntry[];
 }) {
   const presentation = eventPresentation(entry, entries);
+  const decisiveOutcome = displayField(entry, "OUTCOME");
+  const decisiveReason = displayField(entry, "REASON_CODE");
   const summary =
-    displayField(entry, "SUMMARY") ??
-    displayField(entry, "OBSERVATION") ??
-    displayField(entry, "OUTCOME");
+    entry.eventType === "VERIFICATION_RECORDED"
+      ? displayField(entry, "OBSERVATION") ?? displayField(entry, "SUMMARY")
+      : displayField(entry, "SUMMARY") ??
+        displayField(entry, "OBSERVATION") ??
+        displayField(entry, "OUTCOME");
   return (
     <li className={`timeline-event timeline-event--${presentation.tone.toLowerCase()}`}>
       <div className="timeline-event__rail" aria-hidden="true">
@@ -519,28 +626,25 @@ function TimelineEvent({
           <time dateTime={entry.occurredAt}>{formatTimestamp(entry.occurredAt)} UTC</time>
         </div>
         {summary !== null && <p className="timeline-event__summary">{summary}</p>}
-        <div className="timeline-event__facts">
+        <div
+          className="timeline-event__facts"
+          role="group"
+          aria-label="Decisive event outcome"
+        >
           <span>Epoch {entry.epoch}</span>
-          <span>{entry.verificationStatus.toLowerCase().replaceAll("_", " ")}</span>
           <span>
-            {entry.signature === null
-              ? "No signature metadata"
-              : `Signed ${entry.signature.purpose.toLowerCase().replaceAll("_", " ")} metadata`}
+            Record {entry.verificationStatus.toLowerCase().replaceAll("_", " ")}
           </span>
+          {decisiveOutcome !== null && (
+            <span>Outcome {decisiveOutcome.replaceAll("_", " ")}</span>
+          )}
+          {decisiveReason !== null && (
+            <span>Reason {decisiveReason.replaceAll("_", " ")}</span>
+          )}
           {entry.terminalClassification !== "NONE" && (
             <span>{entry.terminalClassification.toLowerCase().replaceAll("_", " ")}</span>
           )}
         </div>
-        {entry.displayFields.length > 0 && (
-          <dl className="display-fields">
-            {entry.displayFields.map((field) => (
-              <div key={field.name}>
-                <dt>{field.name.toLowerCase().replaceAll("_", " ")}</dt>
-                <dd>{field.value}</dd>
-              </div>
-            ))}
-          </dl>
-        )}
         {presentation.advisory && (
           <p className="advisory-boundary">
             Advisory only. This event cannot authorize, classify, enqueue, or mutate a rollout.
@@ -557,15 +661,23 @@ function RevocationOutcome({
   result,
   resolution,
   checkTimeline,
+  outcomeRef,
 }: {
   readonly status: RevocationStatus;
   readonly result: RevocationResult | null;
   readonly resolution: RevocationResolution | null;
   readonly checkTimeline: () => Promise<void>;
+  readonly outcomeRef: RefObject<HTMLElement>;
 }) {
   if (status === "COMMITTED" && result !== null) {
     return (
-      <section className="action-result action-result--success" role="status" aria-live="polite">
+      <section
+        ref={outcomeRef}
+        className="action-result action-result--success"
+        role="status"
+        aria-live="polite"
+        tabIndex={-1}
+      >
         <span aria-hidden="true">✓</span>
         <div>
           <strong>Authority revoked at epoch {result.newEpoch}</strong>
@@ -579,7 +691,12 @@ function RevocationOutcome({
   }
   if (status === "AMBIGUOUS") {
     return (
-      <section className="action-result action-result--danger" role="alert">
+      <section
+        ref={outcomeRef}
+        className="action-result action-result--danger"
+        role="alert"
+        tabIndex={-1}
+      >
         <span aria-hidden="true">!</span>
         <div>
           <strong>Revocation outcome is unknown</strong>
@@ -596,7 +713,13 @@ function RevocationOutcome({
   }
   if (status === "TIMELINE_CONFIRMED" && resolution?.status === "CONFIRMED") {
     return (
-      <section className="action-result action-result--success" role="status" aria-live="polite">
+      <section
+        ref={outcomeRef}
+        className="action-result action-result--success"
+        role="status"
+        aria-live="polite"
+        tabIndex={-1}
+      >
         <span aria-hidden="true">✓</span>
         <div>
           <strong>Revocation confirmed by timeline at epoch {resolution.epoch}</strong>
@@ -611,7 +734,12 @@ function RevocationOutcome({
   }
   if (status === "SUPERSEDED") {
     return (
-      <section className="action-result action-result--warning" role="alert">
+      <section
+        ref={outcomeRef}
+        className="action-result action-result--warning"
+        role="alert"
+        tabIndex={-1}
+      >
         <span aria-hidden="true">!</span>
         <div>
           <strong>Authority advanced without a matching request</strong>
@@ -622,7 +750,12 @@ function RevocationOutcome({
   }
   if (status === "STALE") {
     return (
-      <section className="action-result action-result--warning" role="alert">
+      <section
+        ref={outcomeRef}
+        className="action-result action-result--warning"
+        role="alert"
+        tabIndex={-1}
+      >
         <span aria-hidden="true">!</span>
         <div>
           <strong>Revocation review expired</strong>
@@ -633,7 +766,12 @@ function RevocationOutcome({
   }
   if (status === "DENIED" || status === "FAILED") {
     return (
-      <section className="action-result action-result--danger" role="alert">
+      <section
+        ref={outcomeRef}
+        className="action-result action-result--danger"
+        role="alert"
+        tabIndex={-1}
+      >
         <span aria-hidden="true">!</span>
         <div>
           <strong>{status === "DENIED" ? "Revocation denied" : "Revocation failed safely"}</strong>
@@ -719,7 +857,7 @@ function RevocationDialog({
       >
         <div className="dialog-heading">
           <div>
-            <p className="eyebrow">Human authority action</p>
+            <p className="eyebrow">Authority change</p>
             <h2 id="revocation-title">Review epoch revocation</h2>
           </div>
           <button className="icon-button" type="button" onClick={close} disabled={submitting}>
@@ -728,10 +866,22 @@ function RevocationDialog({
           </button>
         </div>
         <p id="revocation-description" className="dialog-intro">
-          Revocation advances authority by one epoch. It does not select traffic or invoke a
-          cloud control plane.
+          Revoking moves this root from epoch {reviewed.epoch} to {reviewed.epoch + 1}. Any queued
+          work approved for epoch {reviewed.epoch} will be rejected at its next authority check.
+          Revocation does not change traffic itself. Work that has already passed its final
+          authority check may still complete.
         </p>
         <dl className="review-grid">
+          <div className="review-grid__target">
+            <dt>Target under review</dt>
+            <dd>
+              <strong>{reviewed.target.service_name}</strong>
+              <span>
+                {reviewed.target.project_id} · {reviewed.target.region} ·{" "}
+                {reviewed.target.environment}
+              </span>
+            </dd>
+          </div>
           <div>
             <dt>Root under review</dt>
             <dd><code>{reviewed.rootId}</code></dd>
@@ -773,8 +923,9 @@ function RevocationDialog({
               disabled={submitting}
             />
             <span>
-              I reviewed root <code>{shortDigest(reviewed.rootSha256)}</code> and confirm
-              revocation of expected epoch {reviewed.epoch}.
+              I reviewed root <code>{shortDigest(reviewed.rootSha256)}</code> and understand that
+              revoking epoch {reviewed.epoch} advances authority to epoch {reviewed.epoch + 1}
+              and makes work approved for epoch {reviewed.epoch} stale.
             </span>
           </label>
           <div className="dialog-actions">
@@ -786,7 +937,9 @@ function RevocationDialog({
               type="submit"
               disabled={!reasonIsValid || !confirmed || submitting}
             >
-              {submitting ? "Checking fresh epoch…" : `Revoke epoch ${reviewed.epoch}`}
+              {submitting
+                ? "Checking fresh epoch…"
+                : `Revoke and advance to epoch ${reviewed.epoch + 1}`}
             </button>
           </div>
         </form>
@@ -813,8 +966,10 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
   const [advisorResult, setAdvisorResult] = useState<AdvisorOperatorResult | null>(null);
   const [advisorBinding, setAdvisorBinding] = useState<AdvisorBinding | null>(null);
   const reviewButtonRef = useRef<HTMLButtonElement>(null);
+  const revocationOutcomeRef = useRef<HTMLElement>(null);
   const consoleContentRef = useRef<HTMLDivElement>(null);
   const dialogWasOpen = useRef(false);
+  const previousRevocationStatus = useRef<RevocationStatus>("IDLE");
 
   const dialogOpen =
     reviewed !== null &&
@@ -856,17 +1011,28 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
       content.inert = dialogOpen;
       content.setAttribute("aria-hidden", dialogOpen ? "true" : "false");
     }
-    if (dialogWasOpen.current && !dialogOpen) {
+    if (!dialogOpen && previousRevocationStatus.current !== revocationStatus) {
+      if (
+        ["COMMITTED", "TIMELINE_CONFIRMED", "SUPERSEDED", "STALE", "AMBIGUOUS", "DENIED", "FAILED"].includes(
+          revocationStatus,
+        )
+      ) {
+        revocationOutcomeRef.current?.focus();
+      } else if (dialogWasOpen.current) {
+        reviewButtonRef.current?.focus();
+      }
+    } else if (dialogWasOpen.current && !dialogOpen) {
       reviewButtonRef.current?.focus();
     }
     dialogWasOpen.current = dialogOpen;
+    previousRevocationStatus.current = revocationStatus;
     return () => {
       if (content !== null) {
         content.inert = false;
         content.removeAttribute("aria-hidden");
       }
     };
-  }, [dialogOpen]);
+  }, [dialogOpen, revocationStatus]);
 
   const canRevoke =
     view.phase === "LIVE" &&
@@ -1057,18 +1223,6 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
               visible, stale authority stays denied, and model output stays advisory.
             </p>
           </div>
-          <div className="hero-actions">
-            <button
-              ref={reviewButtonRef}
-              className="button button--danger"
-              type="button"
-              onClick={asyncAction(openRevocationReview)}
-              disabled={!canRevoke}
-            >
-              {revocationStatus === "PREPARING" ? "Refreshing authority…" : "Review revocation"}
-            </button>
-            <small>Only epoch revocation is available here. Traffic controls are intentionally absent.</small>
-          </div>
         </section>
 
         <ConnectionNotice
@@ -1085,40 +1239,25 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
           </section>
         )}
 
-        <RevocationOutcome
-          status={revocationStatus}
-          result={revocationResult}
-          resolution={revocationResolution}
-          checkTimeline={checkAmbiguousRevocation}
-        />
-
-        <AdvisorInvestigation
-          eligible={eligibleDenial}
-          status={
-            advisorResult !== null && !advisorResultIsCurrent
-              ? "STALE"
-              : advisorStatus
-          }
-          result={advisorResultIsCurrent ? advisorResult : null}
-          run={runAdvisorInvestigation}
-        />
-
         {view.target !== null && view.authority !== null && (
           <section className="rollout-overview" aria-labelledby="overview-title">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Current evidence view</p>
+                <p className="eyebrow">
+                  {view.phase === "LIVE" ? "Live authority overview" : "Latest admitted evidence"}
+                </p>
                 <h2 id="overview-title">{view.target.service_name}</h2>
               </div>
-              <p>
-                {view.target.project_id} · {view.target.region} · {view.target.environment}
-              </p>
+              <details className="section-disclosure">
+                <summary>Target details</summary>
+                <p>{view.target.project_id} · {view.target.region} · {view.target.environment}</p>
+              </details>
             </div>
             <div className="summary-grid">
               <SummaryCard
                 label="Authority"
                 value={`Epoch ${view.authority.epoch}`}
-                detail={`Root ${shortDigest(view.authority.rootSha256)}`}
+                detail="Target-scoped rollout root"
               />
               <SummaryCard
                 label="Traffic"
@@ -1136,8 +1275,51 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
                 detail={`Timeline head ${view.head.afterSequence}`}
               />
             </div>
+            {view.phase === "LIVE" && (
+              <div className="authority-action">
+                <div>
+                  <span className="proof-kicker">Manual authority action</span>
+                  <strong>Revoke authority for epoch {view.authority.epoch}</strong>
+                  <p>
+                    Revoking advances this root to epoch {view.authority.epoch + 1}. Queued work
+                    approved for epoch {view.authority.epoch} will be denied at its next authority
+                    check. Revocation does not change traffic itself.
+                  </p>
+                </div>
+                <button
+                  ref={reviewButtonRef}
+                  className="button button--quiet"
+                  type="button"
+                  onClick={asyncAction(openRevocationReview)}
+                  disabled={!canRevoke}
+                >
+                  {revocationStatus === "PREPARING"
+                    ? "Refreshing authority…"
+                    : "Review revocation"}
+                </button>
+              </div>
+            )}
           </section>
         )}
+
+        <RevocationOutcome
+          status={revocationStatus}
+          result={revocationResult}
+          resolution={revocationResolution}
+          checkTimeline={checkAmbiguousRevocation}
+          outcomeRef={revocationOutcomeRef}
+        />
+
+        <AdvisorInvestigation
+          eligible={eligibleDenial}
+          status={
+            advisorResult !== null && !advisorResultIsCurrent
+              ? "STALE"
+              : advisorStatus
+          }
+          result={advisorResultIsCurrent ? advisorResult : null}
+          run={runAdvisorInvestigation}
+        />
 
         <section className="timeline-section" id="timeline" aria-labelledby="timeline-title">
           <div className="section-heading">
@@ -1145,23 +1327,26 @@ export function App({ api, pollIntervalMs = 10_000 }: AppProps) {
               <p className="eyebrow">Append-only target history</p>
               <h2 id="timeline-title">Operator timeline</h2>
             </div>
-            <p>
-              Reconnects continue from sequence {view.cursor.afterSequence}. Raw records,
-              capabilities, and credentials are never exposed here.
-            </p>
+            <details className="section-disclosure">
+              <summary>Timeline connection details</summary>
+              <p>
+                Reconnects continue from sequence {view.cursor.afterSequence}. Raw records,
+                capabilities, and credentials are never exposed here.
+              </p>
+            </details>
           </div>
-          {view.entries.length === 0 ? (
+          {view.entries.length === 0 && view.target !== null && view.phase === "EMPTY" ? (
             <div className="empty-timeline" role="status">
               <span aria-hidden="true">○</span>
               <p>No target-scoped evidence is available yet.</p>
             </div>
-          ) : (
+          ) : view.entries.length > 0 ? (
             <ol className="timeline-list">
               {view.entries.map((entry) => (
                 <TimelineEvent entry={entry} entries={view.entries} key={entry.entryId} />
               ))}
             </ol>
-          )}
+          ) : null}
         </section>
       </main>
 

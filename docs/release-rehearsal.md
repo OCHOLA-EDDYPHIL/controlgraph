@@ -125,7 +125,7 @@ jq -n --arg source "$CG_SOURCE_SHA" \
 ```
 
 Build the artifact inventory by hashing the files that actually exist. The architecture document
-contains the rendered Mermaid trust-boundary diagram, the threat model is the limitations source,
+contains the rendered architecture diagram, the threat model is the limitations source,
 and `SECURITY.md` is the disclosure source:
 
 ```bash
@@ -163,9 +163,10 @@ performance|PERFORMANCE_SUMMARY|BUNDLE|measurement-summary.json|controlgraph.mea
 checks|REQUIRED_CHECK_RESULTS|BUNDLE|required-check-results.json|controlgraph.required-check-results/v1
 release-review|RELEASE_REVIEW|BUNDLE|release-review.json|controlgraph.release-review/v1
 architecture|ARCHITECTURE_DOCUMENT|REPOSITORY|docs/architecture.md|
-architecture-diagram|ARCHITECTURE_DIAGRAM|REPOSITORY|docs/architecture.md|
+architecture-diagram|ARCHITECTURE_DIAGRAM|REPOSITORY|docs/assets/architecture.svg|
 quickstart|QUICKSTART_DOCUMENT|REPOSITORY|docs/quickstart.md|
 demo-asset|DEMO_ASSET|REPOSITORY|docs/demo.md|
+stale-authority-diagram|DEMO_ASSET|REPOSITORY|docs/assets/stale-authority-flow.svg|
 comparison|NATIVE_COMPARISON_DOCUMENT|REPOSITORY|docs/native-cloud-comparison.md|
 limitations|LIMITATIONS_DOCUMENT|REPOSITORY|docs/threat-model.md|
 disclosures|DISCLOSURE_DOCUMENT|REPOSITORY|SECURITY.md|

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -15,6 +15,7 @@ import type { TimelinePage, TimelineQuery } from "./contracts/timeline";
 import {
   ROOT_ID,
   ROOT_SHA256,
+  TARGET,
   field,
   timelineEntry,
   timelinePage,
@@ -26,6 +27,17 @@ const IDENTITY: OperatorIdentity = {
   expiresAtEpochSeconds: 9_000_000_000,
 };
 
+function deferred(): { readonly promise: Promise<void>; resolve(): void } {
+  let resolvePromise: (() => void) | null = null;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: () => resolvePromise?.(),
+  };
+}
+
 class FakeOperatorApi implements OperatorApi {
   entries = [timelineEntry(1, "AUTHORITY_ROOT_CREATED")];
   pageSize = 25;
@@ -33,6 +45,8 @@ class FakeOperatorApi implements OperatorApi {
   nextReadError: unknown = null;
   revokeError: unknown = null;
   adviseError: unknown = null;
+  authenticateGate: Promise<void> | null = null;
+  readGate: Promise<void> | null = null;
   nextPageTransform: ((page: TimelinePage) => TimelinePage) | null = null;
   readonly queries: TimelineQuery[] = [];
   readonly authenticationFreshness: boolean[] = [];
@@ -41,6 +55,9 @@ class FakeOperatorApi implements OperatorApi {
 
   async authenticate(options?: { readonly fresh?: boolean }): Promise<OperatorIdentity> {
     this.authenticationFreshness.push(options?.fresh ?? false);
+    if (this.authenticateGate !== null) {
+      await this.authenticateGate;
+    }
     if (this.authenticateError !== null) {
       throw this.authenticateError;
     }
@@ -49,6 +66,9 @@ class FakeOperatorApi implements OperatorApi {
 
   async readTimeline(query: TimelineQuery): Promise<ReturnType<typeof timelinePage>> {
     this.queries.push(query);
+    if (this.readGate !== null) {
+      await this.readGate;
+    }
     if (this.nextReadError !== null) {
       const error = this.nextReadError;
       this.nextReadError = null;
@@ -237,7 +257,12 @@ function completeTimeline() {
       fields: [field("SUMMARY", "Root admitted for the reference target")],
     }),
     timelineEntry(2, "MUTATION_APPLIED", {
-      fields: [field("ACTION", "APPLY_CANARY"), field("STATE", "90/10")],
+      fields: [
+        field("ACTION", "APPLY_CANARY"),
+        field("STATE", "90/10"),
+        field("OUTCOME", "VERIFIED"),
+      ],
+      verificationStatus: "VERIFIED",
     }),
     timelineEntry(3, "HEALTH_OBSERVED", {
       fields: [field("OBSERVATION", "100 candidate requests"), field("WINDOW", "1 of 2")],
@@ -246,7 +271,8 @@ function completeTimeline() {
       fields: [field("STATE", "HEALTHY")],
     }),
     timelineEntry(5, "MUTATION_APPLIED", {
-      fields: [field("ACTION", "PROMOTE_CANDIDATE")],
+      fields: [field("ACTION", "PROMOTE_CANDIDATE"), field("OUTCOME", "VERIFIED")],
+      verificationStatus: "VERIFIED",
     }),
     timelineEntry(6, "RECOVERY_INTENT_CREATED", {
       fields: [field("SUMMARY", "One stable-only recovery intent")],
@@ -255,7 +281,11 @@ function completeTimeline() {
       fields: [field("OUTCOME", "Captured stable at 100%")],
     }),
     timelineEntry(8, "VERIFICATION_RECORDED", {
-      fields: [field("SUMMARY", "Configuration and probe agree")],
+      fields: [
+        field("OBSERVATION", "Configuration and probe"),
+        field("OUTCOME", "MATCH"),
+        field("SUMMARY", "Independent verification recorded"),
+      ],
       verificationStatus: "VERIFIED",
     }),
     timelineEntry(9, "MUTATION_DENIED", {
@@ -286,18 +316,38 @@ describe("operator console", () => {
     render(<App api={api} pollIntervalMs={0} />);
 
     expect(await screen.findByText("DENIED · EPOCH_MISMATCH")).toBeTruthy();
-    expect(screen.getByText(/Work bound to epoch 1 reached authority at epoch 2/)).toBeTruthy();
+    expect(
+      screen.getByText(/work was approved for epoch 1, but the root is now at epoch 2/i),
+    ).toBeTruthy();
+    const overview = screen
+      .getByRole("heading", { name: "controlgraph-reference-target" })
+      .closest("section")!;
+    const advisor = screen
+      .getByRole("heading", { name: "Why the queued action was denied" })
+      .closest("section")!;
+    expect(
+      overview.compareDocumentPosition(advisor) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", { name: "Analyze current rollout evidence" }),
+      screen.getByRole("button", { name: "Analyze evidence" }),
     );
 
-    expect(
-      await screen.findByRole("article", { name: "Validated Gemini evidence analysis" }),
-    ).toBeTruthy();
+    const analysis = await screen.findByRole("article", {
+      name: "Validated Gemini evidence analysis",
+    });
     expect(
       screen.getByText("The denied work was bound to the preceding authority epoch."),
     ).toBeTruthy();
-    expect(screen.getByText("evidence:denied-receipt")).toBeTruthy();
+    const findings = within(analysis)
+      .getByRole("heading", { name: "Causal findings" })
+      .closest("section")!;
+    expect(within(findings).getByText("evidence:denied-receipt")).toBeTruthy();
+    expect(findings.textContent).not.toContain("8888888888…88888888");
+    const technicalDetails = within(analysis)
+      .getByText("Technical model and tool details")
+      .closest("details")!;
+    expect(technicalDetails.open).toBe(false);
+    expect(technicalDetails.textContent).toContain("8888888888…88888888");
     expect(screen.getByText("gemini-3.5-flash")).toBeTruthy();
     expect(screen.getByText("controlgraph.rollout-advisor-prompt/v2")).toBeTruthy();
     expect(screen.getByText(/Authority effect:/).textContent).toContain("none");
@@ -326,7 +376,7 @@ describe("operator console", () => {
 
     await screen.findByText("operator@example.com");
     expect(
-      screen.queryByRole("button", { name: "Analyze current rollout evidence" }),
+      screen.queryByRole("button", { name: "Analyze evidence" }),
     ).toBeNull();
     expect(api.advisorCommands).toHaveLength(0);
   });
@@ -371,7 +421,7 @@ describe("operator console", () => {
 
     await screen.findByText("operator@example.com");
     expect(
-      screen.queryByRole("button", { name: "Analyze current rollout evidence" }),
+      screen.queryByRole("button", { name: "Analyze evidence" }),
     ).toBeNull();
   });
 
@@ -395,7 +445,7 @@ describe("operator console", () => {
 
     await screen.findByText("operator@example.com");
     expect(
-      screen.queryByRole("button", { name: "Analyze current rollout evidence" }),
+      screen.queryByRole("button", { name: "Analyze evidence" }),
     ).toBeNull();
   });
 
@@ -408,7 +458,7 @@ describe("operator console", () => {
     render(<App api={api} pollIntervalMs={15} />);
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Analyze current rollout evidence" }),
+      await screen.findByRole("button", { name: "Analyze evidence" }),
     );
     expect(
       await screen.findByRole("article", { name: "Validated Gemini evidence analysis" }),
@@ -445,9 +495,9 @@ describe("operator console", () => {
     expect(await screen.findByText("operator@example.com")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "controlgraph-reference-target" })).toBeTruthy();
     expect(screen.getAllByText("Epoch 1").length).toBeGreaterThan(0);
-    expect(screen.getByRole("heading", { name: "90/10 canary applied" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "90/10 canary verified" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Health policy: healthy" })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: "Candidate promoted" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Candidate promotion verified" })).toBeTruthy();
     expect(
       screen.getByRole("heading", { name: "Captured stable revision restored" }),
     ).toBeTruthy();
@@ -463,16 +513,116 @@ describe("operator console", () => {
     expect(api.queries[1]?.afterEntrySha256).toBe(api.entries[3]?.entrySha256);
   });
 
+  it("keeps the decisive outcome visible and places raw evidence in disclosure", async () => {
+    const api = new FakeOperatorApi();
+    api.entries = [
+      timelineEntry(1, "AUTHORITY_ROOT_CREATED", {
+        fields: [field("SUMMARY", "Root admitted from server evidence")],
+      }),
+    ];
+    render(<App api={api} pollIntervalMs={0} />);
+
+    const event = (await screen.findByRole("heading", { name: "Rollout root established" }))
+      .closest("article")!;
+    expect(within(event).getByRole("group", { name: "Decisive event outcome" }).textContent).toContain(
+      "Epoch 1",
+    );
+    const disclosure = within(event).getByText("Technical details").closest("details")!;
+    expect(disclosure.open).toBe(false);
+    expect(within(disclosure).getByText("Root admitted from server evidence")).toBeTruthy();
+
+    fireEvent.click(within(disclosure).getByText("Technical details"));
+    expect(disclosure.open).toBe(true);
+  });
+
+  it("keeps a contradictory verification verdict visible when its record is valid", async () => {
+    const api = new FakeOperatorApi();
+    api.entries = [
+      timelineEntry(1, "VERIFICATION_RECORDED", {
+        fields: [
+          field("OUTCOME", "MISMATCH"),
+          field("REASON_CODE", "CONFIGURATION_MISMATCH"),
+          field("SUMMARY", "Independent verification recorded"),
+        ],
+        verificationStatus: "VERIFIED",
+      }),
+    ];
+    render(<App api={api} pollIntervalMs={0} />);
+
+    const event = (
+      await screen.findByRole("heading", {
+        name: "Independent verification found a mismatch",
+      })
+    ).closest("article")!;
+    const status = within(event).getByRole("group", { name: "Decisive event outcome" });
+    expect(status.textContent).toContain("Outcome MISMATCH");
+    expect(status.textContent).toContain("Reason CONFIGURATION MISMATCH");
+    expect(screen.getByText(/Partial or contradictory evidence is present/)).toBeTruthy();
+    expect(
+      within(event).queryByRole("heading", { name: "Independent verification matched" }),
+    ).toBeNull();
+  });
+
+  it("distinguishes provider acceptance from a verified mutation", async () => {
+    const api = new FakeOperatorApi();
+    const request = "request:promotion-awaiting-verification";
+    api.entries = [
+      timelineEntry(1, "AUTHORITY_ROOT_CREATED"),
+      timelineEntry(2, "TASK_CREATED", {
+        fields: [field("ACTION", "PROMOTE_CANDIDATE")],
+        correlations: [{ kind: "REQUEST", correlationId: request }],
+      }),
+      timelineEntry(3, "MUTATION_APPLIED", {
+        fields: [
+          field("OUTCOME", "APPLIED"),
+          field("SUMMARY", "Mutation receipt recorded"),
+        ],
+        correlations: [{ kind: "REQUEST", correlationId: request }],
+        verificationStatus: "NOT_APPLICABLE",
+      }),
+    ];
+    render(<App api={api} pollIntervalMs={0} />);
+
+    const event = (
+      await screen.findByRole("heading", {
+        name: "Candidate promotion accepted; verification pending",
+      })
+    ).closest("article")!;
+    const status = within(event).getByRole("group", { name: "Decisive event outcome" });
+    expect(status.textContent).toContain("Record not applicable");
+    expect(status.textContent).toContain("Outcome APPLIED");
+    expect(
+      screen.queryByRole("heading", { name: "Candidate promotion verified" }),
+    ).toBeNull();
+  });
+
   it("requires fresh root and epoch review, a typed reason, and explicit confirmation", async () => {
     const api = new FakeOperatorApi();
     render(<App api={api} pollIntervalMs={0} />);
     await screen.findByText("operator@example.com");
 
-    fireEvent.click(screen.getByRole("button", { name: "Review revocation" }));
+    const hero = screen.getByRole("heading", { name: "Authority you can inspect." }).closest("section")!;
+    const overview = screen
+      .getByRole("heading", { name: "controlgraph-reference-target" })
+      .closest("section")!;
+    expect(within(hero).queryByRole("button", { name: "Review revocation" })).toBeNull();
+    const review = within(overview).getByRole("button", { name: "Review revocation" });
+    expect(review.classList.contains("button--danger")).toBe(false);
+    fireEvent.click(review);
     const dialog = await screen.findByRole("dialog", { name: "Review epoch revocation" });
     expect(dialog.textContent).toContain(ROOT_ID);
+    expect(dialog.textContent).toContain(TARGET.service_name);
+    expect(dialog.textContent).toContain(TARGET.project_id);
+    expect(dialog.textContent).toContain(TARGET.region);
+    expect(dialog.textContent).toContain(TARGET.environment);
     expect(dialog.textContent).toContain("1 → 2");
-    const submit = screen.getByRole("button", { name: "Revoke epoch 1" });
+    expect(dialog.textContent).toContain("queued work approved for epoch 1 will be rejected");
+    expect(dialog.textContent).toContain("Revocation does not change traffic itself");
+    expect(dialog.textContent).toContain(
+      "Work that has already passed its final authority check may still complete",
+    );
+    const submit = screen.getByRole("button", { name: "Revoke and advance to epoch 2" });
+    expect(submit.classList.contains("button--danger")).toBe(true);
     expect((submit as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.change(screen.getByLabelText("Reason for revocation"), {
@@ -480,12 +630,15 @@ describe("operator console", () => {
     });
     expect((submit as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(
-      screen.getByLabelText(/I reviewed root .* and confirm revocation of expected epoch 1/),
+      screen.getByLabelText(/understand that revoking epoch 1 advances authority to epoch 2/),
     );
     expect((submit as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(submit);
 
-    expect(await screen.findByText("Authority revoked at epoch 2")).toBeTruthy();
+    const committed = (await screen.findByText("Authority revoked at epoch 2")).closest(
+      "section",
+    )!;
+    await waitFor(() => expect(document.activeElement).toBe(committed));
     expect(screen.getByText("evidence:revocation-1")).toBeTruthy();
     expect(api.revocations).toHaveLength(1);
     expect(api.revocations[0]).toMatchObject({
@@ -517,7 +670,7 @@ describe("operator console", () => {
         fields: [field("SUMMARY", "A different request advanced authority")],
       }),
     ];
-    fireEvent.click(screen.getByRole("button", { name: "Revoke epoch 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke and advance to epoch 2" }));
 
     expect(await screen.findByText("Revocation review expired")).toBeTruthy();
     expect(screen.getByText(/No stale command was sent/)).toBeTruthy();
@@ -535,11 +688,14 @@ describe("operator console", () => {
       target: { value: "Operator cannot establish safe rollout state" },
     });
     fireEvent.click(screen.getByLabelText(/I reviewed root/));
-    fireEvent.click(screen.getByRole("button", { name: "Revoke epoch 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke and advance to epoch 2" }));
 
-    expect(await screen.findByText("Revocation outcome is unknown")).toBeTruthy();
+    const ambiguous = (await screen.findByText("Revocation outcome is unknown")).closest(
+      "section",
+    )!;
+    await waitFor(() => expect(document.activeElement).toBe(ambiguous));
     expect(screen.getByRole("button", { name: "Check timeline" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Revoke epoch/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Revoke and advance/ })).toBeNull();
     expect(
       (screen.getByRole("button", { name: "Review revocation" }) as HTMLButtonElement)
         .disabled,
@@ -572,6 +728,16 @@ describe("operator console", () => {
     const trigger = screen.getByRole("button", { name: "Review revocation" });
     fireEvent.click(trigger);
     const dialog = await screen.findByRole("dialog", { name: "Review epoch revocation" });
+    expect(document.activeElement).toBe(screen.getByLabelText("Reason for revocation"));
+
+    const close = screen.getByRole("button", { name: "Close revocation review" });
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    close.focus();
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
+    cancel.focus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
 
     fireEvent.keyDown(dialog, { key: "Escape" });
 
@@ -585,7 +751,10 @@ describe("operator console", () => {
     await screen.findByText("operator@example.com");
     api.nextReadError = new OperatorApiError("UNAVAILABLE");
 
-    expect(await screen.findByText(/Connection interrupted/)).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { name: "Connection interrupted" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
     const previousHead = api.entries.at(-1)!;
     api.entries = [
       ...api.entries,
@@ -604,17 +773,61 @@ describe("operator console", () => {
     expect(screen.getAllByRole("heading", { name: "Rollout root established" })).toHaveLength(1);
   });
 
+  it("labels authentication and loading separately without claiming the timeline is empty", async () => {
+    const api = new FakeOperatorApi();
+    const authentication = deferred();
+    const timelineRead = deferred();
+    api.authenticateGate = authentication.promise;
+    api.readGate = timelineRead.promise;
+    render(<App api={api} pollIntervalMs={0} />);
+
+    expect(
+      screen.getByRole("heading", { name: "Checking operator identity" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("No target-scoped evidence is available yet.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
+
+    authentication.resolve();
+    expect(
+      await screen.findByRole("heading", { name: "Loading verified evidence" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("No target-scoped evidence is available yet.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
+
+    timelineRead.resolve();
+    expect(
+      await screen.findByRole("button", { name: "Review revocation" }),
+    ).toBeTruthy();
+  });
+
+  it("distinguishes a valid empty timeline from failed validation", async () => {
+    const api = new FakeOperatorApi();
+    api.entries = [];
+    render(<App api={api} pollIntervalMs={15} />);
+
+    const heading = await screen.findByRole("heading", { name: "No rollout evidence yet" });
+    const notice = heading.closest("section")!;
+    expect(within(notice).getByText(/verified timeline is empty/)).toBeTruthy();
+    expect(within(notice).getByRole("button", { name: "Check again" })).toBeTruthy();
+    expect(screen.getByText("No target-scoped evidence is available yet.")).toBeTruthy();
+    expect(screen.queryByText(/failed validation/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
+
+    api.entries = [timelineEntry(1, "AUTHORITY_ROOT_CREATED")];
+    expect(
+      await screen.findByRole("heading", { name: "Rollout root established" }),
+    ).toBeTruthy();
+  });
+
   it("fails closed for a denied operator and exposes no mutation surface", async () => {
     const api = new FakeOperatorApi();
     api.authenticateError = new OperatorApiError("ACCESS_DENIED", "AUTH_CALLER_DENIED");
     render(<App api={api} pollIntervalMs={0} />);
 
-    expect(await screen.findByText(/Access denied/)).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Access denied" })).toBeTruthy();
     expect(screen.getByText("AUTH_CALLER_DENIED")).toBeTruthy();
-    expect(
-      (screen.getByRole("button", { name: "Review revocation" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
+    expect(screen.queryByText("No target-scoped evidence is available yet.")).toBeNull();
     expect(screen.queryByText(/Deploy|Delete|Scale service/)).toBeNull();
   });
 
@@ -623,12 +836,11 @@ describe("operator console", () => {
     api.nextReadError = new OperatorApiError("UNAVAILABLE");
     render(<App api={api} pollIntervalMs={0} />);
 
+    expect(await screen.findByRole("heading", { name: "Console unavailable" })).toBeTruthy();
     expect(await screen.findByText(/operator API is unavailable/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reload timeline" })).toBeTruthy();
-    expect(
-      (screen.getByRole("button", { name: "Review revocation" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
+    expect(screen.queryByText("No target-scoped evidence is available yet.")).toBeNull();
   });
 
   it("renders untrusted timeline text as text rather than markup", async () => {
@@ -654,7 +866,11 @@ describe("operator console", () => {
       "TIMELINE_READ_CURSOR_INVALID",
     );
 
-    expect(await screen.findByText(/This view is stale/)).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { name: "Timeline reload required" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/This view is stale/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
     expect(screen.getByText("TIMELINE_READ_CURSOR_INVALID")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Reload timeline" }));
     await waitFor(() => expect(screen.queryByText(/This view is stale/)).toBeNull());
@@ -670,7 +886,11 @@ describe("operator console", () => {
       head: { afterSequence: 0, afterEntrySha256: null },
     });
 
-    expect(await screen.findByText(/Timeline evidence is partial/)).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { name: "Evidence could not be fully verified" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/Timeline evidence is partial/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Review revocation" })).toBeNull();
     expect(screen.getByText("TIMELINE_HEAD_REGRESSED")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Rollout root established" })).toBeTruthy();
   });

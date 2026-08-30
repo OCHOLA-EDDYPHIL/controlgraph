@@ -18,7 +18,9 @@ identities.
 - To run the backend and console locally, use the root [README](../README.md#quick-start).
 - To reproduce all eight hosted cases against a disposable target, continue with this runbook.
 
-The published canonical replay can also be fetched and checked directly:
+### Optional replay integrity check
+
+Fetch the published replay and verify its required digest without running hosted acceptance:
 
 ```bash
 CG_REPLAY_SHA256=13782bc3b1d6f711c39494118a3df783de61b9ac20f0defeca108ec473fcf8cc

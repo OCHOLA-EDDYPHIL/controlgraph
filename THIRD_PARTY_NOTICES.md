@@ -27,6 +27,7 @@ ControlGraph Canary is licensed under Apache-2.0. The project depends on or uses
 | Google and Google Beta Terraform providers | Google Cloud resource providers | MPL-2.0 |
 | GitHub checkout/setup actions | CI bootstrap | MIT |
 | HashiCorp setup-terraform action | CI bootstrap | MPL-2.0 |
+| Draw.io Desktop | Documentation diagram authoring and SVG export | Apache-2.0 |
 
 Container base images and transitive packages may carry additional notices. Produce a dependency lock and software bill of materials for every release, then ship the corresponding source/license obligations with that release.
 

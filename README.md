@@ -1,70 +1,65 @@
 # ControlGraph Canary
 
-**A valid signature proves what was approved. It does not prove that approval still exists when
-queued work finally executes.**
+**Stop stale rollout authority before it changes Cloud Run traffic.**
 
-ControlGraph Canary is last-mile authority for agentic Cloud Run changes. It turns real provider
-observations into deterministic execution decisions, narrow KMS-signed capabilities, durable
-one-use receipt claims, and an evidence-backed causal path that an operator can inspect. Every
-mutating executor rereads the rollout root's current Firestore epoch immediately before invoking
-its target-bound adapter. A capability from any other epoch fails closed even when its caller and
-signature are valid.
+A queued action can be valid when it is approved and wrong when it finally runs. ControlGraph
+checks the rollout's current authority again immediately before the target-bound provider call.
+Current-epoch work can continue through the remaining gates. Delayed work that is stale at this
+final check stops before the target changes. A separate verifier then records what actually
+happened.
 
-The repository contains a Python 3.12 backend and CLI, a static React and TypeScript operator
-console, Terraform, shared contract fixtures, and CI checks. The implemented rollout vertical
-captures a stable Cloud Run revision, applies a 90/10 canary, deterministically evaluates its
-Cloud Monitoring signals, then either promotes the approved candidate or restores the captured
-stable revision. Manual epoch revocation makes delayed otherwise-valid work fail closed.
+ControlGraph applies this rule to one focused canary workflow: capture a stable revision, move
+traffic to a 90/10 split, evaluate fixed health rules, and either promote the candidate or restore
+the captured stable revision. A read-only AI advisor can explain the recorded evidence, but it
+cannot approve or execute a change.
 
-## The proof protocol
+![ControlGraph stops queued work when its authority is no longer current, verifies the unchanged target, and recovers with new authority.](docs/assets/stale-authority-flow.svg)
 
-The strongest end-to-end path is deliberately small and visible:
+## What ControlGraph adds
 
-1. Establish a verified 90/10 canary and enqueue signed promotion work at epoch N.
-2. Hold delivery, revoke authority to N+1, and release the delayed work.
-3. Classify it as `DENIED / EPOCH_MISMATCH` while independent readback proves the target stayed
-   exactly 90/10.
-4. Invoke Gemini 3.5 Flash through Google ADK with six read-only tools. The accepted structured
-   finding cites the receipt, timeline, and target evidence that form the stale-authority causal
-   path; it has `authority_effect=none` and offers no apply action.
-5. Issue fresh, stable-only recovery authority at the current epoch and verify 100/0.
+- **Revocable approval:** an epoch is a version of rollout authority. Advancing it invalidates
+  work issued under an older epoch.
+- **A last-mile check:** the executor reads the current epoch immediately before it calls the
+  target-bound traffic adapter.
+- **Narrow execution:** signed capabilities bind one caller, target, action, traffic plan,
+  precondition, request, and lifetime.
+- **Independent proof:** a separate read-only path checks configuration and data-path evidence
+  before the system reports a verified outcome.
+- **Useful AI without AI authority:** the advisor organizes cited evidence for an operator. The
+  deterministic control path remains in charge.
 
-If a provider mutation might have happened but readback cannot distinguish the outcome,
-ControlGraph records `AMBIGUOUS`; it does not wrap uncertainty in a success-shaped certificate or
-blindly retry. Selected authority, health, and independent-verification evidence and capabilities
-are signed with purpose-separated Cloud KMS keys. The ordered timeline is hash-linked.
+## See the proof
 
-## Verify the published run
+Open the credential-free [public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
+to inspect one accepted hosted run. The recorded sequence shows:
 
-The credential-free [public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
-is bound to:
+1. valid promotion work queued under epoch N;
+2. an operator advancing authority to N+1;
+3. the executor rejecting the delayed action with `DENIED / EPOCH_MISMATCH`;
+4. independent readback confirming that traffic stayed at 90/10; and
+5. new, current-epoch recovery authority restoring 100 percent stable traffic.
 
-- source `dcc2192dade08d3fdfd27daded0ccfdd13193fd1`;
-- accepted run `cgacceptance:380d6733e6caa85a17df5da6c193680bfa7e03b00009ac30a40fa068849b14b9`;
-- acceptance manifest SHA-256
-  `7b5c2e362b702bd675acc8b1fff18a4ece232cd530013967d6ed11122fcea700`; and
-- replay SHA-256 `13782bc3b1d6f711c39494118a3df783de61b9ac20f0defeca108ec473fcf8cc`.
+The replay validates its artifact, schema, payload, case bindings, and event chain before it
+renders. It is recorded evidence for one accepted run, not a live control surface or a claim
+about the current source revision. Cloud KMS signatures are verified in the authenticated
+evidence path, not in the browser.
 
-The browser fails closed unless the artifact hash, closed schema, payload digest, eight-case
-binding, and six-event hash chain validate. It renders recorded, redacted evidence and makes no
-protected API call. It does not independently verify Cloud KMS signatures; those are checked in
-the authenticated verifier path and represented by bounded metadata in the replay.
+## How the design stays small
 
-## Repository layout
+ControlGraph separates four responsibilities:
 
-```text
-backend/  Authority kernel, application services, Google adapters, API, CLI, and tests
-web/      Read-only React/Vite operator console and contract-fixture checks
-infra/    Isolated Google Cloud environment and service modules
-docs/     Product contract, architecture, threat model, acceptance, and provenance
-```
+1. **Approve:** the operator approves one immutable rollout root and its current epoch.
+2. **Execute:** a target-bound executor accepts only a valid capability at that exact epoch.
+3. **Verify:** a separate reader compares intent, receipts, configuration, and probe results.
+4. **Explain:** the timeline and optional advisor present recorded facts without granting
+   authority.
+
+Cloud Run remains the serving and traffic control plane. Firestore stores authority and receipts,
+Cloud KMS signs capabilities and selected evidence, Cloud Tasks carries addressed work, and Cloud
+Monitoring supplies health observations. ControlGraph connects those native controls around the
+execution-time authority decision.
 
 ## Quick start
-
-The commands below are the local development path. For the isolated hosted setup, exact 90/10
-walkthrough, revocation and recovery sequence, evidence review, and cleanup, use the
-[reproducible canary quickstart](docs/quickstart.md) and
-[evidence-backed demo](docs/demo.md).
 
 ### Backend
 
@@ -76,22 +71,16 @@ uv run controlgraph-canary doctor
 uv run controlgraph-canary serve
 ```
 
-Each controller exposes identity-safe read endpoints:
-
-- `GET /healthz`
-- `GET /v1/metadata`
-
-Role-specific protected routes compose the authenticated API, coordinator, issuer, executor,
-recovery, verifier, and evidence-writer boundaries. Mutation routes require the complete
-role-specific environment and exact caller, capability, root, epoch, receipt, and target
-bindings; an ordinary local start does not bypass those gates.
+Every controller exposes identity-safe `GET /healthz` and `GET /v1/metadata` endpoints. Protected
+routes still require their full caller, capability, root, epoch, receipt, and target bindings. A
+local start does not bypass those checks.
 
 ### Web console
 
 ```bash
 cd web
-npm install
-npm test
+npm ci
+npm test -- --run
 npm run dev
 ```
 
@@ -107,28 +96,45 @@ terraform -chdir=infra/runtime init -backend=false
 terraform -chdir=infra/runtime validate
 ```
 
-Terraform must receive immutable container references in the form `...@sha256:...`. Plans
-and applies are intentional operator actions and are never run by the local console.
+Terraform accepts immutable container references in the form `...@sha256:...`. Applying a plan is
+an explicit operator action. The console never applies infrastructure.
 
-## Safety model
+## Read by goal
 
-- Epochs are root-scoped, monotonically increasing authority versions.
-- A capability is valid only for an exact current-epoch match.
-- Authority-bearing Python code has an enforced import boundary and cannot depend on HTTP,
-  cloud, model, or agent-framework packages.
-- Mutation adapters are configured for one target and cannot accept arbitrary coordinates.
-- Cloud Monitoring health decisions are deterministic, root-bound, and signed; no model chooses
-  promotion or recovery.
-- The recovery identity can only verify and forward stable-only work to the executor's separate
-  recovery facade. It has no direct target-update, target service-account impersonation
-  (`actAs`), or operation-read authority.
-- The static console never invokes a cloud control plane directly. It reads the timeline and can
-  submit only an authenticated, explicitly confirmed epoch revocation through the API.
-- ADK/Gemini assistance is bounded and read-only; model output is never mutation authority.
-- Unknown or ambiguous mutation outcomes remain explicit and are never blindly retried.
+| Goal | Start here |
+|---|---|
+| Understand the solution and its boundaries | [Architecture](docs/architecture.md) |
+| Watch the complete stale-authority story | [Evidence-backed demo](docs/demo.md) |
+| Reproduce the local or hosted workflow | [Canary quickstart](docs/quickstart.md) |
+| Review exact states, records, and outcomes | [Product contract](docs/product-contract.md) |
+| Evaluate security assumptions and controls | [Threat model](docs/threat-model.md) and [security policy](SECURITY.md) |
+| Compare the design with native Google Cloud controls | [Native-cloud comparison](docs/native-cloud-comparison.md) |
+| Operate or investigate the system | [Operations runbooks](docs/runbooks.md) |
+| Review source origin and durable choices | [Provenance](docs/provenance.md) and [architecture decisions](docs/decisions/) |
 
-See [docs/architecture.md](docs/architecture.md) and
-[docs/threat-model.md](docs/threat-model.md) for the security boundary.
+## Repository layout
+
+```text
+backend/  Authority kernel, application services, Google adapters, API, CLI, and tests
+web/      Operator evidence console, epoch-revocation control, public replay, and contract checks
+infra/    Isolated Google Cloud environment and service modules
+docs/     Architecture, product contract, evidence, operations, and provenance
+```
+
+## Security posture
+
+- Each rollout root has its own monotonically increasing epoch.
+- Capabilities succeed only when their signed epoch is current and every other binding matches.
+- Authority code cannot import HTTP, cloud, model, or agent-framework packages.
+- Mutation adapters are fixed to one target and a closed traffic operation.
+- Health decisions are deterministic and signed.
+- Recovery can select only the stable revision captured by the rollout root.
+- Provider uncertainty remains `AMBIGUOUS` until exact readback resolves it.
+- The console has no direct cloud-control-plane access.
+
+ControlGraph is pre-release software for the documented reference boundary. See the
+[architecture](docs/architecture.md) and [threat model](docs/threat-model.md) for the complete
+security model.
 
 ## Development
 
@@ -143,9 +149,6 @@ terraform -chdir=infra/foundation init -backend=false && terraform -chdir=infra/
 terraform -chdir=infra/runtime init -backend=false && terraform -chdir=infra/runtime validate
 python scripts/check_clean_room.py
 ```
-
-The source-boundary check keeps credentials, host paths, symlinks, unrecorded adaptations,
-and runtime dependencies on sibling repositories out of the project.
 
 ## License
 

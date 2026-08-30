@@ -2,15 +2,16 @@
 
 ## Status and scope
 
-This document freezes the version 1 product vocabulary and acceptance boundary for
-ControlGraph Canary. It is a contract for implemented behavior, not evidence that any particular
-revision has passed hosted acceptance. The repository implements canonical contracts,
-root-scoped epoch authority, authenticated role composition, KMS signing, Firestore claims and
-receipts, addressed Cloud Tasks delivery, target-bound Cloud Run execution and readback,
-deterministic Monitoring health evaluation, healthy promotion, and captured-stable recovery.
-The current console is static, renders the bounded operator timeline, and submits only an
-authenticated, explicitly confirmed epoch-revocation command through the API. The optional
-ADK/Gemini advisor reads bounded recorded facts and has no mutation authority.
+This document freezes the version 1 product vocabulary and acceptance boundary. Product contract
+version 1 is independent of the internal rollout-root record versions (`v2` and `v3`) listed
+below. It specifies implemented behavior; accepted-run evidence is recorded separately.
+
+ControlGraph implements canonical contracts, root-scoped epoch authority, authenticated role
+composition, signed capabilities, addressed delivery, target-bound execution, independent
+readback, deterministic health evaluation, promotion, and captured-stable recovery. The console
+renders the bounded operator timeline and submits one authenticated, explicitly confirmed epoch
+revocation through the API. The optional advisor reads recorded facts and has no mutation
+authority.
 
 Version 1 controls one canary rollout for one Cloud Run service in one Google Cloud project and
 region. It is not a general deployment system, workflow engine, graph engine, or authorization

@@ -2,8 +2,7 @@
 
 ## Supported versions
 
-ControlGraph Canary is pre-release software. Security fixes are made on the latest revision
-only.
+ControlGraph Canary is pre-release software. The latest revision receives security fixes.
 
 ## Reporting a vulnerability
 
@@ -32,6 +31,6 @@ Do not include production credentials, customer data, or live project identifier
 - CI has read-only repository permissions by default and uses no long-lived cloud key.
 - The web console does not directly invoke cloud control-plane APIs.
 
-This project is not production-ready. Deployment evidence applies only to the isolated
-acceptance environment and exact tested revision; it is not a claim of general security,
-availability, or production suitability.
+The security boundary is the documented isolated canary environment. Deployment evidence applies
+to the exact accepted revision and does not establish general security, availability, or
+production suitability.

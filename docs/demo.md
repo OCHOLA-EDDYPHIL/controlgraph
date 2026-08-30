@@ -1,133 +1,104 @@
 # Evidence-backed demo
 
-This is the evidence order for one hosted acceptance run of the disposable reference target.
-Present a claim only when all four evidence columns below are bound to the same source commit,
-target, root, epoch, request, and run. Examples and fixture identifiers are synthetic; published
-evidence is redacted.
+This demo shows the problem ControlGraph solves: queued work can keep valid credentials after its
+approval is no longer current. The proof connects the authority change, executor decision, target
+readback, recovery, and optional AI explanation in one reviewable sequence.
 
-Use the [reproducible quickstart](quickstart.md) to provision and run the sequence. The
-[product contract](product-contract.md) defines the allowed outcomes, and the
-[threat model](threat-model.md) defines what the demonstration does not prove.
+Open the credential-free [public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
+for the accepted hosted example. Use the [canary quickstart](quickstart.md) to reproduce the full
+workflow in an isolated project.
 
-## Shortest complete proof
+## The proof at a glance
 
-The clearest single path starts from verified 90/10 traffic. Enqueue signed promotion work at
-epoch N, pause delivery, revoke to N+1, and release the queue. The executor returns
-`DENIED / EPOCH_MISMATCH`; configuration readback before and after denial proves the target stayed
-90/10. Gemini 3.5 Flash then uses the Google ADK runner's six read-only tools to derive one
-receipt/timeline/target-cited causal path with no authority effect. Fresh current-epoch,
-stable-only recovery finishes at verified 100/0.
+![A promotion queued at epoch N reaches the executor after authority advances to N+1, so ControlGraph blocks it, verifies unchanged traffic, and restores stable traffic with new authority.](assets/stale-authority-flow.svg)
 
-The immutable, credential-free version of that path is available at the
-[public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay).
+[Open the editable Draw.io source](assets/stale-authority-flow.drawio).
 
-## Demo sequence
+The important point is the timing. The promotion is authentic, signed, and correctly addressed.
+It stops because the executor checks the current epoch immediately before the traffic operation.
 
-### 1. Establish the boundary
+## Walk through the result
 
-Show the exact source SHA, five immutable image references, reviewed Terraform plan digest,
-dedicated project and region, fixed reference target, two task queues, separate service identities,
-and cost and duration bounds. Show only synthetic resource names and digests in a public recording.
+### 1. Start from a known canary
 
-Narrate: "This run controls one disposable Cloud Run service in one isolated project. The browser
-and CLI reach the authenticated API; neither can call the target control plane directly."
+Capture the stable revision, create the rollout root, and apply the approved 90/10 split. Show the
+execution receipt, configuration readback, and probe evidence together. They must name the same
+target, root, epoch, request, and traffic plan.
 
-### 2. Apply the 90/10 canary
+The result is a canary whose starting state is independently confirmed.
 
-Reset and probe the stable 100/0 baseline. Capture it twice, create the immutable rollout root,
-and dispatch `APPLY_CANARY`. Read the exact execution receipt and target configuration before
-showing 90 percent stable and 10 percent candidate traffic.
+### 2. Show deterministic outcomes
 
-Narrate only after the evidence gate passes: "The executor accepted one target-bound capability,
-reread the root's current Firestore epoch immediately before its conditional Cloud Run update,
-and independent readback and probing agree on the 90/10 state."
+Run the fixed Monitoring policy against the approved observation windows. Healthy evidence can
+authorize promotion to the candidate. Terminal unhealthy evidence can authorize recovery only to
+the stable revision captured by the root.
 
-### 3. Show both deterministic health outcomes
+The policy selects the branch. The model does not choose promotion or recovery.
 
-For the healthy case, submit the bounded Monitoring windows, show their signed deterministic
-health chain, dispatch promotion, and verify 0/100 traffic plus the candidate probe marker. For a
-separate reset root, submit the fixed unhealthy inputs; show the atomic recovery intent, separately
-addressed recovery task, executor recovery-facade receipt, and restored 100/0 traffic plus stable
-probe marker.
+### 3. Revoke queued work
 
-Narrate: "Monitoring inputs and the frozen policy determine the branch. A model does not choose
-promotion or recovery, and the recovery identity cannot mutate Cloud Run itself."
+Return to a verified 90/10 state and queue promotion work under epoch N. Hold delivery, then let
+the operator advance authority to N+1. Release the queued task.
 
-### 4. Revoke delayed work
+The task can pass caller, signature, lineage, target, and plan checks. It still receives
+`DENIED / EPOCH_MISMATCH` when the executor reads current authority. No traffic update is admitted.
 
-Reset, create a fresh root, establish its verified 90/10 prestate, hold the execution queue, and
-enqueue otherwise-valid work at epoch N. Revoke to N+1, release the queue, and show that the delayed
-work receives `EPOCH_MISMATCH` without a protected target change. Then use the separately confirmed,
-current-epoch recovery path and verify the captured stable state. Before recovery, invoke the
-bounded advisor against that exact stale-denial snapshot. Show all six successful read-only tool
-calls, the receipt/timeline/target citations, `authority_effect=none`, and the identical replayed
-result that causes no second model call.
+### 4. Verify the target and explain the evidence
 
-Narrate: "Authentication, signature validity, and queue admission are insufficient. Stale authority
-is denied at execution time. Gemini explains the evidence-backed causal path but cannot change the
-decision; recovery is new, stable-only authority rather than revival of epoch N."
+Compare configuration and probe evidence from before and after the denial. Both observations must
+show the same 90/10 target state.
 
-### 5. Review the operator surfaces and clean up
+After the deterministic denial, the read-only advisor can organize the receipt, timeline, target,
+and verifier records into a cited explanation. The result is advisory. It has no apply action and
+cannot change authority, health, traffic, or recovery.
 
-In the authenticated console, page through the ordered timeline and correlate root, epoch,
-request, receipt, health, recovery, and terminal events. The deterministic denial must appear
-before the `ADVISORY_ONLY` analysis, and the advisor has no apply action. Then open `/replay`
-without credentials and show its artifact-hash, schema, payload-digest, and event-chain checks.
-The browser does not independently verify KMS signatures.
+### 5. Recover with current authority
 
-Finish by resetting to 100/0, verifying configuration and the stable data-path marker, releasing
-the terminal service claim, and ensuring the execution queue is running. Infrastructure teardown
-is outside this demonstration and requires separate authorization.
+Create new stable-only recovery authority at N+1. The recovery service validates and forwards the
+task to the executor's recovery-only path. Independent readback must confirm 100 percent traffic
+on the captured stable revision.
 
-## Claim-to-evidence gate
+The old epoch stays revoked. Recovery succeeds because it uses new authority, not because stale
+authority becomes valid again.
 
-Each row is one admissible demo claim. If any cell is missing, contradictory, from another root,
-or outside the run interval, say that the result is unverified and do not make the claim.
+## Evidence required for each claim
 
-| Demo claim | Configuration readback | Data-path proof | Signed timeline evidence | Acceptance manifest |
-|---|---|---|---|---|
-| Canary applied at 90/10 | `controlgraph.target-traffic-read-result/v1`: exact revisions, 90/10 traffic, concurrency, etag, and configuration digests | `controlgraph.probe-attestation/v1`: root-bound 20-sample observation and matching revision markers | `MUTATION_APPLIED` and `VERIFICATION_RECORDED`, with matching root, epoch, receipt, and payload digests | `HEALTHY_PROMOTION` or `UNHEALTHY_STABLE_RECOVERY` case binds the readback, probe, capability, executor check, receipt, and timeline artifacts |
-| Healthy candidate promoted to 100 percent | Final target readback: stable 0, candidate 100, expected candidate configuration digest | Signed independent-verification evidence cites a matching candidate probe attestation | `HEALTH_DECIDED` followed by `TERMINAL_CLASSIFIED=PROMOTED` on one verified chain | `HEALTHY_PROMOTION` is `PASSED` with observed result `PROMOTED` |
-| Unhealthy candidate recovered to captured stable | Final target readback: stable 100, candidate 0, captured configuration and concurrency | Signed independent-verification evidence cites a matching stable probe attestation | `HEALTH_DECIDED`, `RECOVERY_INTENT_CREATED`, `RECOVERY_APPLIED`, then `TERMINAL_CLASSIFIED=RECOVERED` | `UNHEALTHY_STABLE_RECOVERY` is `PASSED` with observed result `RECOVERED` and recovery-identity evidence |
-| Revocation denied delayed epoch-N work and recovery used N+1 | Readbacks before and after delayed delivery show no stale mutation; final readback shows captured stable | Root-bound probe attestations agree with both observed configurations | `AUTHORITY_EPOCH_ADVANCED`, `MUTATION_DENIED` with `EPOCH_MISMATCH`, and the distinct current-epoch recovery sequence | `REVOCATION_STALE_DENIAL` is `PASSED` with authority-transition, executor-check, stale-denial, receipt, timeline, readback, and probe artifacts |
-| Gemini explained the stale denial without authority effect | The cited target summary records the same 90/10 configuration at or after denial | The cited target or verifier record binds the observed configuration | `MODEL_ASSISTANCE_RECORDED` follows the deterministic denial; the structured finding cites receipt, timeline, and target or verifier evidence | `BOUNDED_ADVISOR` is `PASSED` with `ADVISORY_ONLY`, six successful read-only tool calls, accepted non-fallback output, and idempotent replay |
+| Claim | Required evidence |
+|---|---|
+| The canary reached 90/10 | Matching execution receipt, target readback, revision probe, and timeline event |
+| A healthy candidate was promoted | Terminal healthy proof followed by verified 100 percent candidate traffic |
+| An unhealthy candidate recovered | Terminal unhealthy proof, root-owned recovery intent, recovery receipt, and verified stable traffic |
+| Revocation stopped delayed work | N-to-N+1 authority transition, `EPOCH_MISMATCH` receipt, and unchanged before-and-after target reads |
+| The advisor explained rather than acted | Cited receipt, timeline, and target or verifier records; advisory classification; no mutation effect |
 
-The source contracts behind those evidence types are:
+If the records disagree, belong to different roots, or fall outside the accepted interval, the
+claim is not verified. ControlGraph keeps that uncertainty visible.
 
-- [target configuration readback](../backend/src/controlgraph_canary/contracts/operator_observability.py);
-- [probe and independent-verification evidence](../backend/src/controlgraph_canary/contracts/independent_verification.py);
-- [signed evidence events](../backend/src/controlgraph_canary/contracts/root_creation.py);
-- [timeline entries and pages](../backend/src/controlgraph_canary/contracts/timeline.py); and
+The underlying evidence contracts are available in:
+
+- [target observation](../backend/src/controlgraph_canary/contracts/operator_observability.py);
+- [probe and independent verification](../backend/src/controlgraph_canary/contracts/independent_verification.py);
+- [signed evidence](../backend/src/controlgraph_canary/contracts/root_creation.py);
+- [timeline records](../backend/src/controlgraph_canary/contracts/timeline.py); and
 - [completion classification](../backend/src/controlgraph_canary/application/completion_classification.py).
 
-The console renders the server-produced projection in
-[`web/src/timelinePresentation.ts`](../web/src/timelinePresentation.ts). The advisor receives six
-read-only diagnostic tools through
-[`application/model_assistance_m6.py`](../backend/src/controlgraph_canary/application/model_assistance_m6.py);
-it has no mutation facade, and its result is always non-authoritative.
+## What the public replay validates
 
-## Accepted manifest and replay binding
+Before it renders, the browser validates the published artifact, closed schemas, payload digest,
+acceptance-case bindings, immutable image references, and event chain. The visible sequence covers
+the authority advance, stale denial, unchanged target, cited advisor result, verified recovery,
+and committed timeline.
 
-The published replay records one accepted hosted run:
+Full source, manifest, event, and image identifiers remain available under **Verification details**
+in the replay. The accepted manifest is the complete evidence record; the replay is its bounded,
+redacted projection.
 
-- source: `dcc2192dade08d3fdfd27daded0ccfdd13193fd1`;
-- run: `cgacceptance:380d6733e6caa85a17df5da6c193680bfa7e03b00009ac30a40fa068849b14b9`;
-- manifest SHA-256:
-  `7b5c2e362b702bd675acc8b1fff18a4ece232cd530013967d6ed11122fcea700`;
-- public replay SHA-256:
-  `13782bc3b1d6f711c39494118a3df783de61b9ac20f0defeca108ec473fcf8cc`; and
-- result: all eight fixed cases passed with complete evidence binding and five immutable image
-  references.
+## Demonstration scope
 
-The replay's six-event chain records the epoch advance, stale denial, unchanged 90/10 target,
-validated cited advisor result, verified 100/0 recovery, and committed timeline. The acceptance
-manifest remains the run's authoritative full evidence; the replay is its bounded redacted
-projection.
+The demo uses one disposable Cloud Run target in one isolated Google Cloud project and region. It
+contains synthetic identifiers and no customer workload. The result supports the documented
+reference cases for the recorded run. It does not establish general production suitability.
 
-## Publication boundary
-
-Publish only the public-redacted artifact projections and their digests. Do not publish OAuth or
-OIDC tokens, Terraform state, provider responses containing sensitive metadata, raw restricted
-events, account subjects, local paths, or reusable credentials. A successful demo proves only the
-closed reference-target cases at the recorded revision and measured bounds; it does not establish
-general deployment support, production suitability, or autonomous model authority.
+Finish by confirming 100 percent stable traffic, the stable probe marker, a released service
+claim, and an empty running execution queue. Infrastructure teardown is a separate operator
+action.
