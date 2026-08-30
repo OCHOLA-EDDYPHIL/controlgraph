@@ -70,6 +70,8 @@ _LOAD_RESULT_SCHEMA = "controlgraph.core-acceptance-load-result/v1"
 _LOAD_READY_SCHEMA = "controlgraph.core-acceptance-load-ready/v1"
 _TIMELINE_PAGE_SET_DOMAIN = b"controlgraph.timeline-acceptance-page-set/v1\0"
 _TIMELINE_PAGE_LIMIT: Final = 16
+_RECEIPT_POLL_ATTEMPTS: Final = 120
+_RECEIPT_POLL_DELAY_SECONDS: Final = 2.0
 _STALE_COMPLETION_READINESS_ATTEMPTS: Final = 30
 _STALE_COMPLETION_READINESS_DELAY_SECONDS: Final = 1.0
 _LOAD_JOB_PERMISSIONS = (
@@ -1372,7 +1374,7 @@ def _poll_receipt(
         ExecutionReceiptReadResultV1,
     )
 
-    for _attempt in range(90):
+    for _attempt in range(_RECEIPT_POLL_ATTEMPTS):
         status, payload, model = _run_cli(
             repo=run.repo,
             entry_point="controlgraph-canary",
@@ -1415,7 +1417,7 @@ def _poll_receipt(
             "RECEIPT_READ_AUTH_UNAVAILABLE",
         }:
             raise AcceptanceError("ACCEPTANCE_HOSTED_RECEIPT_INVALID")
-        time.sleep(2)
+        time.sleep(_RECEIPT_POLL_DELAY_SECONDS)
     raise AcceptanceError(f"ACCEPTANCE_HOSTED_{label.upper()}_RECEIPT_TIMEOUT")
 
 

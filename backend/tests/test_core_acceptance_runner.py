@@ -2718,6 +2718,51 @@ def test_hosted_receipt_poll_tolerates_transient_read_codes(
         raise AssertionError("fatal receipt-read code was unexpectedly tolerated")
 
 
+def test_hosted_receipt_poll_allows_delayed_terminal_receipt(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    runner = _hosted_module(tmp_path)
+    root = SimpleNamespace(root_id="cgroot:" + "b" * 64, root_sha256="b" * 64)
+    calls = 0
+    delays: list[float] = []
+
+    class _Outcome:
+        value = "VERIFIED"
+
+    class _Receipt:
+        outcome = _Outcome()
+
+    class _Model:
+        receipt = _Receipt()
+
+    def fake_run_cli(*_args: Any, **_kwargs: Any) -> tuple[int, Any, Any]:
+        nonlocal calls
+        calls += 1
+        if calls <= 100:
+            return 4, {"code": "EXECUTION_RECEIPT_NOT_FOUND"}, None
+        return 0, {}, _Model()
+
+    monkeypatch.setattr(runner, "_run_cli", fake_run_cli)
+    monkeypatch.setattr(runner.time, "sleep", delays.append)
+
+    result = runner._poll_receipt(
+        run=SimpleNamespace(repo=SOURCE_ROOT, project_number="123456789"),
+        case=SimpleNamespace(case_id="core-case-1"),
+        root=root,
+        epoch=1,
+        request_id="req",
+        idempotency_key="idem",
+        action="APPLY_CANARY_V1",
+        capability_sha256="c" * 64,
+        label="apply",
+    )
+
+    assert isinstance(result, _Model)
+    assert calls == 101
+    assert delays == [2.0] * 100
+
+
 def test_hosted_candidate_prewarm_returns_on_first_answer(
     monkeypatch: Any,
 ) -> None:
