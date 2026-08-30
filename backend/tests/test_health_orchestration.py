@@ -259,7 +259,7 @@ def test_promotion_verification_fails_on_signature_error_and_expiration() -> Non
             verify_healthy_promotion_chain(
                 chain=chain,
                 signature_verifier=_SignatureVerifier(),
-                now=datetime(2026, 8, 21, 12, 11, 1, tzinfo=UTC),
+                now=datetime(2026, 8, 21, 12, 12, 1, tzinfo=UTC),
             )
         )
     assert expiry_error.value.code is HealthOrchestrationErrorCode.PROMOTION_PROOF_EXPIRED
@@ -269,7 +269,7 @@ def test_promotion_verification_fails_on_signature_error_and_expiration() -> Non
             verify_healthy_promotion_chain(
                 chain=chain,
                 signature_verifier=_SignatureVerifier(),
-                now=datetime(2026, 8, 21, 12, 11, tzinfo=UTC),
+                now=datetime(2026, 8, 21, 12, 12, tzinfo=UTC),
             )
         )
     assert boundary_error.value.code is HealthOrchestrationErrorCode.PROMOTION_PROOF_EXPIRED

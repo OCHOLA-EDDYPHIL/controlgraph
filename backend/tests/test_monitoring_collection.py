@@ -192,12 +192,12 @@ def test_derived_query_id_and_digest_regression_vector() -> None:
 
     assert tuple((query.query_id, canonical_sha256(query)) for query in queries) == (
         (
-            "cgmonq:65ed8c1b6e007aca3cbbbf10094a93f00f8bc9a7a2f23cd0b28db60e16106e4d",
-            "08ac455c61f57ba684aa8ff1bb9cfdb997c3780c2f9b10efe90d0885d9987d7e",
+            "cgmonq:cdd93eb805984bbf10533e50820346aa89e1b772b2db9377eda42e5b364b8ebb",
+            "827b3c338e2c156652a597cb65941295041eda1baa1b71d0fbd20562c7f2839e",
         ),
         (
-            "cgmonq:642eff9202c0a26a56d84587205279dae28bda1a071e395ca8df4b70585ef7d1",
-            "4545834dfcd387d22ee8ef7223f9c70869841c070c927c933a4d2af692cc0295",
+            "cgmonq:d3c67838d4b7f092c3bb88d26d2bfec44b8633a8bb26f6948c180c69c948bda3",
+            "4ebf363fdd18d795465ad659b723d2332736f631d1abd7995a39622ea78b2bae",
         ),
     )
 
@@ -544,8 +544,8 @@ def test_window_index_derives_contiguous_query_interval_and_timing() -> None:
     [
         (3, 59, MonitoringObservationTiming.EARLY),
         (4, 0, MonitoringObservationTiming.READY),
-        (6, 0, MonitoringObservationTiming.READY),
-        (6, 1, MonitoringObservationTiming.LATE),
+        (7, 0, MonitoringObservationTiming.READY),
+        (7, 1, MonitoringObservationTiming.LATE),
     ],
 )
 def test_collection_classifies_delayed_availability(

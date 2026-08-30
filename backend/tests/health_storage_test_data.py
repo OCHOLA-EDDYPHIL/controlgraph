@@ -36,7 +36,7 @@ def make_twenty_proof_chain() -> SignedHealthDecisionChainV1:
     signed_proofs: list[SignedHealthDecisionProofV1] = []
     for window_index in range(1, anchor.policy.maximum_windows + 1):
         window_end_minute = 4 + window_index
-        for observation_minute in (window_end_minute + 3, window_end_minute + 5):
+        for observation_minute in (window_end_minute + 3, window_end_minute + 6):
             observation = make_missing_observation(
                 anchor,
                 window_index=window_index,
