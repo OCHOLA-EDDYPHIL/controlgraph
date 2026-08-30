@@ -17,11 +17,38 @@ type ReplayState =
 const labels: Record<PublicReplayEvent["kind"], string> = {
   AUTHORITY_ADVANCED: "Approval was withdrawn",
   STALE_WORK_DENIED: "Stale promotion was blocked",
-  TARGET_UNCHANGED: "Traffic stayed at 90/10",
+  TARGET_UNCHANGED: "Traffic stayed unchanged",
   ADVISOR_VALIDATED: "Advisor explained the evidence",
-  RECOVERY_VERIFIED: "Recovery reached 100% stable",
+  RECOVERY_VERIFIED: "Recovery was verified",
   TIMELINE_COMMITTED: "Evidence chain was verified",
 };
+
+const advisorToolPresentation = {
+  read_root_summary: {
+    name: "Rollout root",
+    role: "Approved rollout, current epoch, and fixed bounds",
+  },
+  read_target_summary: {
+    name: "Target state",
+    role: "Observed revisions and traffic allocation",
+  },
+  read_health_summary: {
+    name: "Health evidence",
+    role: "Deterministic health-window results",
+  },
+  read_receipt_summary: {
+    name: "Execution receipt",
+    role: "Request decision and denial result",
+  },
+  read_timeline_summary: {
+    name: "Evidence timeline",
+    role: "Ordered authority and execution facts",
+  },
+  read_verifier_summary: {
+    name: "Independent verifier",
+    role: "Target and data-path confirmation",
+  },
+} as const;
 
 function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
@@ -30,6 +57,22 @@ function record(value: unknown): Record<string, unknown> {
 function traffic(value: unknown): string {
   const item = record(value);
   return `${String(item.stable_percent)}% stable / ${String(item.candidate_percent)}% candidate`;
+}
+
+function modelName(modelId: PublicReplayAdvisor["model_id"]): string {
+  return modelId === "gemini-3.5-flash" ? "Gemini 3.5 Flash" : modelId;
+}
+
+function eventLabel(event: PublicReplayEvent): string {
+  if (event.kind === "TARGET_UNCHANGED") {
+    const afterDenial = record(event.details.after_denial);
+    return `Traffic stayed at ${String(afterDenial.stable_percent)}/${String(afterDenial.candidate_percent)}`;
+  }
+  if (event.kind === "RECOVERY_VERIFIED") {
+    const recovered = record(event.details.traffic);
+    return `Recovery reached ${String(recovered.stable_percent)}% stable`;
+  }
+  return labels[event.kind];
 }
 
 function ReplayTime({ value }: { readonly value: string }) {
@@ -61,17 +104,20 @@ function EventFacts({ event }: { readonly event: PublicReplayEvent }) {
     case "AUTHORITY_ADVANCED":
       return (
         <p>
-          An operator revocation advanced authority from epoch{" "}
-          <strong>{String(details.previous_epoch)}</strong> to epoch{" "}
-          <strong>{String(details.new_epoch)}</strong>, invalidating the queued work.
+          Epoch <strong>{String(details.previous_epoch)}</strong> is N for this recorded run. An
+          operator revocation advanced authority once to epoch{" "}
+          <strong>{String(details.new_epoch)}</strong>, N+1; queued work remained bound to N and
+          became stale.
         </p>
       );
     case "STALE_WORK_DENIED":
       return (
         <p>
-          The epoch-{String(details.work_epoch)} promotion finished as{" "}
-          <strong>{String(details.outcome)} / {String(details.reason_code)}</strong> because current
-          authority was epoch {String(details.current_authority_epoch)}.
+          At the final check, authority at execution time was epoch{" "}
+          {String(details.current_authority_epoch)} (N+1), not work epoch{" "}
+          {String(details.work_epoch)} (N). The executor returned{" "}
+          <strong>{String(details.outcome)} / {String(details.reason_code)}</strong> before calling
+          the traffic mutation.
         </p>
       );
     case "TARGET_UNCHANGED":
@@ -82,15 +128,16 @@ function EventFacts({ event }: { readonly event: PublicReplayEvent }) {
         </p>
       );
     case "ADVISOR_VALIDATED": {
-      const advisor = record(details.advisor);
+      const advisor = details.advisor as unknown as PublicReplayAdvisor;
       return (
         <div>
           <p>
-            A read-only advisor explained the already-recorded outcome for operator review. It
-            could not approve work, override deterministic health decisions, or change traffic.
+            {modelName(advisor.model_id)} on Vertex AI, coordinated by Google ADK, explained the
+            already-recorded outcome through six fixed read-only tools. It could not approve work,
+            override deterministic health decisions, dispatch recovery, or change traffic.
           </p>
           <p className="advisor-boundary">
-            Recorded boundary: <strong>authority_effect={String(advisor.authority_effect)}</strong>
+            Recorded boundary: <strong>the advisor had no authority</strong>
           </p>
         </div>
       );
@@ -98,7 +145,8 @@ function EventFacts({ event }: { readonly event: PublicReplayEvent }) {
     case "RECOVERY_VERIFIED":
       return (
         <p>
-          Recovery was <strong>{String(details.outcome)}</strong> at {traffic(details.traffic)}.
+          Separately authorized recovery was <strong>{String(details.outcome)}</strong> at{" "}
+          {traffic(details.traffic)}.
         </p>
       );
     case "TIMELINE_COMMITTED": {
@@ -131,6 +179,78 @@ function OutcomeCard({
       <p className="outcome-value">{value}</p>
       <p className="outcome-detail">{detail}</p>
     </article>
+  );
+}
+
+function AcceptedRunProvenance({ replay }: { readonly replay: PublicReplayEnvelope }) {
+  const { payload } = replay;
+  return (
+    <section className="run-provenance" aria-labelledby="run-provenance-title">
+      <div>
+        <p className="eyebrow">Run provenance</p>
+        <h2 id="run-provenance-title">Accepted stale-authority run</h2>
+        <p>
+          The acceptance time and source revision belong to this accepted hosted run. The current
+          replay viewer is separate and may be newer; displaying the artifact does not extend its
+          evidence to the viewer revision. The exact accepted source revision remains available in
+          Verification gates.
+        </p>
+      </div>
+      <dl className="run-provenance-values">
+        <DetailRow label="Hosted acceptance">
+          {payload.acceptance_status === "PASSED" ? "Passed" : payload.acceptance_status}
+        </DetailRow>
+        <DetailRow label="Accepted at"><ReplayTime value={payload.accepted_at} /></DetailRow>
+      </dl>
+    </section>
+  );
+}
+
+function AdvisorOverview({ advisor }: { readonly advisor: PublicReplayAdvisor }) {
+  const replayExplanation = advisor.replayed_without_model_call
+    ? "The accepted record confirms this page replayed the stored advisor result without a new model call. Loading the replay did not send another request to Gemini."
+    : (
+        "The accepted record does not confirm that the stored advisor result was replayed " +
+        "without a new model call."
+      );
+  return (
+    <section className="advisor-overview" aria-labelledby="advisor-overview-title">
+      <div className="section-heading">
+        <p className="eyebrow">Advisory stack · no authority</p>
+        <h2 id="advisor-overview-title">{modelName(advisor.model_id)} explains; code decides</h2>
+        <p>
+          The accepted run used {modelName(advisor.model_id)} on Vertex AI, coordinated by Google
+          ADK. The model and its tools had no authority to approve work, decide health, dispatch an
+          action, authorize recovery, or mutate traffic. Deterministic ControlGraph code retained
+          those decisions.
+        </p>
+      </div>
+
+      <div className="advisor-tool-panel">
+        <h3>Six fixed read-only tools</h3>
+        <ol className="advisor-tools">
+          {advisor.tool_calls.map((call, index) => {
+            const toolId = String(call.tool_id);
+            const presentation = advisorToolPresentation[
+              toolId as keyof typeof advisorToolPresentation
+            ];
+            return (
+              <li key={`${toolId}-${index}`}>
+                <strong>{presentation.name}</strong>
+                <span>{presentation.role}</span>
+              </li>
+            );
+          })}
+        </ol>
+      </div>
+
+      <div className="advisor-replay-note">
+        <p className="advisor-boundary">
+          Recorded boundary: <strong>no advisor or tool authority</strong>
+        </p>
+        <p>{replayExplanation}</p>
+      </div>
+    </section>
   );
 }
 
@@ -235,7 +355,7 @@ function EventTechnicalDetails({
   return (
     <li className="verification-record">
       <h3>
-        {String(event.sequence).padStart(2, "0")} · {labels[event.kind]}
+        {String(event.sequence).padStart(2, "0")} · {eventLabel(event)}
       </h3>
       <dl className="verification-list">
         <DetailRow label="Envelope schema"><RawValue>{envelope.schema_version}</RawValue></DetailRow>
@@ -368,7 +488,7 @@ function VerificationDetails({ replay }: { readonly replay: PublicReplayEnvelope
   return (
     <details className="verification-details">
       <summary>
-        <span>Verification details</span>
+        <span>Verification gates</span>
         <small aria-hidden="true">Exact evidence, identifiers, and digests</small>
       </summary>
       <div className="verification-content">
@@ -378,7 +498,9 @@ function VerificationDetails({ replay }: { readonly replay: PublicReplayEnvelope
             <DetailRow label="Envelope schema"><RawValue>{replay.schema_version}</RawValue></DetailRow>
             <DetailRow label="Payload schema"><RawValue>{payload.schema_version}</RawValue></DetailRow>
             <DetailRow label="Replay payload SHA-256"><RawValue>{replay.payload_sha256}</RawValue></DetailRow>
-            <DetailRow label="Source commit"><RawValue>{payload.source_commit}</RawValue></DetailRow>
+            <DetailRow label="Accepted run source commit">
+              <RawValue>{payload.source_commit}</RawValue>
+            </DetailRow>
             <DetailRow label="Acceptance manifest SHA-256">
               <RawValue>{payload.acceptance_manifest_sha256}</RawValue>
             </DetailRow>
@@ -524,18 +646,25 @@ export function PublicReplayApp() {
   }
 
   const { payload } = state.replay;
+  const authority = payload.events[0].event.details;
   const denial = payload.events[1].event.details;
   const unchanged = record(payload.events[2].event.details.before_denial);
+  const advisor = record(payload.events[3].event.details).advisor as PublicReplayAdvisor;
+  const recoveryDetails = payload.events[4].event.details;
   const recovery = record(payload.events[4].event.details.traffic);
 
   return (
     <main className="replay-shell">
       <header className="replay-header">
-        <p className="eyebrow">Credential-free · recorded hosted evidence</p>
+        <p className="eyebrow">Recorded demo replay · accepted hosted run · credential-free</p>
         <h1>Stale promotion blocked</h1>
         <p className="lede">
-          The queued promotion lost authority and stopped before changing traffic. The target
-          remained at 90/10, then current recovery authority returned it to 100% stable.
+          Approval advanced from epoch {String(authority.previous_epoch)} (N) to epoch{" "}
+          {String(authority.new_epoch)} (N+1). At the final gate, authority at execution time no
+          longer matched queued epoch {String(denial.work_epoch)}, so the promotion ended{" "}
+          {String(denial.outcome)} / {String(denial.reason_code)} before any target change.
+          Independent readback confirmed {traffic(unchanged)} unchanged, and current-epoch recovery
+          was {String(recoveryDetails.outcome)} at {traffic(recovery)}.
         </p>
 
         <section className="outcome-summary" aria-labelledby="outcome-summary-title">
@@ -569,6 +698,8 @@ export function PublicReplayApp() {
         </div>
       </section>
 
+      <AcceptedRunProvenance replay={state.replay} />
+
       <section className="replay-sequence" aria-labelledby="replay-sequence-title">
         <div className="section-heading">
           <p className="eyebrow">What happened</p>
@@ -584,7 +715,7 @@ export function PublicReplayApp() {
                 </div>
                 <article aria-labelledby={headingId}>
                   <p className="event-time"><ReplayTime value={event.occurred_at} /></p>
-                  <h3 id={headingId}>{labels[event.kind]}</h3>
+                  <h3 id={headingId}>{eventLabel(event)}</h3>
                   <EventFacts event={event} />
                 </article>
               </li>
@@ -592,6 +723,8 @@ export function PublicReplayApp() {
           })}
         </ol>
       </section>
+
+      <AdvisorOverview advisor={advisor} />
 
       <VerificationDetails replay={state.replay} />
 

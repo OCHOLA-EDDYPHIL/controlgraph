@@ -1,14 +1,15 @@
 # Evidence-backed demo
 
 This demo shows the problem ControlGraph solves: queued work can keep valid credentials after its
-approval is no longer current. The proof connects the authority change, executor decision, target
-readback, recovery, and optional AI explanation in one reviewable sequence.
+approval is no longer current. The recorded sequence connects the authority change, executor
+decision, target readback, recovery, and optional advisory explanation.
 
-Open the credential-free [public replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
-for the accepted hosted example. Use the [canary quickstart](quickstart.md) to reproduce the full
-workflow in an isolated project.
+Open the credential-free
+[Live-hosted demo — Verified Replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
+for recorded evidence from the **Accepted stale-authority run**. It is not a live control surface.
+Use the [canary quickstart](quickstart.md) to reproduce the full workflow in an isolated project.
 
-## The proof at a glance
+## The recorded sequence at a glance
 
 ![A promotion queued at epoch N reaches the executor after authority advances to N+1, so ControlGraph blocks it, verifies unchanged traffic, and restores stable traffic with new authority.](assets/stale-authority-flow.svg)
 
@@ -40,17 +41,23 @@ The policy selects the branch. The model does not choose promotion or recovery.
 Return to a verified 90/10 state and queue promotion work under epoch N. Hold delivery, then let
 the operator advance authority to N+1. Release the queued task.
 
-The task can pass caller, signature, lineage, target, and plan checks. It still receives
-`DENIED / EPOCH_MISMATCH` when the executor reads current authority. No traffic update is admitted.
+The task can pass caller, signature, lineage, target, and plan checks. After claiming its exact
+receipt, the executor performs a fresh authoritative read of the root's current epoch immediately
+before the target-bound mutation adapter. The signed epoch N does not equal current epoch N+1, so
+the executor returns `DENIED / EPOCH_MISMATCH` without calling the adapter. Missing, unreadable, or
+otherwise nonmatching authority also fails closed. No traffic update is admitted.
 
 ### 4. Verify the target and explain the evidence
 
 Compare configuration and probe evidence from before and after the denial. Both observations must
 show the same 90/10 target state.
 
-After the deterministic denial, the read-only advisor can organize the receipt, timeline, target,
-and verifier records into a cited explanation. The result is advisory. It has no apply action and
-cannot change authority, health, traffic, or recovery.
+Only after the deterministic denial and unchanged-target readback, Gemini 3.5 Flash on Vertex AI
+is coordinated by Google ADK through exactly six fixed read-only tools: Rollout root, Target state,
+Health evidence, Execution receipt, Evidence timeline, and Independent verifier. The tools expose
+bounded recorded summaries, and the accepted structured result cites its evidence. The result is
+`ADVISORY_ONLY`; it has no apply action and never participates in authority, health, dispatch,
+recovery, or mutation decisions.
 
 ### 5. Recover with current authority
 
@@ -61,7 +68,7 @@ on the captured stable revision.
 The old epoch stays revoked. Recovery succeeds because it uses new authority, not because stale
 authority becomes valid again.
 
-## Evidence required for each claim
+## Verification gates
 
 | Claim | Required evidence |
 |---|---|
@@ -69,7 +76,7 @@ authority becomes valid again.
 | A healthy candidate was promoted | Terminal healthy proof followed by verified 100 percent candidate traffic |
 | An unhealthy candidate recovered | Terminal unhealthy proof, root-owned recovery intent, recovery receipt, and verified stable traffic |
 | Revocation stopped delayed work | N-to-N+1 authority transition, `EPOCH_MISMATCH` receipt, and unchanged before-and-after target reads |
-| The advisor explained rather than acted | Cited receipt, timeline, and target or verifier records; advisory classification; no mutation effect |
+| The advisor explained rather than acted | Gemini 3.5 Flash on Vertex AI coordinated by Google ADK; all six fixed read-only tool calls; cited receipt, timeline, and target or verifier records; `ADVISORY_ONLY`; no authority, health, dispatch, recovery, or mutation effect |
 
 If the records disagree, belong to different roots, or fall outside the accepted interval, the
 claim is not verified. ControlGraph keeps that uncertainty visible.
@@ -89,8 +96,10 @@ acceptance-case bindings, immutable image references, and event chain. The visib
 the authority advance, stale denial, unchanged target, cited advisor result, verified recovery,
 and committed timeline.
 
-Full source, manifest, event, and image identifiers remain available under **Verification details**
-in the replay. The accepted manifest is the complete evidence record; the replay is its bounded,
+Full artifact source, manifest, event, and image identifiers remain available under
+**Verification gates** in the replay. The displayed source commit is the accepted artifact source,
+`dcc2192dade08d3fdfd27daded0ccfdd13193fd1`, not necessarily the revision of the separately
+deployed viewer. The accepted manifest is the complete evidence record; the replay is its bounded,
 redacted projection.
 
 ## Demonstration scope
