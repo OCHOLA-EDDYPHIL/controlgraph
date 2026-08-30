@@ -1213,6 +1213,44 @@ async def test_receipt_readback_allows_delayed_provider_settlement(
 
 
 @_async_test
+async def test_receipt_readback_allows_settlement_after_ten_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsettled = _service(
+        0,
+        100,
+        status_stable_percent=90,
+        status_candidate_percent=10,
+        etag="etag-readback-unsettled",
+    )
+    settled = _service(0, 100, etag="etag-readback-settled")
+    services = _GetOnlyServicesClient(*((unsettled,) * 13), settled)
+    delays: list[float] = []
+
+    async def no_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+    expected = replace(
+        target_configuration_projection(
+            _verified().request.intent,
+            expected_concurrency=8,
+        ),
+        stable_percent=0,
+        candidate_percent=100,
+    )
+
+    observation = await _receipt_readback(services).readback(expected)
+
+    assert observation == ReceiptReadbackResult(
+        state=expected,
+        observed_etag="etag-readback-settled",
+    )
+    assert delays == [1.0] * 13
+    assert len(services.get_calls) == 14
+
+
+@_async_test
 async def test_receipt_readback_uses_one_total_provider_settle_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1233,7 +1271,7 @@ async def test_receipt_readback_uses_one_total_provider_settle_budget(
     observation = await _receipt_readback(services).readback(expected)
 
     assert observation.state == expected
-    assert budgets == [10.0]
+    assert budgets == [15.0]
 
 
 @pytest.mark.parametrize(
@@ -1294,7 +1332,7 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
                 )
             ),
             "etag-after-8",
-            9,
+            14,
         ),
         (
             _service(
@@ -1314,7 +1352,7 @@ async def test_receipt_readback_rejects_unbound_expectations_without_provider_ac
         (
             _service(status_stable_percent=100, status_candidate_percent=0),
             "etag-after-8",
-            9,
+            14,
         ),
         (
             _service(template_revision=f"{SERVICE}-unapproved-v2"),
@@ -1659,7 +1697,7 @@ async def test_mutation_uses_one_traffic_only_conditional_request(
         descriptor.name for descriptor, _value in run_v2.Service.pb(request.service).ListFields()
     }
     assert provider_fields == {"name", "traffic", "etag"}
-    assert operation.calls == [30.0]
+    assert operation.calls == [25.0]
 
 
 def test_recovery_identity_cannot_construct_a_cloud_run_mutation_adapter() -> None:
@@ -1791,7 +1829,7 @@ async def test_unknown_or_mismatched_operation_result_preserves_ambiguity(
     assert result.reason is CloudRunMutationReason.OUTCOME_UNKNOWN
     assert result.operation_name == "operations/update-traffic-1"
     assert len(services.update_calls) == 1
-    assert operation.calls == [30.0]
+    assert operation.calls == [25.0]
     assert map_cloud_run_mutation_result(result) == ReceiptMutationResult(
         status=ReceiptMutationStatus.AMBIGUOUS,
         provider_operation="operations/update-traffic-1",
@@ -1808,7 +1846,7 @@ async def test_cancellation_while_polling_operation_propagates() -> None:
         await _execute(_adapter(services))
 
     assert len(services.update_calls) == 1
-    assert operation.calls == [30.0]
+    assert operation.calls == [25.0]
 
 
 @_async_test
@@ -2051,7 +2089,7 @@ async def test_reference_target_reset_uses_one_conditional_traffic_update_and_re
         descriptor.name for descriptor, _value in run_v2.Service.pb(request.service).ListFields()
     }
     assert provider_fields == {"name", "traffic", "etag"}
-    assert operation.calls == [30.0]
+    assert operation.calls == [25.0]
 
 
 @_async_test
@@ -2154,7 +2192,7 @@ async def test_reference_target_reset_denies_stable_only_baseline_readback() -> 
     assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
     assert len(services.update_calls) == 1
     assert len(services.get_calls) == 2
-    assert operation.calls == [30.0]
+    assert operation.calls == [25.0]
 
 
 @_async_test
@@ -2176,7 +2214,7 @@ async def test_reference_target_reset_denies_non_candidate_latest_ready_readback
     assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
     assert len(services.update_calls) == 1
     assert len(services.get_calls) == 2
-    assert operation.calls == [30.0]
+    assert operation.calls == [25.0]
 
 
 @pytest.mark.parametrize(
