@@ -2093,6 +2093,42 @@ async def test_reference_target_reset_uses_one_conditional_traffic_update_and_re
 
 
 @_async_test
+async def test_reference_target_reset_waits_for_exact_provider_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _service(0, 100, etag="etag-before-reset", generation=8)
+    unsettled = _service(
+        100,
+        0,
+        status_stable_percent=90,
+        status_candidate_percent=10,
+        etag="etag-after-reset",
+        generation=9,
+    )
+    after = _service(100, 0, etag="etag-after-reset", generation=9)
+    operation = _FakeOperation(after, name="operations/reference-target-reset-1")
+    services = _ResetServicesClient(
+        [before, *((unsettled,) * 13), after],
+        update=operation,
+    )
+    delays: list[float] = []
+
+    async def no_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+
+    result = await _resetter(services).reset(_reset_request())
+
+    assert result.outcome is ReferenceTargetResetOutcome.RESET_APPLIED
+    assert result.observed_generation == 9
+    assert result.observed_etag == "etag-after-reset"
+    assert delays == [1.0] * 13
+    assert len(services.get_calls) == 15
+    assert len(services.update_calls) == 1
+
+
+@_async_test
 async def test_reference_target_reset_migrates_the_exact_v20_baseline_to_v21() -> None:
     before = _service(
         100,
@@ -2172,7 +2208,9 @@ async def test_reference_target_reset_rewrites_when_candidate_is_not_latest_read
 
 
 @_async_test
-async def test_reference_target_reset_denies_stable_only_baseline_readback() -> None:
+async def test_reference_target_reset_denies_stable_only_baseline_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     before = _service(90, 10, etag="etag-before-reset", generation=8)
     incomplete = _service(
         100,
@@ -2184,19 +2222,29 @@ async def test_reference_target_reset_denies_stable_only_baseline_readback() -> 
     del incomplete.traffic[1:]
     del incomplete.traffic_statuses[1:]
     operation = _FakeOperation(incomplete, name="operations/reference-target-reset-1")
-    services = _ResetServicesClient([before, incomplete], update=operation)
+    services = _ResetServicesClient(
+        [before, *((incomplete,) * 14)],
+        update=operation,
+    )
+
+    async def no_delay(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
 
     with pytest.raises(ReferenceTargetResetError) as raised:
         await _resetter(services).reset(_reset_request())
 
     assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
     assert len(services.update_calls) == 1
-    assert len(services.get_calls) == 2
+    assert len(services.get_calls) == 15
     assert operation.calls == [25.0]
 
 
 @_async_test
-async def test_reference_target_reset_denies_non_candidate_latest_ready_readback() -> None:
+async def test_reference_target_reset_denies_non_candidate_latest_ready_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     before = _service(90, 10, etag="etag-before-reset", generation=8)
     incomplete = _service(
         100,
@@ -2206,14 +2254,22 @@ async def test_reference_target_reset_denies_non_candidate_latest_ready_readback
         latest_ready_revision=STABLE,
     )
     operation = _FakeOperation(incomplete, name="operations/reference-target-reset-1")
-    services = _ResetServicesClient([before, incomplete], update=operation)
+    services = _ResetServicesClient(
+        [before, *((incomplete,) * 14)],
+        update=operation,
+    )
+
+    async def no_delay(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
 
     with pytest.raises(ReferenceTargetResetError) as raised:
         await _resetter(services).reset(_reset_request())
 
     assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
     assert len(services.update_calls) == 1
-    assert len(services.get_calls) == 2
+    assert len(services.get_calls) == 15
     assert operation.calls == [25.0]
 
 
@@ -2359,20 +2415,27 @@ async def test_reference_target_reset_resolves_unknown_outcome_only_by_exact_rea
 
 
 @_async_test
-async def test_reference_target_reset_preserves_unknown_when_readback_is_not_baseline() -> None:
+async def test_reference_target_reset_preserves_unknown_when_readback_is_not_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     before = _service(90, 10, etag="etag-before-reset", generation=8)
     unchanged = _service(90, 10, etag="etag-before-reset", generation=8)
     services = _ResetServicesClient(
-        [before, unchanged],
+        [before, *((unchanged,) * 14)],
         update=RuntimeError("synthetic unknown provider outcome"),
     )
+
+    async def no_delay(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
 
     with pytest.raises(ReferenceTargetResetError) as raised:
         await _resetter(services).reset(_reset_request())
 
     assert raised.value.code is ReferenceTargetResetErrorCode.OUTCOME_UNKNOWN
     assert len(services.update_calls) == 1
-    assert len(services.get_calls) == 2
+    assert len(services.get_calls) == 15
 
 
 @_async_test
