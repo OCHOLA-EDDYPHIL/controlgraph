@@ -928,6 +928,7 @@ def test_execute_produces_all_cases_before_binding(
     monkeypatch.setattr(FAULTS, "_verify_source", lambda *_args: None)
     monkeypatch.setattr(FAULTS.core, "_validate_execute_destination", lambda *_args: None)
     monkeypatch.setattr(FAULTS.core, "_verify_hosted_bindings", lambda *_args: None)
+    monkeypatch.setattr(FAULTS.core, "_capture_timeline_anchor", lambda *_args: None)
     monkeypatch.setattr(FAULTS.core, "_reset_target", lambda *_args: None)
     monkeypatch.setattr(FAULTS, "_fault_case", lambda *_args: SimpleNamespace())
     monkeypatch.setattr(FAULTS, "_active_identity", lambda _repo: IDENTITY)
