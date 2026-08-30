@@ -24,8 +24,9 @@ The design has four responsibilities:
    target-bound executor. The executor performs the final epoch check.
 3. **Verify:** a separate read-only path observes configuration, traffic, probes, and Monitoring
    data. It determines whether the result matches the approved outcome.
-4. **Explain:** the timeline presents recorded facts. The optional advisor can organize cited
-   evidence, but it cannot change authority or traffic.
+4. **Explain:** after a deterministic outcome, the timeline presents recorded facts and the
+   optional advisor can organize cited evidence. Model output never participates in authority,
+   health, dispatch, recovery, or mutation decisions.
 
 ## Core control path
 
@@ -40,9 +41,11 @@ A protected mutation follows this order:
 7. call the fixed target adapter once; and
 8. record the result and obtain independent readback.
 
-The second authority read is the last authorization operation before the provider call. The signed
-epoch must equal the current epoch. A stale epoch, a future epoch, a missing record, or an
-unavailable authority read stops the action.
+The second authority read occurs after the exact receipt claim and is the final authorization
+operation immediately before the target-bound mutation adapter. It is fresh and authoritative,
+not a cached value or a queue-admission result. The signed epoch must equal the current epoch. A
+stale epoch, a future epoch, a missing record, or an unavailable authority read stops the action
+without calling the adapter.
 
 The executor cannot accept an arbitrary project, region, service, image, URL, API method, or field
 mask from the caller. Its adapter is configured for one target and one traffic operation.
@@ -151,14 +154,22 @@ Selected authority, health, and independent-verification evidence is signed with
 Capabilities use the separate capability key. Receipts, canonical digests, provider readback, and
 the ordered hash-linked timeline bind the remaining effects.
 
-The optional advisor reads a fixed set of recorded summaries through typed, read-only tools. Its
-structured response must cite the evidence used for each factual finding. The response is stored
-as `ADVISORY_ONLY` and never enters an authority, health, dispatch, recovery, or mutation decision.
-See [ADR 0004](decisions/0004-advisory-model-boundary.md).
+Only after the deterministic outcome, Gemini 3.5 Flash on Vertex AI is coordinated by Google ADK
+through six fixed, typed read-only tools: Rollout root, Target state, Health evidence, Execution
+receipt, Evidence timeline, and Independent verifier. Their registry identifiers are
+`read_root_summary`, `read_target_summary`, `read_health_summary`, `read_receipt_summary`,
+`read_timeline_summary`, and `read_verifier_summary`. Its structured response must cite the
+evidence used for each factual finding. The response is stored as `ADVISORY_ONLY` and never enters
+an authority, health, dispatch, recovery, or mutation decision. See
+[ADR 0004](decisions/0004-advisory-model-boundary.md).
 
-The public `/replay` route serves a bounded, redacted projection of one accepted run. The browser
-validates the artifact, schema, payload, case bindings, image references, and event chain before it
-renders. The authenticated evidence path, not the browser, verifies Cloud KMS signatures.
+The credential-free
+[Live-hosted demo — Verified Replay](https://controlgraph-console-936681471311.us-central1.run.app/replay)
+serves a bounded, redacted projection of the **Accepted stale-authority run**. The accepted
+artifact's source revision is `dcc2192dade08d3fdfd27daded0ccfdd13193fd1`; the separately deployed
+viewer may be newer. The browser validates the artifact, schema, payload, case bindings, image
+references, and event chain before it renders. This is recorded evidence, not a live control
+surface. The authenticated evidence path, not the browser, verifies Cloud KMS signatures.
 
 ## Google Cloud mapping
 
@@ -170,7 +181,7 @@ renders. The authenticated evidence path, not the browser, verifies Cloud KMS si
 | Target mutation | Private Cloud Run executor with a fixed adapter |
 | Health and target observation | Cloud Monitoring plus read-only Cloud Run and probe access |
 | Operator presentation | Static React console through the authenticated API |
-| Optional explanation | Separate Google ADK and Gemini integration with read-only tools |
+| Optional explanation | Gemini 3.5 Flash on Vertex AI, coordinated by Google ADK through six fixed read-only tools after the deterministic outcome |
 
 Terraform defines the isolated project substrate, identities, queues, keys, storage, services,
 monitoring, and disposable reference target. Infrastructure details remain in

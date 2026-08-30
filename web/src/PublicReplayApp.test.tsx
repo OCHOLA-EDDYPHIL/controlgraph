@@ -277,6 +277,9 @@ describe("PublicReplayApp", () => {
     expect(screen.getByRole("link", { name: "Retry replay" }).getAttribute("href"))
       .toBe("/replay");
     expect(screen.queryByRole("heading", { name: "Stale promotion blocked" })).toBeNull();
+    expect(screen.queryByText("Recorded demo replay · accepted hosted run · credential-free"))
+      .toBeNull();
+    expect(screen.queryByRole("region", { name: "Accepted stale-authority run" })).toBeNull();
   });
 
   it("leads with the human outcome and preserves the complete six-event proof", async () => {
@@ -288,7 +291,15 @@ describe("PublicReplayApp", () => {
 
     expect(await screen.findByRole("heading", { name: "Stale promotion blocked" }))
       .toBeTruthy();
-    expect(screen.getByText(/target remained at 90\/10/)).toBeTruthy();
+    expect(
+      screen.getByText("Recorded demo replay · accepted hosted run · credential-free"),
+    ).toBeTruthy();
+    const lede = container.querySelector(".lede")?.textContent ?? "";
+    expect(lede).toContain("epoch 7 (N) to epoch 8 (N+1)");
+    expect(lede).toContain("authority at execution time");
+    expect(lede).toContain("DENIED / EPOCH_MISMATCH");
+    expect(lede).toContain("90% stable / 10% candidate unchanged");
+    expect(lede).toContain("VERIFIED at 100% stable / 0% candidate");
     const outcomeSummary = screen.getByRole("region", { name: "Outcome summary" });
     expect(within(outcomeSummary).getByText("Queued promotion").closest("article")?.textContent)
       .toContain("BlockedDENIED / EPOCH_MISMATCH");
@@ -297,6 +308,14 @@ describe("PublicReplayApp", () => {
     expect(within(outcomeSummary).getByText("Verified recovery").closest("article")?.textContent)
       .toContain("100% stable0% candidate");
     expect(screen.getByText("Browser verification passed")).toBeTruthy();
+
+    const provenance = screen.getByRole("region", { name: "Accepted stale-authority run" });
+    expect(provenance.textContent).toContain("2026-08-24T00:00:06Z");
+    expect(provenance.textContent).toContain("current replay viewer is separate and may be newer");
+    expect(provenance.textContent).toContain(
+      "exact accepted source revision remains available in Verification gates",
+    );
+    expect(provenance.textContent).not.toContain("a".repeat(40));
 
     const sequence = screen.getByRole("region", {
       name: "From revoked approval to stable recovery",
@@ -316,11 +335,11 @@ describe("PublicReplayApp", () => {
     expect(
       screen.getByRole("heading", { name: "Approval was withdrawn" }).closest("article")
         ?.textContent,
-    ).toContain("from epoch 7 to epoch 8");
+    ).toContain("Epoch 7 is N for this recorded run");
     expect(
       screen.getByRole("heading", { name: "Stale promotion was blocked" }).closest("article")
         ?.textContent,
-    ).toContain("DENIED / EPOCH_MISMATCH");
+    ).toContain("authority at execution time was epoch 8 (N+1), not work epoch 7 (N)");
     expect(
       screen.getByRole("heading", { name: "Traffic stayed at 90/10" }).closest("article")
         ?.textContent,
@@ -335,10 +354,39 @@ describe("PublicReplayApp", () => {
     const advisorEvent = screen.getByRole("heading", {
       name: "Advisor explained the evidence",
     }).closest("article");
-    expect(advisorEvent?.textContent).toContain("A read-only advisor explained");
-    expect(advisorEvent?.textContent).toContain("authority_effect=none");
+    expect(advisorEvent?.textContent).toContain("Gemini 3.5 Flash on Vertex AI");
+    expect(advisorEvent?.textContent).toContain("Google ADK");
+    expect(advisorEvent?.textContent).toContain("six fixed read-only tools");
+    expect(advisorEvent?.textContent).toContain("the advisor had no authority");
     expect(advisorEvent?.textContent).not.toContain(FINDING);
-    expect(advisorEvent?.textContent).not.toContain("gemini-3.5-flash");
+
+    const advisorOverview = screen.getByRole("region", {
+      name: "Gemini 3.5 Flash explains; code decides",
+    });
+    expect(advisorOverview.textContent).toContain("Vertex AI");
+    expect(advisorOverview.textContent).toContain("Google ADK");
+    expect(advisorOverview.textContent).toContain("no authority to approve work");
+    expect(within(advisorOverview).getAllByRole("listitem")).toHaveLength(6);
+    for (const toolName of [
+      "Rollout root",
+      "Target state",
+      "Health evidence",
+      "Execution receipt",
+      "Evidence timeline",
+      "Independent verifier",
+    ]) {
+      expect(within(advisorOverview).getByText(toolName)).toBeTruthy();
+    }
+    expect(advisorOverview.textContent).toContain(
+      "replayed the stored advisor result without a new model call",
+    );
+    expect(advisorOverview.textContent).toContain(
+      "Loading the replay did not send another request to Gemini",
+    );
+    for (const toolId of TOOL_IDS) {
+      expect(advisorOverview.textContent).not.toContain(toolId);
+    }
+    expect(advisorOverview.textContent).not.toContain("replayed_without_model_call");
 
     expect(container.querySelectorAll(".event-index[aria-hidden='true']")).toHaveLength(6);
     expect(container.querySelector("time[datetime='2026-08-24T00:00:01Z']")?.textContent)
@@ -350,7 +398,7 @@ describe("PublicReplayApp", () => {
     });
   });
 
-  it("keeps exact evidence and advisor metadata in one closed verification disclosure", async () => {
+  it("keeps exact evidence and advisor metadata in one closed verification-gates disclosure", async () => {
     window.controlGraphPublicReplayConfig = { available: true, sha256: REPLAY_SHA256 };
     vi.mocked(fetch).mockResolvedValue(new Response("{}", { status: 200 }));
     const replay = validReplay();
@@ -363,7 +411,9 @@ describe("PublicReplayApp", () => {
     expect(container.querySelectorAll("details")).toHaveLength(1);
     expect(details).toBeTruthy();
     expect((details as HTMLDetailsElement).open).toBe(false);
-    expect(within(details as HTMLElement).getByText("Verification details")).toBeTruthy();
+    expect(within(details as HTMLElement).getByText("Verification gates")).toBeTruthy();
+    expect(within(details as HTMLElement).getByText("Accepted run source commit")).toBeTruthy();
+    expect(within(details as HTMLElement).getByText("Replayed without model call")).toBeTruthy();
 
     const exactEvidence = details?.textContent ?? "";
     expect(exactEvidence).toContain(replay.payload.source_commit);
