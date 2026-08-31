@@ -69,43 +69,53 @@ execution-time authority decision.
 
 ## Quick start
 
-### Backend
+Choose the shortest path for the result you need.
+
+### Inspect the hosted replay without credentials
+
+Open the
+[Live-hosted demo — Verified Replay](https://controlgraph-console-936681471311.us-central1.run.app/replay).
+It needs no Google Cloud credentials or local setup. The replay is recorded, redacted evidence. It
+does not provide a live control surface or mutate the reference target.
+
+### Run local tests and the development console
+
+Install Python 3.12, `uv`, and Node.js 22. Then run the backend tests and the frontend tests:
+
+```bash
+(cd backend && uv sync --frozen --all-extras --dev && uv run pytest)
+(cd web && npm ci && npm test -- --run)
+```
+
+Start the frontend development server separately:
+
+```bash
+cd web
+npm run dev
+```
+
+These local paths need no Google Cloud credentials. They do not start a protected controller or
+grant the console cloud access.
+
+### Start a configured backend service
+
+Backend service startup requires a complete, role-specific deployment environment. The settings
+bind the service to its project, region, identity, callers, cloud resources, and immutable build.
+The repository's `.env.example` is only a non-mutating API baseline; it is not a protected-service
+configuration.
 
 ```bash
 cd backend
-uv sync --all-extras --dev
-uv run pytest
+uv sync --frozen --all-extras --dev
 uv run controlgraph-canary doctor
 uv run controlgraph-canary serve
 ```
 
-Every controller exposes identity-safe `GET /healthz` and `GET /v1/metadata` endpoints. Protected
-routes still require their full caller, capability, root, epoch, receipt, and target bindings. A
-local start does not bypass those checks.
-
-### Web console
-
-```bash
-cd web
-npm ci
-npm test -- --run
-npm run dev
-```
-
-### Terraform
-
-```bash
-terraform -chdir=infra fmt -check -recursive
-terraform -chdir=infra/bootstrap init -backend=false
-terraform -chdir=infra/bootstrap validate
-terraform -chdir=infra/foundation init -backend=false
-terraform -chdir=infra/foundation validate
-terraform -chdir=infra/runtime init -backend=false
-terraform -chdir=infra/runtime validate
-```
-
-Terraform accepts immutable container references in the form `...@sha256:...`. Applying a plan is
-an explicit operator action. The console never applies infrastructure.
+`doctor` reports missing settings without making cloud calls. `serve` refuses incomplete or
+inconsistent settings. Follow the [reproducible canary quickstart](docs/quickstart.md) to configure
+the isolated Google Cloud environment and run the hosted workflow. Every configured controller
+exposes identity-safe `GET /healthz` and `GET /v1/metadata` endpoints. Protected routes still
+require their full caller, capability, root, epoch, receipt, and target bindings.
 
 ## Read by goal
 
