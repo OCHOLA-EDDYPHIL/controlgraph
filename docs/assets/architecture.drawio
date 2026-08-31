@@ -1,97 +1,135 @@
-<mxfile host="Electron" modified="2026-08-30T00:00:00.000Z" agent="Mozilla/5.0" version="31.3.2" type="device">
+<mxfile host="Electron" modified="2026-08-31T00:00:00.000Z" agent="Mozilla/5.0" version="31.3.2" type="device">
   <diagram id="controlgraph-architecture" name="Architecture">
-    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="760" math="0" shadow="0" background="#F7F5EF">
+    <mxGraphModel dx="1600" dy="960" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="960" math="0" shadow="0" background="#F7F5EF">
       <root>
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
-        <mxCell id="title" value="ControlGraph keeps rollout authority current at execution time" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontFamily=Helvetica;fontSize=26;fontStyle=1;fontColor=#173A33;" vertex="1" parent="1">
-          <mxGeometry x="48" y="28" width="1290" height="38" as="geometry"/>
+        <mxCell id="title" value="ControlGraph checks current authority before Cloud Run traffic changes" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontFamily=Helvetica;fontSize=26;fontStyle=1;fontColor=#173A33;" vertex="1" parent="1">
+          <mxGeometry x="48" y="25" width="1504" height="40" as="geometry"/>
         </mxCell>
-        <mxCell id="subtitle" value="A small control path separates approval, bounded execution, independent verification, and explanation." style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontFamily=Helvetica;fontSize=15;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="48" y="70" width="1290" height="28" as="geometry"/>
+        <mxCell id="subtitle" value="A deterministic Google Cloud path owns approval, delivery, execution, and proof. The model reads recorded facts only." style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontFamily=Helvetica;fontSize=15;fontColor=#49685F;" vertex="1" parent="1">
+          <mxGeometry x="48" y="69" width="1504" height="28" as="geometry"/>
         </mxCell>
-        <mxCell id="approve-label" value="APPROVE" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="50" y="122" width="180" height="24" as="geometry"/>
+
+        <mxCell id="operator-label" value="OPERATOR" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
+          <mxGeometry x="35" y="158" width="220" height="24" as="geometry"/>
         </mxCell>
-        <mxCell id="authority-label" value="AUTHORIZE" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="278" y="122" width="220" height="24" as="geometry"/>
+        <mxCell id="browser" value="&lt;b&gt;Browser · React console&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Approve or revoke intent&lt;br&gt;Read timeline + verification&lt;br&gt;No direct cloud-control access&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#A9853A;fillColor=#FFF6D8;fontFamily=Helvetica;fontSize=17;fontColor=#23312D;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="35" y="190" width="220" height="164" as="geometry"/>
         </mxCell>
-        <mxCell id="deliver-label" value="DELIVER" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="548" y="122" width="190" height="24" as="geometry"/>
+
+        <mxCell id="cloud-boundary" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeWidth=2;strokeColor=#9BB8AE;fillColor=#FCFBF7;dashed=1;dashPattern=8 6;" vertex="1" parent="1">
+          <mxGeometry x="285" y="115" width="1270" height="805" as="geometry"/>
         </mxCell>
-        <mxCell id="execute-label" value="EXECUTE" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="788" y="122" width="220" height="24" as="geometry"/>
+        <mxCell id="cloud-label" value="GOOGLE CLOUD · ONE BOUND PROJECT + REGION" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
+          <mxGeometry x="315" y="126" width="720" height="24" as="geometry"/>
         </mxCell>
-        <mxCell id="target-label" value="TARGET" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="1058" y="122" width="230" height="24" as="geometry"/>
+
+        <mxCell id="deterministic-boundary" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeWidth=2;strokeColor=#3D765F;fillColor=#F3F8F4;" vertex="1" parent="1">
+          <mxGeometry x="305" y="164" width="1230" height="510" as="geometry"/>
         </mxCell>
-        <mxCell id="operator" value="&lt;b&gt;Operator approval&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;One rollout root&lt;br&gt;One explicit intent&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#A9853A;fillColor=#FFF6D8;fontFamily=Helvetica;fontSize=17;fontColor=#23312D;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="50" y="150" width="180" height="112" as="geometry"/>
+        <mxCell id="deterministic-label" value="DETERMINISTIC AUTHORITY · EXECUTION · EVIDENCE" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#2E6552;" vertex="1" parent="1">
+          <mxGeometry x="330" y="177" width="720" height="24" as="geometry"/>
         </mxCell>
-        <mxCell id="authority" value="&lt;b&gt;Immutable root + current epoch&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Approved target, plan, limits&lt;br&gt;Revocation advances the epoch&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#3D765F;fillColor=#DDEDE4;fontFamily=Helvetica;fontSize=17;fontColor=#173A33;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="278" y="144" width="220" height="124" as="geometry"/>
+
+        <mxCell id="control-services" value="&lt;b&gt;Cloud Run control services&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;API · coordinator · issuer&lt;br&gt;Recovery · evidence writer&lt;br&gt;Separate identities + closed routes&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#3D765F;fillColor=#DDEDE4;fontFamily=Helvetica;fontSize=17;fontColor=#173A33;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="330" y="222" width="260" height="150" as="geometry"/>
         </mxCell>
-        <mxCell id="delivery" value="&lt;b&gt;Addressed work&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Signed, narrow capability&lt;br&gt;Fixed task destination&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#7D6E9B;fillColor=#EEE8F5;fontFamily=Helvetica;fontSize=17;fontColor=#302940;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="548" y="150" width="190" height="112" as="geometry"/>
+        <mxCell id="tasks" value="&lt;b&gt;Cloud Tasks&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Separate queues + callers&lt;br&gt;Fixed OIDC destinations&lt;br&gt;Delivery is not authority&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#7D6E9B;fillColor=#EEE8F5;fontFamily=Helvetica;fontSize=17;fontColor=#302940;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="230" width="185" height="134" as="geometry"/>
         </mxCell>
-        <mxCell id="gate" value="&lt;b&gt;Final execution gate&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Validate every binding&lt;br&gt;Read the current epoch again&lt;br&gt;Call one fixed adapter&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#173A33;fillColor=#173A33;fontFamily=Helvetica;fontSize=17;fontColor=#FFFFFF;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="788" y="138" width="220" height="136" as="geometry"/>
+        <mxCell id="executor" value="&lt;b&gt;Cloud Run executor&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Normal + recovery facade&lt;br&gt;Validate every binding&lt;br&gt;Claim exact receipt&lt;br&gt;Read current epoch again&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#173A33;fillColor=#173A33;fontFamily=Helvetica;fontSize=17;fontColor=#FFFFFF;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="900" y="218" width="245" height="158" as="geometry"/>
         </mxCell>
-        <mxCell id="target" value="&lt;b&gt;Bound Cloud Run target&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Approved revisions&lt;br&gt;Exact traffic operation&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#48748C;fillColor=#DDECF3;fontFamily=Helvetica;fontSize=17;fontColor=#183746;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="1058" y="150" width="230" height="112" as="geometry"/>
+        <mxCell id="target" value="&lt;b&gt;Bound Cloud Run target&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;One project · region · service&lt;br&gt;Approved revisions only&lt;br&gt;Exact traffic operation&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#48748C;fillColor=#DDECF3;fontFamily=Helvetica;fontSize=17;fontColor=#183746;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1215" y="222" width="280" height="150" as="geometry"/>
         </mxCell>
-        <mxCell id="flow-1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="operator" target="authority">
+
+        <mxCell id="browser-control" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;startArrow=block;startFill=1;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="browser" target="control-services">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="flow-2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="authority" target="delivery">
+        <mxCell id="control-tasks" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F3F8F4;" edge="1" parent="1" source="control-services" target="tasks">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="flow-3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="delivery" target="gate">
+        <mxCell id="tasks-executor" value="OIDC delivery" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F3F8F4;" edge="1" parent="1" source="tasks" target="executor">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="flow-4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="gate" target="target">
+        <mxCell id="executor-target" value="one fixed adapter call" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#173A33;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#173A33;labelBackgroundColor=#F3F8F4;" edge="1" parent="1" source="executor" target="target">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="epoch-read" value="fresh epoch read" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C76C4B;strokeWidth=2;dashed=1;dashPattern=7 5;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#9B4F36;labelBackgroundColor=#F7F5EF;exitX=0.7;exitY=1;entryX=0.25;entryY=1;" edge="1" parent="1" source="authority" target="gate">
+
+        <mxCell id="firestore" value="&lt;b&gt;Firestore&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;&lt;b&gt;Authority&lt;/b&gt; · immutable root + current epoch&lt;br&gt;&lt;b&gt;Receipts&lt;/b&gt; · exact request outcomes&lt;br&gt;&lt;b&gt;Timeline&lt;/b&gt; · hash-linked evidence&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#3D765F;fillColor=#DDEDE4;fontFamily=Helvetica;fontSize=17;fontColor=#173A33;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="330" y="448" width="310" height="164" as="geometry"/>
+        </mxCell>
+        <mxCell id="kms" value="&lt;b&gt;Cloud KMS&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Purpose-separated keys&lt;br&gt;Capability + selected&lt;br&gt;evidence signatures&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#A9853A;fillColor=#FFF6D8;fontFamily=Helvetica;fontSize=17;fontColor=#23312D;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="690" y="460" width="220" height="140" as="geometry"/>
+        </mxCell>
+        <mxCell id="verifier" value="&lt;b&gt;Independent verifier&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Separate Cloud Run identity&lt;br&gt;Read configuration + probes&lt;br&gt;Apply fixed health rules&lt;br&gt;No mutation authority&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#48748C;fillColor=#DDECF3;fontFamily=Helvetica;fontSize=17;fontColor=#183746;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="960" y="448" width="240" height="164" as="geometry"/>
+        </mxCell>
+        <mxCell id="monitoring" value="&lt;b&gt;Cloud Monitoring&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Root-derived queries&lt;br&gt;Canonical observations&lt;br&gt;Deterministic health input&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#48748C;fillColor=#DDECF3;fontFamily=Helvetica;fontSize=17;fontColor=#183746;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="460" width="220" height="140" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="control-firestore" value="approve + record" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;startArrow=block;startFill=1;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F3F8F4;exitX=0.45;exitY=1;entryX=0.45;entryY=0;" edge="1" parent="1" source="control-services" target="firestore">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="control-kms" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#A9853A;strokeWidth=2;startArrow=block;startFill=1;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#7B622A;labelBackgroundColor=#F3F8F4;exitX=0.85;exitY=1;entryX=0.25;entryY=0;" edge="1" parent="1" source="control-services" target="kms">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="fresh-authority" value="fresh authority read after receipt claim" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C76C4B;strokeWidth=2;dashed=1;dashPattern=7 5;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#9B4F36;labelBackgroundColor=#F3F8F4;exitX=0.35;exitY=1;entryX=0.85;entryY=0;" edge="1" parent="1" source="executor" target="firestore">
           <mxGeometry relative="1" as="geometry">
             <Array as="points">
-              <mxPoint x="430" y="316"/>
-              <mxPoint x="843" y="316"/>
+              <mxPoint x="986" y="410"/>
+              <mxPoint x="594" y="410"/>
             </Array>
           </mxGeometry>
         </mxCell>
-        <mxCell id="verify-label" value="VERIFY" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#49685F;" vertex="1" parent="1">
-          <mxGeometry x="830" y="382" width="230" height="24" as="geometry"/>
-        </mxCell>
-        <mxCell id="verifier" value="&lt;b&gt;Independent verifier&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Read configuration, probes,&lt;br&gt;and fixed health observations&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#48748C;fillColor=#DDECF3;fontFamily=Helvetica;fontSize=17;fontColor=#183746;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="830" y="410" width="230" height="116" as="geometry"/>
-        </mxCell>
-        <mxCell id="evidence" value="&lt;b&gt;Receipts + evidence timeline&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Intent, decision, readback,&lt;br&gt;and outcome stay linked&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#3D765F;fillColor=#DDEDE4;fontFamily=Helvetica;fontSize=17;fontColor=#173A33;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="530" y="410" width="240" height="116" as="geometry"/>
-        </mxCell>
-        <mxCell id="presentation" value="&lt;b&gt;Operator timeline + public replay&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Human-readable outcome&lt;br&gt;Verification details on demand&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#A9853A;fillColor=#FFF6D8;fontFamily=Helvetica;fontSize=17;fontColor=#23312D;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="220" y="410" width="250" height="116" as="geometry"/>
-        </mxCell>
-        <mxCell id="advisor" value="&lt;b&gt;Optional read-only advisor&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Explains cited recorded facts&lt;br&gt;No approval or mutation authority&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#7D6E9B;fillColor=#EEE8F5;fontFamily=Helvetica;fontSize=16;fontColor=#302940;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="530" y="570" width="240" height="104" as="geometry"/>
-        </mxCell>
-        <mxCell id="target-read" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#48748C;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="target" target="verifier">
+        <mxCell id="target-verifier" value="independent readback" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#48748C;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F3F8F4;exitX=0.85;exitY=0;entryX=0.25;entryY=1;" edge="1" parent="1" source="verifier" target="target">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="receipt-record" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;exitX=0.5;exitY=1;entryX=0.85;entryY=0;" edge="1" parent="1" source="gate" target="evidence">
+        <mxCell id="monitoring-verifier" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#48748C;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F3F8F4;" edge="1" parent="1" source="monitoring" target="verifier">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="verify-record" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="verifier" target="evidence">
+        <mxCell id="verifier-firestore" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F3F8F4;exitX=0.1;exitY=0;entryX=0.9;entryY=0;" edge="1" parent="1" source="verifier" target="firestore">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="984" y="430"/>
+              <mxPoint x="609" y="430"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="gate-note" value="&lt;b&gt;Last-mile rule:&lt;/b&gt; only an exact signed epoch equal to Firestore's current epoch can reach the bound target. Stale, future, missing, or unreadable authority stops before mutation." style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeWidth=1;strokeColor=#C76C4B;fillColor=#FBE8E1;fontFamily=Helvetica;fontSize=14;fontColor=#713722;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="520" y="626" width="800" height="34" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="advisory-boundary" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeWidth=2;strokeColor=#7D6E9B;fillColor=#F6F1FA;dashed=1;dashPattern=8 6;" vertex="1" parent="1">
+          <mxGeometry x="305" y="700" width="1230" height="195" as="geometry"/>
+        </mxCell>
+        <mxCell id="advisory-label" value="ADVISORY ONLY · AFTER THE DETERMINISTIC OUTCOME" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#5D4B7A;" vertex="1" parent="1">
+          <mxGeometry x="330" y="712" width="720" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="snapshot" value="&lt;b&gt;Coordinator-built snapshot&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Root · target · health&lt;br&gt;Receipt · timeline · verifier&lt;br&gt;Recorded facts only&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#3D765F;fillColor=#DDEDE4;fontFamily=Helvetica;fontSize=17;fontColor=#173A33;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="748" width="300" height="112" as="geometry"/>
+        </mxCell>
+        <mxCell id="advisor" value="&lt;b&gt;Cloud Run advisor · Google ADK&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Six fixed read-only tools&lt;br&gt;Bound, redacted summaries&lt;br&gt;Citations required&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#7D6E9B;fillColor=#EEE8F5;fontFamily=Helvetica;fontSize=17;fontColor=#302940;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="750" y="748" width="310" height="112" as="geometry"/>
+        </mxCell>
+        <mxCell id="gemini" value="&lt;b&gt;Gemini 3.5 Flash&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;Vertex AI · prediction only&lt;br&gt;Structured cited explanation&lt;br&gt;No control-plane IAM&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;strokeWidth=2;strokeColor=#7D6E9B;fillColor=#EEE8F5;fontFamily=Helvetica;fontSize=17;fontColor=#302940;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="748" width="310" height="112" as="geometry"/>
+        </mxCell>
+        <mxCell id="snapshot-advisor" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7D6E9B;strokeWidth=2;dashed=1;dashPattern=7 5;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#5D4B7A;labelBackgroundColor=#F6F1FA;" edge="1" parent="1" source="snapshot" target="advisor">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="present-record" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#49685F;strokeWidth=2;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#355A52;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="evidence" target="presentation">
+        <mxCell id="firestore-snapshot" value="recorded facts" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7D6E9B;strokeWidth=2;dashed=1;dashPattern=7 5;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#5D4B7A;labelBackgroundColor=#F7F5EF;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="firestore" target="snapshot">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="advisor-read" value="cited facts only" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7D6E9B;strokeWidth=2;dashed=1;dashPattern=7 5;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontColor=#5D4B7A;labelBackgroundColor=#F7F5EF;" edge="1" parent="1" source="evidence" target="advisor">
+        <mxCell id="advisor-gemini" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7D6E9B;strokeWidth=2;dashed=1;dashPattern=7 5;startArrow=block;startFill=1;endArrow=block;endFill=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#5D4B7A;labelBackgroundColor=#F6F1FA;" edge="1" parent="1" source="advisor" target="gemini">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="deny-note" value="&lt;b&gt;Decision at the gate:&lt;/b&gt; fully validated current-epoch work can reach the bound target; stale, missing, or uncertain authority stops before mutation." style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeWidth=1;strokeColor=#C76C4B;fillColor=#FBE8E1;fontFamily=Helvetica;fontSize=14;fontColor=#713722;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
-          <mxGeometry x="800" y="585" width="490" height="72" as="geometry"/>
+        <mxCell id="advisory-note" value="Validated output is stored as ADVISORY_ONLY. It cannot approve authority, decide health, enqueue work, recover, sign, or mutate the target." style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=13;fontColor=#5D4B7A;" vertex="1" parent="1">
+          <mxGeometry x="420" y="865" width="1000" height="24" as="geometry"/>
         </mxCell>
       </root>
     </mxGraphModel>
